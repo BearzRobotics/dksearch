@@ -112,7 +112,20 @@ pub const SqliteStateStore = struct {
     }
 
     pub fn documents(self: *SqliteStateStore) storage.DocumentStore {
-        return .{ .ptr = self, .vtable = &.{ .upsert = upsert, .find = find, .delete = delete, .for_each = forEach } };
+        return .{ .ptr = self, .vtable = &.{ .upsert = upsert, .find = find, .delete = delete, .for_each = forEach, .begin = begin, .commit = commit, .rollback = rollback } };
+    }
+
+    fn begin(ptr: *anyopaque) storage.Error!void {
+        const self: *SqliteStateStore = @ptrCast(@alignCast(ptr));
+        try sqlite.execSql(self.db, "BEGIN IMMEDIATE");
+    }
+    fn commit(ptr: *anyopaque) storage.Error!void {
+        const self: *SqliteStateStore = @ptrCast(@alignCast(ptr));
+        try sqlite.execSql(self.db, "COMMIT");
+    }
+    fn rollback(ptr: *anyopaque) storage.Error!void {
+        const self: *SqliteStateStore = @ptrCast(@alignCast(ptr));
+        try sqlite.execSql(self.db, "ROLLBACK");
     }
 
     pub fn documentCount(self: *SqliteStateStore) sqlite.Error!u64 {
@@ -216,8 +229,10 @@ pub const SqliteStateStore = struct {
     }
 
     /// Saves progress. Call it as often as losing that much work would hurt.
+    /// A null `checkpoint` updates only the counters and keeps the position
+    /// saved earlier.
     pub fn saveCheckpoint(self: *SqliteStateStore, job: i64, checkpoint: ?[]const u8, submitted: u64, rejected: u64) sqlite.Error!void {
-        const st = try Stmt.prepare(self.db, "UPDATE jobs SET checkpoint = ?2, submitted = ?3, rejected = ?4 WHERE id = ?1");
+        const st = try Stmt.prepare(self.db, "UPDATE jobs SET checkpoint = COALESCE(?2, checkpoint), submitted = ?3, rejected = ?4 WHERE id = ?1");
         defer st.deinit();
         try st.int(1, job);
         try st.blob(2, checkpoint);
@@ -412,13 +427,15 @@ test "job lifecycle with checkpoints and counters" {
     try testing.expectEqual(JobState.running, job.state);
     try testing.expectEqual(@as(doc.Timestamp, 100), job.started_at);
 
+    try s.saveCheckpoint(j, "row:400", 400, 1);
     try s.saveCheckpoint(j, "row:500", 500, 3);
+    try s.saveCheckpoint(j, null, 510, 4); // counters only: the position stays
     try s.finishJob(j, .completed, 200, null);
     job = (try s.getJob(a, j)).?;
     try testing.expectEqual(JobState.completed, job.state);
     try testing.expectEqual(@as(?doc.Timestamp, 200), job.finished_at);
-    try testing.expectEqual(@as(u64, 500), job.submitted);
-    try testing.expectEqual(@as(u64, 3), job.rejected);
+    try testing.expectEqual(@as(u64, 510), job.submitted);
+    try testing.expectEqual(@as(u64, 4), job.rejected);
     try testing.expectEqualStrings("row:500", job.checkpoint.?);
     try testing.expect((try s.getJob(a, 9999)) == null);
 

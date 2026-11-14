@@ -31,7 +31,23 @@ pub const Indexer = struct {
         clear: *const fn (ptr: *anyopaque) Error!void,
         /// Verify the index's internal consistency; `error.Corrupt` if not.
         check: *const fn (ptr: *anyopaque) Error!void,
+        /// Optional batching, with the same meaning as on the stores
+        /// (`storage.ContentStore`): changes between `begin` and `commit`
+        /// become durable together; null means write-through.
+        begin: ?*const fn (ptr: *anyopaque) Error!void = null,
+        commit: ?*const fn (ptr: *anyopaque) Error!void = null,
+        rollback: ?*const fn (ptr: *anyopaque) Error!void = null,
     };
+
+    pub fn begin(self: Indexer) Error!void {
+        if (self.vtable.begin) |f| return f(self.ptr);
+    }
+    pub fn commit(self: Indexer) Error!void {
+        if (self.vtable.commit) |f| return f(self.ptr);
+    }
+    pub fn rollback(self: Indexer) Error!void {
+        if (self.vtable.rollback) |f| return f(self.ptr);
+    }
 
     pub fn add(self: Indexer, id: doc.Id, d: doc.Document) Error!void {
         return self.vtable.add(self.ptr, id, d);

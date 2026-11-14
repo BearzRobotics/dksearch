@@ -57,7 +57,20 @@ pub const SqliteContentStore = struct {
     }
 
     pub fn store(self: *SqliteContentStore) storage.ContentStore {
-        return .{ .ptr = self, .vtable = &.{ .put = put, .get = get, .delete = delete } };
+        return .{ .ptr = self, .vtable = &.{ .put = put, .get = get, .delete = delete, .begin = begin, .commit = commit, .rollback = rollback } };
+    }
+
+    fn begin(ptr: *anyopaque) storage.Error!void {
+        const self: *SqliteContentStore = @ptrCast(@alignCast(ptr));
+        try sqlite.execSql(self.db, "BEGIN IMMEDIATE");
+    }
+    fn commit(ptr: *anyopaque) storage.Error!void {
+        const self: *SqliteContentStore = @ptrCast(@alignCast(ptr));
+        try sqlite.execSql(self.db, "COMMIT");
+    }
+    fn rollback(ptr: *anyopaque) storage.Error!void {
+        const self: *SqliteContentStore = @ptrCast(@alignCast(ptr));
+        try sqlite.execSql(self.db, "ROLLBACK");
     }
 
     pub fn count(self: *SqliteContentStore) sqlite.Error!u64 {

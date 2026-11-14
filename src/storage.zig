@@ -38,7 +38,25 @@ pub const ContentStore = struct {
         get: *const fn (ptr: *anyopaque, gpa: Allocator, id: doc.Id) Error![]u8,
         /// Deleting a missing id is not an error.
         delete: *const fn (ptr: *anyopaque, id: doc.Id) Error!void,
+        /// Optional batching. `begin` opens a batch: writes made until
+        /// `commit` may be buffered and become durable together, with one
+        /// sync instead of one per write. A crash before `commit` loses the
+        /// whole batch and nothing else. `rollback` abandons it. A store
+        /// without these (null) simply writes through immediately.
+        begin: ?*const fn (ptr: *anyopaque) Error!void = null,
+        commit: ?*const fn (ptr: *anyopaque) Error!void = null,
+        rollback: ?*const fn (ptr: *anyopaque) Error!void = null,
     };
+
+    pub fn begin(self: ContentStore) Error!void {
+        if (self.vtable.begin) |f| return f(self.ptr);
+    }
+    pub fn commit(self: ContentStore) Error!void {
+        if (self.vtable.commit) |f| return f(self.ptr);
+    }
+    pub fn rollback(self: ContentStore) Error!void {
+        if (self.vtable.rollback) |f| return f(self.ptr);
+    }
 
     pub fn put(self: ContentStore, id: doc.Id, bytes: []const u8) Error!void {
         return self.vtable.put(self.ptr, id, bytes);
@@ -86,7 +104,25 @@ pub const DocumentStore = struct {
         /// store must not be modified during the visit. Stops at the first
         /// error returned by the visitor and returns it.
         for_each: *const fn (ptr: *anyopaque, visitor: Visitor) Error!void,
+        /// Optional batching. `begin` opens a batch: writes made until
+        /// `commit` may be buffered and become durable together, with one
+        /// sync instead of one per write. A crash before `commit` loses the
+        /// whole batch and nothing else. `rollback` abandons it. A store
+        /// without these (null) simply writes through immediately.
+        begin: ?*const fn (ptr: *anyopaque) Error!void = null,
+        commit: ?*const fn (ptr: *anyopaque) Error!void = null,
+        rollback: ?*const fn (ptr: *anyopaque) Error!void = null,
     };
+
+    pub fn begin(self: DocumentStore) Error!void {
+        if (self.vtable.begin) |f| return f(self.ptr);
+    }
+    pub fn commit(self: DocumentStore) Error!void {
+        if (self.vtable.commit) |f| return f(self.ptr);
+    }
+    pub fn rollback(self: DocumentStore) Error!void {
+        if (self.vtable.rollback) |f| return f(self.ptr);
+    }
 
     pub fn upsert(self: DocumentStore, rec: Record) Error!void {
         return self.vtable.upsert(self.ptr, rec);

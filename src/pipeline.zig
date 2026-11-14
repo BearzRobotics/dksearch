@@ -43,9 +43,52 @@ pub const Pipeline = struct {
     index: indexer.Indexer,
     options: Options,
     stats: Stats = .{},
+    /// True between `beginBatch` and `commitBatch`/`abortBatch`.
+    in_batch: bool = false,
 
     pub fn init(content: storage.ContentStore, docs: storage.DocumentStore, index: indexer.Indexer, options: Options) Pipeline {
         return .{ .content = content, .docs = docs, .index = index, .options = options };
+    }
+
+    /// Opens a batch on the content store, the index and the document store.
+    /// Everything submitted until `commitBatch` is made durable together,
+    /// with one sync per store instead of one per document. A no-op if a
+    /// batch is already open.
+    pub fn beginBatch(self: *Pipeline) (storage.Error || indexer.Error)!void {
+        if (self.in_batch) return;
+        try self.content.begin();
+        errdefer self.content.rollback() catch {};
+        try self.index.begin();
+        errdefer self.index.rollback() catch {};
+        try self.docs.begin();
+        self.in_batch = true;
+    }
+
+    /// Makes the open batch durable. The order matters and is the point: the
+    /// content and the index are committed first, and the provenance records
+    /// last. A crash between the steps leaves content or index entries with no
+    /// record yet, which a re-import repeats harmlessly, and never a record
+    /// whose content is missing. A no-op if no batch is open.
+    ///
+    /// If a step fails the batch stays open, so that `abortBatch` can roll
+    /// back every store (a store whose commit already succeeded has nothing
+    /// left to roll back, which is harmless).
+    pub fn commitBatch(self: *Pipeline) (storage.Error || indexer.Error)!void {
+        if (!self.in_batch) return;
+        try self.content.commit();
+        try self.index.commit();
+        try self.docs.commit();
+        self.in_batch = false;
+    }
+
+    /// Abandons the open batch: nothing submitted since `beginBatch` is kept.
+    /// Best effort; a no-op if no batch is open.
+    pub fn abortBatch(self: *Pipeline) void {
+        if (!self.in_batch) return;
+        self.in_batch = false;
+        self.docs.rollback() catch {};
+        self.index.rollback() catch {};
+        self.content.rollback() catch {};
     }
 
     /// The `Sink` to hand to connectors. Valid while `self` is.

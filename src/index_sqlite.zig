@@ -125,7 +125,7 @@ pub const SqliteIndex = struct {
     }
 
     pub fn indexer(self: *SqliteIndex) idx_api.Indexer {
-        return .{ .ptr = self, .vtable = &.{ .add = add, .remove = remove, .clear = clear, .check = check } };
+        return .{ .ptr = self, .vtable = &.{ .add = add, .remove = remove, .clear = clear, .check = check, .begin = batchBegin, .commit = batchCommit, .rollback = batchRollback } };
     }
 
     pub fn searcher(self: *SqliteIndex) search.Searcher {
@@ -142,14 +142,29 @@ pub const SqliteIndex = struct {
 
     // ------------------------------------------------------------ writes
 
+    // Each operation is a SAVEPOINT, which is a plain transaction when used
+    // alone and nests inside a batch opened with `batchBegin`.
     fn begin(self: *SqliteIndex) idx_api.Error!void {
-        try self.exec("BEGIN IMMEDIATE");
+        try self.exec("SAVEPOINT op");
     }
     fn commit(self: *SqliteIndex) idx_api.Error!void {
-        try self.exec("COMMIT");
+        try self.exec("RELEASE op");
     }
     fn rollback(self: *SqliteIndex) void {
-        self.exec("ROLLBACK") catch {};
+        self.exec("ROLLBACK TO op; RELEASE op") catch {};
+    }
+
+    fn batchBegin(ptr: *anyopaque) idx_api.Error!void {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
+        try self.exec("BEGIN IMMEDIATE");
+    }
+    fn batchCommit(ptr: *anyopaque) idx_api.Error!void {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
+        try self.exec("COMMIT");
+    }
+    fn batchRollback(ptr: *anyopaque) idx_api.Error!void {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
+        try self.exec("ROLLBACK");
     }
 
     fn add(ptr: *anyopaque, id: doc.Id, d: doc.Document) idx_api.Error!void {
