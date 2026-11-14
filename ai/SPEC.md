@@ -95,6 +95,8 @@ The API must have documented request/response formats, versioning policy, error 
 
 Crawling is one connector type, not the sole or mandatory ingestion path.
 
+Connectors in general are optional. The project supports and ships them, but no installation is forced to use any of them: with no connector configured the system still starts, serves search and administers itself, and content may arrive by other routes through the shared ingestion pipeline (for example the local-files connector or a documented import format for the user's own tools). Bundled connectors use the same interface as any other source and receive no private access. A connector's dependencies are only built in when that connector is.
+
 The architecture must support multiple independent acquisition methods feeding a shared ingestion pipeline.
 
 ### 4.1 Initial data sources
