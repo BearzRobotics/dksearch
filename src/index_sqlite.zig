@@ -53,65 +53,8 @@ pub const OpenError = idx_api.Error || error{
     SchemaMismatch,
 };
 
-const transient: c.sqlite3_destructor_type = @ptrFromInt(std.math.maxInt(usize));
-
-fn mapRc(rc: c_int) idx_api.Error {
-    return switch (rc & 0xff) {
-        c.SQLITE_FULL => error.NoSpace,
-        c.SQLITE_NOMEM => error.OutOfMemory,
-        c.SQLITE_CORRUPT, c.SQLITE_NOTADB => error.Corrupt,
-        else => error.Io,
-    };
-}
-
-const Stmt = struct {
-    s: *c.sqlite3_stmt,
-
-    fn prepare(db: *c.sqlite3, sql: [:0]const u8) idx_api.Error!Stmt {
-        var s: ?*c.sqlite3_stmt = null;
-        const rc = c.sqlite3_prepare_v2(db, sql.ptr, -1, &s, null);
-        if (rc != c.SQLITE_OK) return mapRc(rc);
-        return .{ .s = s.? };
-    }
-    fn deinit(self: Stmt) void {
-        _ = c.sqlite3_finalize(self.s);
-    }
-    fn text(self: Stmt, i: c_int, v: ?[]const u8) idx_api.Error!void {
-        const rc = if (v) |x|
-            c.sqlite3_bind_text(self.s, i, x.ptr, @intCast(x.len), transient)
-        else
-            c.sqlite3_bind_null(self.s, i);
-        if (rc != c.SQLITE_OK) return mapRc(rc);
-    }
-    fn blob(self: Stmt, i: c_int, v: []const u8) idx_api.Error!void {
-        const rc = c.sqlite3_bind_blob(self.s, i, v.ptr, @intCast(v.len), transient);
-        if (rc != c.SQLITE_OK) return mapRc(rc);
-    }
-    fn int(self: Stmt, i: c_int, v: ?i64) idx_api.Error!void {
-        const rc = if (v) |x| c.sqlite3_bind_int64(self.s, i, x) else c.sqlite3_bind_null(self.s, i);
-        if (rc != c.SQLITE_OK) return mapRc(rc);
-    }
-    /// True if a row is available, false when done.
-    fn step(self: Stmt) idx_api.Error!bool {
-        const rc = c.sqlite3_step(self.s);
-        return switch (rc) {
-            c.SQLITE_ROW => true,
-            c.SQLITE_DONE => false,
-            else => mapRc(rc),
-        };
-    }
-    fn colText(self: Stmt, i: c_int) ?[]const u8 {
-        const p = c.sqlite3_column_text(self.s, i) orelse return null;
-        const n: usize = @intCast(c.sqlite3_column_bytes(self.s, i));
-        return p[0..n];
-    }
-    fn colInt(self: Stmt, i: c_int) i64 {
-        return c.sqlite3_column_int64(self.s, i);
-    }
-    fn colFloat(self: Stmt, i: c_int) f64 {
-        return c.sqlite3_column_double(self.s, i);
-    }
-};
+const Stmt = sqlite.Stmt;
+const mapRc = sqlite.mapRc;
 
 pub const SqliteIndex = struct {
     db: *c.sqlite3,
