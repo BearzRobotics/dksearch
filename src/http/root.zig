@@ -1,0 +1,15 @@
+//! dksearch HTTP adapter: routes requests to the core search service and
+//! renders JSON and HTML. Imports the core; the core never imports this.
+//! See docs/decisions/0004-http-api-and-frontend.md.
+
+pub const handler = @import("handler.zig");
+pub const query = @import("query.zig");
+pub const html = @import("html.zig");
+pub const server = @import("server.zig");
+
+test {
+    _ = handler;
+    _ = query;
+    _ = html;
+    _ = server;
+}
