@@ -40,6 +40,12 @@ pub const Diagnostic = struct {
     line: usize = 0,
     column: usize = 0,
 
+    /// Records the file the problem was found in, for errors found by code
+    /// that only sees parsed values (for example connector validation).
+    pub fn setSource(self: *Diagnostic, src: []const u8) void {
+        self.source_len = copyTrunc(&self.source_buf, src);
+    }
+
     pub fn source(self: *const Diagnostic) []const u8 {
         return self.source_buf[0..self.source_len];
     }
@@ -59,7 +65,7 @@ pub const Diagnostic = struct {
         try w.writeAll(self.message_buf[0..self.message_len]);
     }
 
-    fn set(self: *Diagnostic, src: []const u8, key_path: []const u8, comptime fmt: []const u8, args: anytype) void {
+    pub fn set(self: *Diagnostic, src: []const u8, key_path: []const u8, comptime fmt: []const u8, args: anytype) void {
         self.source_len = copyTrunc(&self.source_buf, src);
         self.key_len = copyTrunc(&self.key_buf, key_path);
         const m = std.fmt.bufPrint(&self.message_buf, fmt, args) catch &self.message_buf;
@@ -108,6 +114,60 @@ const listener_ints = [_]ListenerInt{
     .{ .key = "shutdown_grace_ms", .min = 0, .max = 600_000, .field = "shutdown_grace_ms" },
 };
 
+/// A value of a connector-specific setting. Only scalars are allowed, so a
+/// source's whole configuration is flat and easy to validate.
+pub const OptionValue = union(enum) {
+    string: []const u8,
+    integer: i64,
+    boolean: bool,
+};
+
+pub const Option = struct {
+    key: []const u8,
+    value: OptionValue,
+};
+
+/// One configured source: a connector instance. Sources are optional: a
+/// configuration with none is complete and valid (docs/decisions/0007).
+/// `name`, `kind`, `enabled` and `retain_text` are common to all; every other
+/// key is a connector-specific option, validated by that connector.
+pub const Source = struct {
+    /// Unique, 1-64 characters of [a-z0-9_-], starting with a letter or digit.
+    /// Jobs and resume points are keyed by it, so renaming a source starts it afresh.
+    name: []const u8,
+    /// Connector type, e.g. "files".
+    kind: []const u8,
+    /// A disabled source stays in the file but is never run.
+    enabled: bool = true,
+    /// Keep the main text so the index can be rebuilt without reacquiring it.
+    /// Turn off for sources whose terms forbid retention.
+    retain_text: bool = true,
+    options: []const Option = &.{},
+
+    pub fn option(self: Source, key: []const u8) ?OptionValue {
+        for (self.options) |o| if (std.mem.eql(u8, o.key, key)) return o.value;
+        return null;
+    }
+    pub fn optionString(self: Source, key: []const u8) ?[]const u8 {
+        return switch (self.option(key) orelse return null) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+    pub fn optionInt(self: Source, key: []const u8) ?i64 {
+        return switch (self.option(key) orelse return null) {
+            .integer => |n| n,
+            else => null,
+        };
+    }
+    pub fn optionBool(self: Source, key: []const u8) ?bool {
+        return switch (self.option(key) orelse return null) {
+            .boolean => |b| b,
+            else => null,
+        };
+    }
+};
+
 pub const Config = struct {
     arena: std.heap.ArenaAllocator,
 
@@ -120,6 +180,8 @@ pub const Config = struct {
     admin_configured: bool,
     /// Directory for operational state, retained content and indexes.
     data_dir: []const u8,
+    /// Configured sources; empty by default.
+    sources: []const Source,
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -134,7 +196,7 @@ const server_keys = [_][]const u8{
     "max_requests_per_connection", "shutdown_grace_ms",
 };
 const storage_keys = [_][]const u8{"data_dir"};
-const top_keys = [_][]const u8{ "server", "admin", "storage" };
+const top_keys = [_][]const u8{ "server", "admin", "storage", "source" };
 
 /// Parses and validates configuration text. `source_name` is only used in
 /// diagnostics (normally the file path).
@@ -180,6 +242,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
         .admin = .{ .address = "127.0.0.1", .port = 8081 },
         .admin_configured = root.get("admin") != null,
         .data_dir = "data",
+        .sources = &.{},
     };
     errdefer cfg.arena.deinit();
     const a = cfg.arena.allocator();
@@ -198,11 +261,113 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
         }
     }
 
+    cfg.sources = try readSources(a, src, root, diag);
+
     if (cfg.server.port == cfg.admin.port and std.mem.eql(u8, cfg.server.address, cfg.admin.address)) {
         diag.set(src, "admin", "admin and server must not share the same address and port", .{});
         return error.InvalidValue;
     }
     return cfg;
+}
+
+const source_common_keys = [_][]const u8{ "name", "kind", "enabled", "retain_text" };
+
+fn validSourceName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name, 0..) |ch, i| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or (i > 0 and (ch == '_' or ch == '-'));
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn readSources(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error![]const Source {
+    const v = root.get("source") orelse return &.{};
+    const arr = switch (v) {
+        .array => |x| x,
+        else => {
+            diag.set(src, "source", "expected an array of tables ([[source]]), got {s}", .{v.typeName()});
+            return error.WrongType;
+        },
+    };
+    var out = try a.alloc(Source, arr.items.items.len);
+    var kbuf: [96]u8 = undefined;
+    for (arr.items.items, 0..) |item, i| {
+        const t = switch (item) {
+            .table => |x| x,
+            else => {
+                diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}]", .{i}) catch "source", "expected a table, got {s}", .{item.typeName()});
+                return error.WrongType;
+            },
+        };
+        const where = std.fmt.bufPrint(&kbuf, "source[{d}]", .{i}) catch "source";
+
+        const name = (try reqStr(src, where, t, "name", diag));
+        if (!validSourceName(name)) {
+            diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}].name", .{i}) catch "source.name", "must be 1-64 characters of a-z, 0-9, '_' or '-', starting with a letter or digit, got \"{s}\"", .{name});
+            return error.InvalidValue;
+        }
+        for (out[0..i]) |prev| if (std.mem.eql(u8, prev.name, name)) {
+            diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}].name", .{i}) catch "source.name", "duplicate source name \"{s}\"", .{name});
+            return error.InvalidValue;
+        };
+        const kind = try reqStr(src, where, t, "kind", diag);
+        if (kind.len == 0) {
+            diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}].kind", .{i}) catch "source.kind", "must not be empty", .{});
+            return error.InvalidValue;
+        }
+
+        var s: Source = .{ .name = try a.dupe(u8, name), .kind = try a.dupe(u8, kind) };
+        if (try optBool(src, where, t, "enabled", diag)) |b| s.enabled = b;
+        if (try optBool(src, where, t, "retain_text", diag)) |b| s.retain_text = b;
+
+        var opts: std.ArrayList(Option) = .empty;
+        var it = t.entries.iterator();
+        outer: while (it.next()) |e| {
+            for (source_common_keys) |k| if (std.mem.eql(u8, k, e.key_ptr.*)) continue :outer;
+            const value: OptionValue = switch (e.value_ptr.*) {
+                .string => |x| .{ .string = try a.dupe(u8, x) },
+                .integer => |x| .{ .integer = x },
+                .boolean => |x| .{ .boolean = x },
+                else => |other| {
+                    diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}].{s}", .{ i, e.key_ptr.* }) catch "source", "unsupported type {s} (use a string, integer or boolean)", .{other.typeName()});
+                    return error.WrongType;
+                },
+            };
+            try opts.append(a, .{ .key = try a.dupe(u8, e.key_ptr.*), .value = value });
+        }
+        s.options = opts.items;
+        out[i] = s;
+    }
+    return out;
+}
+
+fn reqStr(src: []const u8, where: []const u8, t: *toml.Table, key: []const u8, diag: *Diagnostic) Error![]const u8 {
+    var kbuf: [128]u8 = undefined;
+    const kp = std.fmt.bufPrint(&kbuf, "{s}.{s}", .{ where, key }) catch key;
+    const v = t.get(key) orelse {
+        diag.set(src, kp, "is required", .{});
+        return error.InvalidValue;
+    };
+    return switch (v) {
+        .string => |s| s,
+        else => {
+            diag.set(src, kp, "expected string, got {s}", .{v.typeName()});
+            return error.WrongType;
+        },
+    };
+}
+
+fn optBool(src: []const u8, where: []const u8, t: *toml.Table, key: []const u8, diag: *Diagnostic) Error!?bool {
+    const v = t.get(key) orelse return null;
+    return switch (v) {
+        .boolean => |b| b,
+        else => {
+            var kbuf: [128]u8 = undefined;
+            diag.set(src, std.fmt.bufPrint(&kbuf, "{s}.{s}", .{ where, key }) catch key, "expected boolean, got {s}", .{v.typeName()});
+            return error.WrongType;
+        },
+    };
 }
 
 fn readListener(a: Allocator, src: []const u8, root: *toml.Table, name: []const u8, def: Listener, diag: *Diagnostic) Error!Listener {
@@ -456,4 +621,74 @@ test "admin_configured reflects the presence of an [admin] table" {
     var b = try loadFromSlice(testing.allocator, "t.toml", "[admin]\nport = 9001", &d);
     defer b.deinit();
     try testing.expect(b.admin_configured);
+}
+
+test "no sources is a complete, valid configuration" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "", &d);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 0), c.sources.len);
+}
+
+test "sources: common keys, defaults and connector options" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml",
+        \\[[source]]
+        \\name = "my-notes"
+        \\kind = "files"
+        \\path = "/home/me/notes"
+        \\max_file_bytes = 1048576
+        \\follow = false
+        \\
+        \\[[source]]
+        \\name = "books_2"
+        \\kind = "gutenberg"
+        \\enabled = false
+        \\retain_text = false
+    , &d);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 2), c.sources.len);
+
+    const a = c.sources[0];
+    try testing.expectEqualStrings("my-notes", a.name);
+    try testing.expectEqualStrings("files", a.kind);
+    try testing.expect(a.enabled);
+    try testing.expect(a.retain_text);
+    try testing.expectEqualStrings("/home/me/notes", a.optionString("path").?);
+    try testing.expectEqual(@as(?i64, 1048576), a.optionInt("max_file_bytes"));
+    try testing.expectEqual(@as(?bool, false), a.optionBool("follow"));
+    try testing.expect(a.option("name") == null); // common keys are not options
+    try testing.expect(a.optionString("max_file_bytes") == null); // wrong-type lookup is null
+
+    const b = c.sources[1];
+    try testing.expect(!b.enabled);
+    try testing.expect(!b.retain_text);
+    try testing.expectEqual(@as(usize, 0), b.options.len);
+}
+
+test "sources: invalid entries are rejected with the entry and key in the message" {
+    var d: Diagnostic = .{};
+    const T = testing.allocator;
+    try testing.expectError(error.InvalidValue, loadFromSlice(T, "t.toml", "[[source]]\nkind = \"files\"", &d));
+    try testing.expectEqualStrings("source[0].name", d.key());
+    try testing.expectError(error.InvalidValue, loadFromSlice(T, "t.toml", "[[source]]\nname = \"x\"", &d));
+    try testing.expectEqualStrings("source[0].kind", d.key());
+    try testing.expectError(error.InvalidValue, loadFromSlice(T, "t.toml", "[[source]]\nname = \"Bad Name\"\nkind = \"files\"", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(T, "t.toml", "[[source]]\nname = \"-lead\"\nkind = \"files\"", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(T, "t.toml", "[[source]]\nname = \"\"\nkind = \"files\"", &d));
+    try testing.expectError(error.WrongType, loadFromSlice(T, "t.toml", "[[source]]\nname = 5\nkind = \"files\"", &d));
+    try testing.expectError(error.WrongType, loadFromSlice(T, "t.toml", "[[source]]\nname = \"a\"\nkind = \"files\"\nenabled = \"yes\"", &d));
+    try testing.expectEqualStrings("source[0].enabled", d.key());
+    try testing.expectError(error.WrongType, loadFromSlice(T, "t.toml", "[[source]]\nname = \"a\"\nkind = \"files\"\npaths = [\"x\"]", &d));
+    try testing.expectEqualStrings("source[0].paths", d.key());
+    try testing.expectError(error.WrongType, loadFromSlice(T, "t.toml", "[source]\nname = \"a\"", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(T, "t.toml",
+        \\[[source]]
+        \\name = "dup"
+        \\kind = "files"
+        \\[[source]]
+        \\name = "dup"
+        \\kind = "files"
+    , &d));
+    try testing.expectEqualStrings("source[1].name", d.key());
 }

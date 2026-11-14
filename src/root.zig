@@ -13,6 +13,8 @@ pub const rebuild = @import("rebuild.zig");
 pub const index_sqlite = @import("index_sqlite.zig");
 pub const content_sqlite = @import("content_sqlite.zig");
 pub const state_sqlite = @import("state_sqlite.zig");
+pub const runner = @import("runner.zig");
+pub const connectors = @import("connectors.zig");
 // src/sqlite.zig (raw C API) is internal to index_sqlite.zig and not exported.
 
 test {
@@ -28,5 +30,7 @@ test {
     _ = index_sqlite;
     _ = content_sqlite;
     _ = state_sqlite;
+    _ = runner;
+    _ = connectors;
     _ = @import("sqlite.zig");
 }

@@ -27,17 +27,34 @@ pub const Sink = struct {
         /// The Document and everything it points to is only valid for the
         /// duration of the call; the sink copies what it keeps.
         submit: *const fn (ptr: *anyopaque, doc: Document) Error!void,
+        /// Optional. Receives a resume position a connector reports while it
+        /// runs. The position must be valid for resuming *after every
+        /// document submitted so far*: restarting a run from it must not skip
+        /// any document that has not been submitted yet. A sink that
+        /// persists it makes crash recovery lose at most the work since the
+        /// last checkpoint. `Stopped` means it could not be saved, so the
+        /// connector should stop. Only valid during the call.
+        checkpoint: ?*const fn (ptr: *anyopaque, position: []const u8) Error!void = null,
     };
 
     pub fn submit(self: Sink, doc: Document) Error!void {
         return self.vtable.submit(self.ptr, doc);
+    }
+
+    /// Reports a resume position. A no-op if the sink does not keep them.
+    pub fn checkpoint(self: Sink, position: []const u8) Error!void {
+        if (self.vtable.checkpoint) |f| return f(self.ptr, position);
     }
 };
 
 /// Cooperative control and progress, shared between the runner and a connector.
 pub const Control = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
+    /// Documents the connector handed to the sink and the sink accepted.
     submitted: std.atomic.Value(u64) = .init(0),
+    /// Items the connector itself refused before submitting them (too large,
+    /// unreadable, malformed). Documents the *sink* rejects are not counted
+    /// here: the sink counts those.
     rejected: std.atomic.Value(u64) = .init(0),
 
     pub fn cancel(self: *Control) void {
@@ -85,7 +102,8 @@ pub const Connector = struct {
         info: *const fn (ptr: *anyopaque) Info,
         /// Emit documents until the source is exhausted, `control` is
         /// cancelled, or the sink stops. Must check `control.isCancelled()`
-        /// regularly. Must count each submit in `control`.
+        /// regularly. Should count accepted submits in `control.submitted`
+        /// and items it refuses itself in `control.rejected`.
         run: *const fn (ptr: *anyopaque, sink: Sink, control: *Control, resume_from: ?[]const u8) RunError!Outcome,
     };
 
@@ -118,10 +136,7 @@ const FixtureConnector = struct {
         while (i < self.items.len) : (i += 1) {
             if (control.isCancelled()) return self.interrupted(i);
             sink.submit(.{ .connector = "fixture", .source_id = self.items[i], .text = self.items[i] }) catch |e| switch (e) {
-                error.Rejected => {
-                    _ = control.rejected.fetchAdd(1, .monotonic);
-                    continue;
-                },
+                error.Rejected => continue, // the sink counts its own rejections
                 error.Stopped => return self.interrupted(i),
                 error.OutOfMemory => return error.OutOfMemory,
             };
@@ -174,7 +189,7 @@ test "connector emits all documents to the sink" {
     try testing.expectEqual(@as(u64, 3), ctl.submitted.load(.monotonic));
 }
 
-test "rejected records are counted and do not stop the run" {
+test "records the sink rejects do not stop the run" {
     var fx: FixtureConnector = .{ .items = &.{ "a", "bad", "c" } };
     var cs: CollectingSink = .{ .reject_id = "bad" };
     defer cs.seen.deinit(testing.allocator);
@@ -183,7 +198,7 @@ test "rejected records are counted and do not stop the run" {
     const out = try fx.connector().run(cs.sink(), &ctl, null);
     try testing.expect(!out.interrupted);
     try testing.expectEqual(@as(usize, 2), cs.seen.items.len);
-    try testing.expectEqual(@as(u64, 1), ctl.rejected.load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), ctl.submitted.load(.monotonic));
 }
 
 test "cancellation yields a checkpoint and the run resumes where it stopped" {
