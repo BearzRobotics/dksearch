@@ -150,7 +150,7 @@ BUGS
 See dksearch(1).
 
 TROUBLESHOOTING
-Empty `hits` for a query that should match: check the filters, and check that the index is populated (dksearch(1) cannot yet import documents).
+Empty `hits` for a query that should match: check the filters, and check that the index is populated (see **import** in dksearch(1)).
 
 NOTES
 Document ids are derived from the connector name and the source's own identifier, so the same item keeps the same id across re-imports and index rebuilds.
