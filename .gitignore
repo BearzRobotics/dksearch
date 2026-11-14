@@ -1,0 +1,6 @@
+.zig-cache/
+zig-cache/
+zig-out/
+# Generated or machine-specific state (ai/AGENTS.md section 4)
+/data/
+*.idx
