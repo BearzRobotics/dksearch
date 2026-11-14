@@ -104,6 +104,16 @@ pub const SqliteStateStore = struct {
         return self;
     }
 
+    /// Opens an existing file read-only for `maintenance.check`. Unlike
+    /// `open` it neither upgrades the schema nor marks running jobs
+    /// interrupted, so it is safe while an import is running.
+    pub fn inspect(gpa: Allocator, path: [:0]const u8) OpenError!SqliteStateStore {
+        const db = try sqlite.openReadOnly(path);
+        errdefer _ = c.sqlite3_close(db);
+        try sqlite.requireCurrent(db, migrations.len);
+        return .{ .gpa = gpa, .db = db, .find_arena = .init(gpa), .visit_arena = .init(gpa) };
+    }
+
     pub fn close(self: *SqliteStateStore) void {
         self.find_arena.deinit();
         self.visit_arena.deinit();

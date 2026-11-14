@@ -51,6 +51,15 @@ pub const SqliteContentStore = struct {
         return .{ .gpa = gpa, .db = db };
     }
 
+    /// Opens an existing file read-only for `maintenance.check`: nothing is
+    /// created, upgraded or written.
+    pub fn inspect(gpa: Allocator, path: [:0]const u8) OpenError!SqliteContentStore {
+        const db = try sqlite.openReadOnly(path);
+        errdefer _ = c.sqlite3_close(db);
+        try sqlite.requireCurrent(db, migrations.len);
+        return .{ .gpa = gpa, .db = db };
+    }
+
     pub fn close(self: *SqliteContentStore) void {
         _ = c.sqlite3_close(self.db);
         self.* = undefined;

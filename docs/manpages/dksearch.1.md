@@ -14,12 +14,16 @@ dksearch import --config FILE (SOURCE | --all)
 
 dksearch rebuild [--config FILE]
 
+dksearch check [--config FILE]
+
+dksearch backup [--config FILE] DIR
+
 dksearch check-config FILE
 
 DESCRIPTION
 dksearch is an independently operated, self-hostable search engine. It maintains its own full-text index and does not use an external search provider.
 
-This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, and an index rebuild command. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles two: `files`, which indexes plain-text and Markdown files from a local directory, and `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded. A connector for Wikipedia is planned. The administration interface is not implemented; the `[admin]` configuration table is validated but nothing listens on it.
+This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles two: `files`, which indexes plain-text and Markdown files from a local directory, and `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded. A connector for Wikipedia is planned. The administration interface is not implemented; the `[admin]` configuration table is validated but nothing listens on it.
 
 CONVENTIONS
 Bold represents literal commands, options, and keywords.
@@ -51,6 +55,24 @@ rebuild
 Delete the search index and rebuild it from the retained content and document records, without reading any source. Use it after deleting or losing `index.db`, or after a version change. Documents whose text was not retained (`retain_text = false`) cannot be rebuilt and are reported as skipped. It is safe to run again if interrupted. Searches made while it runs see a partial index, so stop **serve** first if that matters.
 
 Usage: dksearch rebuild [--config FILE]
+
+check
+Verify the stored data without changing it, and report. It runs SQLite's integrity check on `state.db`, `content.db` and `index.db`, checks the index's full-text structures, and then reads every document record's retained text and verifies it (decompression, recorded size and SHA-256), which catches damage SQLite's own check cannot see. It reports records whose text was not retained, texts that no record refers to (harmless leftovers of interrupted imports), and whether the index matches the records. Files are opened read-only, nothing is upgraded or repaired, and a file that does not exist is reported as absent, not created, so it is safe while **serve** or **import** runs. It reads all retained text, so on a large collection it takes a while.
+
+Usage: dksearch check [--config FILE]
+
+Options: --config FILE. Without it the built-in defaults are used.
+
+Examples: dksearch check --config dksearch.toml
+
+backup
+Write a consistent, verified copy of `state.db` and `content.db` (the only copies of what was imported) into the directory DIR, creating it if needed. Each copy is a snapshot taken at one instant, made with SQLite's own copy mechanism, so it is safe while **serve** or **import** runs. `state.db` is copied first and `content.db` second, so the copy of the content always contains every text the copy of the records refers to. The copies are synced to disk and checked with SQLite's integrity check before the command reports success. It never overwrites: if either destination file exists it stops before writing anything. `index.db` is not copied, because **rebuild** recreates it.
+
+Usage: dksearch backup [--config FILE] DIR
+
+Arguments: DIR, the destination directory. Use a new directory for each backup.
+
+Examples: dksearch backup --config dksearch.toml /backups/dksearch-2026-11-14
 
 check-config
 Load and validate FILE exactly as **serve** and **import** would, including the options of every source (enabled or not), report the result, and exit without starting anything or touching any data.
@@ -99,10 +121,10 @@ All diagnostics, each prefixed `dksearch: `. **import** and **rebuild** write th
 EXIT STATUS
 Status	Meaning
 0	Success, including a normal stop of **serve** by SIGINT or SIGTERM, and an **import** in which every run source completed.
-1	The server stopped on an unexpected error after starting, or an **import** run did not complete (it failed, or was cancelled by a signal). The run's state and any resume position are recorded.
+1	The server stopped on an unexpected error after starting, an **import** run did not complete (it failed, or was cancelled by a signal), or **check** found damage. The run's state and any resume position are recorded.
 2	Invalid command-line usage, including naming a source that does not exist or is disabled.
 3	Configuration error: syntax error, unknown key, wrong type, out-of-range value.
-4	I/O or resource error: configuration file unreadable, data directory or index cannot be created or opened, address cannot be bound.
+4	I/O or resource error: configuration file unreadable, data directory or index cannot be created or opened, address cannot be bound, a backup could not be written or verified or would overwrite an existing file.
 Termination by an unhandled signal (for example SIGKILL or SIGHUP) has the usual status of that signal.
 
 ENVIRONMENT
@@ -217,6 +239,11 @@ Check a file before deploying
     dksearch check-config dksearch.toml && echo valid
 Prints `dksearch.toml: ok (N sources)` and exits 0, or prints the reason and exits 3 (or 4 if the file cannot be read).
 
+Check the stored data, and back it up
+    dksearch check --config dksearch.toml
+    dksearch backup --config dksearch.toml /backups/dksearch-$(date +%F)
+**check** prints one line per database and the verification totals, then `ok` and exit status 0, or a `problem:` line and exit status 1 when it finds damage. To restore, stop dksearch, copy `state.db` and `content.db` from the backup into `data_dir` (removing any `state.db-wal`, `state.db-shm`, `content.db-wal` and `content.db-shm` left there), and run `dksearch rebuild` to recreate the index.
+
 Ask the running server
     curl 'http://127.0.0.1:8080/api/v1/search?q=truth&limit=5'
 
@@ -282,7 +309,7 @@ PERFORMANCE
 Search time is that of SQLite FTS5 over the index. Statements are prepared per query and each connection is handled by its own task; neither has been optimised or measured. Results are limited to a window of 10000 (offset plus limit) to bound deep-pagination cost.
 
 CONCURRENCY AND ATOMICITY
-Requests are served concurrently. Do not run two servers, or two imports, on the same `data_dir`. Running **serve** while **import** writes is supported: readers are not blocked, and new documents appear when each batch commits.
+Requests are served concurrently. Do not run two servers, or two imports, on the same `data_dir`. **check** and **backup** may run at any time. Running **serve** while **import** writes is supported: readers are not blocked, and new documents appear when each batch commits.
 
 Imports write in batches: content first, then the index, then the document records, and only then the saved position. After a crash, everything up to the last committed batch is intact and the run resumes from its position; the interrupted batch is lost as a unit and repeated, and the pipeline's duplicate detection makes that repetition harmless. The index file is written in WAL mode with synchronous=NORMAL: after a power loss the last few commits may be lost, but the file remains consistent. Because the index is derived data, this is accepted in exchange for write speed.
 
@@ -307,7 +334,7 @@ Stability guarantees
 The `/api/v1/` API is intended to be stable within version 1 (see dksearch-api(7)). The command-line syntax, configuration keys and diagnostics text are experimental at version 0.
 
 LIMITATIONS
-Two connectors are bundled (`files` and `gutenberg`); Wikipedia is planned. The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. No way yet to remove a source's documents, or to import documents that no longer exist as files (re-importing never deletes). No integrity-check or backup command yet. No administration interface. No TLS. No reload or request log. Only the `unicode61` tokenizer is used, so languages without word separators (such as Chinese or Japanese) are not segmented well. Index size and query time at large scale have not been measured.
+Two connectors are bundled (`files` and `gutenberg`); Wikipedia is planned. The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. No way yet to remove a source's documents, or to import documents that no longer exist as files (re-importing never deletes). Backups are manual (no scheduling or retention) and the copies are not encrypted. No administration interface. No TLS. No reload or request log. Only the `unicode61` tokenizer is used, so languages without word separators (such as Chinese or Japanese) are not segmented well. Index size and query time at large scale have not been measured.
 
 BUGS
 No issue tracker is published yet. When one exists it will be listed under AVAILABILITY. Include the dksearch version, the configuration file, the full diagnostic output and the request that failed.
@@ -326,7 +353,7 @@ NOTES
 The three databases are SQLite files. The index holds a `docs` table and an FTS5 table `fts`. Layouts are internal and may change between versions; a version mismatch is detected and reported.
 
 CAVEATS
-Deleting `index.db` is safe: **rebuild** restores it. Deleting `state.db` or `content.db` is not: they are the only copy of what was imported, and an index cannot be rebuilt without them. Back them up (copy them while no **import** runs, or with SQLite's online backup); a documented backup procedure is still to come. Re-importing never deletes documents whose source files were removed.
+Deleting `index.db` is safe: **rebuild** restores it. Deleting `state.db` or `content.db` is not: they are the only copy of what was imported, and an index cannot be rebuilt without them. Back them up with **backup**, and check them now and then with **check**; do not copy the files with `cp` while **import** runs, because the write-ahead log (`-wal`) files must be copied with them to be consistent. Re-importing never deletes documents whose source files were removed.
 
 HISTORY
 Version 0.0.0 is the first, pre-release version.

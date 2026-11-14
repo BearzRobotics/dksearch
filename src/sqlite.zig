@@ -37,6 +37,26 @@ pub fn open(path: [:0]const u8) Error!*c.sqlite3 {
     return db.?;
 }
 
+/// Opens an existing database read-only; never creates or changes anything.
+pub fn openReadOnly(path: [:0]const u8) Error!*c.sqlite3 {
+    var db: ?*c.sqlite3 = null;
+    const rc = c.sqlite3_open_v2(path.ptr, &db, c.SQLITE_OPEN_READONLY, null);
+    if (rc != c.SQLITE_OK) {
+        if (db) |d| _ = c.sqlite3_close(d);
+        return mapRc(rc);
+    }
+    return db.?;
+}
+
+/// True if SQLite's own `PRAGMA integrity_check` reports "ok".
+pub fn integrityOk(db: *c.sqlite3) Error!bool {
+    const st = try Stmt.prepare(db, "PRAGMA integrity_check(1)");
+    defer st.deinit();
+    if (!try st.step()) return error.Io;
+    const msg = st.colText(0) orelse return false;
+    return std.mem.eql(u8, msg, "ok");
+}
+
 pub fn execSql(db: *c.sqlite3, sql: [:0]const u8) Error!void {
     const rc = c.sqlite3_exec(db, sql.ptr, null, null, null);
     if (rc != c.SQLITE_OK) return mapRc(rc);
@@ -114,6 +134,9 @@ pub fn userVersion(db: *c.sqlite3) Error!i64 {
 }
 
 pub const MigrateError = Error || error{
+    /// Read-only inspection of a file that is older than this program: it
+    /// would be upgraded by the next normal open, which inspection must not do.
+    NeedsUpgrade,
     /// The file was written by a newer version of this program. Refusing to
     /// touch it: open it with the version that wrote it, or restore a backup.
     NewerSchema,
@@ -121,6 +144,13 @@ pub const MigrateError = Error || error{
     /// (and a backup of the pre-migration state exists next to it).
     MigrationFailed,
 };
+
+/// For read-only inspection: the schema must already be at `steps.len`.
+pub fn requireCurrent(db: *c.sqlite3, steps: usize) MigrateError!void {
+    const v = try userVersion(db);
+    if (v < 0 or v > steps) return error.NewerSchema;
+    if (v < steps) return error.NeedsUpgrade;
+}
 
 /// Brings the database up to `steps.len`. Step `i` takes the schema from
 /// version `i` to `i + 1` and must be one SQL script. The version is kept in

@@ -50,6 +50,8 @@ const usage =
     \\       dksearch serve [--config FILE]
     \\       dksearch import --config FILE (SOURCE | --all)
     \\       dksearch rebuild [--config FILE]
+    \\       dksearch check [--config FILE]
+    \\       dksearch backup [--config FILE] DIR
     \\       dksearch check-config FILE
     \\
 ;
@@ -103,6 +105,27 @@ fn run(init: std.process.Init) u8 {
         cfg.deinit();
         out(io, "{s}: ok ({d} source{s})\n", .{ path, n, if (n == 1) "" else "s" });
         return exit_ok;
+    }
+
+    if (eq(first, "check") or eq(first, "backup")) {
+        var config_path: ?[]const u8 = null;
+        var dir: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (eq(a, "--config")) {
+                config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+            } else if (std.mem.startsWith(u8, a, "--config=")) {
+                config_path = a["--config=".len..];
+            } else if (std.mem.startsWith(u8, a, "-")) {
+                err(io, "unknown option for {s}: {s}", .{ first, a });
+                return exit_usage;
+            } else if (eq(first, "backup") and dir == null) {
+                dir = a;
+            } else {
+                return usageError(io, "too many arguments");
+            }
+        }
+        if (eq(first, "check")) return checkCmd(io, gpa, config_path);
+        return backupCmd(io, gpa, config_path, dir orelse return usageError(io, "backup needs a destination DIR"));
     }
 
     if (eq(first, "serve") or eq(first, "rebuild")) {
@@ -314,6 +337,100 @@ fn rebuildCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         return exit_io;
     };
     out(io, "index rebuilt: {d} documents indexed, {d} without retained text (skipped), {d} unreadable\n", .{ stats.reindexed, stats.unrecoverable, stats.failed });
+    return exit_ok;
+}
+
+fn word(f: dk.maintenance.FileState) []const u8 {
+    return switch (f) {
+        .absent => "absent (not created yet)",
+        .ok => "ok",
+        .damaged => "DAMAGED",
+        .newer_version => "written by a newer version of dksearch; not touched",
+        .needs_upgrade => "older format; any other command upgrades it first",
+        .unreadable => "UNREADABLE (cannot be opened; check permissions and the disk)",
+    };
+}
+
+fn checkCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const paths = Paths.make(arena_state.allocator(), cfg.data_dir) catch return exit_io;
+
+    const r = dk.maintenance.check(gpa, io, .{ .index = paths.index, .state = paths.state, .content = paths.content }) catch {
+        err(io, "out of memory", .{});
+        return exit_io;
+    };
+    out(io, "state.db    {s} ({d} documents)\n", .{ word(r.state), r.documents });
+    out(io, "content.db  {s} ({d} retained texts)\n", .{ word(r.content), r.texts });
+    if (r.indexed) |n| {
+        out(io, "index.db    {s} ({d} documents)\n", .{ word(r.index), n });
+    } else {
+        out(io, "index.db    {s}\n", .{word(r.index)});
+    }
+    if (r.cross_checked) {
+        out(io, "texts verified against their records: {d} corrupt, {d} records without retained text, {d} unreferenced texts\n", .{ r.corrupt_texts, r.without_text, r.orphan_texts });
+    } else {
+        out(io, "texts not verified (needs state.db and content.db both readable)\n", .{});
+    }
+    // Advice, never failures: none of these is damage.
+    if (r.cross_checked and r.index != .damaged and (r.index == .absent or (r.indexed orelse r.documents) != r.documents)) {
+        out(io, "note: the index does not match the document records; `dksearch rebuild` recreates it\n", .{});
+    }
+    if (r.orphan_texts > 0) out(io, "note: unreferenced texts are leftovers of interrupted imports and are harmless\n", .{});
+    if (r.index == .damaged) out(io, "note: the index is derived data; delete index.db and run `dksearch rebuild`\n", .{});
+    if (r.state == .damaged or r.content == .damaged or r.corrupt_texts > 0) {
+        out(io, "problem: stored data is damaged. Restore state.db and content.db from a backup (see `dksearch backup`), then re-import or rebuild\n", .{});
+    }
+    if (r.healthy()) {
+        out(io, "ok\n", .{});
+        return exit_ok;
+    }
+    return exit_failure;
+}
+
+fn backupCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, dest_dir: []const u8) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const paths = Paths.make(a, cfg.data_dir) catch return exit_io;
+    const dests = Paths.make(a, dest_dir) catch return exit_io;
+
+    // Both must exist, and neither destination may: a backup never overwrites.
+    for ([_][:0]const u8{ paths.state, paths.content }) |p| {
+        Io.Dir.cwd().access(io, p, .{}) catch {
+            err(io, "{s} does not exist; nothing to back up", .{p});
+            return exit_io;
+        };
+    }
+    for ([_][:0]const u8{ dests.state, dests.content }) |p| {
+        if (Io.Dir.cwd().access(io, p, .{})) |_| {
+            err(io, "{s} already exists; backups never overwrite. Use a new directory", .{p});
+            return exit_io;
+        } else |_| {}
+    }
+    Io.Dir.cwd().createDirPath(io, dest_dir) catch |e| {
+        err(io, "cannot create {s}: {t}", .{ dest_dir, e });
+        return exit_io;
+    };
+
+    // state.db first, then content.db: an import writes content before the
+    // records that refer to it, so a content snapshot taken later always
+    // contains every text the earlier state snapshot refers to.
+    const pairs = [_][2][:0]const u8{ .{ paths.state, dests.state }, .{ paths.content, dests.content } };
+    for (pairs) |pair| {
+        dk.maintenance.backupFile(pair[0], pair[1], true) catch |e| {
+            err(io, "backup of {s} failed: {t}. Remove any partial file in {s} before retrying", .{ pair[0], e, dest_dir });
+            return exit_io;
+        };
+        out(io, "{s} -> {s}\n", .{ pair[0], pair[1] });
+    }
+    out(io, "backup complete and verified. index.db is not backed up: `dksearch rebuild` recreates it\n", .{});
     return exit_ok;
 }
 
