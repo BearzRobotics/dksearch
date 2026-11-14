@@ -124,7 +124,7 @@ Status	Meaning
 1	The server stopped on an unexpected error after starting, an **import** run did not complete (it failed, or was cancelled by a signal), or **check** found damage. The run's state and any resume position are recorded.
 2	Invalid command-line usage, including naming a source that does not exist or is disabled.
 3	Configuration error: syntax error, unknown key, wrong type, out-of-range value.
-4	I/O or resource error: configuration file unreadable, data directory or index cannot be created or opened, address cannot be bound, a backup could not be written or verified or would overwrite an existing file.
+4	I/O or resource error: another **import** or **rebuild** is running on the same data directory, configuration file unreadable, data directory or index cannot be created or opened, address cannot be bound, a backup could not be written or verified or would overwrite an existing file.
 Termination by an unhandled signal (for example SIGKILL or SIGHUP) has the usual status of that signal.
 
 ENVIRONMENT
@@ -309,7 +309,7 @@ PERFORMANCE
 Search time is that of SQLite FTS5 over the index. Statements are prepared per query and each connection is handled by its own task; neither has been optimised or measured. Results are limited to a window of 10000 (offset plus limit) to bound deep-pagination cost.
 
 CONCURRENCY AND ATOMICITY
-Requests are served concurrently. Do not run two servers, or two imports, on the same `data_dir`. **check** and **backup** may run at any time. Running **serve** while **import** writes is supported: readers are not blocked, and new documents appear when each batch commits.
+Requests are served concurrently. Do not run two servers on the same `data_dir`. **import** and **rebuild** take an exclusive lock on `data_dir/write.lock`, so a second one refuses to start (exit status 4) while another runs; the operating system releases the lock when the process ends, even after a crash, and the lock file itself is harmless and may stay. **check** and **backup** may run at any time. Running **serve** while **import** writes is supported: readers are not blocked, and new documents appear when each batch commits.
 
 Imports write in batches: content first, then the index, then the document records, and only then the saved position. After a crash, everything up to the last committed batch is intact and the run resumes from its position; the interrupted batch is lost as a unit and repeated, and the pipeline's duplicate detection makes that repetition harmless. The index file is written in WAL mode with synchronous=NORMAL: after a power loss the last few commits may be lost, but the file remains consistent. Because the index is derived data, this is accepted in exchange for write speed.
 

@@ -16,4 +16,8 @@
 
 ## Not done
 
-Scheduling, retention, encryption of backups, restoring through a command (the manual procedure is in the manpage), and preventing two `import` processes from running on one `data_dir` at the same time (documented as unsupported; the second would mark the first's running job interrupted when it opens the state store).
+Scheduling, retention, encryption of backups, restoring through a command (the manual procedure is in the manpage).
+
+## Addendum: writer lock
+
+`import` and `rebuild` take an exclusive `flock`-style lock on `data_dir/write.lock` (`maintenance.WriterLock`) before opening any store, and refuse to start if it is held. The OS drops it when the process dies, so there are no stale locks to clean up. `check` and `backup` do not take it. `serve` does not either: it only reads the index.

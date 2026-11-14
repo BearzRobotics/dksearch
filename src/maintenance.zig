@@ -71,6 +71,35 @@ pub const Report = struct {
     }
 };
 
+/// An exclusive advisory lock on `data_dir/write.lock`, held by commands that
+/// write the stores (`import`, `rebuild`) so that two of them never run on one
+/// data directory: the second would, among other things, mark the first one's
+/// running job as interrupted. The operating system releases it when the
+/// process ends, however it ends, so a crash leaves no stale lock.
+pub const WriterLock = struct {
+    file: Io.File,
+
+    pub const Error = error{
+        /// Another process holds it.
+        Busy,
+        /// The lock file could not be created or locked (permissions, disk).
+        Io,
+    };
+
+    pub fn acquire(io: Io, dir: Io.Dir, name: []const u8) Error!WriterLock {
+        const file = dir.createFile(io, name, .{ .truncate = false }) catch return error.Io;
+        errdefer file.close(io);
+        const got = file.tryLock(io, .exclusive) catch return error.Io;
+        if (!got) return error.Busy;
+        return .{ .file = file };
+    }
+
+    pub fn release(self: WriterLock, io: Io) void {
+        self.file.unlock(io);
+        self.file.close(io);
+    }
+};
+
 pub const CheckError = error{OutOfMemory};
 
 fn exists(io: Io, path: []const u8) bool {
@@ -373,4 +402,14 @@ test "backup makes a verified, independent snapshot" {
     // A missing source is an error and creates nothing.
     var b4: [160]u8 = undefined;
     try testing.expectError(error.Io, backupFile(try tmpPath(&b4, &tmp, "nope.db"), dest_state, false));
+}
+
+test "the writer lock is exclusive and is released" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = try WriterLock.acquire(testing.io, tmp.dir, "write.lock");
+    try testing.expectError(error.Busy, WriterLock.acquire(testing.io, tmp.dir, "write.lock"));
+    a.release(testing.io);
+    const b = try WriterLock.acquire(testing.io, tmp.dir, "write.lock");
+    b.release(testing.io);
 }

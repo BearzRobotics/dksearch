@@ -316,6 +316,22 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     return exit_ok;
 }
 
+/// Takes the data directory's writer lock, or explains why not.
+fn lockWriters(io: Io, data_dir: []const u8, what: []const u8) ?dk.maintenance.WriterLock {
+    var dir = Io.Dir.cwd().openDir(io, data_dir, .{}) catch |e| {
+        err(io, "cannot open data_dir {s}: {t}", .{ data_dir, e });
+        return null;
+    };
+    defer dir.close(io);
+    return dk.maintenance.WriterLock.acquire(io, dir, "write.lock") catch |e| {
+        switch (e) {
+            error.Busy => err(io, "another import or rebuild is already running on {s}; {s} was not started", .{ data_dir, what }),
+            error.Io => err(io, "cannot lock {s}/write.lock", .{data_dir}),
+        }
+        return null;
+    };
+}
+
 fn rebuildCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     var diag: dk.config.Diagnostic = .{};
     var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
@@ -324,6 +340,8 @@ fn rebuildCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const paths = Paths.make(arena_state.allocator(), cfg.data_dir) catch return exit_io;
+    const lock = lockWriters(io, cfg.data_dir, "rebuild") orelse return exit_io;
+    defer lock.release(io);
 
     var state = openState(io, gpa, paths.state) orelse return exit_io;
     defer state.close();
@@ -466,6 +484,8 @@ fn importCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, one: ?[]co
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const paths = Paths.make(arena_state.allocator(), cfg.data_dir) catch return exit_io;
+    const lock = lockWriters(io, cfg.data_dir, "import") orelse return exit_io;
+    defer lock.release(io);
 
     var state = openState(io, gpa, paths.state) orelse return exit_io;
     defer state.close();
