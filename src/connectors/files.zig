@@ -87,7 +87,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     }
 }
 
-fn validLanguageTag(l: []const u8) bool {
+pub fn validLanguageTag(l: []const u8) bool {
     if (l.len == 0 or l.len > 35) return false;
     for (l) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '-') return false;
     return true;

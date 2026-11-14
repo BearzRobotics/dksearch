@@ -1,0 +1,10 @@
+Text#,Type,Issued,Title,Language,Authors,Subjects,LoCC,Bookshelves
+1001,Text,2001-01-01,The Lighthouse Keeper's Almanac,en,"Example, Alice, 1801-1870","Lighthouses -- Fiction; Sea stories",PR,Adventure
+1002,Text,2002-02-02,"A Title with ""Quotes"", a Comma
+and a Line Break",en; fr,"Sample, Bob, 1820-1890; Other, Carol","Gardening",SB,
+1003,Sound,2003-03-03,An Audio Recording,en,"Voice, Dan",Music,M,
+1004,Text,2004-04-04,Livre de Test,fr,"Exemple, Eve, 1850-1900",Jardins,SB,
+1005,Text,2005-05-05,The Book We Do Not Have,en,"Nobody, N.",Absence,PR,
+1006,Text,2006-06-06,Old Text Without Markers,en,"Ancient, Ann",History,D,
+1007,Text,2007-07-07,Latin-1 Encoded Text,en,"Legacy, Len",Encoding,PR,
+abc,Text,2008-08-08,Not a Number,en,"Bad, Id",Errors,PR,

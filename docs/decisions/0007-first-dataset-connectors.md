@@ -46,6 +46,17 @@ The maintainer's condition: users must not be forced to use the connectors, but 
 - **Dependencies follow the connectors.** The vendored libbz2 and expat exist only for the Wikipedia connector. They are compiled in only when that connector is, selectable at build time, so a build without it carries no extra third-party code.
 - **Bundled does not mean mandatory data.** No dataset is downloaded, shipped or fetched by default.
 
+## Implementation notes: Gutenberg connector
+
+Built 2026-11-14 as `src/connectors/gutenberg.zig` with the CSV reader in `src/csv.zig`, following decisions 1-4, 8 and 9. Where it differs from or refines the text above:
+
+- Catalog columns are found by header name (`Text#`, `Type`, `Title`, `Language`, `Authors`, `Subjects`, `LoCC`, `Bookshelves`, `Issued`); only `Text#` and `Title` are required.
+- Book files are looked up under five naming patterns, flat or in a per-book subdirectory, so both a plain download and a mirror layout work. Ids are digits only, so a catalog row cannot name a path outside the books directory.
+- The license header and footer are not stored at all; the rights record carries the license name, its URL, an attribution line and the conservative `restricted` flag instead of the boilerplate text.
+- The CSV reader is strict (malformed input fails the job rather than being repaired) and bounded (field size and field count).
+- The resume position is the catalog row count, which assumes the same catalog file; delivery after a replaced catalog repeats documents but never loses them.
+- Fixtures are invented books under invented catalog entries, not copies of real ones, so tests are offline and no text is passed off as a real edition. Real files have not been tried against the full catalog yet; that needs a catalog download from the administrator's side.
+
 ## Alternatives
 
 - **Gutenberg from the RDF archive instead of CSV:** richer metadata but needs bzip2 and XML before the first connector works.

@@ -19,7 +19,7 @@ dksearch check-config FILE
 DESCRIPTION
 dksearch is an independently operated, self-hostable search engine. It maintains its own full-text index and does not use an external search provider.
 
-This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, and an index rebuild command. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles one, `files`, which indexes plain-text and Markdown files from a local directory. Connectors for Project Gutenberg and Wikipedia are planned. The administration interface is not implemented; the `[admin]` configuration table is validated but nothing listens on it.
+This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, and an index rebuild command. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles two: `files`, which indexes plain-text and Markdown files from a local directory, and `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded. A connector for Wikipedia is planned. The administration interface is not implemented; the `[admin]` configuration table is validated but nothing listens on it.
 
 CONVENTIONS
 Bold represents literal commands, options, and keywords.
@@ -157,7 +157,7 @@ Each `[[source]]` table has these keys. Any other key is an option of the connec
 
 Key	Type	Default	Description
 name	String	required	Unique name, 1-64 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit. Resume positions are kept per name, and it becomes the `connector` of each document, so renaming a source makes it start afresh and its old documents stay under the old name.
-kind	String	required	Connector type. This version knows `files`.
+kind	String	required	Connector type. This version knows `files` and `gutenberg`.
 enabled	Boolean	true	A disabled source stays in the file but is never run.
 retain_text	Boolean	true	Keep each document's text so the index can be rebuilt without reading the source again. Set false for a source whose terms forbid keeping its text; its documents are then skipped by **rebuild**.
 
@@ -176,6 +176,25 @@ Example:
     name = "my-notes"
     kind = "files"
     path = "/home/me/notes"
+    language = "en"
+
+Kind `gutenberg` indexes books from Project Gutenberg. It never uses the network: download the catalog (`pg_catalog.csv`, which Project Gutenberg publishes for this purpose) and the books yourself, for example from a mirror, and point the source at them.
+
+Key	Type	Default	Description
+catalog	String	required	Path of the catalog CSV file.
+books	String	required	Directory holding the book text files.
+language	String	none	Only import books in this language, such as `en`. A book listed in several languages matches any of them.
+max_file_bytes	Integer	16777216	Largest book accepted, 1-67108864. Larger books are refused, never truncated.
+
+Only catalog rows of type `Text` are used. A book with catalog number N is looked for as `pgN.txt`, `N-0.txt`, `N.txt`, `N.txt.utf8` or `pgN.txt.utf8`, directly in `books` or in a subdirectory `N/` of it. A catalog row with no local file is skipped, which is normal when only part of the collection was downloaded. A book that is not valid UTF-8, contains a NUL byte, is too large or has no text after trimming is refused and counted as rejected; it is not converted. The Project Gutenberg license header and footer (the text outside the `*** START OF` and `*** END OF` lines) is not indexed; a file without those lines is indexed whole. The title, authors, language, subjects and bookshelves come from the catalog. Each document records the catalog number, a link to `https://www.gutenberg.org/ebooks/N`, the source dataset "Project Gutenberg", and rights: the license "Project Gutenberg License", its URL, an attribution line, and redistribution `restricted`. The id is derived from the source name and the catalog number. A saved position is the number of catalog rows handled, so resuming needs the same catalog file; a malformed catalog fails the job instead of being skipped.
+
+Example:
+
+    [[source]]
+    name = "gutenberg-en"
+    kind = "gutenberg"
+    catalog = "/data/gutenberg/pg_catalog.csv"
+    books = "/data/gutenberg/books"
     language = "en"
 
 Validation, unknown keys, reload behavior, versioning, and migration rules
@@ -249,6 +268,8 @@ SQLite is compiled without extension loading, so no native code is loaded at run
 
 The index directory should be writable only by the account running dksearch. There are no secrets in the configuration at present.
 
+The `gutenberg` connector treats the catalog and the book files as untrusted input: it bounds field and file sizes, refuses malformed catalogs and invalid text, derives file names only from validated numeric catalog ids, never follows symbolic links, and executes nothing. Project Gutenberg's license and trademark terms apply to the books you import; read them at https://www.gutenberg.org/policy/license.html before redistributing text or running a public service with it.
+
 The `files` connector treats the directory tree as untrusted input. It never follows symbolic links, skips hidden entries, reads only regular files with the expected extensions, enforces a size limit, rejects invalid text, and executes nothing. It indexes only what its account can read, and the text of every indexed file becomes searchable and is shown in results, so point it only at directories whose contents may be searched by everyone who can reach the server. Result URLs for these files are `file://` URLs, which the HTML page shows as plain text, not links.
 
 PRIVACY
@@ -286,7 +307,7 @@ Stability guarantees
 The `/api/v1/` API is intended to be stable within version 1 (see dksearch-api(7)). The command-line syntax, configuration keys and diagnostics text are experimental at version 0.
 
 LIMITATIONS
-Only one connector (`files`, for `.txt` and `.md`) is bundled; Gutenberg and Wikipedia are planned. No way yet to remove a source's documents, or to import documents that no longer exist as files (re-importing never deletes). No integrity-check or backup command yet. No administration interface. No TLS. No reload or request log. Only the `unicode61` tokenizer is used, so languages without word separators (such as Chinese or Japanese) are not segmented well. Index size and query time at large scale have not been measured.
+Two connectors are bundled (`files` and `gutenberg`); Wikipedia is planned. The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. No way yet to remove a source's documents, or to import documents that no longer exist as files (re-importing never deletes). No integrity-check or backup command yet. No administration interface. No TLS. No reload or request log. Only the `unicode61` tokenizer is used, so languages without word separators (such as Chinese or Japanese) are not segmented well. Index size and query time at large scale have not been measured.
 
 BUGS
 No issue tracker is published yet. When one exists it will be listed under AVAILABILITY. Include the dksearch version, the configuration file, the full diagnostic output and the request that failed.

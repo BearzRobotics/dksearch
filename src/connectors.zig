@@ -13,13 +13,15 @@ const config = @import("config.zig");
 const api = @import("connector.zig");
 
 pub const files = @import("connectors/files.zig");
+pub const gutenberg = @import("connectors/gutenberg.zig");
 
 /// Every kind this build knows, for help text and error messages.
-pub const kinds = [_][]const u8{files.kind};
+pub const kinds = [_][]const u8{ files.kind, gutenberg.kind };
 
 /// A connector instance of any bundled kind.
 pub const Instance = union(enum) {
     files: files.FilesConnector,
+    gutenberg: gutenberg.GutenbergConnector,
 
     pub fn deinit(self: *Instance) void {
         switch (self.*) {
@@ -38,8 +40,9 @@ pub const Instance = union(enum) {
 /// kind. Touches nothing outside memory, so it is safe in `check-config`.
 pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!void {
     if (std.mem.eql(u8, source.kind, files.kind)) return files.validate(source, diag);
+    if (std.mem.eql(u8, source.kind, gutenberg.kind)) return gutenberg.validate(source, diag);
     var kbuf: [128]u8 = undefined;
-    diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].kind", .{source.name}) catch "kind", "unknown connector kind \"{s}\" (this build has: {s})", .{ source.kind, kinds[0] });
+    diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].kind", .{source.name}) catch "kind", "unknown connector kind \"{s}\" (this build has: files, gutenberg)", .{source.kind});
     return error.InvalidValue;
 }
 
@@ -53,6 +56,7 @@ pub fn validateAll(sources: []const config.Source, diag: *config.Diagnostic) con
 /// Builds a connector for `source`, which must have passed `validate`.
 pub fn create(gpa: Allocator, io: Io, source: config.Source) Allocator.Error!Instance {
     if (std.mem.eql(u8, source.kind, files.kind)) return .{ .files = try files.FilesConnector.init(gpa, io, source) };
+    if (std.mem.eql(u8, source.kind, gutenberg.kind)) return .{ .gutenberg = try gutenberg.GutenbergConnector.init(gpa, io, source) };
     unreachable; // `validate` rejects unknown kinds
 }
 
