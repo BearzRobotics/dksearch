@@ -49,6 +49,8 @@ const usage =
     \\usage: dksearch [-h | --help] [-V | --version]
     \\       dksearch serve [--config FILE]
     \\       dksearch import --config FILE (SOURCE | --all)
+    \\       dksearch import --config FILE (SOURCE | --all) [--prune]
+    \\       dksearch remove --config FILE SOURCE [--yes]
     \\       dksearch rebuild [--config FILE]
     \\       dksearch check [--config FILE]
     \\       dksearch backup [--config FILE] DIR
@@ -143,10 +145,35 @@ fn run(init: std.process.Init) u8 {
         return if (eq(first, "serve")) serve(io, gpa, config_path) else rebuildCmd(io, gpa, config_path);
     }
 
+    if (eq(first, "remove")) {
+        var config_path: ?[]const u8 = null;
+        var source: ?[]const u8 = null;
+        var yes = false;
+        while (args.next()) |a| {
+            if (eq(a, "--config")) {
+                config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+            } else if (std.mem.startsWith(u8, a, "--config=")) {
+                config_path = a["--config=".len..];
+            } else if (eq(a, "--yes")) {
+                yes = true;
+            } else if (std.mem.startsWith(u8, a, "-")) {
+                err(io, "unknown option for remove: {s}", .{a});
+                return exit_usage;
+            } else if (source == null) {
+                source = a;
+            } else {
+                return usageError(io, "remove takes one SOURCE");
+            }
+        }
+        if (config_path == null) return usageError(io, "remove needs --config FILE (it names the data directory)");
+        return removeCmd(io, gpa, config_path.?, source orelse return usageError(io, "remove needs a SOURCE name"), yes);
+    }
+
     if (eq(first, "import")) {
         var config_path: ?[]const u8 = null;
         var source: ?[]const u8 = null;
         var all = false;
+        var prune = false;
         while (args.next()) |a| {
             if (eq(a, "--config")) {
                 config_path = args.next() orelse return usageError(io, "--config needs a FILE");
@@ -154,6 +181,8 @@ fn run(init: std.process.Init) u8 {
                 config_path = a["--config=".len..];
             } else if (eq(a, "--all")) {
                 all = true;
+            } else if (eq(a, "--prune")) {
+                prune = true;
             } else if (std.mem.startsWith(u8, a, "-")) {
                 err(io, "unknown option for import: {s}", .{a});
                 return exit_usage;
@@ -165,7 +194,7 @@ fn run(init: std.process.Init) u8 {
         }
         if (config_path == null) return usageError(io, "import needs --config FILE (sources are defined there)");
         if (all == (source != null)) return usageError(io, "import needs exactly one of SOURCE or --all");
-        return importCmd(io, gpa, config_path.?, source, all);
+        return importCmd(io, gpa, config_path.?, source, all, prune);
     }
 
     err(io, "unknown command: {s}", .{first});
@@ -452,7 +481,47 @@ fn backupCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, dest_dir:
     return exit_ok;
 }
 
-fn importCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, one: ?[]const u8, all: bool) u8 {
+fn removeCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, source: []const u8, yes: bool) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadAndValidate(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    // The source need not be in the configuration: removing a source you
+    // already deleted from the file is the common case.
+    if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const paths = Paths.make(arena_state.allocator(), cfg.data_dir) catch return exit_io;
+    const lock = lockWriters(io, cfg.data_dir, "remove") orelse return exit_io;
+    defer lock.release(io);
+
+    var state = openState(io, gpa, paths.state) orelse return exit_io;
+    defer state.close();
+    var content = openContent(io, gpa, paths.content) orelse return exit_io;
+    defer content.close();
+    var index = openIndex(io, paths.index) orelse return exit_io;
+    defer index.close();
+
+    const n = state.documents().countOf(source) catch |e| {
+        err(io, "cannot read the document records: {t}", .{e});
+        return exit_io;
+    };
+    if (!yes) {
+        out(io, "source \"{s}\" has {d} document{s}. Nothing was removed; run again with --yes to remove them from the index, the retained text and the records (this cannot be undone; re-import restores them from the source)\n", .{ source, n, if (n == 1) "" else "s" });
+        return exit_ok;
+    }
+    installSignalHandlers(onImportSignal);
+    var pipe = dk.pipeline.Pipeline.init(content.store(), state.documents(), index.indexer(), .{ .now = now });
+    var result_arena = std.heap.ArenaAllocator.init(gpa);
+    defer result_arena.deinit();
+    const r = dk.runner.removeSource(result_arena.allocator(), &state, &pipe, source, &import_control) catch |e| {
+        err(io, "removal failed: {t}. Run it again to finish", .{e});
+        return exit_io;
+    };
+    out(io, "{s}: removed {d} of {d} document{s}{s}\n", .{ source, r.removed, n, if (n == 1) "" else "s", if (r.complete) "" else " (stopped early; run again to finish)" });
+    return if (r.complete) exit_ok else exit_failure;
+}
+
+fn importCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, one: ?[]const u8, all: bool, prune: bool) u8 {
     var diag: dk.config.Diagnostic = .{};
     var cfg = loadAndValidate(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
     defer cfg.deinit();
@@ -529,6 +598,18 @@ fn importCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, one: ?[]co
         });
         if (r.failure) |why| err(io, "{s}: {s}", .{ source.name, why });
         if (r.state != .completed) worst = exit_failure;
+        if (prune) {
+            if (r.state != .completed) {
+                err(io, "{s}: not pruning, because the import did not complete", .{source.name});
+            } else {
+                const p = dk.runner.pruneSource(result_arena.allocator(), &pipe, inst.connector(), source.name, &import_control) catch |e| {
+                    err(io, "{s}: pruning failed: {t}", .{ source.name, e });
+                    return exit_io;
+                };
+                out(io, "{s}: pruned {d} document{s} no longer in the source{s}\n", .{ source.name, p.removed, if (p.removed == 1) "" else "s", if (p.complete) "" else " (stopped early)" });
+                if (!p.complete) worst = exit_failure;
+            }
+        }
     }
     return worst;
 }

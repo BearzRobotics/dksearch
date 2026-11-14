@@ -94,6 +94,15 @@ pub const Outcome = struct {
     checkpoint: ?[]const u8 = null,
 };
 
+/// Whether an item the pipeline holds is still in its source.
+pub const Presence = enum {
+    present,
+    /// Certainly gone: the source is readable and the item is not in it.
+    gone,
+    /// Cannot tell (source unreadable, unsupported). Never treated as gone.
+    unknown,
+};
+
 pub const Connector = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -105,7 +114,15 @@ pub const Connector = struct {
         /// regularly. Should count accepted submits in `control.submitted`
         /// and items it refuses itself in `control.rejected`.
         run: *const fn (ptr: *anyopaque, sink: Sink, control: *Control, resume_from: ?[]const u8) RunError!Outcome,
+        /// Optional: lets `import --prune` remove documents whose items left
+        /// the source. Connectors without it never have anything pruned.
+        exists: ?*const fn (ptr: *anyopaque, source_id: []const u8) Presence = null,
     };
+
+    pub fn exists(self: Connector, source_id: []const u8) Presence {
+        const f = self.vtable.exists orelse return .unknown;
+        return f(self.ptr, source_id);
+    }
 
     pub fn info(self: Connector) Info {
         return self.vtable.info(self.ptr);

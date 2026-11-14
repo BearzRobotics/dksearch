@@ -10,7 +10,9 @@ dksearch [-h | --help] [-V | --version]
 
 dksearch serve [--config FILE]
 
-dksearch import --config FILE (SOURCE | --all)
+dksearch import --config FILE (SOURCE | --all) [--prune]
+
+dksearch remove --config FILE SOURCE [--yes]
 
 dksearch rebuild [--config FILE]
 
@@ -45,11 +47,22 @@ Examples: dksearch serve --config /etc/dksearch/dksearch.toml
 import
 Run one source, or every enabled source, and add its documents to the index. Progress is recorded durably, so a run that is interrupted or fails resumes from its last saved position the next time the same source is imported. A source that completed starts over, and documents that have not changed are recognised and skipped.
 
-Usage: dksearch import --config FILE (SOURCE | --all)
+Usage: dksearch import --config FILE (SOURCE | --all) [--prune]
 
 Arguments: SOURCE, the `name` of a `[[source]]` in FILE. A source with `enabled = false` is not run, and naming one is an error. **--all** runs every enabled source in file order. Exactly one of SOURCE or **--all** is required. **--config** is required, since sources are defined there.
 
+Options: **--prune** also removes the source's documents whose items are no longer in the source, after a run that completed. The `files` connector treats a file that no longer exists (or is no longer a regular file) as gone; the `gutenberg` connector treats a book with no remaining local file as gone. If the source itself cannot be read (the directory is missing or unmounted), nothing is removed. Without **--prune**, re-importing never deletes anything.
+
 Examples: dksearch import --config dksearch.toml my-notes
+
+remove
+Remove every document of the source named SOURCE from the index, the retained text and the document records, and forget the source's import history, so a later import of that name starts afresh. SOURCE need not be in the configuration file, which is the usual case after deleting a source from it. Without **--yes** nothing is changed: it reports how many documents the source has. Removal works in batches that are committed one at a time, and is safe to interrupt (SIGINT) or repeat: what was not removed yet is removed by the next run. The documents can be restored by importing the source again.
+
+Usage: dksearch remove --config FILE SOURCE [--yes]
+
+Arguments: SOURCE, the name the documents were imported under. **--config** is required because it names the data directory. **--yes** performs the removal.
+
+Examples: dksearch remove --config dksearch.toml old-notes --yes
 
 rebuild
 Delete the search index and rebuild it from the retained content and document records, without reading any source. Use it after deleting or losing `index.db`, or after a version change. Documents whose text was not retained (`retain_text = false`) cannot be rebuilt and are reported as skipped. It is safe to run again if interrupted. Searches made while it runs see a partial index, so stop **serve** first if that matters.
@@ -124,7 +137,7 @@ Status	Meaning
 1	The server stopped on an unexpected error after starting, an **import** run did not complete (it failed, or was cancelled by a signal), or **check** found damage. The run's state and any resume position are recorded.
 2	Invalid command-line usage, including naming a source that does not exist or is disabled.
 3	Configuration error: syntax error, unknown key, wrong type, out-of-range value.
-4	I/O or resource error: another **import** or **rebuild** is running on the same data directory, configuration file unreadable, data directory or index cannot be created or opened, address cannot be bound, a backup could not be written or verified or would overwrite an existing file.
+4	I/O or resource error: another **import**, **rebuild** or **remove** is running on the same data directory, configuration file unreadable, data directory or index cannot be created or opened, address cannot be bound, a backup could not be written or verified or would overwrite an existing file.
 Termination by an unhandled signal (for example SIGKILL or SIGHUP) has the usual status of that signal.
 
 ENVIRONMENT
@@ -309,7 +322,7 @@ PERFORMANCE
 Search time is that of SQLite FTS5 over the index. Statements are prepared per query and each connection is handled by its own task; neither has been optimised or measured. Results are limited to a window of 10000 (offset plus limit) to bound deep-pagination cost.
 
 CONCURRENCY AND ATOMICITY
-Requests are served concurrently. Do not run two servers on the same `data_dir`. **import** and **rebuild** take an exclusive lock on `data_dir/write.lock`, so a second one refuses to start (exit status 4) while another runs; the operating system releases the lock when the process ends, even after a crash, and the lock file itself is harmless and may stay. **check** and **backup** may run at any time. Running **serve** while **import** writes is supported: readers are not blocked, and new documents appear when each batch commits.
+Requests are served concurrently. Do not run two servers on the same `data_dir`. **import**, **rebuild** and **remove** take an exclusive lock on `data_dir/write.lock`, so a second one refuses to start (exit status 4) while another runs; the operating system releases the lock when the process ends, even after a crash, and the lock file itself is harmless and may stay. **check** and **backup** may run at any time. Running **serve** while **import** writes is supported: readers are not blocked, and new documents appear when each batch commits.
 
 Imports write in batches: content first, then the index, then the document records, and only then the saved position. After a crash, everything up to the last committed batch is intact and the run resumes from its position; the interrupted batch is lost as a unit and repeated, and the pipeline's duplicate detection makes that repetition harmless. The index file is written in WAL mode with synchronous=NORMAL: after a power loss the last few commits may be lost, but the file remains consistent. Because the index is derived data, this is accepted in exchange for write speed.
 
@@ -334,7 +347,7 @@ Stability guarantees
 The `/api/v1/` API is intended to be stable within version 1 (see dksearch-api(7)). The command-line syntax, configuration keys and diagnostics text are experimental at version 0.
 
 LIMITATIONS
-Two connectors are bundled (`files` and `gutenberg`); Wikipedia is planned. The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. No way yet to remove a source's documents, or to import documents that no longer exist as files (re-importing never deletes). Backups are manual (no scheduling or retention) and the copies are not encrypted. No administration interface. No TLS. No reload or request log. Only the `unicode61` tokenizer is used, so languages without word separators (such as Chinese or Japanese) are not segmented well. Index size and query time at large scale have not been measured.
+Two connectors are bundled (`files` and `gutenberg`); Wikipedia is planned. The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. No administration interface. No TLS. No reload or request log. Only the `unicode61` tokenizer is used, so languages without word separators (such as Chinese or Japanese) are not segmented well. Index size and query time at large scale have not been measured.
 
 BUGS
 No issue tracker is published yet. When one exists it will be listed under AVAILABILITY. Include the dksearch version, the configuration file, the full diagnostic output and the request that failed.
@@ -353,7 +366,7 @@ NOTES
 The three databases are SQLite files. The index holds a `docs` table and an FTS5 table `fts`. Layouts are internal and may change between versions; a version mismatch is detected and reported.
 
 CAVEATS
-Deleting `index.db` is safe: **rebuild** restores it. Deleting `state.db` or `content.db` is not: they are the only copy of what was imported, and an index cannot be rebuilt without them. Back them up with **backup**, and check them now and then with **check**; do not copy the files with `cp` while **import** runs, because the write-ahead log (`-wal`) files must be copied with them to be consistent. Re-importing never deletes documents whose source files were removed.
+Deleting `index.db` is safe: **rebuild** restores it. Deleting `state.db` or `content.db` is not: they are the only copy of what was imported, and an index cannot be rebuilt without them. Back them up with **backup**, and check them now and then with **check**; do not copy the files with `cp` while **import** runs, because the write-ahead log (`-wal`) files must be copied with them to be consistent. Re-importing never deletes documents whose source items were removed unless you pass **--prune**; **remove** deletes a whole source.
 
 HISTORY
 Version 0.0.0 is the first, pre-release version.

@@ -131,7 +131,22 @@ pub const FilesConnector = struct {
     }
 
     pub fn connector(self: *FilesConnector) api.Connector {
-        return .{ .ptr = self, .vtable = &.{ .info = info, .run = run } };
+        return .{ .ptr = self, .vtable = &.{ .info = info, .run = run, .exists = exists } };
+    }
+
+    /// An item is gone only if the root is readable and the file is not a
+    /// regular file any more. Any other trouble is "unknown", never "gone".
+    fn exists(ptr: *anyopaque, source_id: []const u8) api.Presence {
+        const self: *FilesConnector = @ptrCast(@alignCast(ptr));
+        const root = Io.Dir.cwd().statFile(self.io, self.root, .{}) catch return .unknown;
+        if (root.kind != .directory) return .unknown;
+        const path = std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.root, source_id }) catch return .unknown;
+        defer self.gpa.free(path);
+        const st = Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => return .gone,
+            else => return .unknown,
+        };
+        return if (st.kind == .file) .present else .gone;
     }
 
     fn info(_: *anyopaque) api.Info {
@@ -586,4 +601,125 @@ test "cancel mid-run, then resume from the last finished path" {
     try testing.expect(!rest.interrupted);
     try testing.expectEqual(@as(u64, 4), try e.idx.count());
     try testing.expectEqual(@as(u64, 0), e.pipe.stats.unchanged); // nothing delivered twice
+}
+
+test "prune removes only documents whose files are gone" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "keep.txt", .data = "keeper words" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "drop.txt", .data = "dropword here" });
+    try tmp.dir.createDirPath(testing.io, "sub");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "sub/deep.txt", .data = "deepword here" });
+    var pb: [200]u8 = undefined;
+    const source = try treeSource(&tmp, &pb, &.{});
+    defer testing.allocator.free(source.options);
+    var fc = try FilesConnector.init(testing.allocator, testing.io, source);
+    defer fc.deinit();
+    var e: E2e = undefined;
+    try e.init();
+    defer e.deinit();
+    var ctl: api.Control = .{};
+    _ = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc.connector(), "notes", &ctl, E2e.now);
+    try testing.expectEqual(@as(u64, 3), try e.idx.count());
+
+    try tmp.dir.deleteFile(testing.io, "drop.txt");
+    try tmp.dir.deleteTree(testing.io, "sub");
+    var ctl2: api.Control = .{};
+    const r = try runner.pruneSource(e.arena.allocator(), &e.pipe, fc.connector(), "notes", &ctl2);
+    try testing.expect(r.complete);
+    try testing.expectEqual(@as(u64, 2), r.removed);
+    try testing.expectEqual(@as(u64, 1), try e.idx.count());
+    try testing.expectEqual(@as(usize, 0), try e.hits("dropword"));
+    try testing.expectEqual(@as(usize, 0), try e.hits("deepword"));
+    try testing.expectEqual(@as(usize, 1), try e.hits("keeper"));
+    try testing.expectEqual(@as(usize, 1), e.docs.count());
+    try testing.expectEqual(@as(usize, 1), e.content.count()); // retained text removed too
+}
+
+test "prune never removes anything when the source cannot be read" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "alpha text" });
+    var pb: [200]u8 = undefined;
+    const source = try treeSource(&tmp, &pb, &.{});
+    defer testing.allocator.free(source.options);
+    var fc = try FilesConnector.init(testing.allocator, testing.io, source);
+    defer fc.deinit();
+    var e: E2e = undefined;
+    try e.init();
+    defer e.deinit();
+    var ctl: api.Control = .{};
+    _ = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc.connector(), "notes", &ctl, E2e.now);
+    tmp.cleanup(); // the whole directory vanishes, like an unmounted disk
+
+    var ctl2: api.Control = .{};
+    const r = try runner.pruneSource(e.arena.allocator(), &e.pipe, fc.connector(), "notes", &ctl2);
+    try testing.expectEqual(@as(u64, 0), r.removed);
+    try testing.expectEqual(@as(u64, 1), try e.idx.count());
+}
+
+test "removeSource deletes one source everywhere and forgets its history" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "alpha words" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.txt", .data = "beta words" });
+    var pb: [200]u8 = undefined;
+    const source = try treeSource(&tmp, &pb, &.{});
+    defer testing.allocator.free(source.options);
+    var fc = try FilesConnector.init(testing.allocator, testing.io, source);
+    defer fc.deinit();
+
+    var tmp2 = testing.tmpDir(.{ .iterate = true });
+    defer tmp2.cleanup();
+    try tmp2.dir.writeFile(testing.io, .{ .sub_path = "c.txt", .data = "gamma words" });
+    var pb2: [200]u8 = undefined;
+    var source2 = try treeSource(&tmp2, &pb2, &.{});
+    defer testing.allocator.free(source2.options);
+    source2.name = "other";
+    var fc2 = try FilesConnector.init(testing.allocator, testing.io, source2);
+    defer fc2.deinit();
+
+    var e: E2e = undefined;
+    try e.init();
+    defer e.deinit();
+    var ctl: api.Control = .{};
+    _ = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc.connector(), "notes", &ctl, E2e.now);
+    _ = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc2.connector(), "other", &ctl, E2e.now);
+    try testing.expectEqual(@as(u64, 3), try e.idx.count());
+    try testing.expectEqual(@as(u64, 2), try e.docs.store().countOf("notes"));
+
+    var ctl2: api.Control = .{};
+    const r = try runner.removeSource(e.arena.allocator(), &e.state, &e.pipe, "notes", &ctl2);
+    try testing.expect(r.complete);
+    try testing.expectEqual(@as(u64, 2), r.removed);
+    try testing.expectEqual(@as(u64, 1), try e.idx.count());
+    try testing.expectEqual(@as(usize, 0), try e.hits("alpha"));
+    try testing.expectEqual(@as(usize, 1), try e.hits("gamma")); // the other source is untouched
+    try testing.expectEqual(@as(u64, 0), try e.docs.store().countOf("notes"));
+    try testing.expectEqual(@as(u64, 1), try e.docs.store().countOf("other"));
+    try testing.expectEqual(@as(usize, 1), e.content.count());
+    try testing.expect((try e.state.getJob(e.arena.allocator(), 1)) == null); // history forgotten
+    try testing.expect((try e.state.getJob(e.arena.allocator(), 2)) != null);
+
+    // Removing again is a no-op; the source can be imported afresh.
+    const again = try runner.removeSource(e.arena.allocator(), &e.state, &e.pipe, "notes", &ctl2);
+    try testing.expectEqual(@as(u64, 0), again.removed);
+    var ctl3: api.Control = .{};
+    _ = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc.connector(), "notes", &ctl3, E2e.now);
+    try testing.expectEqual(@as(u64, 3), try e.idx.count());
+}
+
+test "removeSource stops when cancelled and can be repeated" {
+    var e: E2e = undefined;
+    try e.init();
+    defer e.deinit();
+    try e.pipe.submit(.{ .connector = "s", .source_id = "1", .text = "one" });
+    var ctl: api.Control = .{};
+    ctl.cancel();
+    const r = try runner.removeSource(e.arena.allocator(), &e.state, &e.pipe, "s", &ctl);
+    try testing.expect(!r.complete);
+    try testing.expectEqual(@as(u64, 1), try e.idx.count());
+    var ctl2: api.Control = .{};
+    const r2 = try runner.removeSource(e.arena.allocator(), &e.state, &e.pipe, "s", &ctl2);
+    try testing.expect(r2.complete);
+    try testing.expectEqual(@as(u64, 0), try e.idx.count());
 }

@@ -142,7 +142,34 @@ pub const GutenbergConnector = struct {
     }
 
     pub fn connector(self: *GutenbergConnector) api.Connector {
-        return .{ .ptr = self, .vtable = &.{ .info = info, .run = run } };
+        return .{ .ptr = self, .vtable = &.{ .info = info, .run = run, .exists = exists } };
+    }
+
+    /// A book is gone when none of its candidate files exists any more and
+    /// the books directory itself is readable. (Rows that a changed
+    /// `language` filter would now skip are not treated as gone.)
+    fn exists(ptr: *anyopaque, source_id: []const u8) api.Presence {
+        const self: *GutenbergConnector = @ptrCast(@alignCast(ptr));
+        if (!validBookId(source_id)) return .unknown;
+        const root = Io.Dir.cwd().statFile(self.io, self.books, .{}) catch return .unknown;
+        if (root.kind != .directory) return .unknown;
+        const names = [_][]const u8{ "pg{s}.txt", "{s}-0.txt", "{s}.txt", "{s}.txt.utf8", "pg{s}.txt.utf8" };
+        var buf: [160]u8 = undefined;
+        for ([_]bool{ false, true }) |in_subdir| {
+            inline for (names) |pattern| {
+                const file = std.fmt.bufPrint(buf[0..64], pattern, .{source_id}) catch return .unknown;
+                const path = if (in_subdir)
+                    std.fmt.bufPrint(buf[64..], "{s}/{s}/{s}", .{ self.books, source_id, file }) catch return .unknown
+                else
+                    std.fmt.bufPrint(buf[64..], "{s}/{s}", .{ self.books, file }) catch return .unknown;
+                const st = Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch |e| switch (e) {
+                    error.FileNotFound, error.NotDir => null,
+                    else => return .unknown,
+                };
+                if (st) |x| if (x.kind == .file) return .present;
+            }
+        }
+        return .gone;
     }
 
     fn info(_: *anyopaque) api.Info {
@@ -784,4 +811,30 @@ test "cancel mid-run, then resume at the next catalog row" {
 
     var ctl3: api.Control = .{};
     try testing.expectError(error.InvalidSource, gc.connector().run(e.pipe.sink(), &ctl3, "not a number"));
+}
+
+test "prune removes books whose files were deleted, not books still present" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try makeCollection(&tmp);
+    var pb: [300]u8 = undefined;
+    const source = try collectionSource(&tmp, &pb, &.{});
+    defer testing.allocator.free(source.options);
+    var gc = try GutenbergConnector.init(testing.allocator, testing.io, source);
+    defer gc.deinit();
+    var e: E2e = undefined;
+    try e.init();
+    defer e.deinit();
+    var ctl: api.Control = .{};
+    _ = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, gc.connector(), "pg", &ctl, E2e.now);
+    try testing.expectEqual(@as(u64, 4), try e.idx.count());
+
+    try tmp.dir.deleteFile(testing.io, "books/1004.txt");
+    try tmp.dir.deleteTree(testing.io, "books/1002"); // the subdirectory layout
+    var ctl2: api.Control = .{};
+    const r = try runner.pruneSource(e.arena.allocator(), &e.pipe, gc.connector(), "pg", &ctl2);
+    try testing.expectEqual(@as(u64, 2), r.removed);
+    try testing.expectEqual(@as(usize, 0), try e.hits("tulipes"));
+    try testing.expectEqual(@as(usize, 1), try e.hits("cormorants"));
+    try testing.expectEqual(@as(usize, 1), try e.hits("aqueducts"));
 }

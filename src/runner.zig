@@ -18,6 +18,7 @@ const doc = @import("document.zig");
 const connector_mod = @import("connector.zig");
 const pipeline = @import("pipeline.zig");
 const state_sqlite = @import("state_sqlite.zig");
+const storage = @import("storage.zig");
 
 pub const Result = struct {
     job_id: i64,
@@ -191,6 +192,90 @@ pub fn runImport(
         .checkpoint = if (final == .completed) null else checkpoint,
         .failure = failure,
     };
+}
+
+pub const RemoveResult = struct {
+    removed: u64 = 0,
+    /// False if cancelled or stopped by an error before every document was handled.
+    complete: bool = true,
+};
+
+const page = 1000;
+
+/// Removes every document of `source` (stores and index), page by page, each
+/// page committed as one batch. Interrupting it, or a crash, leaves the rest
+/// for a repeat run: records are removed last, so they still list what is left.
+/// Also forgets the source's job history once nothing is left.
+pub fn removeSource(
+    arena: Allocator,
+    state: *state_sqlite.SqliteStateStore,
+    pipe: *pipeline.Pipeline,
+    source: []const u8,
+    control: *connector_mod.Control,
+) Error!RemoveResult {
+    var result: RemoveResult = .{};
+    while (true) {
+        if (control.isCancelled()) {
+            result.complete = false;
+            return result;
+        }
+        // Documents are removed as they are listed, so each page is the first.
+        const entries = pipe.docs.list(arena, source, null, page) catch |e| return stateError(e);
+        if (entries.len == 0) break;
+        const done = removeEntries(pipe, entries) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            result.complete = false;
+            return result;
+        };
+        result.removed += done;
+    }
+    state.forgetSource(source) catch return error.StateUnavailable;
+    return result;
+}
+
+/// Removes `entries` as one batch.
+fn removeEntries(pipe: *pipeline.Pipeline, entries: []const storage.Entry) !u64 {
+    try pipe.beginBatch();
+    errdefer pipe.abortBatch();
+    for (entries) |e| try pipe.remove(e.id);
+    try pipe.commitBatch();
+    return entries.len;
+}
+
+/// Removes the documents of `source` that its connector says have left the
+/// source. Only items answered `.gone` are removed; `.unknown` is kept. Call
+/// it after a run that completed, since an unreadable source must not look
+/// like an empty one (a connector answers `.unknown` then, as a second guard).
+pub fn pruneSource(
+    arena: Allocator,
+    pipe: *pipeline.Pipeline,
+    conn: connector_mod.Connector,
+    source: []const u8,
+    control: *connector_mod.Control,
+) Error!RemoveResult {
+    var result: RemoveResult = .{};
+    var cursor: ?[]const u8 = null;
+    while (true) {
+        if (control.isCancelled()) {
+            result.complete = false;
+            return result;
+        }
+        const entries = pipe.docs.list(arena, source, cursor, page) catch |e| return stateError(e);
+        if (entries.len == 0) break;
+        cursor = entries[entries.len - 1].source_id;
+        var gone: std.ArrayList(storage.Entry) = .empty;
+        for (entries) |e| {
+            if (conn.exists(e.source_id) == .gone) gone.append(arena, e) catch return error.OutOfMemory;
+        }
+        if (gone.items.len == 0) continue;
+        const done = removeEntries(pipe, gone.items) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            result.complete = false;
+            return result;
+        };
+        result.removed += done;
+    }
+    return result;
 }
 
 fn stateError(e: anyerror) Error {
@@ -444,8 +529,6 @@ test "a full index stops the run and the job says why" {
 
 // ------------------------------------------------ batching and durability
 
-const storage = @import("storage.zig");
-
 /// Records the order of batch calls across the three stores.
 const Log = struct {
     events: std.ArrayList([]const u8) = .empty,
@@ -531,7 +614,15 @@ const SpyDocs = struct {
         s.log.add("docs.rollback");
     }
     fn store(s: *SpyDocs) storage.DocumentStore {
-        return .{ .ptr = s, .vtable = &.{ .upsert = upsert, .find = find, .delete = delete, .for_each = forEach, .begin = begin, .commit = commit, .rollback = rollback } };
+        return .{ .ptr = s, .vtable = &.{ .upsert = upsert, .find = find, .delete = delete, .for_each = forEach, .list = list, .count_of = countOf, .begin = begin, .commit = commit, .rollback = rollback } };
+    }
+    fn list(p: *anyopaque, a: Allocator, c: []const u8, after: ?[]const u8, n: usize) storage.Error![]storage.Entry {
+        const s: *SpyDocs = @ptrCast(@alignCast(p));
+        return s.inner.list(a, c, after, n);
+    }
+    fn countOf(p: *anyopaque, c: []const u8) storage.Error!u64 {
+        const s: *SpyDocs = @ptrCast(@alignCast(p));
+        return s.inner.countOf(c);
     }
 };
 

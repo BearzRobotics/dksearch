@@ -26,6 +26,7 @@ pub const Stats = struct {
     unchanged: u64 = 0,
     /// Records refused (invalid, or a store/index failure for that record).
     rejected: u64 = 0,
+    removed: u64 = 0,
 };
 
 pub const Options = struct {
@@ -132,6 +133,16 @@ pub const Pipeline = struct {
         }) catch |e| return self.fail(e);
 
         if (existing == null) self.stats.added += 1 else self.stats.updated += 1;
+    }
+
+    /// Removes a document everywhere: retained text, index entry, record.
+    /// The record goes last, in the same order as `submit` writes, so a crash
+    /// leaves a record that a repeated removal still finds and finishes.
+    pub fn remove(self: *Pipeline, id: doc.Id) (storage.Error || indexer.Error)!void {
+        try self.content.delete(id);
+        try self.index.remove(id);
+        try self.docs.delete(id);
+        self.stats.removed += 1;
     }
 
     fn fail(self: *Pipeline, e: storage.Error) connector.Sink.Error {

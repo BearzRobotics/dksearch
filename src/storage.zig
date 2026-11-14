@@ -88,6 +88,12 @@ pub const Visitor = struct {
 };
 
 /// Document metadata and provenance records.
+/// One document of a source, as listed for removal and pruning.
+pub const Entry = struct {
+    id: doc.Id,
+    source_id: []const u8,
+};
+
 pub const DocumentStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -104,6 +110,13 @@ pub const DocumentStore = struct {
         /// store must not be modified during the visit. Stops at the first
         /// error returned by the visitor and returns it.
         for_each: *const fn (ptr: *anyopaque, visitor: Visitor) Error!void,
+        /// Up to `limit` documents of `connector` in source-id order, those
+        /// after source id `after` when given. Strings are allocated from
+        /// `arena`. Paging by source id stays correct while documents are
+        /// deleted between calls.
+        list: *const fn (ptr: *anyopaque, arena: Allocator, connector: []const u8, after: ?[]const u8, limit: usize) Error![]Entry,
+        /// How many documents `connector` has.
+        count_of: *const fn (ptr: *anyopaque, connector: []const u8) Error!u64,
         /// Optional batching. `begin` opens a batch: writes made until
         /// `commit` may be buffered and become durable together, with one
         /// sync instead of one per write. A crash before `commit` loses the
@@ -132,6 +145,12 @@ pub const DocumentStore = struct {
     }
     pub fn delete(self: DocumentStore, id: doc.Id) Error!void {
         return self.vtable.delete(self.ptr, id);
+    }
+    pub fn list(self: DocumentStore, arena: Allocator, connector: []const u8, after: ?[]const u8, limit: usize) Error![]Entry {
+        return self.vtable.list(self.ptr, arena, connector, after, limit);
+    }
+    pub fn countOf(self: DocumentStore, connector: []const u8) Error!u64 {
+        return self.vtable.count_of(self.ptr, connector);
     }
     pub fn forEach(self: DocumentStore, visitor: Visitor) Error!void {
         return self.vtable.for_each(self.ptr, visitor);

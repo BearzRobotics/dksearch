@@ -122,7 +122,7 @@ pub const SqliteStateStore = struct {
     }
 
     pub fn documents(self: *SqliteStateStore) storage.DocumentStore {
-        return .{ .ptr = self, .vtable = &.{ .upsert = upsert, .find = find, .delete = delete, .for_each = forEach, .begin = begin, .commit = commit, .rollback = rollback } };
+        return .{ .ptr = self, .vtable = &.{ .upsert = upsert, .find = find, .delete = delete, .for_each = forEach, .list = list, .count_of = countOf, .begin = begin, .commit = commit, .rollback = rollback } };
     }
 
     fn begin(ptr: *anyopaque) storage.Error!void {
@@ -211,6 +211,47 @@ pub const SqliteStateStore = struct {
         const st = try Stmt.prepare(self.db, "DELETE FROM documents WHERE id = ?1");
         defer st.deinit();
         try st.blob(1, &id);
+        _ = try st.step();
+    }
+
+    fn list(ptr: *anyopaque, arena: Allocator, connector: []const u8, after: ?[]const u8, limit: usize) storage.Error![]storage.Entry {
+        const self: *SqliteStateStore = @ptrCast(@alignCast(ptr));
+        // Uses the (connector, source_id) index, so each page costs only its size.
+        const st = try Stmt.prepare(self.db, if (after == null)
+            "SELECT id, source_id FROM documents WHERE connector = ?1 ORDER BY source_id LIMIT ?3"
+        else
+            "SELECT id, source_id FROM documents WHERE connector = ?1 AND source_id > ?2 ORDER BY source_id LIMIT ?3");
+        defer st.deinit();
+        try st.text(1, connector);
+        if (after) |a| try st.text(2, a);
+        try st.int(3, @intCast(limit));
+        var out: std.ArrayList(storage.Entry) = .empty;
+        while (try st.step()) {
+            const id_blob = st.colBlob(0) orelse return error.Corrupt;
+            if (id_blob.len != @sizeOf(doc.Id)) return error.Corrupt;
+            var e: storage.Entry = undefined;
+            @memcpy(&e.id, id_blob);
+            e.source_id = try arena.dupe(u8, st.colText(1) orelse return error.Corrupt);
+            try out.append(arena, e);
+        }
+        return out.items;
+    }
+
+    fn countOf(ptr: *anyopaque, connector: []const u8) storage.Error!u64 {
+        const self: *SqliteStateStore = @ptrCast(@alignCast(ptr));
+        const st = try Stmt.prepare(self.db, "SELECT count(*) FROM documents WHERE connector = ?1");
+        defer st.deinit();
+        try st.text(1, connector);
+        if (!try st.step()) return error.Io;
+        return @intCast(st.colInt(0));
+    }
+
+    /// Forgets the job history of `source`, so the next import of a source
+    /// with that name starts from the beginning.
+    pub fn forgetSource(self: *SqliteStateStore, source: []const u8) sqlite.Error!void {
+        const st = try Stmt.prepare(self.db, "DELETE FROM jobs WHERE source = ?1");
+        defer st.deinit();
+        try st.text(1, source);
         _ = try st.step();
     }
 

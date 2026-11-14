@@ -77,7 +77,7 @@ pub const MemoryDocumentStore = struct {
     }
 
     pub fn store(self: *MemoryDocumentStore) storage.DocumentStore {
-        return .{ .ptr = self, .vtable = &.{ .upsert = upsert, .find = find, .delete = delete, .for_each = forEach } };
+        return .{ .ptr = self, .vtable = &.{ .upsert = upsert, .find = find, .delete = delete, .for_each = forEach, .list = list, .count_of = countOf } };
     }
 
     fn upsert(ptr: *anyopaque, rec: storage.Record) storage.Error!void {
@@ -103,6 +103,33 @@ pub const MemoryDocumentStore = struct {
             var a = kv.value.arena;
             a.deinit();
         }
+    }
+
+    fn lessEntry(_: void, a: storage.Entry, b: storage.Entry) bool {
+        return std.mem.lessThan(u8, a.source_id, b.source_id);
+    }
+
+    fn list(ptr: *anyopaque, arena: Allocator, connector: []const u8, after: ?[]const u8, limit: usize) storage.Error![]storage.Entry {
+        const self: *MemoryDocumentStore = @ptrCast(@alignCast(ptr));
+        var all: std.ArrayList(storage.Entry) = .empty;
+        var it = self.map.valueIterator();
+        while (it.next()) |v| {
+            if (!std.mem.eql(u8, v.rec.meta.connector, connector)) continue;
+            if (after) |a| if (!std.mem.lessThan(u8, a, v.rec.meta.source_id)) continue;
+            try all.append(arena, .{ .id = v.rec.id, .source_id = try arena.dupe(u8, v.rec.meta.source_id) });
+        }
+        std.mem.sort(storage.Entry, all.items, {}, lessEntry);
+        return all.items[0..@min(limit, all.items.len)];
+    }
+
+    fn countOf(ptr: *anyopaque, connector: []const u8) storage.Error!u64 {
+        const self: *MemoryDocumentStore = @ptrCast(@alignCast(ptr));
+        var n: u64 = 0;
+        var it = self.map.valueIterator();
+        while (it.next()) |v| {
+            if (std.mem.eql(u8, v.rec.meta.connector, connector)) n += 1;
+        }
+        return n;
     }
 
     fn forEach(ptr: *anyopaque, visitor: storage.Visitor) storage.Error!void {
