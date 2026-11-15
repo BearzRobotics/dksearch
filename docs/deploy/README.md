@@ -4,6 +4,8 @@ This describes a plain Linux installation with systemd. dksearch has no installe
 
 ## Install
 
+For a binary with no dependencies on the system's C library, build it static: `zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl` (or `aarch64-linux-musl`). The default build links the system's C library.
+
     zig build -Doptimize=ReleaseSafe
     sudo install -m 0755 zig-out/bin/dksearch /usr/local/bin/dksearch
     sudo useradd --system --home-dir /var/lib/dksearch --shell /usr/sbin/nologin dksearch

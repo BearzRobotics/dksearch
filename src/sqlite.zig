@@ -24,7 +24,14 @@ pub fn mapRc(rc: c_int) Error {
 }
 
 /// SQLITE_TRANSIENT: tells SQLite to copy bound text/blobs.
-const transient: c.sqlite3_destructor_type = @ptrFromInt(std.math.maxInt(usize));
+// SQLITE_TRANSIENT is the address -1 used as a destructor marker. It is not a
+// real function, and a function pointer type demands alignment on ARM, so a
+// direct @ptrFromInt or @ptrCast does not compile there; reading the same
+// bits through an extern union does.
+const transient: c.sqlite3_destructor_type = (extern union {
+    bits: usize,
+    destructor: c.sqlite3_destructor_type,
+}{ .bits = std.math.maxInt(usize) }).destructor;
 
 /// Opens (creating if needed) a read-write database.
 pub fn open(path: [:0]const u8) Error!*c.sqlite3 {

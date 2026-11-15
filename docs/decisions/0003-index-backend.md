@@ -45,7 +45,7 @@ Verified by tests in `src/sqlite.zig` on Zig 0.17.1, Linux x86_64:
 
 3. Rebuilding an empty index from the content and document stores reproduces identical hits, order and scores for the fixture queries (`src/rebuild.zig` tests).
 
-Not yet verified: cross-compilation to other targets, behavior at scale, and the per-term ranking explanations the admin interface needs.
+Verified later (ADR 0015): cross-compilation to aarch64, riscv64, macOS and FreeBSD targets builds. Still not verified: behavior at large scale (see docs/performance.md for a 20,000-document measurement) and per-term ranking explanations (the admin query-testing page shows scores and weights only).
 
 ## Implementation notes
 
