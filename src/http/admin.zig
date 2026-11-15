@@ -52,6 +52,9 @@ pub const Options = struct {
     jobs: ?*dk.jobs.Manager = null,
     /// For the query-testing page; null hides it.
     searcher: ?dk.search.Searcher = null,
+    /// Regular-expression filtering for the query-testing page and API (with
+    /// the larger administration limits), if available.
+    regex: ?*dk.regexsearch.Service = null,
 };
 
 const Session = struct {
@@ -223,6 +226,20 @@ pub const App = struct {
 
     fn apiSearchTest(self: *App, arena: Allocator, params: query.Params) error{OutOfMemory}!Response {
         const searcher = self.opts.searcher orelse return handler.apiError(arena, .not_found, "not_found", "searching is not available here");
+        switch (handler.parseRegexParams(params)) {
+            .none => {},
+            .bad => |b| return handler.apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
+            .ok => |req| {
+                const r = switch (try handler.regexSearch(arena, searcher, self.opts.regex, testQuery(params), req)) {
+                    .ok => |r| r,
+                    .failed => |n| return handler.apiError(arena, n.status, n.code, n.message),
+                };
+                const RHit = struct { id: []const u8, connector: []const u8, url: ?[]const u8, title: ?[]const u8, snippet: ?[]const u8, score: f64 };
+                const rhits = try arena.alloc(RHit, r.page.hits.len);
+                for (r.page.hits, rhits) |h, *o| o.* = .{ .id = try arena.dupe(u8, &std.fmt.bytesToHex(h.id, .lower)), .connector = h.connector, .url = h.url, .title = h.title, .snippet = h.snippet, .score = h.score };
+                return handler.jsonResponse(arena, .ok, .{ .tokenizer = self.opts.tokenizer, .hits = rhits, .has_more = r.page.has_more, .regex = .{ .examined = r.examined, .truncated = r.truncated } });
+            },
+        }
         const page = searcher.search(arena, testQuery(params)) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.EmptyQuery => handler.apiError(arena, .bad_request, "empty_query", "the query has no searchable terms"),
@@ -241,7 +258,7 @@ pub const App = struct {
         const w = &aw.writer;
         const q = testQuery(params);
         writePage(w, "Search test", csrf, "search") catch return error.OutOfMemory;
-        writeSearchTest(self, arena, w, searcher, q) catch return error.OutOfMemory;
+        writeSearchTest(self, arena, w, searcher, q, handler.parseRegexParams(params)) catch return error.OutOfMemory;
         w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
         return handler.htmlResponse(arena, .ok, aw.written());
     }
@@ -789,22 +806,63 @@ fn writePage(w: *Io.Writer, title: []const u8, csrf: ?[]const u8, current: []con
     try w.print("</header><h1>{s}</h1>\n", .{title});
 }
 
-fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.search.Searcher, q: dk.search.Query) !void {
+fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.search.Searcher, q: dk.search.Query, rx: handler.RegexParams) !void {
     try w.writeAll("<form class=\"search\" action=\"/search\" method=\"get\"><input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Query\" autofocus value=\"");
     try html.writeEscaped(w, q.text);
-    try w.writeAll("\"><button type=\"submit\">Run query</button></form>\n");
+    try w.writeAll("\"><button type=\"submit\">Run query</button>");
+    if (app.opts.regex != null) {
+        const pattern = switch (rx) {
+            .ok => |r| r.pattern,
+            else => "",
+        };
+        const icase = switch (rx) {
+            .ok => |r| r.ignore_case,
+            else => false,
+        };
+        try w.writeAll("<details open><summary>Regex</summary><label>Pattern <input name=\"regex\" maxlength=\"2000\" spellcheck=\"false\" value=\"");
+        try html.writeEscaped(w, pattern);
+        try w.writeAll("\"></label><label><input type=\"checkbox\" name=\"regex_flags\" value=\"i\"");
+        if (icase) try w.writeAll(" checked");
+        try w.writeAll("> ignore case</label></details>");
+    }
+    try w.writeAll("</form>\n");
     try w.print("<p class=\"muted\">Runs the same search as the public page and shows the ranking score of each result (higher is better; a match in the title counts ten times a match in the text; tokenizer: {s}). Terms are ANDed, text in double quotes is a phrase, and no query syntax is interpreted.</p>\n", .{app.opts.tokenizer});
     if (q.text.len == 0) return;
-    const page = searcher.search(arena, q) catch |e| {
-        try w.writeAll("<p class=\"error\" role=\"alert\">");
-        try html.writeEscaped(w, switch (e) {
-            error.EmptyQuery => "The query has no searchable terms.",
-            error.InvalidQuery => "The query is not valid (too long or too many terms).",
-            else => "The search failed; see the server's error output.",
-        });
-        try w.writeAll("</p>\n");
-        return;
+    var examined: ?struct { n: u32, truncated: bool } = null;
+    const page = blk: {
+        switch (rx) {
+            .none => {},
+            .bad => |b| {
+                try w.writeAll("<p class=\"error\" role=\"alert\">");
+                try html.writeEscaped(w, b.message);
+                try w.writeAll("</p>\n");
+                return;
+            },
+            .ok => |req| switch (try handler.regexSearch(arena, searcher, app.opts.regex, q, req)) {
+                .ok => |r| {
+                    examined = .{ .n = r.examined, .truncated = r.truncated };
+                    break :blk r.page;
+                },
+                .failed => |n| {
+                    try w.writeAll("<p class=\"error\" role=\"alert\">");
+                    try html.writeEscaped(w, n.message);
+                    try w.writeAll("</p>\n");
+                    return;
+                },
+            },
+        }
+        break :blk searcher.search(arena, q) catch |e| {
+            try w.writeAll("<p class=\"error\" role=\"alert\">");
+            try html.writeEscaped(w, switch (e) {
+                error.EmptyQuery => "The query has no searchable terms.",
+                error.InvalidQuery => "The query is not valid (too long or too many terms).",
+                else => "The search failed; see the server's error output.",
+            });
+            try w.writeAll("</p>\n");
+            return;
+        };
     };
+    if (examined) |e| try w.print("<p class=\"muted\">Regex checked {d} candidate document(s){s}.</p>\n", .{ e.n, if (e.truncated) "; a limit was reached, so more matches may exist" else "" });
     if (page.hits.len == 0) return w.writeAll("<p>No results.</p>\n");
     try w.print("<p class=\"muted\">{d} result(s){s}.</p>\n", .{ page.hits.len, if (page.has_more) ", more exist" else "" });
     try w.writeAll("<table><thead><tr><th>#</th><th>Score</th><th>Title</th><th>Source</th><th>Id</th></tr></thead><tbody>\n");

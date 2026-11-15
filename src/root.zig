@@ -10,6 +10,7 @@ pub const memory = @import("memory.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const search = @import("search.zig");
 pub const evaluate = @import("evaluate.zig");
+pub const regexsearch = @import("regexsearch.zig");
 pub const help = @import("help.zig");
 pub const rebuild = @import("rebuild.zig");
 pub const index_sqlite = @import("index_sqlite.zig");
@@ -32,6 +33,7 @@ test {
     _ = pipeline;
     _ = search;
     _ = evaluate;
+    _ = regexsearch;
     _ = help;
     _ = rebuild;
     _ = index_sqlite;

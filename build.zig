@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const toml = b.dependency("toml", .{ .target = target, .optimize = optimize }).module("toml");
+    const regex = b.dependency("regex", .{ .target = target, .optimize = optimize }).module("regex");
 
     // Vendored SQLite (public domain). The header is translated to a Zig
     // module and the amalgamation is compiled into it. Compile-time options:
@@ -121,6 +122,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "toml", .module = toml },
+            .{ .name = "regex", .module = regex },
             .{ .name = "sqlite_c", .module = sqlite },
             .{ .name = "build_options", .module = core_options.createModule() },
         },

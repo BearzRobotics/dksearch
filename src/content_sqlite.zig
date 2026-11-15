@@ -170,6 +170,65 @@ fn decompress(gpa: Allocator, data: []const u8, expected_size: usize) error{ Out
     return out;
 }
 
+/// Several read-only connections to `content.db`, so searches that read stored
+/// text (regex filtering) can run side by side, like `index_sqlite.SearchPool`.
+/// Only `get` works; every write is refused.
+pub const ContentPool = struct {
+    gpa: Allocator,
+    io: Io,
+    slots: []Slot,
+    idle: Io.Semaphore,
+
+    const Slot = struct {
+        store: SqliteContentStore,
+        busy: std.atomic.Value(bool) = .init(false),
+    };
+
+    pub fn open(gpa: Allocator, io: Io, path: [:0]const u8, size: usize) OpenError!ContentPool {
+        const n = @max(size, 1);
+        const slots = try gpa.alloc(Slot, n);
+        var opened: usize = 0;
+        errdefer {
+            for (slots[0..opened]) |*sl| sl.store.close();
+            gpa.free(slots);
+        }
+        while (opened < n) : (opened += 1) {
+            slots[opened] = .{ .store = try SqliteContentStore.inspect(gpa, path) };
+        }
+        return .{ .gpa = gpa, .io = io, .slots = slots, .idle = .{ .permits = n } };
+    }
+
+    pub fn close(self: *ContentPool) void {
+        for (self.slots) |*sl| sl.store.close();
+        self.gpa.free(self.slots);
+        self.* = undefined;
+    }
+
+    pub fn store(self: *ContentPool) storage.ContentStore {
+        return .{ .ptr = self, .vtable = &.{ .put = refusePut, .get = poolGet, .delete = refuseDelete } };
+    }
+
+    fn poolGet(ptr: *anyopaque, gpa: Allocator, id: doc.Id) storage.Error![]u8 {
+        const self: *ContentPool = @ptrCast(@alignCast(ptr));
+        self.idle.waitUncancelable(self.io);
+        defer self.idle.post(self.io);
+        for (self.slots) |*slot| {
+            if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                defer slot.busy.store(false, .release);
+                return SqliteContentStore.get(@ptrCast(&slot.store), gpa, id);
+            }
+        }
+        unreachable; // permits never exceed the number of idle slots
+    }
+
+    fn refusePut(_: *anyopaque, _: doc.Id, _: []const u8) storage.Error!void {
+        return error.Io;
+    }
+    fn refuseDelete(_: *anyopaque, _: doc.Id) storage.Error!void {
+        return error.Io;
+    }
+};
+
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -311,4 +370,28 @@ test "a ContentStore feeds the rebuild path just like the memory one" {
     defer arena.deinit();
     const page = try fresh.searcher().search(arena.allocator(), .{ .text = "ishmael" });
     try testing.expectEqual(@as(usize, 1), page.hits.len);
+}
+
+test "the read-only pool reads from several connections and refuses writes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [160]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pb, ".zig-cache/tmp/{s}/content.db", .{tmp.sub_path}, 0);
+    const id = doc.idFromSource("t", "x");
+    {
+        var s = try SqliteContentStore.open(testing.allocator, path, true);
+        defer s.close();
+        try s.store().put(id, "stored text for the pool");
+    }
+    var pool = try ContentPool.open(testing.allocator, testing.io, path, 3);
+    defer pool.close();
+    const st = pool.store();
+    for (0..5) |_| {
+        const got = try st.get(testing.allocator, id);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("stored text for the pool", got);
+    }
+    try testing.expectError(error.NotFound, st.get(testing.allocator, doc.idFromSource("t", "missing")));
+    try testing.expectError(error.Io, st.put(id, "nope"));
+    try testing.expectError(error.Io, st.delete(id));
 }

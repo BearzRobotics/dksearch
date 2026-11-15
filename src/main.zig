@@ -528,6 +528,33 @@ fn adminServeTask(
     };
 }
 
+/// The public limits for regex queries, from the `[search]` table.
+fn publicRegexLimits(s: dk.config.SearchSettings) dk.regexsearch.Limits {
+    return .{
+        .max_pattern_bytes = s.regex_max_pattern,
+        .max_candidates = s.regex_max_candidates,
+        .budget_ms = s.regex_budget_ms,
+        .max_steps = s.regex_max_steps,
+        .concurrency = s.regex_concurrency,
+    };
+}
+
+/// Ten times the public limits (within the configurable maxima), for the
+/// administration interface's query-testing page.
+fn adminRegexLimits(s: dk.config.SearchSettings) dk.regexsearch.Limits {
+    var l = publicRegexLimits(s);
+    l.max_pattern_bytes = @min(l.max_pattern_bytes * 10, 2000);
+    l.max_candidates = @min(l.max_candidates * 10, 10_000);
+    l.budget_ms = @min(l.budget_ms * 10, 60_000);
+    l.max_steps = @min(l.max_steps * 10, 10_000_000);
+    l.max_text_bytes = 8 << 20;
+    l.max_repeat = 1000;
+    l.max_depth = 100;
+    l.concurrency = 4;
+    l.queue_ms = 1000;
+    return l;
+}
+
 fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     var diag: dk.config.Diagnostic = .{};
     var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
@@ -556,6 +583,27 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         };
     }
     const searcher = if (pool) |*p| p.searcher() else index.searcher();
+
+    // Regular-expression filtering reads the stored texts through its own
+    // read-only connections. Without a content.db (nothing imported yet) or
+    // with `[search] regex = false` the filter is simply not offered.
+    var content_pool: ?dk.content_sqlite.ContentPool = null;
+    defer if (content_pool) |*p| p.close();
+    var regex_service: ?dk.regexsearch.Service = null;
+    var admin_regex_service: ?dk.regexsearch.Service = null;
+    if (cfg.search.regex) {
+        if (Io.Dir.cwd().access(io, paths.content, .{})) |_| {
+            if (dk.content_sqlite.ContentPool.open(gpa, io, paths.content, @max(cfg.search.regex_concurrency, 2))) |p| {
+                content_pool = p;
+                regex_service = dk.regexsearch.Service.init(io, content_pool.?.store(), publicRegexLimits(cfg.search));
+                admin_regex_service = dk.regexsearch.Service.init(io, content_pool.?.store(), adminRegexLimits(cfg.search));
+            } else |e| {
+                err(io, "note: the regex filter is off: cannot open {s} for reading ({t})", .{ paths.content, e });
+            }
+        } else |_| {
+            err(io, "note: the regex filter is off until something has been imported ({s} does not exist yet); restart after the first import", .{paths.content});
+        }
+    }
 
     // Validated as a literal at load time, so this cannot fail.
     const address = Io.net.IpAddress.parse(cfg.server.address, cfg.server.port) catch unreachable;
@@ -640,6 +688,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         admin_app = dkhttp.admin.App.init(gpa, io, .{
             .jobs = if (job_manager_ready) &job_manager else null,
             .searcher = searcher,
+            .regex = if (admin_regex_service) |*r| r else null,
             .tokenizer = @tagName(cfg.tokenizer),
             .index_path = paths.index,
             .state_path = paths.state,
@@ -673,7 +722,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
 
     installSignalHandlers(onServeSignal);
     var result: u8 = exit_ok;
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, if (regex_service) |*r| r else null, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

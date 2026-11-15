@@ -6,7 +6,7 @@ NAME
 dksearch-api - HTTP interface of dksearch: JSON API version 1 and the HTML search page
 
 SYNOPSIS
-GET /api/v1/search?q=TEXT[&language=L][&content_type=T][&connector=C][&limit=N][&offset=N]
+GET /api/v1/search?q=TEXT[&language=L][&content_type=T][&connector=C][&limit=N][&offset=N][&regex=PATTERN[&regex_flags=i][&regex_dialect=perl|ere]]
 
 GET /api/v1/health
 
@@ -37,7 +37,10 @@ limit
 : Optional page size. Default 10, maximum 100.
 
 offset
-: Optional number of hits to skip. `offset + limit` may not exceed 10000.
+: Optional number of hits to skip. `offset + limit` may not exceed 10000. With `regex`, it counts matching hits.
+
+regex, regex_flags, regex_dialect
+: Optional regular-expression filter. The words in `q` choose the candidate documents through the index, in ranking order; the pattern is then checked against each candidate's stored text and only matching documents are returned, with a snippet around the first match (marked with the same `\u0002` and `\u0003` bytes). `q` must therefore contain at least one word: the filter never scans the whole corpus. `regex_flags` may be `i` for ignore case. `regex_dialect` is `perl` (the default: classes, groups, alternation, repetition, lazy and possessive quantifiers, back-references, look-around, `\d \w \s \b`) or `ere` (POSIX extended). The pattern is matched on bytes, not characters, so `.` matches one byte of a multi-byte character; unsupported constructs (for example `\p{L}`) are refused. The server limits it strictly (see `[search]` in dksearch(1)): at most 200 bytes of pattern, 200 candidate documents, 500 ms in total and a bounded number of matching steps per document by default. The response then has an additional member, `"regex": {"examined": N, "truncated": B}`: how many candidates were checked, and whether a limit ended the search early, so that more matches may exist (`has_more` is then true as well). Errors: 400 `invalid_pattern` (with the reason and position), `invalid_parameter` for bad flags or dialect, `empty_query` when `q` has no words, `regex_disabled` when the server has turned the filter off; 422 `pattern_too_complex` when the pattern ran out of steps on several documents; 429 `busy` (with `Retry-After`) when too many regex searches are running.
 
 Response: 200 with `application/json`:
 
@@ -61,7 +64,7 @@ GET /api/v1/health
 Returns 200 and `{"status":"ok"}`. It reports that the process is serving requests and nothing about the index.
 
 GET /search and GET /
-HTML pages. `/` is the search form. `/search` takes `q`, `language`, `connector` and `offset`; the page size is fixed at 10 and any `limit` is ignored. Result URLs are links only if they begin with `http://` or `https://`; otherwise they are shown as text. An empty `q` shows the form again.
+HTML pages. `/` is the search form. `/search` takes `q`, `language`, `connector`, `offset` and, when the server offers it, `regex` and `regex_flags` (the search form has a Regex field under Filters); the page size is fixed at 10 and any `limit` is ignored. Result URLs are links only if they begin with `http://` or `https://`; otherwise they are shown as text. An empty `q` shows the form again.
 
 GET /assets/style.css
 The stylesheet, cacheable for one hour. All other responses are `Cache-Control: no-store`.

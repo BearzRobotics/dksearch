@@ -62,12 +62,17 @@ fn route(path: []const u8) Route {
 /// Handles one request. Never fails: problems become error responses.
 /// `HEAD` is routed like `GET`; the transport layer omits the body.
 pub fn handle(arena: Allocator, searcher: dk.search.Searcher, method: http.Method, target: []const u8) Response {
-    return handleInner(arena, searcher, method, target) catch |e| switch (e) {
+    return handleWith(arena, searcher, null, method, target);
+}
+
+/// Like `handle`, with the regex filter available when `regex` is set.
+pub fn handleWith(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, method: http.Method, target: []const u8) Response {
+    return handleInner(arena, searcher, regex, method, target) catch |e| switch (e) {
         error.OutOfMemory => plain(.service_unavailable, "temporarily out of memory\n"),
     };
 }
 
-fn handleInner(arena: Allocator, searcher: dk.search.Searcher, method: http.Method, target: []const u8) error{OutOfMemory}!Response {
+fn handleInner(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, method: http.Method, target: []const u8) error{OutOfMemory}!Response {
     const t = query.parseTarget(arena, target) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         // Cannot tell whether the client wants JSON or HTML; use plain text.
@@ -90,25 +95,25 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, method: http.Meth
     }
 
     return switch (r) {
-        .home => try renderHtml(arena, .ok, struct {
-            fn f(w: *std.Io.Writer) !void {
-                try html.writeHome(w, null);
-            }
-        }.f),
+        .home => blk: {
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            html.writeHomeWith(&aw.writer, null, regex != null) catch return error.OutOfMemory;
+            break :blk htmlResponse(arena, .ok, aw.written());
+        },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
         .api_health => try jsonResponse(arena, .ok, .{ .status = "ok" }),
-        .api_search => try apiSearch(arena, searcher, t.params),
-        .search_page => try pageSearch(arena, searcher, t.params),
+        .api_search => try apiSearch(arena, searcher, regex, t.params),
+        .search_page => try pageSearch(arena, searcher, regex, t.params),
         .other => unreachable,
     };
 }
 
 // ------------------------------------------------------------ parameters
 
-const ParamError = struct { name: []const u8, message: []const u8 };
+pub const ParamError = struct { name: []const u8, message: []const u8 };
 
 const Parsed = union(enum) {
-    ok: dk.search.Query,
+    ok: struct { q: dk.search.Query, re: ?dk.regexsearch.Request },
     bad: ParamError,
 };
 
@@ -128,7 +133,33 @@ fn parseQuery(params: query.Params, html_mode: bool) Parsed {
     } else if (params.get("limit")) |v| if (v.len > 0) {
         q.limit = std.fmt.parseInt(u32, v, 10) catch return .{ .bad = .{ .name = "limit", .message = "must be a non-negative integer" } };
     };
-    return .{ .ok = q };
+    const re: ?dk.regexsearch.Request = switch (parseRegexParams(params)) {
+        .none => null,
+        .ok => |r| r,
+        .bad => |b| return .{ .bad = b },
+    };
+    return .{ .ok = .{ .q = q, .re = re } };
+}
+
+pub const RegexParams = union(enum) { none, ok: dk.regexsearch.Request, bad: ParamError };
+
+/// Regular-expression filter parameters: `regex` is the pattern, `regex_flags`
+/// may contain `i` (ignore case), `regex_dialect` is `perl` (default) or `ere`.
+pub fn parseRegexParams(params: query.Params) RegexParams {
+    const p = params.get("regex") orelse return .none;
+    if (p.len == 0) return .none;
+    var req: dk.regexsearch.Request = .{ .pattern = p };
+    if (params.get("regex_flags")) |fl| {
+        for (fl) |ch| switch (ch) {
+            'i' => req.ignore_case = true,
+            else => return .{ .bad = .{ .name = "regex_flags", .message = "only the flag i (ignore case) is supported" } },
+        };
+    }
+    if (params.get("regex_dialect")) |d| if (d.len > 0) {
+        req.dialect = std.meta.stringToEnum(dk.regexsearch.Dialect, d) orelse
+            return .{ .bad = .{ .name = "regex_dialect", .message = "must be perl or ere" } };
+    };
+    return .{ .ok = req };
 }
 
 fn validFilter(v: []const u8) bool {
@@ -149,25 +180,59 @@ const ApiHit = struct {
 };
 const ApiPage = struct { hits: []const ApiHit, has_more: bool };
 
-fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, params: query.Params) error{OutOfMemory}!Response {
-    const q = switch (parseQuery(params, false)) {
-        .ok => |q| q,
+pub const RegexNote = struct { status: http.Status, code: []const u8, message: []const u8 };
+
+/// The words-and-regex search: the page and how much was checked, or why not.
+pub fn regexSearch(arena: Allocator, searcher: dk.search.Searcher, service: ?*dk.regexsearch.Service, q: dk.search.Query, req: dk.regexsearch.Request) error{OutOfMemory}!union(enum) { ok: dk.regexsearch.Result, failed: RegexNote } {
+    const svc = service orelse return .{ .failed = .{ .status = .bad_request, .code = "regex_disabled", .message = "regular-expression search is not enabled on this server" } };
+    var diag: dk.regexsearch.PatternDiag = .{};
+    const r = svc.run(arena, searcher, q, req, &diag) catch |e| return .{ .failed = switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.EmptyQuery => .{ .status = .bad_request, .code = "empty_query", .message = "a regular-expression search also needs at least one word, which chooses the documents to check" },
+        error.InvalidQuery => .{ .status = .bad_request, .code = "invalid_query", .message = "the query or paging parameters are out of range" },
+        error.InvalidPattern => .{ .status = .bad_request, .code = "invalid_pattern", .message = try std.fmt.allocPrint(arena, "invalid pattern: {s}", .{diag.message}) },
+        error.TooComplex => .{ .status = .unprocessable_entity, .code = "pattern_too_complex", .message = "the pattern is too complex to run on these documents; simplify it" },
+        error.Busy => .{ .status = .too_many_requests, .code = "busy", .message = "too many regular-expression searches are running; try again in a moment" },
+        error.Io => .{ .status = .internal_server_error, .code = "internal_error", .message = "the search failed" },
+    } };
+    return .{ .ok = r };
+}
+
+fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, params: query.Params) error{OutOfMemory}!Response {
+    const parsed = switch (parseQuery(params, false)) {
+        .ok => |p| p,
         .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
+    const q = parsed.q;
+    if (parsed.re) |req| {
+        const r = switch (try regexSearch(arena, searcher, regex, q, req)) {
+            .ok => |r| r,
+            .failed => |n| {
+                var resp = try apiError(arena, n.status, n.code, n.message);
+                if (n.status == .too_many_requests) resp.headers = headersWith(arena, &.{ .{ .name = "retry-after", .value = "2" }, no_store });
+                return resp;
+            },
+        };
+        const hits = try arena.alloc(ApiHit, r.page.hits.len);
+        for (r.page.hits, hits) |h, *out| out.* = try apiHit(arena, h);
+        return jsonResponse(arena, .ok, .{ .hits = hits, .has_more = r.page.has_more, .regex = .{ .examined = r.examined, .truncated = r.truncated } });
+    }
     const page = searcher.search(arena, q) catch |e| return searchFailure(arena, e, true);
 
     const hits = try arena.alloc(ApiHit, page.hits.len);
-    for (page.hits, hits) |h, *out| {
-        out.* = .{
-            .id = try arena.dupe(u8, &std.fmt.bytesToHex(h.id, .lower)),
-            .connector = h.connector,
-            .url = h.url,
-            .title = h.title,
-            .snippet = h.snippet,
-            .score = h.score,
-        };
-    }
+    for (page.hits, hits) |h, *out| out.* = try apiHit(arena, h);
     return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more });
+}
+
+fn apiHit(arena: Allocator, h: dk.search.Hit) error{OutOfMemory}!ApiHit {
+    return .{
+        .id = try arena.dupe(u8, &std.fmt.bytesToHex(h.id, .lower)),
+        .connector = h.connector,
+        .url = h.url,
+        .title = h.title,
+        .snippet = h.snippet,
+        .score = h.score,
+    };
 }
 
 fn searchFailure(arena: Allocator, e: dk.search.Error, api: bool) error{OutOfMemory}!Response {
@@ -199,12 +264,32 @@ pub fn apiError(arena: Allocator, status: http.Status, code: []const u8, message
 
 // ------------------------------------------------------------ HTML pages
 
-fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, params: query.Params) error{OutOfMemory}!Response {
-    const q = switch (parseQuery(params, true)) {
-        .ok => |q| q,
+fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, params: query.Params) error{OutOfMemory}!Response {
+    const parsed = switch (parseQuery(params, true)) {
+        .ok => |p| p,
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
-    const form: html.Form = .{ .q = q.text, .language = q.language orelse "", .connector = q.connector orelse "" };
+    const q = parsed.q;
+    var form: html.Form = .{ .q = q.text, .language = q.language orelse "", .connector = q.connector orelse "", .regex_enabled = regex != null };
+    if (parsed.re) |req| {
+        form.regex = req.pattern;
+        form.regex_ignore_case = req.ignore_case;
+        const result = try regexSearch(arena, searcher, regex, q, req);
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        switch (result) {
+            .ok => |r| {
+                html.writeResults(&aw.writer, form, r.page, q.offset, html_page_size) catch return error.OutOfMemory;
+                return htmlResponse(arena, .ok, aw.written());
+            },
+            .failed => |n| {
+                form.regex_notice = n.message;
+                html.writeResults(&aw.writer, form, .{ .hits = &.{}, .has_more = false }, 0, html_page_size) catch return error.OutOfMemory;
+                var resp = htmlResponse(arena, n.status, aw.written());
+                if (n.status == .too_many_requests) resp.headers = headersWith(arena, &.{ .{ .name = "retry-after", .value = "2" }, no_store });
+                return resp;
+            },
+        }
+    }
 
     const page = searcher.search(arena, q) catch |e| switch (e) {
         // An empty box just shows the form again.
@@ -467,4 +552,124 @@ test "end to end against the real index" {
         const r = handle(ar.allocator(), idx.searcher(), .GET, t);
         try testing.expect(r.status == .ok or r.status == .bad_request);
     }
+}
+
+// ----------------------------------------------------- regular-expression filter
+
+const RegexFixture = struct {
+    store: dk.memory.MemoryContentStore,
+    fake: FakeSearch,
+    svc: dk.regexsearch.Service,
+    hits: [2]dk.search.Hit,
+
+    fn init(f: *RegexFixture, limits: dk.regexsearch.Limits) !void {
+        f.store = dk.memory.MemoryContentStore.init(testing.allocator);
+        const ids = [2]dk.document.Id{ dk.document.idFromSource("t", "a"), dk.document.idFromSource("t", "b") };
+        try f.store.store().put(ids[0], "The order number is 123-456 today");
+        try f.store.store().put(ids[1], "No digits in this order at all");
+        for (&f.hits, ids, 0..) |*h, id, i| h.* = .{ .id = id, .connector = "t", .url = if (i == 0) "https://e.org/a" else null, .title = if (i == 0) "A" else "B", .snippet = null, .score = 3 - @as(f64, @floatFromInt(i)) };
+        f.fake = .{ .result = .{ .hits = &f.hits, .has_more = false } };
+        f.svc = dk.regexsearch.Service.init(testing.io, f.store.store(), limits);
+    }
+    fn deinit(f: *RegexFixture) void {
+        f.store.deinit();
+    }
+    fn get(f: *RegexFixture, arena: *std.heap.ArenaAllocator, with_service: bool, target: []const u8) Response {
+        return handleWith(arena.allocator(), f.fake.searcher(), if (with_service) &f.svc else null, .GET, target);
+    }
+};
+
+test "API regex filter keeps matching documents and says how much was checked" {
+    var f: RegexFixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const r = f.get(&ar, true, "/api/v1/search?q=order&regex=%5Cd%7B3%7D-%5Cd%2B");
+    try testing.expectEqual(http.Status.ok, r.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, r.body, .{});
+    defer parsed.deinit();
+    const hits = parsed.value.object.get("hits").?.array.items;
+    try testing.expectEqual(@as(usize, 1), hits.len);
+    try testing.expectEqualStrings("A", hits[0].object.get("title").?.string);
+    try testing.expect(std.mem.indexOf(u8, hits[0].object.get("snippet").?.string, "\x02123-456\x03") != null);
+    const note = parsed.value.object.get("regex").?.object;
+    try testing.expectEqual(@as(i64, 2), note.get("examined").?.integer);
+    try testing.expect(!note.get("truncated").?.bool);
+
+    // Ignore case through the flag.
+    const r2 = f.get(&ar, true, "/api/v1/search?q=order&regex=ORDER&regex_flags=i");
+    try testing.expectEqual(http.Status.ok, r2.status);
+    try testing.expect(std.mem.indexOf(u8, r2.body, "\"title\":\"A\"") != null and std.mem.indexOf(u8, r2.body, "\"title\":\"B\"") != null);
+}
+
+test "API regex errors are JSON with stable codes" {
+    var f: RegexFixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const cases = [_]struct { target: []const u8, service: bool, status: http.Status, code: []const u8 }{
+        .{ .target = "/api/v1/search?q=order&regex=(unclosed", .service = true, .status = .bad_request, .code = "invalid_pattern" },
+        .{ .target = "/api/v1/search?q=order&regex=a&regex_flags=x", .service = true, .status = .bad_request, .code = "invalid_parameter" },
+        .{ .target = "/api/v1/search?q=order&regex=a&regex_dialect=pcre", .service = true, .status = .bad_request, .code = "invalid_parameter" },
+        .{ .target = "/api/v1/search?q=order&regex=a", .service = false, .status = .bad_request, .code = "regex_disabled" },
+    };
+    for (cases) |c| {
+        const r = f.get(&ar, c.service, c.target);
+        try testing.expectEqual(c.status, r.status);
+        const needle = try std.fmt.allocPrint(ar.allocator(), "\"code\":\"{s}\"", .{c.code});
+        try testing.expect(std.mem.indexOf(u8, r.body, needle) != null);
+    }
+    // A pattern that cannot finish is refused as too complex (422).
+    var hay: [60]u8 = @splat('a');
+    hay[59] = 'b';
+    try f.store.store().put(f.hits[0].id, &hay);
+    try f.store.store().put(f.hits[1].id, &hay);
+    var small: RegexFixture = undefined;
+    try small.init(.{ .max_complex = 1, .max_steps = 20_000 });
+    defer small.deinit();
+    try small.store.store().put(small.hits[0].id, &hay);
+    const r = small.get(&ar, true, "/api/v1/search?q=order&regex=(a%2B)%2B%24");
+    try testing.expectEqual(http.Status.unprocessable_entity, r.status);
+    try testing.expect(std.mem.indexOf(u8, r.body, "pattern_too_complex") != null);
+}
+
+test "a busy regex service answers 429 with Retry-After" {
+    var f: RegexFixture = undefined;
+    try f.init(.{ .concurrency = 1, .queue_ms = 10 });
+    defer f.deinit();
+    f.svc.permits.waitUncancelable(testing.io); // another query holds the only turn
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const r = f.get(&ar, true, "/api/v1/search?q=order&regex=order");
+    try testing.expectEqual(http.Status.too_many_requests, r.status);
+    try testing.expectEqualStrings("2", headerValue(r, "retry-after").?);
+    f.svc.permits.post(testing.io);
+}
+
+test "the HTML page offers the regex field only when enabled, escapes it and keeps it when paging" {
+    var f: RegexFixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const home_off = f.get(&ar, false, "/");
+    try testing.expect(std.mem.indexOf(u8, home_off.body, "name=\"regex\"") == null);
+    const home_on = f.get(&ar, true, "/");
+    try testing.expect(std.mem.indexOf(u8, home_on.body, "name=\"regex\"") != null);
+
+    const r = f.get(&ar, true, "/search?q=order&regex=%3Cb%3E%5Cd%2B");
+    // Nothing matches "<b>\d+", the pattern is shown escaped and never as markup.
+    try testing.expect(std.mem.indexOf(u8, r.body, "<b>\\d+") == null);
+    try testing.expect(std.mem.indexOf(u8, r.body, "&lt;b&gt;\\d+") != null);
+
+    const bad = f.get(&ar, true, "/search?q=order&regex=(x");
+    try testing.expectEqual(http.Status.bad_request, bad.status);
+    try testing.expect(std.mem.indexOf(u8, bad.body, "invalid pattern") != null);
+
+    // The pager link carries the regex.
+    f.fake.result = .{ .hits = &f.hits, .has_more = true };
+    const paged = f.get(&ar, true, "/search?q=order&regex=order&regex_flags=i");
+    try testing.expect(std.mem.indexOf(u8, paged.body, "regex=order&amp;regex_flags=i") != null or std.mem.indexOf(u8, paged.body, "regex=order") != null);
 }

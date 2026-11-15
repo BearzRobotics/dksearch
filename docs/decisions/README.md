@@ -36,3 +36,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0017 | Crawler direction, feed fetching, Windows, rights override |
 | 0018 | Web crawler connector |
 | 0019 | Internet Archive metadata connector |
+| 0020 | Regular-expression search |

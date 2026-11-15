@@ -60,6 +60,12 @@ pub const Form = struct {
     q: []const u8 = "",
     language: []const u8 = "",
     connector: []const u8 = "",
+    /// Regular-expression filter; the field is only shown when `regex_enabled`.
+    regex: []const u8 = "",
+    regex_ignore_case: bool = false,
+    regex_enabled: bool = false,
+    /// A message about the regex filter (bad pattern, too busy, ...).
+    regex_notice: ?[]const u8 = null,
 };
 
 pub fn writeHead(w: *Writer, title: []const u8) Writer.Error!void {
@@ -75,18 +81,36 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
         "<input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Search\" autofocus value=\"");
     try writeEscaped(w, f.q);
     try w.writeAll("\"><button type=\"submit\">Search</button>");
-    const open = if (f.language.len > 0 or f.connector.len > 0) " open" else "";
+    const open = if (f.language.len > 0 or f.connector.len > 0 or f.regex.len > 0) " open" else "";
     try w.print("<details{s}><summary>Filters</summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
     try writeEscaped(w, f.language);
     try w.writeAll("\"></label><label>Source <input name=\"connector\" maxlength=\"64\" value=\"");
     try writeEscaped(w, f.connector);
-    try w.writeAll("\"></label></details></form>\n");
+    try w.writeAll("\"></label>");
+    if (f.regex_enabled) {
+        try w.writeAll("<label>Regex <input name=\"regex\" maxlength=\"200\" spellcheck=\"false\" placeholder=\"e.g. \\d{3}-\\d{4}\" value=\"");
+        try writeEscaped(w, f.regex);
+        try w.writeAll("\"></label><label class=\"check\"><input type=\"checkbox\" name=\"regex_flags\" value=\"i\"");
+        if (f.regex_ignore_case) try w.writeAll(" checked");
+        try w.writeAll("> ignore case</label><small>The words above choose the documents; the regex then keeps those whose text matches it.</small>");
+    }
+    try w.writeAll("</details></form>\n");
+    if (f.regex_notice) |n| {
+        try w.writeAll("<p class=\"error\" role=\"alert\">");
+        try writeEscaped(w, n);
+        try w.writeAll("</p>\n");
+    }
 }
 
 pub fn writeHome(w: *Writer, notice: ?[]const u8) Writer.Error!void {
+    return writeHomeWith(w, notice, false);
+}
+
+/// The home page; `regex_enabled` adds the regex filter to the form.
+pub fn writeHomeWith(w: *Writer, notice: ?[]const u8, regex_enabled: bool) Writer.Error!void {
     try writeHead(w, "dksearch");
     try w.writeAll("<body class=\"home\"><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
-    try writeForm(w, .{});
+    try writeForm(w, .{ .regex_enabled = regex_enabled });
     if (notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
         try writeEscaped(w, n);
@@ -168,6 +192,11 @@ fn writePagerLink(w: *Writer, f: Form, offset: u32, label_html: []const u8) Writ
     if (f.connector.len > 0) {
         try w.writeAll("&amp;connector=");
         try query.writeEncoded(w, f.connector);
+    }
+    if (f.regex.len > 0) {
+        try w.writeAll("&amp;regex=");
+        try query.writeEncoded(w, f.regex);
+        if (f.regex_ignore_case) try w.writeAll("&amp;regex_flags=i");
     }
     if (offset > 0) try w.print("&amp;offset={d}", .{offset});
     try w.writeAll("\">");

@@ -233,6 +233,10 @@ pub const config_topic =
     \\    [index]
     \\    tokenizer = "unicode61"        # or "porter" for English stemming (then run rebuild)
     \\
+    \\    [search]
+    \\    regex = true                   # the regex filter on the search page and API (default on)
+    \\    # regex_max_candidates = 200   # limits keep expensive patterns cheap; see the manual
+    \\
     \\    [[source]]                     # zero or more: what to import
     \\    name = "my-notes"
     \\    kind = "files"                 # files, gutenberg, wikipedia, feeds, crawl, archive

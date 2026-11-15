@@ -193,6 +193,23 @@ pub const Source = struct {
     }
 };
 
+/// The `[search]` table: regular-expression filtering of results
+/// (docs/decisions/0020). The limits protect the server from expensive patterns.
+pub const SearchSettings = struct {
+    /// Offer the `regex` filter on the public interface and API.
+    regex: bool = true,
+    /// Longest pattern, in bytes.
+    regex_max_pattern: u32 = 200,
+    /// Most candidate documents whose text is checked per query.
+    regex_max_candidates: u32 = 200,
+    /// Wall-clock budget for one regex query.
+    regex_budget_ms: u32 = 500,
+    /// Backtracking steps allowed per document.
+    regex_max_steps: u32 = 100_000,
+    /// Regex queries that may run at once.
+    regex_concurrency: u32 = 2,
+};
+
 pub const Config = struct {
     arena: std.heap.ArenaAllocator,
 
@@ -203,6 +220,7 @@ pub const Config = struct {
     admin_options: AdminOptions = .{},
     /// How the search index splits and normalises text (docs/decisions/0013).
     tokenizer: Tokenizer = .unicode61,
+    search: SearchSettings = .{},
     /// True if the file has an `[admin]` table: the administration interface
     /// is then served (and needs credentials, see docs/decisions/0012).
     admin_configured: bool,
@@ -227,7 +245,8 @@ const server_keys = [_][]const u8{
 const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
-const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "source" };
+const search_keys = [_][]const u8{ "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
+const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source" };
 
 /// Parses and validates configuration text. `source_name` is only used in
 /// diagnostics (normally the file path).
@@ -313,6 +332,16 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
                 return error.InvalidValue;
             };
         }
+    }
+
+    if (try subTable(src, root, "search", diag)) |t| {
+        try checkKeys(src, "search", t, &search_keys, diag);
+        if (try optBool(src, "search", t, "regex", diag)) |b| cfg.search.regex = b;
+        if (try intIn(src, "search", t, "regex_max_pattern", 1, 2000, diag)) |n| cfg.search.regex_max_pattern = @intCast(n);
+        if (try intIn(src, "search", t, "regex_max_candidates", 1, 10_000, diag)) |n| cfg.search.regex_max_candidates = @intCast(n);
+        if (try intIn(src, "search", t, "regex_budget_ms", 10, 60_000, diag)) |n| cfg.search.regex_budget_ms = @intCast(n);
+        if (try intIn(src, "search", t, "regex_max_steps", 1000, 10_000_000, diag)) |n| cfg.search.regex_max_steps = @intCast(n);
+        if (try intIn(src, "search", t, "regex_concurrency", 1, 64, diag)) |n| cfg.search.regex_concurrency = @intCast(n);
     }
 
     cfg.sources = try readSources(a, src, root, diag);
@@ -740,6 +769,24 @@ test "sources: common keys, defaults and connector options" {
     try testing.expectEqual(@as(?document.Redistribution, .forbidden), b.rights);
     try testing.expectEqual(@as(?document.Redistribution, null), a.rights);
     try testing.expectEqual(@as(usize, 0), b.options.len);
+}
+
+test "search table: regex settings are read and checked" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "[search]\nregex = false\nregex_max_pattern = 50\nregex_budget_ms = 100\nregex_concurrency = 1", &d);
+    defer c.deinit();
+    try testing.expect(!c.search.regex);
+    try testing.expectEqual(@as(u32, 50), c.search.regex_max_pattern);
+    try testing.expectEqual(@as(u32, 100), c.search.regex_budget_ms);
+    try testing.expectEqual(@as(u32, 1), c.search.regex_concurrency);
+    try testing.expectEqual(@as(u32, 200), c.search.regex_max_candidates); // default
+    var def = try loadFromSlice(testing.allocator, "t.toml", "", &d);
+    defer def.deinit();
+    try testing.expect(def.search.regex); // on by default, with strict limits
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[search]\nregex_max_candidates = 0", &d));
+    try testing.expectEqualStrings("search.regex_max_candidates", d.key());
+    try testing.expectError(error.UnknownKey, loadFromSlice(testing.allocator, "t.toml", "[search]\nregexx = true", &d));
+    try testing.expectError(error.WrongType, loadFromSlice(testing.allocator, "t.toml", "[search]\nregex = \"yes\"", &d));
 }
 
 test "sources: invalid entries are rejected with the entry and key in the message" {
