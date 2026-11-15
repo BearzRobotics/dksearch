@@ -18,4 +18,4 @@ SPEC section 4.2 and milestone 6 list RSS and Atom feeds. AGENTS.md says crawlin
 
 ## Not done
 
-Fetching feeds; conditional GET and polling schedules; OPML subscription lists; sitemaps and the seed bank (the rest of milestone 6); enclosure and media handling; feed autodiscovery.
+XML encodings beyond UTF-8, UTF-16, ISO-8859-1 and US-ASCII (Expat's built-in set; others make the file unparseable); fetching feeds; conditional GET and polling schedules; OPML subscription lists; sitemaps and the seed bank (the rest of milestone 6); enclosure and media handling; feed autodiscovery.

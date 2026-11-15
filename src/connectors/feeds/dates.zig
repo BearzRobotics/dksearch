@@ -26,7 +26,9 @@ fn daysInMonth(year: i64, month: u8) u8 {
 }
 
 fn build(year: i64, month: u8, day: u8, hour: u8, min: u8, sec: u8, offset_min: i64) ?i64 {
-    if (month < 1 or month > 12 or year < 1 or year > 9999) return null;
+    // Feed dates are publication times; anything before the Unix epoch is a
+    // mistake (or a placeholder such as year 0001) and is treated as no date.
+    if (month < 1 or month > 12 or year < 1970 or year > 9999) return null;
     if (day < 1 or day > daysInMonth(year, month) or hour > 23 or min > 59 or sec > 60) return null;
     return daysFromCivil(year, month, day) * 86400 + @as(i64, hour) * 3600 + @as(i64, min) * 60 + sec - offset_min * 60;
 }
@@ -167,6 +169,13 @@ test "RFC 822 rejects what is not a date" {
     for ([_][]const u8{ "", "Tue, 31 Foo 2003 04:00:00 GMT", "Tue, 32 Jun 2003 04:00:00 GMT", "Tue, 10 Jun 2003 25:00:00 GMT", "Tue, 10 Jun 2003 04:00:00 XYZ", "2003-12-13T18:30:02Z" }) |bad| {
         try testing.expect(parseRfc822(bad) == null);
     }
+}
+
+test "dates before the Unix epoch are not dates" {
+    try testing.expect(parseRfc822("01 Jan 0001 00:00:00 GMT") == null);
+    try testing.expect(parseIso("1969-12-31T23:59:59Z") == null);
+    try testing.expect(parseIso("0001-01-01T00:00:00Z") == null);
+    try testing.expectEqual(@as(?i64, 0), parseIso("1970-01-01T00:00:00Z"));
 }
 
 test "parse tries both" {

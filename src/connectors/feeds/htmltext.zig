@@ -19,6 +19,9 @@ const dropped_tags = [_][]const u8{ "script", "style", "head", "noscript" };
 
 pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
+    // A dropped tag whose end tag is missing is searched for only once: after
+    // that it is just a tag. This keeps unclosed `<script>` soup linear.
+    var missing_end: [dropped_tags.len]bool = @splat(false);
     var i: usize = 0;
     while (i < html.len) {
         const ch = html[i];
@@ -29,9 +32,18 @@ pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
                 continue;
             }
             if (tagAt(html, i)) |t| {
-                if (!t.closing and !t.self_closing and isOneOf(t.name, &dropped_tags)) {
-                    i = endOf(html, t.end, t.name) orelse t.end;
-                    continue;
+                if (!t.closing and !t.self_closing) {
+                    if (indexOf(t.name, &dropped_tags)) |k| {
+                        if (!missing_end[k]) {
+                            if (endOf(html, t.end, t.name)) |e| {
+                                i = e;
+                                continue;
+                            }
+                            missing_end[k] = true;
+                        }
+                        i = t.end;
+                        continue;
+                    }
                 }
                 if (isOneOf(t.name, &block_tags)) try out.append(arena, '\n');
                 i = t.end;
@@ -61,9 +73,13 @@ fn tagAt(s: []const u8, i: usize) ?Tag {
     return .{ .name = s[start..j], .closing = closing, .self_closing = s[gt - 1] == '/', .end = gt + 1 };
 }
 
+fn indexOf(name: []const u8, list: []const []const u8) ?usize {
+    for (list, 0..) |n, k| if (std.ascii.eqlIgnoreCase(name, n)) return k;
+    return null;
+}
+
 fn isOneOf(name: []const u8, list: []const []const u8) bool {
-    for (list) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
-    return false;
+    return indexOf(name, list) != null;
 }
 
 /// Index just after `</name>`, searching from `from`.
@@ -185,4 +201,14 @@ test "random tag soup: no crash, valid UTF-8" {
         try testing.expect(std.unicode.utf8ValidateSlice(out));
         try testing.expect(out.len <= src.items.len + 4);
     }
+}
+
+test "many unclosed script tags stay linear" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var src: std.ArrayList(u8) = .empty;
+    for (0..60_000) |_| try src.appendSlice(a, "<script>x");
+    const out = try toText(a, src.items);
+    try testing.expect(out.len <= src.items.len);
 }

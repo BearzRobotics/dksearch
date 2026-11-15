@@ -170,13 +170,19 @@ pub const FeedsConnector = struct {
         defer if (close_dir) dir.close(io);
         std.mem.sort([]const u8, paths, {}, lessThan);
 
+        // File contents live only while their file is parsed.
+        var bytes_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer bytes_arena.deinit();
+        const single = st.kind == .file;
+
         var done: ?[]const u8 = null;
         var since: u32 = 0;
         for (paths) |rel| {
             if (resume_from) |r| if (!std.mem.lessThan(u8, r, rel)) continue;
             if (control.isCancelled()) return self.stopped(done);
 
-            switch (self.readFile(arena, dir, rel)) {
+            _ = bytes_arena.reset(.free_all);
+            switch (self.readFile(bytes_arena.allocator(), dir, rel, single)) {
                 .out_of_memory => return error.OutOfMemory,
                 .refused => _ = control.rejected.fetchAdd(1, .monotonic),
                 .bytes => |data| {
@@ -210,8 +216,11 @@ pub const FeedsConnector = struct {
 
     const Read = union(enum) { bytes: []const u8, refused, out_of_memory };
 
-    fn readFile(self: *FeedsConnector, arena: Allocator, dir: Io.Dir, rel: []const u8) Read {
-        const st = dir.statFile(self.io, rel, .{ .follow_symlinks = false }) catch return .refused;
+    /// `named` is true when the administrator named this very file as `path`,
+    /// in which case a symbolic link is followed; files found while walking a
+    /// directory are never links.
+    fn readFile(self: *FeedsConnector, arena: Allocator, dir: Io.Dir, rel: []const u8, named: bool) Read {
+        const st = dir.statFile(self.io, rel, .{ .follow_symlinks = named }) catch return .refused;
         if (st.kind != .file or st.size > self.max_file_bytes) return .refused;
         const data = dir.readFileAlloc(self.io, rel, arena, .limited(self.max_file_bytes + 1)) catch |e| switch (e) {
             error.OutOfMemory => return .out_of_memory,
@@ -292,6 +301,9 @@ const FeedHandler = struct {
     depth: u32 = 0,
     /// Depth of the direct children of the feed's channel (RSS) or root (Atom).
     feed_child_depth: u32 = 0,
+    /// Inside the channel (RSS) or the feed root (Atom): feed-level fields
+    /// are read only there, not from siblings such as RSS 1.0 `image`.
+    in_channel: bool = false,
     in_entry: bool = false,
     entry_depth: u32 = 0,
     in_author: bool = false,
@@ -318,6 +330,9 @@ const FeedHandler = struct {
     entry_count: u32 = 0,
     /// Text of the `<category>` element being read.
     scratch: std.ArrayList(u8) = .empty,
+    /// The captured field reached its size cap: the rest of it is ignored, so
+    /// a long field keeps its beginning rather than a spliced remainder.
+    overflow: bool = false,
 
     const P = xml.Parser(FeedHandler);
 
@@ -357,18 +372,22 @@ const FeedHandler = struct {
         // Inside a captured element (XHTML content has child elements): text
         // continues, with a line break at each nested element.
         if (self.capture) |f| {
-            if (f == .content or f == .summary) self.list(f).append(self.arenaFor(f), '\n') catch return self.abort(p, .out_of_memory);
+            if ((f == .content or f == .summary) and self.list(f).items.len < text_cap) {
+                self.list(f).append(self.arenaFor(f), '\n') catch return self.abort(p, .out_of_memory);
+            }
             return;
         }
 
         if (!self.in_entry) {
             if (self.depth == 1) {
                 self.feed_child_depth = if (eq(name, "feed")) 2 else 3; // rss/channel/x, rdf:RDF/channel/x
+                self.in_channel = eq(name, "feed");
                 if (attrs.get("xml:lang")) |l| self.setText(.feed_language, l); // Atom declares its language here
                 return;
             }
+            if (self.depth == 2 and self.feed_child_depth == 3) self.in_channel = eq(name, "channel");
             if (eq(name, "item") or eq(name, "entry")) return self.beginEntry();
-            if (self.depth == self.feed_child_depth) {
+            if (self.in_channel and self.depth == self.feed_child_depth) {
                 if (eq(name, "title")) return self.start(.feed_title);
                 if (eq(name, "language")) return self.start(.feed_language);
                 if (eq(name, "link")) {
@@ -418,6 +437,7 @@ const FeedHandler = struct {
     fn start(self: *FeedHandler, f: Field) void {
         self.capture = f;
         self.capture_depth = self.depth;
+        self.overflow = false;
         if (f == .category) self.scratch.clearRetainingCapacity() else self.list(f).clearRetainingCapacity();
     }
 
@@ -425,7 +445,8 @@ const FeedHandler = struct {
     fn setText(self: *FeedHandler, f: Field, value: []const u8) void {
         const l = self.list(f);
         l.clearRetainingCapacity();
-        const n = @min(value.len, small_cap);
+        var n = @min(value.len, small_cap);
+        while (n > 0 and n < value.len and (value[n] & 0xC0) == 0x80) n -= 1; // do not cut a character in half
         l.appendSlice(self.arenaFor(f), value[0..n]) catch {
             self.fail = .out_of_memory;
         };
@@ -469,7 +490,11 @@ const FeedHandler = struct {
         const f = self.capture orelse return;
         const target = if (f == .category) &self.scratch else self.list(f);
         const cap: usize = if (f == .content or f == .summary) text_cap else small_cap;
-        if (target.items.len + bytes.len > cap) return; // an oversized field keeps its first part
+        if (self.overflow) return;
+        if (target.items.len + bytes.len > cap) {
+            self.overflow = true; // an oversized field keeps its first part
+            return;
+        }
         target.appendSlice(self.arenaFor(f), bytes) catch {
             self.fail = .out_of_memory;
         };
@@ -883,4 +908,44 @@ test "random mutations of a real-shaped feed never crash the connector" {
         const r = try runAll(&e, source);
         try testing.expect(r.state == .completed);
     }
+}
+
+test "RSS 1.0: siblings of the channel do not overwrite the feed title; long ids keep valid UTF-8" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const rdf =
+        \\<?xml version="1.0"?>
+        \\<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns="http://purl.org/rss/1.0/">
+        \\<channel><title>Real Title</title><link>https://example.org/</link></channel>
+        \\<image><title>Logo</title><link>https://example.org/logo</link></image>
+        \\<item><title>One</title><link>https://example.org/one</link><description>rdfbody</description></item>
+        \\<textinput><title>Search</title><link>https://example.org/cgi</link></textinput>
+        \\</rdf:RDF>
+    ;
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "r.rdf", .data = rdf });
+    var pb: [200]u8 = undefined;
+    const source = try feedSource(&tmp, &pb, "", &.{});
+    defer testing.allocator.free(source.options);
+    var e: E2e = undefined;
+    try e.init();
+    defer e.deinit();
+    const r = try runAll(&e, source);
+    try testing.expectEqual(@as(u64, 1), r.submitted);
+    const rec = (try e.docs.store().find(doc.idFromSource("feeds", "https://example.org/one"))).?.meta;
+    try testing.expectEqualStrings("Real Title", rec.source_dataset.?);
+}
+
+test "a symlink named as the path is followed; one over-long text field keeps its start" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "real.xml", .data = fx_rss });
+    tmp.dir.symLink(testing.io, "real.xml", "current.xml", .{}) catch return error.SkipZigTest;
+    var pb: [200]u8 = undefined;
+    const source = try feedSource(&tmp, &pb, "current.xml", &.{});
+    defer testing.allocator.free(source.options);
+    var e: E2e = undefined;
+    try e.init();
+    defer e.deinit();
+    const r = try runAll(&e, source);
+    try testing.expectEqual(@as(u64, 3), r.submitted);
 }
