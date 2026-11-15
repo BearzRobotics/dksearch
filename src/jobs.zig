@@ -47,6 +47,10 @@ pub const StartError = error{
     UnknownSource,
     SourceDisabled,
     AlreadyRunning,
+    /// The data directory or its lock file cannot be used (permissions,
+    /// missing directory, disk error): not the same as another process
+    /// holding the lock.
+    DataDirUnavailable,
     /// The writer lock is held by another process (an import or rebuild on
     /// the command line, for instance).
     LockHeld,
@@ -128,9 +132,12 @@ pub const Manager = struct {
 
         // The lock is taken here, so a conflict is reported to the caller,
         // and handed to the task, which releases it when the run ends.
-        var dir = Io.Dir.cwd().openDir(self.io, self.opts.data_dir, .{}) catch return error.LockHeld;
+        var dir = Io.Dir.cwd().openDir(self.io, self.opts.data_dir, .{}) catch return error.DataDirUnavailable;
         defer dir.close(self.io);
-        const lock = maintenance.WriterLock.acquire(self.io, dir, "write.lock") catch return error.LockHeld;
+        const lock = maintenance.WriterLock.acquire(self.io, dir, "write.lock") catch |e| return switch (e) {
+            error.Busy => error.LockHeld,
+            error.Io => error.DataDirUnavailable,
+        };
         errdefer lock.release(self.io);
 
         const control = self.gpa.create(connector.Control) catch return error.OutOfMemory;
@@ -246,11 +253,8 @@ pub const Manager = struct {
     }
 
     fn task(self: *Manager, source: config.Source, control: *connector.Control, lock: maintenance.WriterLock) Io.Cancelable!void {
+        // `runOne` sets the state on every path; `failed` is the safe default.
         var outcome: Outcome = .{ .state = .failed };
-        self.fail(&outcome, "internal error");
-        // `runOne` overwrites the placeholder; free it first.
-        if (outcome.failure) |f| self.gpa.free(f);
-        outcome.failure = null;
         runOne(self, source, control, &outcome);
         lock.release(self.io);
         self.record(source.name, outcome);
@@ -261,6 +265,10 @@ pub const Manager = struct {
         defer self.mutex.unlock(self.io);
         if (self.last) |old| self.freeFinished(old);
         const owned_name = self.gpa.dupe(u8, name) catch null;
+        if (owned_name == null) {
+            // Out of memory: nothing can be remembered; do not leak the text.
+            if (o.failure) |f| self.gpa.free(f);
+        }
         self.last = if (owned_name == null) null else .{
             .source = owned_name.?,
             .state = o.state,

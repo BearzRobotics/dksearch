@@ -490,7 +490,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     defer if (pool) |*p| p.close();
     {
         const cpus = std.Thread.getCpuCount() catch 4;
-        pool = dk.index_sqlite.SearchPool.open(gpa, paths.index, std.math.clamp(cpus, 2, 8)) catch |e| blk: {
+        pool = dk.index_sqlite.SearchPool.open(gpa, io, paths.index, std.math.clamp(cpus, 2, 8)) catch |e| blk: {
             err(io, "note: cannot open parallel search connections ({t}); searches will run one at a time", .{e});
             break :blk null;
         };

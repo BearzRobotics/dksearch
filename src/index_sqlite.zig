@@ -23,6 +23,7 @@ const Allocator = std.mem.Allocator;
 const sqlite = @import("sqlite.zig");
 const c = sqlite.c;
 const doc = @import("document.zig");
+const Io = std.Io;
 const idx_api = @import("indexer.zig");
 const search = @import("search.zig");
 
@@ -371,10 +372,13 @@ pub const SqliteIndex = struct {
 /// run in parallel instead of queueing on a single connection (SQLite
 /// serialises the use of one connection). WAL mode lets any number of readers
 /// run alongside the single writer. A search takes any idle connection; if
-/// all are busy it yields until one is free.
+/// all are busy it waits on a semaphore (no spinning) until one is free.
 pub const SearchPool = struct {
     gpa: Allocator,
+    io: Io,
     slots: []Slot,
+    /// One permit per idle connection.
+    idle: Io.Semaphore,
 
     const Slot = struct {
         index: SqliteIndex,
@@ -382,7 +386,7 @@ pub const SearchPool = struct {
     };
 
     /// `size` connections (at least one) to the existing index at `path`.
-    pub fn open(gpa: Allocator, path: [:0]const u8, size: usize) OpenError!SearchPool {
+    pub fn open(gpa: Allocator, io: Io, path: [:0]const u8, size: usize) OpenError!SearchPool {
         const n = @max(size, 1);
         const slots = try gpa.alloc(Slot, n);
         var opened: usize = 0;
@@ -393,7 +397,7 @@ pub const SearchPool = struct {
         while (opened < n) : (opened += 1) {
             slots[opened] = .{ .index = try SqliteIndex.openReadOnly(path) };
         }
-        return .{ .gpa = gpa, .slots = slots };
+        return .{ .gpa = gpa, .io = io, .slots = slots, .idle = .{ .permits = n } };
     }
 
     pub fn close(self: *SearchPool) void {
@@ -408,19 +412,16 @@ pub const SearchPool = struct {
 
     fn poolSearch(ptr: *anyopaque, arena: Allocator, q: search.Query) search.Error!search.Page {
         const self: *SearchPool = @ptrCast(@alignCast(ptr));
-        var start: usize = 0;
-        while (true) {
-            // Start at a different slot each round so one slot is not favoured.
-            for (0..self.slots.len) |k| {
-                const slot = &self.slots[(start + k) % self.slots.len];
-                if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
-                    defer slot.busy.store(false, .release);
-                    return SqliteIndex.searchImpl(&slot.index, arena, q);
-                }
+        // A permit means at least one slot is idle; claim it.
+        self.idle.waitUncancelable(self.io);
+        defer self.idle.post(self.io);
+        for (self.slots) |*slot| {
+            if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                defer slot.busy.store(false, .release);
+                return SqliteIndex.searchImpl(&slot.index, arena, q);
             }
-            start +%= 1;
-            std.Thread.yield() catch {};
         }
+        unreachable; // permits never exceed the number of idle slots
     }
 };
 
@@ -781,7 +782,7 @@ test "pool: same answers as one connection, also from many threads at once" {
             .text = try std.fmt.bufPrint(&tb, "lamp number {d} keeper {d} harbour", .{ i, i % 7 }),
         });
     }
-    var pool = try SearchPool.open(testing.allocator, path, 3);
+    var pool = try SearchPool.open(testing.allocator, testing.io, path, 3);
     defer pool.close();
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -815,6 +816,6 @@ test "pool: same answers as one connection, also from many threads at once" {
     // A pool never creates or changes anything: a missing file is an error.
     var missing: [200:0]u8 = undefined;
     const mp = try std.fmt.bufPrintSentinel(&missing, ".zig-cache/tmp/{s}/nope.db", .{tmp.sub_path}, 0);
-    try testing.expectError(error.Io, SearchPool.open(testing.allocator, mp, 2));
+    try testing.expectError(error.Io, SearchPool.open(testing.allocator, testing.io, mp, 2));
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "nope.db", .{}));
 }

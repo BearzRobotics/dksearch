@@ -238,6 +238,7 @@ pub const App = struct {
             error.SourceDisabled => .{ .status = .conflict, .code = "source_disabled", .message = "that source is disabled in the configuration" },
             error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "an import is already running" },
             error.LockHeld => .{ .status = .conflict, .code = "locked", .message = "another import, rebuild or removal is running on this data directory" },
+            error.DataDirUnavailable => .{ .status = .internal_server_error, .code = "data_dir_unavailable", .message = "the data directory or its lock file cannot be used; see the server's error output" },
             error.OutOfMemory => return error.OutOfMemory,
             error.NoConcurrency => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start a background task" },
         });
