@@ -83,6 +83,8 @@ pub const Error = error{
     Busy,
     /// The pattern ran out of steps on several documents.
     TooComplex,
+    /// The index search for candidates ran past its time limit.
+    Timeout,
     Io,
     OutOfMemory,
 };
@@ -183,6 +185,7 @@ pub const Service = struct {
             const page = searcher.search(arena, bq) catch |e| switch (e) {
                 error.EmptyQuery => return error.EmptyQuery,
                 error.InvalidQuery => return error.InvalidQuery,
+                error.Timeout => return error.Timeout,
                 error.Io => return error.Io,
                 error.OutOfMemory => return error.OutOfMemory,
             };

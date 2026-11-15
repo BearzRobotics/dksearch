@@ -232,6 +232,7 @@ admin.session_idle_minutes	Integer	30	A sign-in session ends after this much ina
 admin.session_max_hours	Integer	8	A sign-in session ends this long after it began, however active, 1-168.
 admin.actions	Boolean	false	Let the administration interface start and cancel imports of configured sources. Off: the interface is strictly read-only.
 admin.cookie_secure	Boolean	false	Add `Secure` to the session cookie. Set it when a reverse proxy serves the interface over HTTPS.
+search.query_timeout_ms	Integer	5000	Longest a search may run, 0-60000 milliseconds (0 = no limit, which is not recommended). Very common words over a very large index take seconds to rank, because every matching document is scored; a search that runs past this is stopped and answers HTTP 503 `search_timeout` ("try more specific words") instead of tying up a connection until the connection's own deadline (`server.write_timeout_ms`) cuts it off. Keep it below that deadline.
 search.regex	Boolean	true	Offer the regular-expression filter on the public search page and API, and on the administration query-testing page. It needs `content.db` (it reads the stored texts), so it is off until something has been imported; restart after the first import. See the notes below.
 search.regex_max_pattern	Integer	200	Longest regular expression, in bytes, 1-2000.
 search.regex_max_candidates	Integer	200	Most candidate documents whose text is checked per query, 1-10000.

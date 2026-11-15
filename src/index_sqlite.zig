@@ -85,6 +85,8 @@ const mapRc = sqlite.mapRc;
 
 pub const SqliteIndex = struct {
     db: *c.sqlite3,
+    /// A time limit for each search, if set (`setQueryTimeout`).
+    timeout: ?struct { io: Io, ms: u32 } = null,
 
     /// Opens (creating if needed) the index at `path`; ":memory:" gives a
     /// throwaway index.
@@ -108,6 +110,13 @@ pub const SqliteIndex = struct {
 
     /// Opens an existing index for searching only: read-only, nothing is
     /// created or changed. Used by `SearchPool`.
+    /// Limits each search to `ms` milliseconds (0 = no limit): SQLite is told to
+    /// stop, and the search fails with `error.Timeout`. Set it before sharing
+    /// the index between threads.
+    pub fn setQueryTimeout(self: *SqliteIndex, io: Io, ms: u32) void {
+        self.timeout = if (ms == 0) null else .{ .io = io, .ms = ms };
+    }
+
     pub fn openReadOnly(path: [:0]const u8) OpenError!SqliteIndex {
         const db = sqlite.openReadOnly(path) catch |e| return e;
         var self: SqliteIndex = .{ .db = db };
@@ -344,9 +353,16 @@ pub const SqliteIndex = struct {
         st.int(7, @as(i64, limit) + 1) catch |e| return searchError(e);
         st.int(8, q.offset) catch |e| return searchError(e);
 
+        var guard: Deadline = undefined;
+        if (self.timeout) |t| {
+            guard = .{ .io = t.io, .deadline_ns = Io.Timestamp.now(t.io, .awake).nanoseconds + @as(i96, t.ms) * std.time.ns_per_ms };
+            c.sqlite3_progress_handler(self.db, 2000, progressCallback, &guard);
+        } else guard = .{ .io = undefined, .deadline_ns = 0 };
+        defer if (self.timeout != null) c.sqlite3_progress_handler(self.db, 0, null, null);
+
         var hits: std.ArrayList(search.Hit) = .empty;
         var more = false;
-        while (st.step() catch |e| return searchError(e)) {
+        while (st.step() catch |e| return if (guard.fired) error.Timeout else searchError(e)) {
             if (hits.items.len == limit) {
                 more = true;
                 break;
@@ -373,6 +389,22 @@ pub const SqliteIndex = struct {
 /// serialises the use of one connection). WAL mode lets any number of readers
 /// run alongside the single writer. A search takes any idle connection; if
 /// all are busy it waits on a semaphore (no spinning) until one is free.
+/// The deadline of one search, watched from SQLite's progress callback.
+const Deadline = struct {
+    io: Io,
+    deadline_ns: i96,
+    fired: bool = false,
+};
+
+fn progressCallback(ctx: ?*anyopaque) callconv(.c) c_int {
+    const d: *Deadline = @ptrCast(@alignCast(ctx.?));
+    if (Io.Timestamp.now(d.io, .awake).nanoseconds >= d.deadline_ns) {
+        d.fired = true;
+        return 1; // non-zero: interrupt the statement
+    }
+    return 0;
+}
+
 pub const SearchPool = struct {
     gpa: Allocator,
     io: Io,
@@ -404,6 +436,11 @@ pub const SearchPool = struct {
         for (self.slots) |*sl| sl.index.close();
         self.gpa.free(self.slots);
         self.* = undefined;
+    }
+
+    /// See `SqliteIndex.setQueryTimeout`; call before searching.
+    pub fn setQueryTimeout(self: *SearchPool, ms: u32) void {
+        for (self.slots) |*sl| sl.index.setQueryTimeout(self.io, ms);
     }
 
     pub fn searcher(self: *SearchPool) search.Searcher {
@@ -517,6 +554,25 @@ test "buildMatch quotes every term and neutralizes syntax" {
     @memset(long, 'a');
     try testing.expectError(error.InvalidQuery, buildMatch(a, long));
     try testing.expectError(error.InvalidQuery, buildMatch(a, "a b c d e f g h i j k l m n o p q r s t u v w x y z aa bb cc dd ee ff gg"));
+}
+
+test "a search past its time limit stops with Timeout; without a limit it finishes" {
+    var idx = try SqliteIndex.open(":memory:", .{ .sync = .off });
+    defer idx.close();
+    // Many documents share one word, so ranking them takes a measurable time.
+    for (0..30_000) |i| {
+        var idb: [16]u8 = undefined;
+        var tb: [96]u8 = undefined;
+        _ = try put(&idx, "t", try std.fmt.bufPrint(&idb, "d{d}", .{i}), null, try std.fmt.bufPrint(&tb, "common filler words number {d} appear in every document here", .{i}));
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    idx.setQueryTimeout(testing.io, 1);
+    try testing.expectError(error.Timeout, searchAll(arena.allocator(), &idx, "common"));
+    // The connection is usable afterwards, and with no limit the search completes.
+    idx.setQueryTimeout(testing.io, 0);
+    const page = try searchAll(arena.allocator(), &idx, "common");
+    try testing.expectEqual(@as(usize, 10), page.hits.len);
 }
 
 test "title matches outrank body matches; ties break by id" {

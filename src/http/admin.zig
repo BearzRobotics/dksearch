@@ -247,6 +247,7 @@ pub const App = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.EmptyQuery => handler.apiError(arena, .bad_request, "empty_query", "the query has no searchable terms"),
             error.InvalidQuery => handler.apiError(arena, .bad_request, "invalid_query", "the query is out of range"),
+            error.Timeout => handler.apiError(arena, .service_unavailable, "search_timeout", "the search took too long"),
             error.Io => handler.apiError(arena, .internal_server_error, "internal_error", "the search failed"),
         };
         const Hit = struct { id: []const u8, connector: []const u8, url: ?[]const u8, title: ?[]const u8, snippet: ?[]const u8, score: f64 };
@@ -866,6 +867,7 @@ fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.sear
             try html.writeEscaped(w, switch (e) {
                 error.EmptyQuery => "The query has no searchable terms.",
                 error.InvalidQuery => "The query is not valid (too long or too many terms).",
+                error.Timeout => "The search took too long (see [search] query_timeout_ms); try more specific words.",
                 else => "The search failed; see the server's error output.",
             });
             try w.writeAll("</p>\n");

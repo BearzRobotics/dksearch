@@ -58,6 +58,9 @@ pub const Error = error{
     EmptyQuery,
     /// Query too long, limit/offset out of range, or similar misuse.
     InvalidQuery,
+    /// The search ran past its time limit (see `[search] query_timeout_ms`).
+    /// Common words over a very large index can take seconds to rank.
+    Timeout,
     Io,
     OutOfMemory,
 };

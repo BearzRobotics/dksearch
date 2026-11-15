@@ -196,6 +196,10 @@ pub const Source = struct {
 /// The `[search]` table: regular-expression filtering of results
 /// (docs/decisions/0020). The limits protect the server from expensive patterns.
 pub const SearchSettings = struct {
+    /// Longest a search may run, in milliseconds (0 = no limit). Common words
+    /// over a very large index take seconds to rank; past this the search is
+    /// stopped and answers "too broad" instead of tying up a connection.
+    query_timeout_ms: u32 = 5000,
     /// Offer the `regex` filter on the public interface and API.
     regex: bool = true,
     /// Longest pattern, in bytes.
@@ -245,7 +249,7 @@ const server_keys = [_][]const u8{
 const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
-const search_keys = [_][]const u8{ "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
+const search_keys = [_][]const u8{ "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
 const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source" };
 
 /// Parses and validates configuration text. `source_name` is only used in
@@ -336,6 +340,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
 
     if (try subTable(src, root, "search", diag)) |t| {
         try checkKeys(src, "search", t, &search_keys, diag);
+        if (try intIn(src, "search", t, "query_timeout_ms", 0, 60_000, diag)) |n| cfg.search.query_timeout_ms = @intCast(n);
         if (try optBool(src, "search", t, "regex", diag)) |b| cfg.search.regex = b;
         if (try intIn(src, "search", t, "regex_max_pattern", 1, 2000, diag)) |n| cfg.search.regex_max_pattern = @intCast(n);
         if (try intIn(src, "search", t, "regex_max_candidates", 1, 10_000, diag)) |n| cfg.search.regex_max_candidates = @intCast(n);

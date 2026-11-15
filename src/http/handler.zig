@@ -192,6 +192,7 @@ pub fn regexSearch(arena: Allocator, searcher: dk.search.Searcher, service: ?*dk
         error.InvalidQuery => .{ .status = .bad_request, .code = "invalid_query", .message = "the query or paging parameters are out of range" },
         error.InvalidPattern => .{ .status = .bad_request, .code = "invalid_pattern", .message = try std.fmt.allocPrint(arena, "invalid pattern: {s}", .{diag.message}) },
         error.TooComplex => .{ .status = .unprocessable_entity, .code = "pattern_too_complex", .message = "the pattern is too complex to run on these documents; simplify it" },
+        error.Timeout => .{ .status = .service_unavailable, .code = "search_timeout", .message = "the search took too long; try more specific words (very common words match too much of the index)" },
         error.Busy => .{ .status = .too_many_requests, .code = "busy", .message = "too many regular-expression searches are running; try again in a moment" },
         error.Io => .{ .status = .internal_server_error, .code = "internal_error", .message = "the search failed" },
     } };
@@ -240,10 +241,13 @@ fn searchFailure(arena: Allocator, e: dk.search.Error, api: bool) error{OutOfMem
         error.EmptyQuery => .{ .bad_request, "empty_query", "the query has no searchable terms" },
         error.InvalidQuery => .{ .bad_request, "invalid_query", "the query or paging parameters are out of range" },
         error.OutOfMemory => return error.OutOfMemory,
+        error.Timeout => .{ .service_unavailable, "search_timeout", "the search took too long; try more specific words (very common words match too much of the index)" },
         // Details belong in logs, never in responses.
         error.Io => .{ .internal_server_error, "internal_error", "the search failed" },
     };
-    return if (api) apiError(arena, status, code, msg) else htmlError(arena, status, "Search problem", msg);
+    var resp = if (api) try apiError(arena, status, code, msg) else try htmlError(arena, status, "Search problem", msg);
+    if (e == error.Timeout) resp.headers = headersWith(arena, &.{ .{ .name = "retry-after", .value = "5" }, no_store });
+    return resp;
 }
 
 pub fn jsonResponse(arena: Allocator, status: http.Status, value: anytype) error{OutOfMemory}!Response {

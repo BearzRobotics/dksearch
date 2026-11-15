@@ -611,6 +611,10 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             break :blk null;
         };
     }
+    // A search that runs too long is stopped, so the client gets an answer
+    // before the connection's own deadline cuts it off.
+    if (pool) |*p| p.setQueryTimeout(cfg.search.query_timeout_ms);
+    index.setQueryTimeout(io, cfg.search.query_timeout_ms);
     const searcher = if (pool) |*p| p.searcher() else index.searcher();
 
     // Regular-expression filtering reads the stored texts through its own

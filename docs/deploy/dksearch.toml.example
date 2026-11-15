@@ -27,6 +27,7 @@ port = 8081
 # The regular-expression filter on the search page and API (a "Regex" field under
 # Filters, or &regex=PATTERN). The words in the query choose the documents; the
 # regex then keeps those whose text matches. Bounded by these limits:
+#query_timeout_ms = 5000   # stop searches (very common words on a huge index) after this long
 #regex = true
 #regex_max_pattern = 200
 #regex_max_candidates = 200
