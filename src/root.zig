@@ -17,6 +17,7 @@ pub const runner = @import("runner.zig");
 pub const connectors = @import("connectors.zig");
 pub const maintenance = @import("maintenance.zig");
 pub const secrets = @import("secrets.zig");
+pub const jobs = @import("jobs.zig");
 // src/sqlite.zig (raw C API) is internal to index_sqlite.zig and not exported.
 
 test {
@@ -36,6 +37,7 @@ test {
     _ = connectors;
     _ = maintenance;
     _ = secrets;
+    _ = jobs;
     if (connectors.have_wikipedia) _ = connectors.wikipedia;
     _ = @import("sqlite.zig");
 }
