@@ -483,6 +483,20 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     var index = openIndex(io, paths.index, cfg.tokenizer, false) orelse return exit_io;
     defer index.close();
 
+    // Searches run on several read-only connections so that concurrent
+    // requests are answered in parallel (one connection would serialise
+    // them). If they cannot be opened, the single connection is used.
+    var pool: ?dk.index_sqlite.SearchPool = null;
+    defer if (pool) |*p| p.close();
+    {
+        const cpus = std.Thread.getCpuCount() catch 4;
+        pool = dk.index_sqlite.SearchPool.open(gpa, paths.index, std.math.clamp(cpus, 2, 8)) catch |e| blk: {
+            err(io, "note: cannot open parallel search connections ({t}); searches will run one at a time", .{e});
+            break :blk null;
+        };
+    }
+    const searcher = if (pool) |*p| p.searcher() else index.searcher();
+
     // Validated as a literal at load time, so this cannot fail.
     const address = Io.net.IpAddress.parse(cfg.server.address, cfg.server.port) catch unreachable;
     var listener = dkhttp.server.listen(io, address) catch |e| {
@@ -597,7 +611,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
 
     installSignalHandlers(onServeSignal);
     var result: u8 = exit_ok;
-    dkhttp.server.servePublic(gpa, io, &listener, index.searcher(), if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

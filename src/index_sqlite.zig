@@ -105,6 +105,16 @@ pub const SqliteIndex = struct {
         self.* = undefined;
     }
 
+    /// Opens an existing index for searching only: read-only, nothing is
+    /// created or changed. Used by `SearchPool`.
+    pub fn openReadOnly(path: [:0]const u8) OpenError!SqliteIndex {
+        const db = sqlite.openReadOnly(path) catch |e| return e;
+        var self: SqliteIndex = .{ .db = db };
+        errdefer self.close();
+        try self.exec("PRAGMA query_only = 1;");
+        return self;
+    }
+
     fn exec(self: SqliteIndex, sql: [:0]const u8) idx_api.Error!void {
         const rc = c.sqlite3_exec(self.db, sql.ptr, null, null, null);
         if (rc != c.SQLITE_OK) return mapRc(rc);
@@ -301,7 +311,7 @@ pub const SqliteIndex = struct {
 
     // ------------------------------------------------------------ search
 
-    fn searchImpl(ptr: *anyopaque, arena: Allocator, q: search.Query) search.Error!search.Page {
+    pub fn searchImpl(ptr: *anyopaque, arena: Allocator, q: search.Query) search.Error!search.Page {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
 
         const limit: u32 = if (q.limit == 0) search.default_limit else q.limit;
@@ -354,6 +364,63 @@ pub const SqliteIndex = struct {
             });
         }
         return .{ .hits = hits.items, .has_more = more };
+    }
+};
+
+/// Several read-only connections to one index file, so concurrent searches
+/// run in parallel instead of queueing on a single connection (SQLite
+/// serialises the use of one connection). WAL mode lets any number of readers
+/// run alongside the single writer. A search takes any idle connection; if
+/// all are busy it yields until one is free.
+pub const SearchPool = struct {
+    gpa: Allocator,
+    slots: []Slot,
+
+    const Slot = struct {
+        index: SqliteIndex,
+        busy: std.atomic.Value(bool) = .init(false),
+    };
+
+    /// `size` connections (at least one) to the existing index at `path`.
+    pub fn open(gpa: Allocator, path: [:0]const u8, size: usize) OpenError!SearchPool {
+        const n = @max(size, 1);
+        const slots = try gpa.alloc(Slot, n);
+        var opened: usize = 0;
+        errdefer {
+            for (slots[0..opened]) |*sl| sl.index.close();
+            gpa.free(slots);
+        }
+        while (opened < n) : (opened += 1) {
+            slots[opened] = .{ .index = try SqliteIndex.openReadOnly(path) };
+        }
+        return .{ .gpa = gpa, .slots = slots };
+    }
+
+    pub fn close(self: *SearchPool) void {
+        for (self.slots) |*sl| sl.index.close();
+        self.gpa.free(self.slots);
+        self.* = undefined;
+    }
+
+    pub fn searcher(self: *SearchPool) search.Searcher {
+        return .{ .ptr = self, .vtable = &.{ .search = poolSearch } };
+    }
+
+    fn poolSearch(ptr: *anyopaque, arena: Allocator, q: search.Query) search.Error!search.Page {
+        const self: *SearchPool = @ptrCast(@alignCast(ptr));
+        var start: usize = 0;
+        while (true) {
+            // Start at a different slot each round so one slot is not favoured.
+            for (0..self.slots.len) |k| {
+                const slot = &self.slots[(start + k) % self.slots.len];
+                if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                    defer slot.busy.store(false, .release);
+                    return SqliteIndex.searchImpl(&slot.index, arena, q);
+                }
+            }
+            start +%= 1;
+            std.Thread.yield() catch {};
+        }
     }
 };
 
@@ -696,4 +763,58 @@ test "an index keeps its tokenizer; a different one is refused unless retokenizi
         try testing.expectEqual(@as(usize, 0), (try idx.searcher().search(arena.allocator(), .{ .text = "run" })).hits.len);
     }
     try testing.expectError(error.TokenizerMismatch, SqliteIndex.open(path, .{ .tokenizer = .porter, .sync = .off }));
+}
+
+test "pool: same answers as one connection, also from many threads at once" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [200:0]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pb, ".zig-cache/tmp/{s}/p.db", .{tmp.sub_path}, 0);
+    var idx = try SqliteIndex.open(path, .{ .sync = .off });
+    defer idx.close();
+    for (0..200) |i| {
+        var idb: [16]u8 = undefined;
+        var tb: [80]u8 = undefined;
+        try idx.indexer().add(doc.idFromSource("t", try std.fmt.bufPrint(&idb, "d{d}", .{i})), .{
+            .connector = "t",
+            .source_id = try std.fmt.bufPrint(&idb, "d{d}", .{i}),
+            .text = try std.fmt.bufPrint(&tb, "lamp number {d} keeper {d} harbour", .{ i, i % 7 }),
+        });
+    }
+    var pool = try SearchPool.open(testing.allocator, path, 3);
+    defer pool.close();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const want = try idx.searcher().search(arena.allocator(), .{ .text = "keeper harbour", .limit = 5 });
+    const got = try pool.searcher().search(arena.allocator(), .{ .text = "keeper harbour", .limit = 5 });
+    try testing.expectEqual(want.hits.len, got.hits.len);
+    for (want.hits, got.hits) |a, b| try testing.expectEqualSlices(u8, &a.id, &b.id);
+
+    // More threads than connections, all searching at once.
+    const Worker = struct {
+        fn run(p: *SearchPool, failures: *std.atomic.Value(u32)) void {
+            var a = std.heap.ArenaAllocator.init(testing.allocator);
+            defer a.deinit();
+            for (0..40) |_| {
+                _ = a.reset(.retain_capacity);
+                const page = p.searcher().search(a.allocator(), .{ .text = "lamp harbour", .limit = 10 }) catch {
+                    _ = failures.fetchAdd(1, .monotonic);
+                    return;
+                };
+                if (page.hits.len != 10) _ = failures.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var failures: std.atomic.Value(u32) = .init(0);
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &pool, &failures });
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+
+    // A pool never creates or changes anything: a missing file is an error.
+    var missing: [200:0]u8 = undefined;
+    const mp = try std.fmt.bufPrintSentinel(&missing, ".zig-cache/tmp/{s}/nope.db", .{tmp.sub_path}, 0);
+    try testing.expectError(error.Io, SearchPool.open(testing.allocator, mp, 2));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "nope.db", .{}));
 }
