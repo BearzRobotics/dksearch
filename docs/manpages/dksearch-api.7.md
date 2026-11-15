@@ -91,7 +91,7 @@ not_found	404	No such endpoint.
 method_not_allowed	405	Method other than GET or HEAD.
 internal_error	500	The search failed. The cause is never included; it is for the operator's logs.
 
-Messages are for humans and may change; the codes are stable. Every response, including errors, carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cross-Origin-Resource-Policy: same-origin` and a Content-Security-Policy with `default-src 'none'`. HTML responses are `text/html; charset=utf-8`; JSON is UTF-8.
+Messages are for humans and may change; the codes are stable. Every response, including errors, carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cross-Origin-Resource-Policy: same-origin` and a Content-Security-Policy with `default-src 'none'` that allows stylesheets and scripts only from the same origin, never inline (the only script is the administration interface's `/assets/admin.js`, which updates import progress; the public interface serves none). HTML responses are `text/html; charset=utf-8`; JSON is UTF-8.
 
 EXIT STATUS
 Not applicable.
@@ -162,7 +162,7 @@ GET /api/v1/admin/search
 : Runs a search like the public API (`q`, optional `language` and `connector`, at most 20 results) and returns `hits` with their ranking `score`, plus `tokenizer`, `title_weight` and `body_weight`, so ranking can be inspected. Same errors as the public search (`empty_query`, `invalid_query`). The HTML page `/search` is the same thing for people.
 
 GET /api/v1/admin/imports
-: Returns `actions` (whether imports can be started), `running` (`source`, `started_at`, `submitted` so far, or null) and `last` (the last import started through this interface since the process began: `source`, `state`, `submitted`, `rejected`, `skip_reasons` (as for jobs), `failure`, `finished_at`, or null).
+: Returns `actions` (whether imports can be started), `running` (`source`, `started_at`, `submitted` so far, `progress_done` and `progress_total`: the connector's own measure of how far it is, such as bytes of a dump read or files handled, with a total of 0 when it cannot tell; or null) and `last` (the last import started through this interface since the process began: `source`, `state`, `submitted`, `rejected`, `skip_reasons` (as for jobs), `failure`, `finished_at`, or null).
 
 POST /api/v1/admin/imports
 : Starts an import of the source named by the form field `source` (`application/x-www-form-urlencoded` body). Returns 202 with `started`. Errors: 404 `unknown_source`, 409 `source_disabled`, `already_running` or `locked` (another import, rebuild or removal holds the data directory), 403 `actions_disabled`.

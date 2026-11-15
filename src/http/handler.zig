@@ -24,7 +24,7 @@ const max_filter_bytes = 64;
 /// Results per page on the HTML page.
 pub const html_page_size: u32 = 10;
 
-const csp = "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; " ++
+const csp = "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self'; form-action 'self'; " ++
     "base-uri 'none'; frame-ancestors 'none'";
 
 /// Sent with every response.
@@ -481,7 +481,10 @@ test "every response carries the security headers" {
         try testing.expectEqualStrings("no-referrer", headerValue(r, "referrer-policy").?);
         const policy = headerValue(r, "content-security-policy").?;
         try testing.expect(std.mem.indexOf(u8, policy, "default-src 'none'") != null);
-        try testing.expect(std.mem.indexOf(u8, policy, "script-src") == null); // no script allowed at all
+        // Scripts only from this origin (the admin interface's one file): never inline, never eval.
+        try testing.expect(std.mem.indexOf(u8, policy, "script-src 'self'") != null);
+        try testing.expect(std.mem.indexOf(u8, policy, "unsafe") == null);
+        try testing.expect(std.mem.indexOf(u8, policy, "default-src 'none'") != null);
     }
 }
 

@@ -112,11 +112,21 @@ pub const Control = struct {
     rejected: std.atomic.Value(u64) = .init(0),
     /// How many of `rejected` had which reason (only those a connector gave).
     reasons: [reason_count]std.atomic.Value(u64) = @splat(.init(0)),
+    /// See `setProgress`.
+    progress_done: std.atomic.Value(u64) = .init(0),
+    progress_total: std.atomic.Value(u64) = .init(0),
 
     /// Counts one refused item, with its reason.
     pub fn reject(self: *Control, why: Reason) void {
         _ = self.rejected.fetchAdd(1, .monotonic);
         _ = self.reasons[@backingInt(why)].fetchAdd(1, .monotonic);
+    }
+
+    /// How far along the run is, for display: `done` of `total` units (bytes,
+    /// files, items: the connector chooses). A total of 0 means unknown.
+    pub fn setProgress(self: *Control, done: u64, total: u64) void {
+        self.progress_done.store(done, .monotonic);
+        self.progress_total.store(total, .monotonic);
     }
 
     pub fn reasonCounts(self: *const Control) ReasonCounts {

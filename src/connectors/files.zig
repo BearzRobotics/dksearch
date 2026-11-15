@@ -172,7 +172,8 @@ pub const FilesConnector = struct {
 
         var done: ?[]const u8 = null; // last path fully handled
         var since_checkpoint: u32 = 0;
-        for (paths) |rel| {
+        for (paths, 0..) |rel, path_index| {
+            control.setProgress(path_index, paths.len);
             if (resume_from) |r| if (!std.mem.lessThan(u8, r, rel)) continue; // already done
 
             if (control.isCancelled()) return self.stopped(done);

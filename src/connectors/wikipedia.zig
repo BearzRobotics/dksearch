@@ -248,6 +248,7 @@ pub const WikipediaConnector = struct {
             // For bzip2 only the decoder knows the real end: a stream can end
             // without a byte of output, which must not look like end of file.
             const final = if (dec) |*d| d.eof else n == 0;
+            control.setProgress(if (dec) |*d| d.next_fetch else plain_pos, size);
             parser.feed(buf[0..n], final) catch |e| {
                 if (h.fail) |f| return self.finish(f);
                 return switch (e) {

@@ -177,7 +177,8 @@ pub const FeedsConnector = struct {
 
         var done: ?[]const u8 = null;
         var since: u32 = 0;
-        for (paths) |rel| {
+        for (paths, 0..) |rel, path_index| {
+            control.setProgress(path_index, paths.len);
             if (resume_from) |r| if (!std.mem.lessThan(u8, r, rel)) continue;
             if (control.isCancelled()) return self.stopped(done);
 

@@ -14,6 +14,7 @@ const http = std.http;
 const dk = @import("dksearch");
 const server = @import("server.zig");
 const handler = @import("handler.zig");
+const admin_js = @embedFile("assets/admin.js");
 const html = @import("html.zig");
 const query = @import("query.zig");
 
@@ -115,7 +116,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -123,7 +124,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, login, logout, style, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -132,6 +133,7 @@ pub const App = struct {
             .{ "/login", .login },
             .{ "/logout", .logout },
             .{ "/assets/style.css", .style },
+            .{ "/assets/admin.js", .script },
             .{ "/api/v1/admin/status", .api_status },
             .{ "/api/v1/admin/sources", .api_sources },
             .{ "/api/v1/admin/jobs", .api_jobs },
@@ -160,6 +162,7 @@ pub const App = struct {
                 handler.apiError(arena, .not_found, "not_found", "no such endpoint")
             else
                 handler.htmlError(arena, .not_found, "Not found", "That page does not exist."),
+            .script => if (!head_ok) return methodNotAllowed(arena, is_api, "GET, HEAD") else return .{ .status = .ok, .content_type = "text/javascript; charset=utf-8", .body = admin_js, .headers = handler.headersWith(arena, &.{.{ .name = "cache-control", .value = "public, max-age=3600" }}) },
             .style => {
                 if (!head_ok) return methodNotAllowed(arena, is_api, "GET, HEAD");
                 return .{ .status = .ok, .content_type = "text/css; charset=utf-8", .body = html.style_css, .headers = handler.headersWith(arena, &.{.{ .name = "cache-control", .value = "public, max-age=3600" }}) };
@@ -327,11 +330,11 @@ pub const App = struct {
 
     fn apiImports(self: *App, arena: Allocator) error{OutOfMemory}!Response {
         const JsonLast = struct { source: []const u8, state: []const u8, submitted: u64, rejected: u64, skip_reasons: JsonReasons, failure: ?[]const u8, finished_at: i64 };
-        const JsonRunning = struct { source: []const u8, started_at: i64, submitted: u64 };
+        const JsonRunning = struct { source: []const u8, started_at: i64, submitted: u64, progress_done: u64, progress_total: u64 };
         var running: ?JsonRunning = null;
         var last: ?JsonLast = null;
         if (self.opts.jobs) |m| {
-            if (try m.current(arena)) |c| running = .{ .source = c.source, .started_at = c.started_at, .submitted = c.submitted };
+            if (try m.current(arena)) |c| running = .{ .source = c.source, .started_at = c.started_at, .submitted = c.submitted, .progress_done = c.progress_done, .progress_total = c.progress_total };
             if (try m.lastResult(arena)) |l| last = .{ .source = l.source, .state = @tagName(l.state), .submitted = l.submitted, .rejected = l.rejected, .skip_reasons = jsonReasons(l.reasons), .failure = l.failure, .finished_at = l.finished_at };
         }
         return handler.jsonResponse(arena, .ok, .{ .actions = self.opts.jobs != null, .running = running, .last = last });
@@ -790,20 +793,27 @@ fn renderLogin(arena: Allocator, status: http.Status, notice: ?[]const u8) error
     return handler.htmlResponse(arena, status, aw.written());
 }
 
+/// The pages of the interface, in navigation order: key, path, label.
+const nav_items = [_]struct { []const u8, []const u8, []const u8 }{
+    .{ "dashboard", "/", "Dashboard" },
+    .{ "jobs", "/jobs", "Jobs" },
+    .{ "search", "/search", "Search test" },
+};
+
 fn writePage(w: *Io.Writer, title: []const u8, csrf: ?[]const u8, current: []const u8) Io.Writer.Error!void {
     var tbuf: [96]u8 = undefined;
     try html.writeHead(w, std.fmt.bufPrint(&tbuf, "{s} - dksearch administration", .{title}) catch title);
-    try w.writeAll("<body class=\"admin\"><main><header class=\"adminbar\"><span class=\"brand\">dksearch administration</span><nav>");
-    for ([_]struct { []const u8, []const u8, []const u8 }{ .{ "dashboard", "/", "Dashboard" }, .{ "jobs", "/jobs", "Jobs" }, .{ "search", "/search", "Search test" } }) |n| {
-        try w.print("<a href=\"{s}\"{s}>{s}</a> ", .{ n[1], if (std.mem.eql(u8, n[0], current)) " aria-current=\"page\"" else "", n[2] });
+    try w.writeAll("<body class=\"admin\"><header class=\"adminbar\"><div class=\"adminbar-inner\"><a class=\"logo\" href=\"/\">dksearch <small>administration</small></a><nav aria-label=\"Sections\">");
+    for (nav_items) |n| {
+        try w.print("<a href=\"{s}\"{s}>{s}</a>", .{ n[1], if (std.mem.eql(u8, n[0], current)) " aria-current=\"page\"" else "", n[2] });
     }
-    try w.writeAll("</nav>");
+    try w.writeAll("</nav><span class=\"grow\"></span>");
     if (csrf) |token| {
         try w.writeAll("<form action=\"/logout\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
         try html.writeEscaped(w, token);
-        try w.writeAll("\"><button type=\"submit\">Sign out</button></form>");
+        try w.writeAll("\"><button type=\"submit\" class=\"btn secondary\">Sign out</button></form>");
     }
-    try w.print("</header><h1>{s}</h1>\n", .{title});
+    try w.print("</div></header><main><script src=\"/assets/admin.js\" defer></script><h1>{s}</h1>\n", .{title});
 }
 
 fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.search.Searcher, q: dk.search.Query, rx: handler.RegexParams) !void {
@@ -905,10 +915,25 @@ fn writeBytes(w: *Io.Writer, n: ?u64) Io.Writer.Error!void {
     try w.print("{d} B", .{v});
 }
 
+fn badgeClass(state: dk.state_sqlite.JobState) []const u8 {
+    return switch (state) {
+        .completed => "ok",
+        .failed => "err",
+        .running => "run",
+        .cancelled, .interrupted => "warn",
+    };
+}
+
+fn writeBadge(w: *Io.Writer, state: dk.state_sqlite.JobState) Io.Writer.Error!void {
+    try w.print("<span class=\"badge {s}\">{s}</span>", .{ badgeClass(state), @tagName(state) });
+}
+
 fn writeJobCells(w: *Io.Writer, j: dk.state_sqlite.Job) Io.Writer.Error!void {
-    try w.print("<td>{s}</td><td>", .{@tagName(j.state)});
+    try w.writeAll("<td>");
+    try writeBadge(w, j.state);
+    try w.writeAll("</td><td>");
     try writeTime(w, j.started_at);
-    try w.print("</td><td>{d}</td><td>{d}", .{ j.submitted, j.rejected });
+    try w.print("</td><td class=\"num\">{d}</td><td class=\"num\">{d}", .{ j.submitted, j.rejected });
     if (j.reasons) |t| {
         // Our own "reason=count" text, never connector- or site-supplied.
         try w.print(" <span class=\"muted\">({s})</span>", .{t});
@@ -916,24 +941,48 @@ fn writeJobCells(w: *Io.Writer, j: dk.state_sqlite.Job) Io.Writer.Error!void {
     try w.writeAll("</td>");
 }
 
+/// "3 d 4 h", "2 h 5 min", "45 s".
+fn writeDuration(w: *Io.Writer, seconds: u64) Io.Writer.Error!void {
+    const d = seconds / 86400;
+    const h = (seconds % 86400) / 3600;
+    const m = (seconds % 3600) / 60;
+    if (d > 0) return w.print("{d} d {d} h", .{ d, h });
+    if (h > 0) return w.print("{d} h {d} min", .{ h, m });
+    if (m > 0) return w.print("{d} min {d} s", .{ m, seconds % 60 });
+    try w.print("{d} s", .{seconds});
+}
+
+fn writeStat(w: *Io.Writer, value: []const u8, label: []const u8) Io.Writer.Error!void {
+    try w.print("<div class=\"stat\"><span class=\"stat-n\">{s}</span><span class=\"stat-l\">{s}</span></div>", .{ value, label });
+}
+
 fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8) !void {
-    try w.writeAll("<h2>Imports</h2>\n");
     const m = app.opts.jobs orelse {
-        try w.writeAll("<p class=\"muted\">Starting imports from here is turned off (<code>admin.actions</code> is false). Use <code>dksearch import</code> on the command line.</p>\n");
+        try w.writeAll("<section class=\"card\"><h2>Imports</h2><p class=\"muted\">Starting imports from here is turned off (<code>admin.actions</code> is false). Use <code>dksearch import</code> on the command line.</p></section>\n");
         return;
     };
     if (try m.current(arena)) |c| {
-        try w.writeAll("<p>Running: <strong>");
+        try w.writeAll("<section class=\"card running\" id=\"import-live\" data-running=\"1\"><h2>Importing <strong>");
         try html.writeEscaped(w, c.source);
-        try w.print("</strong>, {d} documents so far, started ", .{c.submitted});
-        try writeTime(w, c.started_at);
-        try w.writeAll(".</p>\n");
+        try w.writeAll("</strong></h2>");
+        if (c.progress_total > 0) {
+            try w.print("<progress id=\"import-bar\" max=\"{d}\" value=\"{d}\"></progress> <span data-f=\"percent\" class=\"muted\">{d:.1} %</span>", .{ c.progress_total, @min(c.progress_done, c.progress_total), 100.0 * @as(f64, @floatFromInt(@min(c.progress_done, c.progress_total))) / @as(f64, @floatFromInt(c.progress_total)) });
+        } else {
+            try w.writeAll("<progress id=\"import-bar\"></progress> <span data-f=\"percent\" class=\"muted\">size unknown</span>");
+        }
+        try w.print("<dl class=\"facts\"><div><dt>Documents</dt><dd data-f=\"docs\">{d}</dd></div><div><dt>Speed</dt><dd data-f=\"rate\">measuring</dd></div><div><dt>Time left</dt><dd data-f=\"eta\">estimating</dd></div><div><dt>Running for</dt><dd data-f=\"elapsed\">", .{c.submitted});
+        try writeDuration(w, @intCast(@max(0, unixNow(app.io) - c.started_at)));
+        try w.writeAll("</dd></div></dl>\n<noscript><p class=\"muted\">Without JavaScript the numbers above only update when you reload the page.</p></noscript>");
         if (csrf) |token| {
             try w.writeAll("<form action=\"/actions/cancel\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
             try html.writeEscaped(w, token);
-            try w.writeAll("\"><button type=\"submit\">Cancel the running import</button></form>\n");
+            try w.writeAll("\"><button type=\"submit\" class=\"btn danger\">Cancel the import</button></form>");
         }
-    } else if (csrf) |token| {
+        try w.writeAll("</section>\n");
+        return;
+    }
+    try w.writeAll("<section class=\"card\"><h2>Imports</h2>");
+    if (csrf) |token| {
         var any = false;
         for (app.opts.sources) |s| {
             if (!s.enabled) continue;
@@ -942,19 +991,20 @@ fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const 
             try html.writeEscaped(w, token);
             try w.writeAll("\"><input type=\"hidden\" name=\"source\" value=\"");
             try html.writeEscaped(w, s.name);
-            try w.writeAll("\"><button type=\"submit\">Import ");
+            try w.writeAll("\"><button type=\"submit\" class=\"btn\">Import ");
             try html.writeEscaped(w, s.name);
             try w.writeAll("</button></form> ");
         }
-        if (!any) try w.writeAll("<p>No enabled sources.</p>");
-        try w.writeAll("\n");
+        if (!any) try w.writeAll("<p class=\"muted\">No enabled sources.</p>");
     } else {
-        try w.writeAll("<p class=\"muted\">Sign in with the password to use the buttons, or use the API.</p>\n");
+        try w.writeAll("<p class=\"muted\">Sign in with the password to use the buttons, or use the API.</p>");
     }
     if (try m.lastResult(arena)) |l| {
         try w.writeAll("<p class=\"muted\">Last import started from here: ");
         try html.writeEscaped(w, l.source);
-        try w.print(", {s}, {d} submitted, {d} rejected", .{ @tagName(l.state), l.submitted, l.rejected });
+        try w.writeAll(" ");
+        try writeBadge(w, l.state);
+        try w.print(" {d} submitted, {d} skipped", .{ l.submitted, l.rejected });
         {
             var rb: [256]u8 = undefined;
             var rw: Io.Writer = .fixed(&rb);
@@ -967,34 +1017,65 @@ fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const 
             try w.writeAll(". Problem: ");
             try html.writeEscaped(w, f);
         }
-        try w.writeAll(".</p>\n");
+        try w.writeAll(".</p>");
     }
+    try w.writeAll("</section>\n");
+}
+
+fn unixNow(io: Io) i64 {
+    return @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
 }
 
 fn writeDashboard(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot, csrf: ?[]const u8) !void {
     var total: u64 = 0;
-    for (snap.counts) |c| total += c.documents;
-    try w.print("<p class=\"muted\">dksearch {s}. Up {d} s. {d} documents. {s}</p>\n", .{
+    var max_docs: u64 = 1;
+    for (snap.counts) |c| {
+        total += c.documents;
+        max_docs = @max(max_docs, c.documents);
+    }
+    var storage_total: u64 = 0;
+    for (snap.sizes) |sz| storage_total += sz orelse 0;
+
+    // Summary cards.
+    try w.writeAll("<section class=\"statgrid\">");
+    var nb: [32]u8 = undefined;
+    try writeStat(w, std.fmt.bufPrint(&nb, "{d}", .{total}) catch "?", "documents");
+    var sb: [32]u8 = undefined;
+    try writeStat(w, std.fmt.bufPrint(&sb, "{d}", .{app.opts.sources.len}) catch "?", "sources");
+    {
+        var bb: [48]u8 = undefined;
+        var bw: Io.Writer = .fixed(&bb);
+        try writeBytes(&bw, storage_total);
+        try writeStat(w, bw.buffered(), "stored data");
+        var ub: [48]u8 = undefined;
+        var uw: Io.Writer = .fixed(&ub);
+        try writeDuration(&uw, @intCast(@max(0, app.uptimeSeconds())));
+        try writeStat(w, uw.buffered(), "uptime");
+    }
+    try w.print("</section>\n<p class=\"muted\">dksearch {s}. {s}</p>\n", .{
         app.opts.version,
-        app.uptimeSeconds(),
-        total,
         if (app.opts.jobs != null) "Imports can be started below; rebuild, check, backup and removal are command-line only." else "Read-only view: use the command line to import, rebuild, check or back up.",
     });
 
+    try writeImportsPanel(app, arena, w, csrf);
+
     try w.writeAll("<h2>Sources</h2>\n");
     if (app.opts.sources.len == 0 and snap.counts.len == 0) {
-        try w.writeAll("<p>No sources are configured. dksearch works without them; add a <code>[[source]]</code> to the configuration to import documents.</p>\n");
+        try w.writeAll("<p>No sources are configured. dksearch works without them; add a <code>[[source]]</code> to the configuration to import documents (see <code>dksearch help config</code>).</p>\n");
     } else {
-        try w.writeAll("<table><thead><tr><th>Name</th><th>Kind</th><th>Enabled</th><th>Documents</th><th>Last import</th><th>Started</th><th>Submitted</th><th>Rejected</th></tr></thead><tbody>\n");
+        try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Name</th><th>Kind</th><th>Documents</th><th>Last import</th><th>Started</th><th class=\"num\">Submitted</th><th class=\"num\">Skipped</th></tr></thead><tbody>\n");
         for (app.opts.sources, 0..) |s, i| {
-            try w.writeAll("<tr><td>");
+            try w.writeAll("<tr><td><strong>");
             try html.writeEscaped(w, s.name);
+            try w.writeAll("</strong>");
+            if (!s.enabled) try w.writeAll(" <span class=\"badge off\">disabled</span>");
             try w.writeAll("</td><td>");
             try html.writeEscaped(w, s.kind);
-            try w.print("</td><td>{s}</td><td>{d}</td>", .{ if (s.enabled) "yes" else "no", App.docsFor(snap, s.name) });
+            const docs = App.docsFor(snap, s.name);
+            try w.print("</td><td><meter min=\"0\" max=\"{d}\" value=\"{d}\"></meter> <span class=\"num\">{d}</span></td>", .{ max_docs, docs, docs });
             if (i < snap.last.len and snap.last[i] != null) {
                 try writeJobCells(w, snap.last[i].?);
-            } else try w.writeAll("<td colspan=\"4\">never run</td>");
+            } else try w.writeAll("<td colspan=\"4\" class=\"muted\">never run</td>");
             try w.writeAll("</tr>\n");
         }
         for (snap.counts) |c| {
@@ -1003,27 +1084,32 @@ fn writeDashboard(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot
                 known = true;
             };
             if (known) continue;
-            try w.writeAll("<tr><td>");
+            try w.writeAll("<tr><td><strong>");
             try html.writeEscaped(w, c.source);
-            try w.print("</td><td colspan=\"2\">not in the configuration</td><td>{d}</td><td colspan=\"4\">&mdash;</td></tr>\n", .{c.documents});
+            try w.print("</strong></td><td><span class=\"badge off\">not in the configuration</span></td><td><meter min=\"0\" max=\"{d}\" value=\"{d}\"></meter> <span class=\"num\">{d}</span></td><td colspan=\"4\" class=\"muted\">&mdash;</td></tr>\n", .{ max_docs, c.documents, c.documents });
         }
-        try w.writeAll("</tbody></table>\n");
+        try w.writeAll("</tbody></table></div>\n");
     }
 
-    try writeImportsPanel(app, arena, w, csrf);
+    try w.writeAll("<h2>Storage</h2><div class=\"tablewrap\"><table class=\"data\"><tbody>");
+    const names = [_][]const u8{ "index.db", "state.db", "content.db" };
+    const what = [_][]const u8{ "the search index (rebuildable)", "document records and import history", "the retained text" };
+    const max_size: u64 = blk: {
+        var mx: u64 = 1;
+        for (snap.sizes) |sz| mx = @max(mx, sz orelse 0);
+        break :blk mx;
+    };
+    for (names, what, snap.sizes) |n, d, sz| {
+        try w.print("<tr><th>{s}</th><td class=\"muted\">{s}</td><td><meter min=\"0\" max=\"{d}\" value=\"{d}\"></meter></td><td class=\"num\">", .{ n, d, max_size, sz orelse 0 });
+        try writeBytes(w, sz);
+        try w.writeAll("</td></tr>");
+    }
+    try w.writeAll("</tbody></table></div>\n");
 
-    try w.writeAll("<h2>Data</h2><table><tbody><tr><th>index.db</th><td>");
-    try writeBytes(w, snap.sizes[0]);
-    try w.writeAll("</td></tr><tr><th>state.db</th><td>");
-    try writeBytes(w, snap.sizes[1]);
-    try w.writeAll("</td></tr><tr><th>content.db</th><td>");
-    try writeBytes(w, snap.sizes[2]);
-    try w.writeAll("</td></tr></tbody></table>\n");
-
-    try w.writeAll("<h2>Traffic since start</h2><table><thead><tr><th></th><th>Requests</th><th>2xx</th><th>3xx</th><th>4xx</th><th>5xx</th><th>&le;10 ms</th><th>&le;50 ms</th><th>&le;250 ms</th><th>&le;1 s</th><th>slower</th><th>Refused busy</th><th>Timed out</th></tr></thead><tbody>\n");
+    try w.writeAll("<details><summary>Traffic since start</summary><div class=\"tablewrap\"><table class=\"data\"><thead><tr><th></th><th class=\"num\">Requests</th><th class=\"num\">2xx</th><th class=\"num\">3xx</th><th class=\"num\">4xx</th><th class=\"num\">5xx</th><th class=\"num\">&le;10 ms</th><th class=\"num\">&le;50 ms</th><th class=\"num\">&le;250 ms</th><th class=\"num\">&le;1 s</th><th class=\"num\">slower</th><th class=\"num\">Refused busy</th><th class=\"num\">Timed out</th></tr></thead><tbody>\n");
     for ([_]struct { []const u8, *const server.Stats }{ .{ "Public", app.opts.public_stats }, .{ "Admin", app.opts.admin_stats } }) |row| {
         const c = App.counters(row.@"1");
-        try w.print("<tr><th>{s}</th><td>{d}</td><td>{d}</td><td>{d}</td><td>{d}</td><td>{d}</td><td>{d}</td><td>{d}</td><td>{d}</td><td>{d}</td><td>{d}</td><td>{d}</td><td>{d}</td></tr>\n", .{
+        try w.print("<tr><th>{s}</th><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td></tr>\n", .{
             row.@"0",
             c.requests,
             c.status_2xx,
@@ -1039,13 +1125,13 @@ fn writeDashboard(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot
             c.connections_timed_out,
         });
     }
-    try w.writeAll("</tbody></table>\n");
+    try w.writeAll("</tbody></table></div></details>\n");
     try w.print("<p class=\"muted\">{d} active session(s). A job shown as running may belong to an import that was killed; the next command that opens the data marks it interrupted.</p>\n", .{app.sessionCount()});
 }
 
 fn writeJobs(w: *Io.Writer, jobs: []const dk.state_sqlite.Job) Io.Writer.Error!void {
     if (jobs.len == 0) return w.writeAll("<p>No imports have run yet.</p>\n");
-    try w.writeAll("<table><thead><tr><th>Job</th><th>Source</th><th>Kind</th><th>State</th><th>Started</th><th>Submitted</th><th>Rejected</th><th>Note</th></tr></thead><tbody>\n");
+    try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Job</th><th>Source</th><th>Kind</th><th>State</th><th>Started</th><th class=\"num\">Submitted</th><th class=\"num\">Skipped</th><th>Note</th></tr></thead><tbody>\n");
     for (jobs) |j| {
         try w.print("<tr><td>{d}</td><td>", .{j.id});
         try html.writeEscaped(w, j.source);
@@ -1057,7 +1143,7 @@ fn writeJobs(w: *Io.Writer, jobs: []const dk.state_sqlite.Job) Io.Writer.Error!v
         if (j.error_message) |m| try html.writeEscaped(w, m);
         try w.writeAll("</td></tr>\n");
     }
-    try w.writeAll("</tbody></table>\n");
+    try w.writeAll("</tbody></table></div>\n");
 }
 
 // ---------------------------------------------------------------- tests
@@ -1705,7 +1791,8 @@ test "query testing page and API show scores, escape everything, and need sign-i
     try testing.expect(std.mem.indexOf(u8, page.body, "(untitled)") != null);
     try testing.expect(std.mem.indexOf(u8, page.body, "tokenizer: porter") != null);
     try testing.expect(std.mem.indexOf(u8, page.body, "value=\"lamp &lt;script&gt;\"") != null); // the box keeps the text, escaped
-    try testing.expect(std.mem.indexOf(u8, page.body, "<script") == null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "<script>") == null); // no inline script, ever
+    try testing.expect(std.mem.indexOf(u8, page.body, "javascript:") == null);
     try testing.expect(std.mem.indexOf(u8, page.body, "abababababababababababababababab") != null);
 
     // An empty box just shows the form; a failing search says so without details.

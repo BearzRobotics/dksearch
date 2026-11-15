@@ -196,6 +196,12 @@ pub const ArchiveConnector = struct {
                 .object => |o| o,
                 else => return error.SourceFailed,
             };
+            // `total` is how many items match; the run stops at max_items.
+            const matching: u64 = if (root.get("total")) |t| switch (t) {
+                .integer => |n| if (n > 0) @intCast(n) else 0,
+                else => 0,
+            } else 0;
+            if (matching > 0) control.setProgress(seen, @min(matching, self.max_items));
             const items = switch (root.get("items") orelse return error.SourceFailed) {
                 .array => |arr| arr.items,
                 else => return error.SourceFailed,
@@ -203,6 +209,7 @@ pub const ArchiveConnector = struct {
             for (items) |item| {
                 if (seen >= self.max_items) break;
                 seen += 1;
+                if (matching > 0 and seen % 50 == 0) control.setProgress(seen, @min(matching, self.max_items));
                 switch (try self.submitItem(a, item, sink, control)) {
                     .stopped => return self.stopped(cursor_buf.items),
                     .ok => {},

@@ -273,7 +273,10 @@ pub const CrawlConnector = struct {
 
         var done: ?[]const u8 = if (start > 0) seeds[start - 1].line else null;
         var since: u32 = 0;
-        for (seeds[start..]) |seed| {
+        for (seeds[start..], start..) |seed, seed_index| {
+            // With no link following the seeds are the whole job; otherwise the
+            // number of pages is open-ended and only the page budget bounds it.
+            if (self.max_depth == 0) control.setProgress(seed_index, seeds.len) else control.setProgress(r.fetched, self.max_pages);
             if (control.isCancelled()) return self.stopped(done);
             switch (try r.crawlSeed(seed)) {
                 .stopped => return self.stopped(done),

@@ -74,6 +74,10 @@ pub const Active = struct {
     started_at: document.Timestamp,
     /// Documents submitted so far (live).
     submitted: u64,
+    /// The connector's own measure of progress (see `Control.setProgress`);
+    /// `progress_total` is 0 when it cannot tell how much there is.
+    progress_done: u64 = 0,
+    progress_total: u64 = 0,
 };
 
 pub const Manager = struct {
@@ -174,6 +178,8 @@ pub const Manager = struct {
             .source = try arena.dupe(u8, r.source),
             .started_at = r.started_at,
             .submitted = r.control.submitted.load(.monotonic),
+            .progress_done = r.control.progress_done.load(.monotonic),
+            .progress_total = r.control.progress_total.load(.monotonic),
         };
     }
 
