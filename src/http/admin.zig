@@ -1463,6 +1463,13 @@ const kind_infos = [_]KindInfo{
         .template = "dump = \"/data/enwiki-latest-pages-articles-multistream.xml.bz2\"   # the downloaded file (change this)\n",
     },
     .{
+        .kind = "zim",
+        .title = "A Kiwix (ZIM) file",
+        .blurb = "Indexes the articles of a .zim file from the Kiwix project: offline copies of Wikipedia, Wiktionary, Stack Exchange, documentation sites and more.",
+        .needs = "The .zim file's path (optionally the address where you serve it, for links).",
+        .template = "path = \"/data/wikipedia_en_all_maxi.zim\"   # the downloaded .zim file (change this)\n# url_base = \"http://localhost:8080/content/wikipedia_en_all_maxi/\"   # optional: makes each result link to a kiwix-serve\n",
+    },
+    .{
         .kind = "gutenberg",
         .title = "Project Gutenberg books",
         .blurb = "Indexes Project Gutenberg books from its catalog file and a folder of book files you have downloaded.",

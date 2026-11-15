@@ -15,6 +15,7 @@ const build_options = @import("build_options");
 
 pub const files = @import("connectors/files.zig");
 pub const gutenberg = @import("connectors/gutenberg.zig");
+pub const zim = @import("connectors/zim.zig");
 /// Present only in builds with `-Dwikipedia` (the default); see build.zig.
 pub const have_wikipedia = build_options.wikipedia;
 pub const wikipedia = if (have_wikipedia) @import("connectors/wikipedia.zig") else struct {};
@@ -29,7 +30,7 @@ pub const archive = if (have_crawler) @import("connectors/archive.zig") else str
 
 /// Every kind this build knows, for help text and error messages.
 pub const kinds = blk: {
-    var k: []const []const u8 = &.{ files.kind, gutenberg.kind };
+    var k: []const []const u8 = &.{ files.kind, gutenberg.kind, zim.kind };
     if (have_wikipedia) k = k ++ &[_][]const u8{wikipedia.kind};
     if (have_feeds) k = k ++ &[_][]const u8{feeds.kind};
     if (have_crawler) k = k ++ &[_][]const u8{ crawl.kind, archive.kind };
@@ -38,7 +39,7 @@ pub const kinds = blk: {
 
 /// "files, gutenberg, wikipedia", for messages.
 pub const kinds_text = blk: {
-    var t: []const u8 = "files, gutenberg";
+    var t: []const u8 = "files, gutenberg, zim";
     if (have_wikipedia) t = t ++ ", wikipedia";
     if (have_feeds) t = t ++ ", feeds";
     if (have_crawler) t = t ++ ", crawl, archive";
@@ -57,6 +58,7 @@ const Absent = struct {
 pub const Instance = union(enum) {
     files: files.FilesConnector,
     gutenberg: gutenberg.GutenbergConnector,
+    zim: zim.ZimConnector,
     wikipedia: if (have_wikipedia) wikipedia.WikipediaConnector else Absent,
     feeds: if (have_feeds) feeds.FeedsConnector else Absent,
     crawl: if (have_crawler) crawl.CrawlConnector else Absent,
@@ -80,6 +82,7 @@ pub const Instance = union(enum) {
 pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!void {
     if (std.mem.eql(u8, source.kind, files.kind)) return files.validate(source, diag);
     if (std.mem.eql(u8, source.kind, gutenberg.kind)) return gutenberg.validate(source, diag);
+    if (std.mem.eql(u8, source.kind, zim.kind)) return zim.validate(source, diag);
     if (have_wikipedia and std.mem.eql(u8, source.kind, "wikipedia")) return wikipedia.validate(source, diag);
     if (have_feeds and std.mem.eql(u8, source.kind, "feeds")) return feeds.validate(source, diag);
     if (have_crawler and std.mem.eql(u8, source.kind, "crawl")) return crawl.validate(source, diag);
@@ -100,6 +103,7 @@ pub fn validateAll(sources: []const config.Source, diag: *config.Diagnostic) con
 pub fn create(gpa: Allocator, io: Io, source: config.Source) Allocator.Error!Instance {
     if (std.mem.eql(u8, source.kind, files.kind)) return .{ .files = try files.FilesConnector.init(gpa, io, source) };
     if (std.mem.eql(u8, source.kind, gutenberg.kind)) return .{ .gutenberg = try gutenberg.GutenbergConnector.init(gpa, io, source) };
+    if (std.mem.eql(u8, source.kind, zim.kind)) return .{ .zim = try zim.ZimConnector.init(gpa, io, source) };
     if (have_wikipedia and std.mem.eql(u8, source.kind, "wikipedia")) return .{ .wikipedia = try wikipedia.WikipediaConnector.init(gpa, io, source) };
     if (have_feeds and std.mem.eql(u8, source.kind, "feeds")) return .{ .feeds = try feeds.FeedsConnector.init(gpa, io, source) };
     if (have_crawler and std.mem.eql(u8, source.kind, "crawl")) return .{ .crawl = try crawl.CrawlConnector.init(gpa, io, source) };

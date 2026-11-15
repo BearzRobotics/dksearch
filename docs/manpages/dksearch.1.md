@@ -29,7 +29,7 @@ dksearch check-config FILE
 DESCRIPTION
 dksearch is an independently operated, self-hostable search engine. It maintains its own full-text index and does not use an external search provider.
 
-This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles six: `files`, which indexes plain-text and Markdown files from a local directory; `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded; `wikipedia`, which indexes the articles of a Wikipedia dump file you have already downloaded; `feeds`, which indexes the entries of RSS and Atom feed files you have already downloaded; `crawl`, which fetches a list of web pages you name, over HTTP or HTTPS; and `archive`, which indexes the metadata of Internet Archive items matching a search. `crawl` and `archive` are the only connectors that use the network. The `wikipedia`, `feeds`, `crawl` and `archive` connectors are built by default and can be left out with `zig build -Dwikipedia=false`, `-Dfeeds=false` and `-Dcrawler=false` (the last one removes both network connectors). A separate administration interface (a dashboard with sources, storage and a live progress bar for a running import, import jobs and why items were skipped, counters, a query-testing page that shows ranking scores, and optionally starting and cancelling imports, and with `actions` on, running a check, a backup or the removal of a source from the Maintenance page) is served on its own address when the configuration has an `[admin]` table and credentials exist; see **admin-token**, **admin-password** and SECURITY CONSIDERATIONS.
+This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles seven: `files`, which indexes plain-text and Markdown files from a local directory; `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded; `wikipedia`, which indexes the articles of a Wikipedia dump file you have already downloaded; `zim`, which indexes the articles of a Kiwix ZIM file you have already downloaded; `feeds`, which indexes the entries of RSS and Atom feed files you have already downloaded; `crawl`, which fetches a list of web pages you name, over HTTP or HTTPS; and `archive`, which indexes the metadata of Internet Archive items matching a search. `crawl` and `archive` are the only connectors that use the network. The `wikipedia`, `feeds`, `crawl` and `archive` connectors are built by default and can be left out with `zig build -Dwikipedia=false`, `-Dfeeds=false` and `-Dcrawler=false` (the last one removes both network connectors). A separate administration interface (a dashboard with sources, storage and a live progress bar for a running import, import jobs and why items were skipped, counters, a query-testing page that shows ranking scores, and optionally starting and cancelling imports, and with `actions` on, running a check, a backup or the removal of a source from the Maintenance page) is served on its own address when the configuration has an `[admin]` table and credentials exist; see **admin-token**, **admin-password** and SECURITY CONSIDERATIONS.
 
 CONVENTIONS
 Bold represents literal commands, options, and keywords.
@@ -251,7 +251,7 @@ Each `[[source]]` table has these keys. Any other key is an option of the connec
 
 Key	Type	Default	Description
 name	String	required	Unique name, 1-64 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit. Resume positions are kept per name, and it becomes the `connector` of each document, so renaming a source makes it start afresh and its old documents stay under the old name.
-kind	String	required	Connector type. This version knows `files`, `gutenberg`, `wikipedia`, `feeds`, `crawl` and `archive` (the last four only in builds that include them).
+kind	String	required	Connector type. This version knows `files`, `gutenberg`, `zim`, `wikipedia`, `feeds`, `crawl` and `archive` (the last four only in builds that include them).
 enabled	Boolean	true	A disabled source stays in the file but is never run.
 retain_text	Boolean	true	Keep each document's text so the index can be rebuilt without reading the source again. Set false for a source whose terms forbid keeping its text; its documents are then skipped by **rebuild**.
 rights	String	connector default	Override the redistribution flag (`unknown`, `allowed`, `restricted`, `forbidden`) of every document from this source. Defaults are conservative guesses, not legal advice; the decision is yours. Only documents that are added or changed afterwards pick it up; unchanged ones keep the flag they were stored with.
@@ -312,6 +312,24 @@ Example:
     kind = "wikipedia"
     dump = "/data/wikipedia/enwiki-20260101-pages-articles-multistream.xml.bz2"
     dataset_version = "20260101"
+
+Kind `zim` indexes the articles of a ZIM file, the offline-content format of the Kiwix project (Wikipedia, Wiktionary, Stack Exchange, project documentation and many other sites packaged as one file; downloads at download.kiwix.org). It never uses the network: download the file yourself and point the source at it. The reader is written for dksearch on Zig's own xz and zstd decoders, not on libzim, and treats the file as untrusted input.
+
+Key	Type	Default	Description
+path	String	required	The `.zim` file (format version 5 or 6).
+language	String	none	Language tag stored on each document.
+url_base	String	none	Where the articles can be read, starting with http:// or https:// and ending in "/", for example the address of a kiwix-serve (`http://localhost:8080/content/wikipedia_en_all_maxi/`). Each result then links to that address plus the article's path. Without it results have no link.
+max_article_bytes	Integer	4194304	Largest article text indexed, 1-67108864; larger ones are skipped.
+max_cluster_bytes	Integer	134217728	Largest decompressed cluster accepted, 1-1073741824.
+
+Entries of the content namespace (`C`, or `A` in older files) of type HTML or plain text become documents; redirects, images, scripts, stylesheets and metadata do not. HTML is converted to text like feed entries. The entry's own title is used, else the page's `<title>`, else its path. The library's `Title` metadata is recorded as the dataset. The directory is read once to find the articles (a few seconds per million entries and about 12 bytes of memory per article), then the file is processed cluster by cluster so each compressed block is decompressed once. An interrupted run resumes at the next cluster. Rights are `unknown`: Kiwix files package content that keeps its original licence (often CC BY-SA); check the file's metadata. Progress is shown as the share of clusters handled.
+
+Example:
+
+    [[source]]
+    name = "wiki-offline"
+    kind = "zim"
+    path = "/data/wikipedia_en_all_maxi_2026-01.zim"
 
 Kind `feeds` indexes RSS 2.0, RSS 1.0 (RDF) and Atom 1.0 files. It never uses the network: fetch the feeds yourself (a scheduled `curl` into a directory works, see `docs/deploy/README.md`) and point the source at them.
 
