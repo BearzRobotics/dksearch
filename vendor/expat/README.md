@@ -6,6 +6,6 @@
 - Files kept, unmodified: the C sources and headers of upstream `lib/`, and `COPYING`. Only `xmlparse.c`, `xmlrole.c` and `xmltok.c` are compiled (the other `.c` files are included by those or are alternative entropy sources; the right one is selected by the build).
 - Not upstream: `expat_config.h` was written for this project (minimal features: no general entities, no DTD) and replaces the generated one.
 - License: MIT, see `COPYING`.
-- Used only by the Wikipedia connector (`docs/decisions/0011-wikipedia-connector.md`), and compiled only when the build option `-Dwikipedia` is on (the default).
+- Used by the Wikipedia and feeds connectors (`docs/decisions/0011-wikipedia-connector.md`, `0016-feeds-connector.md`), and compiled only when the build option `-Dwikipedia` or `-Dfeeds` is on (both are the default).
 
 Do not edit the upstream files. To update: download the new release, verify its published hash and signature, replace the files, and update this README.
