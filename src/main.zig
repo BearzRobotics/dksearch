@@ -48,6 +48,29 @@ const exit_io = 4;
 /// Shown (on standard error) when no command is given.
 const short_usage = "usage: dksearch COMMAND [options]\ntry: dksearch --help   (or: dksearch help start, dksearch help admin)\n";
 
+const starter_config = @embedFile("assets/starter.toml");
+
+/// Writes the commented starter configuration; never overwrites.
+fn initCmd(io: Io, path: []const u8) u8 {
+    const f = Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .truncate = false }) catch |e| switch (e) {
+        error.PathAlreadyExists => {
+            err(io, "{s} already exists; init never overwrites. Choose another name: dksearch init OTHER.toml", .{path});
+            return exit_failure;
+        },
+        else => {
+            err(io, "cannot create {s}: {t}", .{ path, e });
+            return exit_io;
+        },
+    };
+    defer f.close(io);
+    f.writePositionalAll(io, starter_config, 0) catch |e| {
+        err(io, "cannot write {s}: {t}", .{ path, e });
+        return exit_io;
+    };
+    out(io, "wrote {s}\n\nNext:\n  1. edit it to add a [[source]] to index\n  2. dksearch import --config {s} NAME\n  3. dksearch serve  --config {s}\n\nTo turn on the administration interface, follow the steps in the [admin] part of the file\nor run: dksearch help admin\n", .{ path, path, path });
+    return exit_ok;
+}
+
 fn helpCmd(io: Io, topic: ?[]const u8) u8 {
     var buf: [4096]u8 = undefined;
     var w = Io.File.stdout().writerStreaming(io, &buf);
@@ -245,6 +268,12 @@ fn run(init: std.process.Init) u8 {
         if (config_path == null) return usageError(io, "import needs --config FILE (sources are defined there)");
         if (all == (source != null)) return usageError(io, "import needs exactly one of SOURCE or --all");
         return importCmd(io, gpa, config_path.?, source, all, prune);
+    }
+
+    if (eq(first, "init")) {
+        const path = args.next() orelse "dksearch.toml";
+        if (args.next() != null) return usageError(io, "init takes at most one FILE");
+        return initCmd(io, path);
     }
 
     if (eq(first, "eval")) {

@@ -12,9 +12,10 @@ port = 8080
 # One line per request, without queries or client details:
 #access_log = "/var/lib/dksearch/access.log"
 
+# The administration interface. With this table present it starts when a
+# credential exists; create one with `dksearch admin-password` and/or
+# `dksearch admin-token` (see `dksearch help admin`). Keep it on loopback.
 [admin]
-# Present: the administration interface starts if credentials exist
-# (dksearch admin-token / admin-password). Keep it on loopback.
 address = "127.0.0.1"
 port = 8081
 # Let the interface start and cancel imports (default: read-only).

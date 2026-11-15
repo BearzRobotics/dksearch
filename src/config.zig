@@ -919,3 +919,26 @@ test "random mutations of a valid configuration never crash the loader" {
         } else |_| {}
     }
 }
+
+test "the starter configuration loads, and the admin interface is off until uncommented" {
+    const starter = @embedFile("assets/starter.toml");
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "starter.toml", starter, &d);
+    defer c.deinit();
+    try testing.expect(!c.admin_configured); // off by default: the block is commented out
+    try testing.expectEqual(@as(usize, 0), c.sources.len);
+    // Removing the '#' from the [admin] block (and nothing else) makes it valid and on.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var it = std.mem.splitScalar(u8, starter, '\n');
+    while (it.next()) |line| {
+        const on = std.mem.startsWith(u8, line, "#[admin]") or std.mem.startsWith(u8, line, "#address = \"127.0.0.1\"") or std.mem.startsWith(u8, line, "#port = 8081") or std.mem.startsWith(u8, line, "#actions = true");
+        try buf.appendSlice(testing.allocator, if (on) line[1..] else line);
+        try buf.append(testing.allocator, '\n');
+    }
+    var c2 = try loadFromSlice(testing.allocator, "starter-admin.toml", buf.items, &d);
+    defer c2.deinit();
+    try testing.expect(c2.admin_configured);
+    try testing.expectEqual(@as(u16, 8081), c2.admin.port);
+    try testing.expect(c2.admin_options.actions);
+}

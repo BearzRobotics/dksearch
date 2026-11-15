@@ -20,17 +20,19 @@ Needs Zig 0.17.1 and nothing else. All dependencies are vendored (SQLite, a TOML
 
 Index a directory of text and Markdown files and search it:
 
-    cat > dksearch.toml <<'TOML'
-    [[source]]
-    name = "notes"
-    kind = "files"
-    path = "/home/me/notes"
-    TOML
+    dksearch init        # writes dksearch.toml (commented; never overwrites)
+    # edit it: add a source, e.g.
+    #   [[source]]
+    #   name = "notes"
+    #   kind = "files"
+    #   path = "/home/me/notes"
 
     dksearch import --config dksearch.toml notes
     dksearch serve --config dksearch.toml
     # then open http://127.0.0.1:8080/ or:
     curl 'http://127.0.0.1:8080/api/v1/search?q=lighthouse'
+
+The generated file also holds the administration interface, commented out with the three steps to turn it on (remove the `#`, run `dksearch admin-password`, restart `serve`); `dksearch help admin` has the details.
 
 Sources are optional. With none configured, `serve` still works and serves whatever index exists, and documents can arrive through any connector that uses the same interface.
 

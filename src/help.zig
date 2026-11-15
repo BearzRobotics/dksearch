@@ -131,6 +131,19 @@ pub const commands = [_]Command{
         ,
     },
     .{
+        .name = "init",
+        .synopsis = "init [FILE]",
+        .summary = "Write a starter configuration file (default: dksearch.toml)",
+        .detail =
+        \\Writes a commented starter configuration to FILE (default dksearch.toml in the
+        \\current directory). It never overwrites an existing file. The file has the
+        \\search settings and, commented out with the exact steps to turn it on, the
+        \\administration interface ([admin]), plus an example source. Edit it, check it
+        \\with `dksearch check-config FILE`, then import and serve.
+        \\
+        ,
+    },
+    .{
         .name = "check-config",
         .synopsis = "check-config FILE",
         .summary = "Validate a configuration file without starting anything",
@@ -171,7 +184,8 @@ pub const admin_topic =
     \\The administration interface is separate from the public search: its own address
     \\and port, off unless you set it up, and it only starts if a credential exists.
     \\
-    \\1. Add an [admin] table to your configuration file (dksearch.toml):
+    \\1. Add an [admin] table to your configuration file (dksearch.toml). The file
+    \\   written by `dksearch init` already has it, commented out: just remove the '#'.
     \\
     \\       [admin]
     \\       address = "127.0.0.1"    # keep it on this machine; see the manual for remote use
@@ -226,9 +240,9 @@ pub const config_topic =
     \\    port = 8080
     \\    # access_log = "/var/log/dksearch/access.log"   # one line per request, no queries
     \\
-    \\    [admin]                        # off unless present; see `dksearch help admin`
-    \\    address = "127.0.0.1"
-    \\    port = 8081
+    \\    # [admin]                      # the administration interface: OFF until you remove the
+    \\    # address = "127.0.0.1"        # leading '#' here AND create a credential with
+    \\    # port = 8081                  # `dksearch admin-password`; see `dksearch help admin`
     \\
     \\    [index]
     \\    tokenizer = "unicode61"        # or "porter" for English stemming (then run rebuild)
@@ -250,7 +264,8 @@ pub const config_topic =
 pub const start_topic =
     \\Getting started
     \\
-    \\1. Write a configuration file that names what to index (`dksearch help config`):
+    \\1. Write a starter configuration file:   dksearch init
+    \\   then edit dksearch.toml to name what to index (`dksearch help config`), e.g.
     \\
     \\       [[source]]
     \\       name = "my-notes"

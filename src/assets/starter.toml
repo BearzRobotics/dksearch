@@ -1,0 +1,52 @@
+# dksearch configuration, written by `dksearch init`.
+# Everything here is optional; lines starting with '#' are examples and notes.
+# Check this file at any time with:  dksearch check-config dksearch.toml
+# Short help on any command or topic:  dksearch help   (try: dksearch help config)
+
+[storage]
+# Where the databases live. A relative path is relative to where you run dksearch.
+data_dir = "data"
+
+# The public search website and JSON API: http://127.0.0.1:8080/
+[server]
+address = "127.0.0.1"
+port = 8080
+
+# ---------------------------------------------------------------------------
+# ADMINISTRATION INTERFACE (dashboard, import jobs, query testing)
+#
+# It is OFF until you do these three things:
+#
+#   1. Remove the leading '#' from the four [admin] lines below.
+#   2. Create a credential (as the user that runs dksearch):
+#        dksearch admin-password --config dksearch.toml   # for the browser
+#        dksearch admin-token    --config dksearch.toml   # for curl and scripts
+#   3. Start (or restart) the server:  dksearch serve --config dksearch.toml
+#      then open http://127.0.0.1:8081/ and sign in.
+#
+# Keep it on this machine (127.0.0.1). For remote use see `dksearch help admin`.
+# ---------------------------------------------------------------------------
+#[admin]
+#address = "127.0.0.1"
+#port = 8081
+#actions = true    # also allow starting and cancelling imports from the pages
+
+# Search options. The regular-expression filter is on by default with strict limits.
+#[search]
+#regex = true
+#regex_max_candidates = 200
+
+# How text is split into words. "porter" adds English stemming (then run `dksearch rebuild`).
+#[index]
+#tokenizer = "unicode61"
+
+# ---------------------------------------------------------------------------
+# SOURCES: what to index. Add as many [[source]] tables as you like, then run
+#   dksearch import --config dksearch.toml NAME
+# Kinds: files, gutenberg, wikipedia, feeds, crawl, archive. Each has its own
+# keys; see `man dksearch` or docs/deploy/dksearch.toml.example.
+# ---------------------------------------------------------------------------
+#[[source]]
+#name = "my-notes"
+#kind = "files"
+#path = "/home/me/notes"
