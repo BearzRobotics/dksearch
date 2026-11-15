@@ -185,20 +185,19 @@ pub const Manager = struct {
 
     // ------------------------------------------------------------ the task
 
-    fn task(self: *Manager, source: config.Source, control: *connector.Control, lock: maintenance.WriterLock) Io.Cancelable!void {
-        var outcome: Outcome = .{ .state = .failed, .failure = "internal error" };
-        runOne(self, source, control, &outcome);
-        lock.release(self.io);
-        self.record(source.name, control, outcome);
-    }
-
+    /// How a run ended. `failure`, when set, is allocated from the manager's
+    /// allocator and ownership passes to `last` in `record`.
     const Outcome = struct {
         state: state_sqlite.JobState,
         submitted: u64 = 0,
         rejected: u64 = 0,
-        /// Static text or allocated from `scratch` (copied before use).
         failure: ?[]const u8 = null,
     };
+
+    fn fail(self: *Manager, out: *Outcome, text: []const u8) void {
+        out.state = .failed;
+        out.failure = self.gpa.dupe(u8, text) catch null;
+    }
 
     fn runOne(self: *Manager, source: config.Source, control: *connector.Control, out: *Outcome) void {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
@@ -206,12 +205,12 @@ pub const Manager = struct {
         const arena = arena_state.allocator();
 
         var state = state_sqlite.SqliteStateStore.open(self.gpa, self.opts.state_path, self.opts.sync_off) catch {
-            out.failure = "cannot open state.db";
+            self.fail(out, "cannot open state.db");
             return;
         };
         defer state.close();
         var content = content_sqlite.SqliteContentStore.open(self.gpa, self.opts.content_path, self.opts.sync_off) catch {
-            out.failure = "cannot open content.db";
+            self.fail(out, "cannot open content.db");
             return;
         };
         defer content.close();
@@ -219,16 +218,16 @@ pub const Manager = struct {
             .tokenizer = self.opts.tokenizer,
             .sync = if (self.opts.sync_off) .off else .normal,
         }) catch |e| {
-            out.failure = if (e == error.TokenizerMismatch)
+            self.fail(out, if (e == error.TokenizerMismatch)
                 "the index was built with a different tokenizer; run `dksearch rebuild`"
             else
-                "cannot open index.db";
+                "cannot open index.db");
             return;
         };
         defer index.close();
 
         var inst = connectors.create(self.gpa, self.io, source) catch {
-            out.failure = "out of memory";
+            self.fail(out, "out of memory");
             return;
         };
         defer inst.deinit();
@@ -237,53 +236,44 @@ pub const Manager = struct {
             .now = now,
         });
         const r = runner.runImport(arena, &state, &pipe, inst.connector(), source.name, control, now) catch {
-            out.failure = "the run could not be recorded (storage problem)";
+            self.fail(out, "the run could not be recorded (storage problem)");
             return;
         };
         out.state = r.state;
         out.submitted = r.submitted;
         out.rejected = r.rejected;
-        out.failure = if (r.failure) |f| (arena.dupe(u8, f) catch null) else null;
-        // `failure` points into the arena, which dies here: copy now.
-        if (out.failure) |f| out.failure = self.gpa.dupe(u8, f) catch null;
+        if (r.failure) |f| out.failure = self.gpa.dupe(u8, f) catch null; // `f` lives in the arena
     }
 
-    fn record(self: *Manager, name: []const u8, control: *connector.Control, o: Outcome) void {
+    fn task(self: *Manager, source: config.Source, control: *connector.Control, lock: maintenance.WriterLock) Io.Cancelable!void {
+        var outcome: Outcome = .{ .state = .failed };
+        self.fail(&outcome, "internal error");
+        // `runOne` overwrites the placeholder; free it first.
+        if (outcome.failure) |f| self.gpa.free(f);
+        outcome.failure = null;
+        runOne(self, source, control, &outcome);
+        lock.release(self.io);
+        self.record(source.name, outcome);
+    }
+
+    fn record(self: *Manager, name: []const u8, o: Outcome) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.last) |old| self.freeFinished(old);
-        self.last = .{
-            .source = self.gpa.dupe(u8, name) catch "",
+        const owned_name = self.gpa.dupe(u8, name) catch null;
+        self.last = if (owned_name == null) null else .{
+            .source = owned_name.?,
             .state = o.state,
             .submitted = o.submitted,
             .rejected = o.rejected,
-            .failure = if (o.failure) |f| self.gpa.dupe(u8, f) catch null else null,
+            .failure = o.failure, // ownership moves here
             .finished_at = now(),
         };
-        // `runOne` may have allocated the failure text itself.
-        if (o.failure) |f| if (self.ownsFailure(f)) self.gpa.free(f);
         if (self.running) |r| {
             self.gpa.free(r.source);
             self.gpa.destroy(r.control);
         }
-        _ = control;
         self.running = null;
-    }
-
-    /// True for failure texts `runOne` allocated (static strings are not).
-    fn ownsFailure(self: *Manager, f: []const u8) bool {
-        _ = self;
-        const static = [_][]const u8{
-            "internal error",
-            "cannot open state.db",
-            "cannot open content.db",
-            "cannot open index.db",
-            "out of memory",
-            "the run could not be recorded (storage problem)",
-            "the index was built with a different tokenizer; run `dksearch rebuild`",
-        };
-        for (static) |s| if (s.ptr == f.ptr) return false;
-        return true;
     }
 };
 
