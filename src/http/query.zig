@@ -174,3 +174,21 @@ test "writeEncoded round-trips through decode" {
     try testing.expectEqualStrings("a%20b%26c%3Dd%2F%C3%A9%22%3C%3E", enc);
     try testing.expectEqualStrings("a b&c=d/é\"<>", try decode(ar.allocator(), enc));
 }
+
+test "random request targets never crash the parser" {
+    var prng = std.Random.DefaultPrng.init(0x91e7);
+    const rnd = prng.random();
+    const alphabet = "/?&=%+ab01AF\x00\x7f\xff\xc3\xa9 \t";
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for (0..4000) |_| {
+        _ = arena_state.reset(.retain_capacity);
+        var buf: [120]u8 = undefined;
+        const len = rnd.uintLessThan(usize, buf.len);
+        for (buf[0..len]) |*b| b.* = alphabet[rnd.uintLessThan(usize, alphabet.len)];
+        const t = parseTarget(arena_state.allocator(), buf[0..len]) catch continue;
+        // Whatever parsed must be valid UTF-8 and addressable.
+        try testing.expect(std.unicode.utf8ValidateSlice(t.path));
+        _ = t.params.get("q");
+    }
+}

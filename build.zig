@@ -87,8 +87,10 @@ pub fn build(b: *std.Build) void {
     const core_options = b.addOptions();
     core_options.addOption(bool, "wikipedia", want_wikipedia);
 
-    // The core library. It must stay independent of HTTP, the web UI and
-    // individual connectors (ai/AGENTS.md section 3).
+    // The core library: search, storage and ingestion, plus the bundled
+    // connectors behind the one connector interface. The search, storage and
+    // pipeline code does not depend on any connector, and nothing here
+    // depends on HTTP or the web UI (ai/AGENTS.md section 3).
     const core = b.addModule("dksearch", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,

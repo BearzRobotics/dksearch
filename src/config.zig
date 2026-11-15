@@ -809,3 +809,51 @@ test "index.tokenizer" {
     try testing.expectEqualStrings("index.tokenizer", d.key());
     try testing.expectError(error.UnknownKey, loadFromSlice(testing.allocator, "t.toml", "[index]\nstem = true", &d));
 }
+
+test "random mutations of a valid configuration never crash the loader" {
+    const base =
+        \\[server]
+        \\address = "127.0.0.1"
+        \\port = 8080
+        \\[admin]
+        \\port = 8081
+        \\actions = true
+        \\[storage]
+        \\data_dir = "data"
+        \\[index]
+        \\tokenizer = "porter"
+        \\[[source]]
+        \\name = "notes"
+        \\kind = "files"
+        \\path = "/tmp/x"
+    ;
+    var prng = std.Random.DefaultPrng.init(0x7041);
+    const rnd = prng.random();
+    const inserts = "=\"[]{},.#\n ab1";
+    var buf: [base.len + 8]u8 = undefined;
+    for (0..3000) |_| {
+        @memcpy(buf[0..base.len], base);
+        var len: usize = base.len;
+        for (0..1 + rnd.uintLessThan(usize, 5)) |_| {
+            switch (rnd.uintLessThan(u8, 3)) {
+                0 => buf[rnd.uintLessThan(usize, len)] = rnd.int(u8), // overwrite
+                1 => { // delete
+                    const at = rnd.uintLessThan(usize, len);
+                    std.mem.copyForwards(u8, buf[at .. len - 1], buf[at + 1 .. len]);
+                    len -= 1;
+                },
+                else => if (len < buf.len) { // insert
+                    const at = rnd.uintLessThan(usize, len);
+                    std.mem.copyBackwards(u8, buf[at + 1 .. len + 1], buf[at..len]);
+                    buf[at] = inserts[rnd.uintLessThan(usize, inserts.len)];
+                    len += 1;
+                },
+            }
+        }
+        var d: Diagnostic = .{};
+        if (loadFromSlice(testing.allocator, "fuzz.toml", buf[0..len], &d)) |c| {
+            var cfg = c;
+            cfg.deinit();
+        } else |_| {}
+    }
+}

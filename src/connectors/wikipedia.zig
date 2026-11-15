@@ -873,3 +873,56 @@ test "bzip2 decoder: boundaries are reported once per stream" {
     try testing.expectEqual(@as(u32, 3), boundaries);
     try testing.expectEqual(@as(u64, fx_bz2.len), last);
 }
+
+test "bzip2 decoder: corrupted and truncated copies of a real file never crash" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var prng = std.Random.DefaultPrng.init(0xb21b);
+    const rnd = prng.random();
+    var copy: [fx_bz2.len]u8 = undefined;
+    for (0..60) |round| {
+        @memcpy(&copy, fx_bz2);
+        var len: usize = copy.len;
+        if (round % 3 == 0) {
+            len = rnd.uintLessThan(usize, copy.len); // truncate
+        } else {
+            for (0..1 + rnd.uintLessThan(usize, 4)) |_| {
+                copy[rnd.uintLessThan(usize, copy.len)] ^= @as(u8, 1) << @as(u3, @intCast(rnd.uintLessThan(u8, 8)));
+            }
+        }
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "x.bz2", .data = copy[0..len] });
+        const file = try tmp.dir.openFile(testing.io, "x.bz2", .{});
+        defer file.close(testing.io);
+        var dec = try bz2.Decoder.init(testing.allocator, testing.io, file, 0);
+        defer dec.deinit();
+        var buf: [256]u8 = undefined;
+        var total: usize = 0;
+        while (true) {
+            const n = dec.read(&buf) catch break; // an error is the expected outcome for damage
+            if (n == 0) break;
+            total += n;
+            if (total > 100 * fx_xml.len) return error.TestUnexpectedResult; // output stays bounded
+        }
+    }
+}
+
+test "xml parser: random mutations of the fixture fail cleanly or parse" {
+    var prng = std.Random.DefaultPrng.init(0x4d71);
+    const rnd = prng.random();
+    var buf: [fx_xml.len]u8 = undefined;
+    for (0..40) |_| {
+        @memcpy(&buf, fx_xml);
+        for (0..1 + rnd.uintLessThan(usize, 6)) |_| buf[rnd.uintLessThan(usize, buf.len)] = rnd.int(u8);
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var e: E2e = undefined;
+        try e.init();
+        defer e.deinit();
+        var pb: [200]u8 = undefined;
+        const source = try dumpSource(&tmp, "m.xml", &buf, &pb, &.{});
+        defer testing.allocator.free(source.options);
+        const r = try importAll(&e, source);
+        // Either it parsed (some pages may be refused) or the job failed; never a crash.
+        try testing.expect(r.state == .completed or r.state == .failed);
+    }
+}

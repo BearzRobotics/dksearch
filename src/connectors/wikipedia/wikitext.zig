@@ -451,3 +451,26 @@ test "blank lines and spaces are tidied" {
     try expectConv("", "");
     try expectConv("{{only a template}}", "");
 }
+
+test "random markup soup: no crash, valid UTF-8, bounded output" {
+    var prng = std.Random.DefaultPrng.init(0x77e1);
+    const rnd = prng.random();
+    const pieces = [_][]const u8{
+        "[[",   "]]",      "{{",  "}}", "{|",          "|}",           "|",    "<ref>", "</ref>",    "<ref name=x/>", "<!--",    "-->",              "<",            ">",
+        "==",   "=",       "'''", "''", "*",           "#",            ":",    ";",     "&nbsp;",    "&#x41;",        "&#0;",    "&",                "[http://a b]", "[",
+        "]",    "__TOC__", "\n",  " ",  "caf\xc3\xa9", "\xe4\xb8\xad", "word", "File:", "Category:", "<math>",        "</math>", "== References ==", "<gallery>",    "</gallery>",
+        "----",
+    };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for (0..4000) |_| {
+        _ = arena_state.reset(.retain_capacity);
+        var src: std.ArrayList(u8) = .empty;
+        const n = rnd.uintLessThan(usize, 60);
+        for (0..n) |_| src.appendSlice(arena_state.allocator(), pieces[rnd.uintLessThan(usize, pieces.len)]) catch unreachable;
+        const out = try convert(arena_state.allocator(), src.items);
+        try testing.expect(std.unicode.utf8ValidateSlice(out));
+        try testing.expect(out.len <= src.items.len + 8);
+        try testing.expect(std.mem.indexOfScalar(u8, out, 0) == null);
+    }
+}

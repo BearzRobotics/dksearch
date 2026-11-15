@@ -217,3 +217,26 @@ test "fields without escapes point into the input" {
     try testing.expect(row[0].ptr == input.ptr);
     try testing.expect(row[1].ptr == input.ptr + 7);
 }
+
+test "random input never crashes the reader and respects its limits" {
+    var prng = std.Random.DefaultPrng.init(0xc5f1);
+    const rnd = prng.random();
+    const alphabet = "ab,\"\r\n \xef\xbb\xbf\x00";
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for (0..4000) |_| {
+        _ = arena_state.reset(.retain_capacity);
+        var buf: [160]u8 = undefined;
+        const len = rnd.uintLessThan(usize, buf.len);
+        for (buf[0..len]) |*b| b.* = alphabet[rnd.uintLessThan(usize, alphabet.len)];
+        var r = Reader.init(buf[0..len], .{ .max_field_bytes = 20, .max_fields = 6 });
+        var rows: usize = 0;
+        while (r.next(arena_state.allocator())) |maybe| {
+            const row = maybe orelse break;
+            try testing.expect(row.len >= 1 and row.len <= 6);
+            for (row) |f| try testing.expect(f.len <= 20);
+            rows += 1;
+            if (rows > len + 1) return error.TestUnexpectedResult; // must make progress
+        } else |_| {}
+    }
+}
