@@ -45,21 +45,25 @@ const exit_usage = 2;
 const exit_config = 3;
 const exit_io = 4;
 
-const usage =
-    \\usage: dksearch [-h | --help] [-V | --version]
-    \\       dksearch serve [--config FILE]
-    \\       dksearch import --config FILE (SOURCE | --all)
-    \\       dksearch import --config FILE (SOURCE | --all) [--prune]
-    \\       dksearch remove --config FILE SOURCE [--yes]
-    \\       dksearch rebuild [--config FILE]
-    \\       dksearch check [--config FILE]
-    \\       dksearch admin-token [--config FILE]
-    \\       dksearch admin-password [--config FILE]
-    \\       dksearch backup [--config FILE] DIR
-    \\       dksearch restore [--config FILE] [--no-index] DIR
-    \\       dksearch check-config FILE
-    \\
-;
+/// Shown (on standard error) when no command is given.
+const short_usage = "usage: dksearch COMMAND [options]\ntry: dksearch --help   (or: dksearch help start, dksearch help admin)\n";
+
+fn helpCmd(io: Io, topic: ?[]const u8) u8 {
+    var buf: [4096]u8 = undefined;
+    var w = Io.File.stdout().writerStreaming(io, &buf);
+    const t = topic orelse {
+        dk.help.writeOverview(&w.interface) catch return exit_io;
+        w.interface.flush() catch {};
+        return exit_ok;
+    };
+    const known = dk.help.writeTopic(&w.interface, t) catch return exit_io;
+    w.interface.flush() catch {};
+    if (!known) {
+        err(io, "no help for \"{s}\"; `dksearch help` lists the commands and topics", .{t});
+        return exit_usage;
+    }
+    return exit_ok;
+}
 
 fn out(io: Io, comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
@@ -88,13 +92,18 @@ fn run(init: std.process.Init) u8 {
     var args = init.minimal.args.iterate();
     _ = args.next(); // program name
     const first = args.next() orelse {
-        Io.File.stderr().writeStreamingAll(io, usage) catch {};
+        Io.File.stderr().writeStreamingAll(io, short_usage) catch {};
         return exit_usage;
     };
 
-    if (eq(first, "-h") or eq(first, "--help")) {
-        out(io, "{s}", .{usage});
-        return exit_ok;
+    if (eq(first, "-h") or eq(first, "--help")) return helpCmd(io, null);
+    if (eq(first, "help")) return helpCmd(io, args.next());
+    // `dksearch COMMAND --help` shows that command's help instead of running it.
+    if (dk.help.find(first) != null) {
+        var scan = init.minimal.args.iterate();
+        _ = scan.next();
+        _ = scan.next();
+        while (scan.next()) |a| if (eq(a, "-h") or eq(a, "--help")) return helpCmd(io, first);
     }
     if (eq(first, "-V") or eq(first, "--version")) {
         out(io, "dksearch {s}\n", .{build_options.version});
@@ -238,8 +247,35 @@ fn run(init: std.process.Init) u8 {
         return importCmd(io, gpa, config_path.?, source, all, prune);
     }
 
+    if (eq(first, "eval")) {
+        var config_path: ?[]const u8 = null;
+        var file: ?[]const u8 = null;
+        var k: u32 = 10;
+        var json = false;
+        while (args.next()) |a| {
+            if (eq(a, "--config")) {
+                config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+            } else if (std.mem.startsWith(u8, a, "--config=")) {
+                config_path = a["--config=".len..];
+            } else if (eq(a, "-k")) {
+                const v = args.next() orelse return usageError(io, "-k needs a number");
+                k = std.fmt.parseInt(u32, v, 10) catch return usageError(io, "-k needs a number from 1 to 100");
+            } else if (eq(a, "--json")) {
+                json = true;
+            } else if (std.mem.startsWith(u8, a, "-")) {
+                err(io, "unknown option for eval: {s}", .{a});
+                return exit_usage;
+            } else if (file == null) {
+                file = a;
+            } else {
+                return usageError(io, "too many arguments");
+            }
+        }
+        return evalCmd(io, gpa, config_path, file orelse return usageError(io, "eval needs a JUDGMENTS file"), k, json);
+    }
+
     err(io, "unknown command: {s}", .{first});
-    Io.File.stderr().writeStreamingAll(io, usage) catch {};
+    Io.File.stderr().writeStreamingAll(io, short_usage) catch {};
     return exit_usage;
 }
 
@@ -249,7 +285,7 @@ fn eq(a: []const u8, b: []const u8) bool {
 
 fn usageError(io: Io, msg: []const u8) u8 {
     err(io, "{s}", .{msg});
-    Io.File.stderr().writeStreamingAll(io, usage) catch {};
+    Io.File.stderr().writeStreamingAll(io, "try: dksearch help COMMAND (or dksearch --help)\n") catch {};
     return exit_usage;
 }
 
@@ -781,6 +817,56 @@ fn backupCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, dest_dir:
         out(io, "{s} -> {s}\n", .{ pair[0], pair[1] });
     }
     out(io, "backup complete and verified. index.db is not backed up: `dksearch rebuild` recreates it\n", .{});
+    return exit_ok;
+}
+
+fn evalCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, judgments_path: []const u8, k: u32, json: bool) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const paths = Paths.make(a, cfg.data_dir) catch return exit_io;
+
+    const text = Io.Dir.cwd().readFileAlloc(io, judgments_path, a, .limited(16 * 1024 * 1024)) catch |e| {
+        err(io, "cannot read {s}: {t}", .{ judgments_path, e });
+        return exit_io;
+    };
+    var jd: dk.evaluate.Diagnostic = .{};
+    const judgments = dk.evaluate.parseJudgments(a, text, &jd) catch |e| switch (e) {
+        error.OutOfMemory => {
+            err(io, "out of memory", .{});
+            return exit_io;
+        },
+        error.BadJudgments => {
+            if (jd.line > 0) {
+                err(io, "{s}:{d}: {s}", .{ judgments_path, jd.line, jd.message });
+            } else {
+                err(io, "{s}: {s}", .{ judgments_path, jd.message });
+            }
+            return exit_failure;
+        },
+    };
+
+    // Read-only use of the index, as `serve` does; evaluating never writes.
+    Io.Dir.cwd().access(io, paths.index, .{}) catch {
+        err(io, "{s} does not exist: import something first (or run `dksearch rebuild`)", .{paths.index});
+        return exit_io;
+    };
+    var index = openIndex(io, paths.index, cfg.tokenizer, false) orelse return exit_io;
+    defer index.close();
+    const report = dk.evaluate.evaluate(a, index.searcher(), judgments, k) catch |e| switch (e) {
+        error.InvalidK => return usageError(io, "-k must be from 1 to 100"),
+        error.OutOfMemory => {
+            err(io, "out of memory", .{});
+            return exit_io;
+        },
+    };
+    var buf: [4096]u8 = undefined;
+    var w = Io.File.stdout().writerStreaming(io, &buf);
+    (if (json) dk.evaluate.writeJson(&w.interface, report) else dk.evaluate.writeText(&w.interface, report)) catch return exit_io;
+    w.interface.flush() catch return exit_io;
     return exit_ok;
 }
 

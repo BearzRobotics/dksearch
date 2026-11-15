@@ -93,6 +93,20 @@ Arguments: DIR, the destination directory. Use a new directory for each backup.
 
 Examples: dksearch backup --config dksearch.toml /backups/dksearch-2026-11-14
 
+help
+Show help at the terminal: `dksearch --help` lists the commands and topics, `dksearch help COMMAND` (or `dksearch COMMAND --help`) explains one command, and the topics `dksearch help start`, `dksearch help config` and `dksearch help admin` give a first run, the shape of the configuration file and the steps to set up the administration interface.
+
+Usage: dksearch help [COMMAND | start | config | admin]
+
+eval
+Measure the ranking. JUDGMENTS is a text file with one JSON object per line, naming a query and the documents relevant to it, by URL or by document id: `{"query": "lighthouse keeper", "relevant": ["https://example.org/keeper"]}`, or with grades from 1 up, `{"query": "tides", "relevant": {"https://example.org/tides": 3, "https://example.org/moon": 1}}`. Blank lines and lines starting with `#` are skipped. Each query is run against the index as **serve** would run it, and the command prints, per query and as means, precision and recall in the first K hits, the reciprocal rank of the first relevant hit, and nDCG (with gain 2^grade-1), then lists judged documents that were outside the first K with their rank (searched to 100). A query the search cannot run (no searchable terms) is reported as failed and scores zero. Nothing is written. Use it to compare settings, such as the tokenizer, on judgments you trust; a handful of queries shows direction, not proof.
+
+Usage: dksearch eval [--config FILE] [-k N] [--json] JUDGMENTS
+
+Arguments: JUDGMENTS, the file described above. **-k** is the cutoff, 1-100, default 10. **--json** prints one JSON object instead of the table.
+
+Examples: dksearch eval --config dksearch.toml judgments.jsonl
+
 restore
 Recreate `state.db` and `content.db` in `data_dir` from a backup directory DIR made by **backup**, then rebuild the search index from them. The backup is checked first (SQLite integrity and every text against its record) and nothing is written if it is damaged. It never overwrites: if `state.db`, `content.db` or `index.db` already exists in `data_dir` it stops before writing anything, so move the old files away or point `data_dir` at an empty directory. Each file is written under a temporary name and renamed into place only once complete and verified, `content.db` first and `state.db` last, so a `state.db` in `data_dir` always belongs to a complete restore; an interrupted restore can simply be run again. It takes the same write lock as **import** and **rebuild**. Stop **serve** first if it uses the same `data_dir`. Restoring and then rebuilding 286,047 Simple English Wikipedia articles took 2 minutes 20 seconds, and the restored index returned identical results.
 

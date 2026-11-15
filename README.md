@@ -12,6 +12,10 @@ Needs Zig 0.17.1 and nothing else. All dependencies are vendored (SQLite, a TOML
     zig build test                       # all tests; they run offline
     zig build -Dwikipedia=false -Dfeeds=false -Dcrawler=false   # leave out those connectors and what they need
 
+## Help
+
+`dksearch --help` lists the commands; `dksearch help COMMAND` explains one; `dksearch help start`, `dksearch help config` and `dksearch help admin` cover a first run, the configuration file and the steps to set up the administration interface.
+
 ## Try it
 
 Index a directory of text and Markdown files and search it:
