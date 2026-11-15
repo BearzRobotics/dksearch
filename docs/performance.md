@@ -19,7 +19,7 @@ Stored sizes for the 20,000 articles (43.0 MB of text):
 |---|---|---|
 | `index.db` | 94.5 MB | 2.2 times the text: FTS5 with word positions |
 | `content.db` | 16.3 MB | text compressed to 0.27 of its size |
-| `state.db` | 25.8 MB | about 1.3 KB per document, mostly repeated rights text; a candidate for slimming |
+| `state.db` | 25.8 MB | about 1.3 KB per document in these measurements, mostly the same rights text repeated in every record; the Wikipedia rights note has since been shortened (about 0.4 KB less per record), and storing rights once per source remains a candidate |
 
 Search, 20,000 documents, per-query latency with one client (the single-connection and pooled servers are identical here):
 

@@ -473,7 +473,7 @@ const PageHandler = struct {
                 .license = "CC-BY-SA-4.0",
                 .license_url = "https://creativecommons.org/licenses/by-sa/4.0/",
                 .attribution = attribution,
-                .access_notes = "Text is available under the Creative Commons Attribution-ShareAlike license (and, for older contributions, the GNU Free Documentation License); see https://en.wikipedia.org/wiki/Wikipedia:Copyrights. Images and other media have their own licenses and are not included.",
+                .access_notes = "CC BY-SA and, for older text, GFDL; see https://en.wikipedia.org/wiki/Wikipedia:Copyrights. Media are not included.",
                 .redistribution = .allowed,
             },
         };
