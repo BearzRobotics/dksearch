@@ -29,6 +29,10 @@ SPEC milestone 4 needs an administration interface, separate from the public one
 9. **Access log, off by default.** `access_log = "stderr"` or a file path under `[server]` and `[admin]` writes one line per request: UTC time, method, route label, status, duration in milliseconds, response bytes. It never records query strings, request targets, client addresses, user agents, cookies or credentials; the route is a fixed label such as `/search`, not the URL. Rotation is the operator's (logrotate with copytruncate works: each line is appended at the file's current end). The two listeners cannot share one log file.
 10. **Not offered:** a full request log with queries and addresses. If relevance tuning later needs query data, that gets its own decision with a retention limit.
 
+## Addendum: query testing
+
+The interface also has a query-testing page (`/search`, and `/api/v1/admin/search`) that runs the public search and shows each result's ranking score with the tokenizer and field weights, for the SPEC's "search quality" area. It uses the same search service and adds no new access to data.
+
 ## Alternatives considered
 
 Username and password as the only method (login form, cookies, CSRF and a stored user for a single-administrator tool: more surface, and no script access); Unix socket only (no browser); client certificates (heavy to deploy). A token only (no browser login) was the other half of the maintainer's choice.

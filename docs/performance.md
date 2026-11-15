@@ -33,13 +33,13 @@ Search throughput against the number of concurrent clients:
 |---|---|---|
 | 1 | 57 queries/s | 60 queries/s |
 | 4 | 58 queries/s (p50 64 ms) | 228 queries/s (p50 15 ms) |
-| 16 | 57 queries/s (p50 210 ms, p99 1.1 s) | 265 queries/s (p50 45 ms, p99 265 ms) |
+| 16 | 57 queries/s (p50 210 ms, p99 1.1 s) | 306 queries/s (p50 51 ms, p99 104 ms) |
 
 The server process stayed under 35 MB resident with 20,000 documents indexed.
 
 ## What this found
 
-The first run showed throughput flat at about 57 queries/s however many clients there were: all searches shared one SQLite connection, which SQLite serialises. `serve` now searches on a pool of min(CPUs, 8) read-only connections (WAL mode allows concurrent readers), which restored scaling with unchanged per-query latency. Generating snippets was not the cost (tested: moving it out of the ranking query saved under 20%); scoring every matching document is, which is inherent to BM25 ranking over very common terms.
+The first run showed throughput flat at about 57 queries/s however many clients there were: all searches shared one SQLite connection, which SQLite serialises. `serve` now searches on a pool of min(CPUs, 8) read-only connections (WAL mode allows concurrent readers), which restored scaling with unchanged per-query latency (a first version that spun while waiting for a free connection was replaced by a semaphore wait after review, which also cut the 16-client tail latency). Generating snippets was not the cost (tested: moving it out of the ranking query saved under 20%); scoring every matching document is, which is inherent to BM25 ranking over very common terms.
 
 ## Extrapolation (a guess, not a measurement)
 

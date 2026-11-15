@@ -45,9 +45,13 @@ pub const Options = struct {
     cookie_secure: bool = false,
     public_stats: *const server.Stats,
     admin_stats: *const server.Stats,
+    /// Name of the index tokenizer, shown on the query-testing page.
+    tokenizer: []const u8 = "unicode61",
     /// Present only when actions are enabled (`admin.actions`): lets the
     /// interface start and cancel imports. Null means strictly read-only.
     jobs: ?*dk.jobs.Manager = null,
+    /// For the query-testing page; null hides it.
+    searcher: ?dk.search.Searcher = null,
 };
 
 const Session = struct {
@@ -108,7 +112,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/login", "/logout", "/actions/import", "/actions/cancel", "/assets/style.css", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -116,7 +120,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, login, logout, style, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, other };
+    const Route = enum { dashboard, jobs, login, logout, style, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -132,6 +136,8 @@ pub const App = struct {
             .{ "/actions/cancel", .action_cancel },
             .{ "/api/v1/admin/imports", .api_imports },
             .{ "/api/v1/admin/imports/cancel", .api_imports_cancel },
+            .{ "/search", .search_test },
+            .{ "/api/v1/admin/search", .api_search },
         };
         for (table) |t| if (std.mem.eql(u8, path, t[0])) return t[1];
         return .other;
@@ -193,9 +199,51 @@ pub const App = struct {
             .api_imports => if (req.method == .POST) self.startImport(arena, req, auth, true) else self.apiImports(arena),
             .action_import => self.startImport(arena, req, auth, false),
             .api_imports_cancel => self.cancelImport(arena, req, auth, true),
+            .search_test => self.pageSearchTest(arena, csrf, t.params),
+            .api_search => self.apiSearchTest(arena, t.params),
             .action_cancel => self.cancelImport(arena, req, auth, false),
             else => unreachable,
         };
+    }
+
+    // ------------------------------------------------------- query testing
+
+    const test_limit: u32 = 20;
+
+    fn testQuery(params: query.Params) dk.search.Query {
+        var q: dk.search.Query = .{ .text = params.get("q") orelse "", .limit = test_limit };
+        if (params.get("connector")) |v| if (v.len > 0 and v.len <= 64) {
+            q.connector = v;
+        };
+        if (params.get("language")) |v| if (v.len > 0 and v.len <= 64) {
+            q.language = v;
+        };
+        return q;
+    }
+
+    fn apiSearchTest(self: *App, arena: Allocator, params: query.Params) error{OutOfMemory}!Response {
+        const searcher = self.opts.searcher orelse return handler.apiError(arena, .not_found, "not_found", "searching is not available here");
+        const page = searcher.search(arena, testQuery(params)) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.EmptyQuery => handler.apiError(arena, .bad_request, "empty_query", "the query has no searchable terms"),
+            error.InvalidQuery => handler.apiError(arena, .bad_request, "invalid_query", "the query is out of range"),
+            error.Io => handler.apiError(arena, .internal_server_error, "internal_error", "the search failed"),
+        };
+        const Hit = struct { id: []const u8, connector: []const u8, url: ?[]const u8, title: ?[]const u8, snippet: ?[]const u8, score: f64 };
+        const hits = try arena.alloc(Hit, page.hits.len);
+        for (page.hits, hits) |h, *o| o.* = .{ .id = try arena.dupe(u8, &std.fmt.bytesToHex(h.id, .lower)), .connector = h.connector, .url = h.url, .title = h.title, .snippet = h.snippet, .score = h.score };
+        return handler.jsonResponse(arena, .ok, .{ .tokenizer = self.opts.tokenizer, .title_weight = 10, .body_weight = 1, .hits = hits, .has_more = page.has_more });
+    }
+
+    fn pageSearchTest(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
+        const searcher = self.opts.searcher orelse return handler.htmlError(arena, .not_found, "Not found", "Searching is not available here.");
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        const q = testQuery(params);
+        writePage(w, "Search test", csrf, "search") catch return error.OutOfMemory;
+        writeSearchTest(self, arena, w, searcher, q) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
     }
 
     // ------------------------------------------------------------- actions
@@ -703,7 +751,7 @@ fn writePage(w: *Io.Writer, title: []const u8, csrf: ?[]const u8, current: []con
     var tbuf: [96]u8 = undefined;
     try html.writeHead(w, std.fmt.bufPrint(&tbuf, "{s} - dksearch administration", .{title}) catch title);
     try w.writeAll("<body class=\"admin\"><main><header class=\"adminbar\"><span class=\"brand\">dksearch administration</span><nav>");
-    for ([_]struct { []const u8, []const u8, []const u8 }{ .{ "dashboard", "/", "Dashboard" }, .{ "jobs", "/jobs", "Jobs" } }) |n| {
+    for ([_]struct { []const u8, []const u8, []const u8 }{ .{ "dashboard", "/", "Dashboard" }, .{ "jobs", "/jobs", "Jobs" }, .{ "search", "/search", "Search test" } }) |n| {
         try w.print("<a href=\"{s}\"{s}>{s}</a> ", .{ n[1], if (std.mem.eql(u8, n[0], current)) " aria-current=\"page\"" else "", n[2] });
     }
     try w.writeAll("</nav>");
@@ -713,6 +761,47 @@ fn writePage(w: *Io.Writer, title: []const u8, csrf: ?[]const u8, current: []con
         try w.writeAll("\"><button type=\"submit\">Sign out</button></form>");
     }
     try w.print("</header><h1>{s}</h1>\n", .{title});
+}
+
+fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.search.Searcher, q: dk.search.Query) !void {
+    try w.writeAll("<form class=\"search\" action=\"/search\" method=\"get\"><input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Query\" autofocus value=\"");
+    try html.writeEscaped(w, q.text);
+    try w.writeAll("\"><button type=\"submit\">Run query</button></form>\n");
+    try w.print("<p class=\"muted\">Runs the same search as the public page and shows the ranking score of each result (higher is better; a match in the title counts ten times a match in the text; tokenizer: {s}). Terms are ANDed, text in double quotes is a phrase, and no query syntax is interpreted.</p>\n", .{app.opts.tokenizer});
+    if (q.text.len == 0) return;
+    const page = searcher.search(arena, q) catch |e| {
+        try w.writeAll("<p class=\"error\" role=\"alert\">");
+        try html.writeEscaped(w, switch (e) {
+            error.EmptyQuery => "The query has no searchable terms.",
+            error.InvalidQuery => "The query is not valid (too long or too many terms).",
+            else => "The search failed; see the server's error output.",
+        });
+        try w.writeAll("</p>\n");
+        return;
+    };
+    if (page.hits.len == 0) return w.writeAll("<p>No results.</p>\n");
+    try w.print("<p class=\"muted\">{d} result(s){s}.</p>\n", .{ page.hits.len, if (page.has_more) ", more exist" else "" });
+    try w.writeAll("<table><thead><tr><th>#</th><th>Score</th><th>Title</th><th>Source</th><th>Id</th></tr></thead><tbody>\n");
+    for (page.hits, 1..) |h, i| {
+        try w.print("<tr><td>{d}</td><td>{d:.4}</td><td>", .{ i, h.score });
+        const title = h.title orelse "(untitled)";
+        if (h.url) |u| if (html.isLinkable(u)) {
+            try w.writeAll("<a href=\"");
+            try html.writeEscaped(w, u);
+            try w.writeAll("\" rel=\"noreferrer\">");
+            try html.writeEscaped(w, title);
+            try w.writeAll("</a>");
+        } else try html.writeEscaped(w, title) else try html.writeEscaped(w, title);
+        try w.writeAll("</td><td>");
+        try html.writeEscaped(w, h.connector);
+        try w.print("</td><td><code>{x}</code></td></tr>\n", .{h.id});
+        if (h.snippet) |sn| {
+            try w.writeAll("<tr><td></td><td colspan=\"4\" class=\"muted\">");
+            try html.writeSnippet(w, sn);
+            try w.writeAll("</td></tr>\n");
+        }
+    }
+    try w.writeAll("</tbody></table>\n");
 }
 
 /// "2026-11-14 10:20:30 UTC".
@@ -1468,4 +1557,78 @@ test "a form post with the session's token starts an import; a busy data directo
     const c = try f.call(a, .POST, "/api/v1/admin/imports/cancel", .{ .auth = try f.bearer(a) });
     try testing.expectEqual(http.Status.ok, c.status);
     try testing.expect(std.mem.indexOf(u8, c.body, "\"cancelling\":false") != null);
+}
+
+const FakeSearcher = struct {
+    result: dk.search.Error!dk.search.Page,
+    last_text: []const u8 = "",
+
+    fn search(ptr: *anyopaque, _: Allocator, q: dk.search.Query) dk.search.Error!dk.search.Page {
+        const self: *FakeSearcher = @ptrCast(@alignCast(ptr));
+        self.last_text = q.text;
+        return self.result;
+    }
+    fn searcher(self: *FakeSearcher) dk.search.Searcher {
+        return .{ .ptr = self, .vtable = &.{ .search = search } };
+    }
+};
+
+test "query testing page and API show scores, escape everything, and need sign-in" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const hits = [_]dk.search.Hit{
+        .{ .id = @splat(0xab), .connector = "wiki<i>", .url = "https://e.org/?a=1&b=2", .title = "T <b>1</b>", .snippet = "x \x02hit\x03 <y>", .score = 12.5 },
+        .{ .id = @splat(0x01), .connector = "c", .url = "javascript:alert(1)", .title = null, .snippet = null, .score = 0.25 },
+    };
+    var fake: FakeSearcher = .{ .result = .{ .hits = &hits, .has_more = true } };
+    f.app.opts.searcher = fake.searcher();
+    f.app.opts.tokenizer = "porter";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Signed out: refused.
+    try testing.expectEqual(http.Status.see_other, (try f.call(a, .GET, "/search?q=x", .{})).status);
+    try testing.expectEqual(http.Status.unauthorized, (try f.call(a, .GET, "/api/v1/admin/search?q=x", .{})).status);
+
+    const cookie = try f.signIn(a);
+    const page = try f.call(a, .GET, "/search?q=lamp%20%3Cscript%3E", .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.ok, page.status);
+    try testing.expectEqualStrings("lamp <script>", fake.last_text);
+    try testing.expect(std.mem.indexOf(u8, page.body, "12.5000") != null); // the score
+    try testing.expect(std.mem.indexOf(u8, page.body, "T &lt;b&gt;1&lt;/b&gt;") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "wiki&lt;i&gt;") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "href=\"https://e.org/?a=1&amp;b=2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "href=\"javascript:") == null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "<mark>hit</mark> &lt;y&gt;") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "(untitled)") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "tokenizer: porter") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "value=\"lamp &lt;script&gt;\"") != null); // the box keeps the text, escaped
+    try testing.expect(std.mem.indexOf(u8, page.body, "<script") == null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "abababababababababababababababab") != null);
+
+    // An empty box just shows the form; a failing search says so without details.
+    const empty = try f.call(a, .GET, "/search", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, empty.body, "Run query") != null);
+    try testing.expect(std.mem.indexOf(u8, empty.body, "<table>") == null);
+    fake.result = error.Io;
+    const failed = try f.call(a, .GET, "/search?q=x", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, failed.body, "search failed") != null);
+    fake.result = error.EmptyQuery;
+    try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/search?q=%21%21", .{ .cookie = cookie })).body, "no searchable terms") != null);
+
+    // API: JSON with scores and the weights.
+    fake.result = .{ .hits = &hits, .has_more = false };
+    const api = try f.call(a, .GET, "/api/v1/admin/search?q=lamp", .{ .auth = try f.bearer(a) });
+    try testing.expectEqual(http.Status.ok, api.status);
+    try testing.expect(std.mem.indexOf(u8, api.body, "\"score\":12.5") != null);
+    try testing.expect(std.mem.indexOf(u8, api.body, "\"title_weight\":10") != null);
+    try testing.expect(std.mem.indexOf(u8, api.body, "\"tokenizer\":\"porter\"") != null);
+    fake.result = error.InvalidQuery;
+    try testing.expectEqual(http.Status.bad_request, (try f.call(a, .GET, "/api/v1/admin/search?q=x", .{ .auth = try f.bearer(a) })).status);
+
+    // Without a searcher the page is absent.
+    f.app.opts.searcher = null;
+    try testing.expectEqual(http.Status.not_found, (try f.call(a, .GET, "/search?q=x", .{ .cookie = cookie })).status);
 }

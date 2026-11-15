@@ -579,6 +579,8 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         }
         admin_app = dkhttp.admin.App.init(gpa, io, .{
             .jobs = if (job_manager_ready) &job_manager else null,
+            .searcher = searcher,
+            .tokenizer = @tagName(cfg.tokenizer),
             .index_path = paths.index,
             .state_path = paths.state,
             .content_path = paths.content,
