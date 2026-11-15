@@ -70,7 +70,7 @@ const Converter = struct {
                         }
                         self.no_template_close = true;
                     } else if (std.mem.startsWith(u8, src[i..], "{|") and !self.no_table_close) {
-                        if (findClose(src, i + 2, "{|", "|}")) |end| {
+                        if (findTableClose(src, i + 2)) |end| {
                             i = end + 2;
                             continue;
                         }
@@ -205,7 +205,8 @@ const Converter = struct {
             if (std.mem.indexOfScalar(u8, shown, '#')) |h| if (h > 0) {
                 shown = shown[0..h];
             };
-            try self.out.appendSlice(self.arena, shown);
+            // Through `run` so entities such as &nbsp; in the target are decoded.
+            if (depth < max_depth) try self.run(shown, depth + 1, true) else try self.out.appendSlice(self.arena, shown);
         } else if (depth < max_depth) {
             try self.run(label, depth + 1, true);
         }
@@ -283,6 +284,29 @@ fn findClose(s: []const u8, start: usize, open: []const u8, close: []const u8) ?
     return null;
 }
 
+/// Index of the `|}` that closes the table opened just before `start`.
+/// Like MediaWiki, only `{|` and `|}` at the start of a line count, so a
+/// template argument list ending in `|}}` inside a table does not close it;
+/// templates inside a table are skipped as a whole.
+fn findTableClose(s: []const u8, start: usize) ?usize {
+    var depth: usize = 1;
+    var i = start;
+    // Move to the start of the next line.
+    while (i < s.len) {
+        const nl = std.mem.indexOfScalarPos(u8, s, i, '\n') orelse return null;
+        i = nl + 1;
+        var j = i;
+        while (j < s.len and (s[j] == ' ' or s[j] == '\t')) j += 1;
+        if (std.mem.startsWith(u8, s[j..], "|}")) {
+            depth -= 1;
+            if (depth == 0) return j;
+        } else if (std.mem.startsWith(u8, s[j..], "{|")) {
+            depth += 1;
+        }
+    }
+    return null;
+}
+
 /// Index just after `</name>` (case-insensitive), searching from `from`.
 fn findEndTag(s: []const u8, from: usize, name: []const u8) ?usize {
     var i = from;
@@ -351,6 +375,15 @@ test "templates, tables, comments and refs are removed" {
     try expectConv("a<!-- hidden\nmulti-line -->b", "ab");
     try expectConv("Fact.<ref name=a>Source {{cite}}</ref> More.<ref name=b/> End.", "Fact. More. End.");
     try expectConv("x<math>a^2+b^2</math>y<gallery>\nFile:a.jpg\n</gallery>z", "xyz");
+}
+
+test "bare link targets decode entities; tables ignore |} inside templates" {
+    try expectConv("[[Pope Leo&nbsp;III]] crowned him.", "Pope Leo III crowned him.");
+    // From a real article: a family-tree template ends in `|}}` inside a table.
+    try expectConv("Before\n{|\n{{tree chart | | |F|~|J|}}\n{{tree chart/end}}\n|}\nAfter [[x]]", "Before\n\nAfter x");
+    // Nested tables, and a table with no close stays plain text.
+    try expectConv("a\n{|\n| x\n{|\n| y\n|}\n|}\nb", "a\n\nb");
+    try expectConv("a\n{|\n| never closed", "a\n{|\n| never closed");
 }
 
 test "formatting marks are removed, text is kept" {

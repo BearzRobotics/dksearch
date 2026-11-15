@@ -20,7 +20,9 @@ ADR 0007 settled the plan: vendor libbz2 and Expat for this connector only, read
 
 ## Measured and not measured
 
-Measured on a synthetic 1500-page multistream dump (not real Wikipedia): 1.8 s of CPU for the whole import, search correct on the converted text, `check` clean. Wall time there was dominated by this machine's slow fsync (6 minutes for 15 batches). Not measured: a real dump (tens of GB), memory at that scale, and conversion quality on real wikitext.
+Measured on a synthetic 1500-page multistream dump (not real Wikipedia): 1.8 s of CPU for the whole import, search correct on the converted text, `check` clean. Wall time there was dominated by this machine's slow fsync (6 minutes for 15 batches). Also tried on real wikitext: ten real English articles (Lighthouse, Rhubarb, Alan Turing, Roman Empire and others, 600 KB of XML) fetched through Special:Export, which uses the dump's format, and kept outside the repository. This found two converter bugs, both fixed with tests: a bare link target kept `&nbsp;` undecoded, and a template ending in `|}}` inside a table closed the table early (MediaWiki only honours `{|` and `|}` at the start of a line). After the fixes, none of the ten converted texts contained any template, link, table, tag or entity residue, and the prose read cleanly. Ten articles are a spot check, not a quality measurement.
+
+Not measured: a real dump (tens of GB), memory at that scale, and conversion quality on real wikitext.
 
 ## Not done
 
