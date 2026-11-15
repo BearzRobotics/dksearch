@@ -43,14 +43,40 @@ pub const Sync = enum {
     off,
 };
 
+/// How text is split into terms and normalised (docs/decisions/0013).
+/// Both fold case and remove diacritics. `porter` also reduces English words
+/// to their stems, so "running" matches "run"; it suits English text only.
+pub const Tokenizer = enum {
+    unicode61,
+    porter,
+
+    fn sql(self: Tokenizer) []const u8 {
+        return switch (self) {
+            .unicode61 => "unicode61 remove_diacritics 2",
+            .porter => "porter unicode61 remove_diacritics 2",
+        };
+    }
+};
+
 pub const OpenOptions = struct {
     sync: Sync = .normal,
+    /// Null keeps an existing index's tokenizer (and uses `unicode61` for a
+    /// new one). A value must match the existing index, else
+    /// `error.TokenizerMismatch` (unless `retokenize`).
+    tokenizer: ?Tokenizer = null,
+    /// Allow an existing index built with another tokenizer to be emptied and
+    /// recreated with this one. Only `rebuild` sets this: the index is
+    /// derived data, and it is refilled right after.
+    retokenize: bool = false,
 };
 
 pub const OpenError = idx_api.Error || error{
     /// The file was written by an incompatible schema version. Delete it and
     /// rebuild.
     SchemaMismatch,
+    /// The index was built with another tokenizer than the configuration
+    /// asks for. Run `dksearch rebuild` to recreate it.
+    TokenizerMismatch,
 };
 
 const Stmt = sqlite.Stmt;
@@ -104,6 +130,18 @@ pub const SqliteIndex = struct {
         });
         const v = try self.userVersion();
         if (v != 0 and v != schema_version) return error.SchemaMismatch;
+        var tokenizer: Tokenizer = options.tokenizer orelse .unicode61;
+        if (v != 0) {
+            const have = (try self.existingTokenizer()) orelse tokenizer;
+            if (options.tokenizer) |want| {
+                if (have != want) {
+                    if (!options.retokenize) return error.TokenizerMismatch;
+                    try self.exec("DROP TABLE fts; DROP TABLE docs;");
+                }
+            } else tokenizer = have; // keep what the index has
+        }
+        const create = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(title, body, tokenize = '{s}');", .{tokenizer.sql()}, 0);
+        defer std.heap.page_allocator.free(create);
         try self.exec(
             \\CREATE TABLE IF NOT EXISTS docs(
             \\  rowid        INTEGER PRIMARY KEY,
@@ -115,13 +153,20 @@ pub const SqliteIndex = struct {
             \\  content_type TEXT,
             \\  published_at INTEGER
             \\);
-            \\CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
-            \\  title, body, tokenize = 'unicode61 remove_diacritics 2'
-            \\);
             \\CREATE INDEX IF NOT EXISTS docs_language ON docs(language);
             \\CREATE INDEX IF NOT EXISTS docs_connector ON docs(connector);
         );
+        try self.exec(create);
         if (v == 0) try self.exec("PRAGMA user_version = 1");
+    }
+
+    /// The tokenizer the existing `fts` table was created with, if any.
+    fn existingTokenizer(self: SqliteIndex) idx_api.Error!?Tokenizer {
+        const st = try Stmt.prepare(self.db, "SELECT sql FROM sqlite_master WHERE name = 'fts'");
+        defer st.deinit();
+        if (!try st.step()) return null;
+        const text = st.colText(0) orelse return null;
+        return if (std.mem.indexOf(u8, text, "porter") != null) .porter else .unicode61;
     }
 
     pub fn indexer(self: *SqliteIndex) idx_api.Indexer {
@@ -594,4 +639,61 @@ test "non-database file is reported as corrupt, not crashed on" {
     var pbuf: [256]u8 = undefined;
     const path = try std.mem.printSentinel(&pbuf, ".zig-cache/tmp/{s}/junk.db", .{tmp.sub_path}, 0);
     try testing.expectError(error.Corrupt, SqliteIndex.open(path, .{ .sync = .off }));
+}
+
+test "porter tokenizer: stems English words; the default does not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]Tokenizer{ .unicode61, .porter }) |tk| {
+        var idx = try SqliteIndex.open(":memory:", .{ .tokenizer = tk });
+        defer idx.close();
+        try idx.indexer().add(doc.idFromSource("t", "1"), .{ .connector = "t", .source_id = "1", .title = "Gardening", .text = "The keeper was running along the shores and watching lighthouses." });
+        const run = try idx.searcher().search(a, .{ .text = "run" });
+        const lighthouse = try idx.searcher().search(a, .{ .text = "lighthouse" });
+        const watched = try idx.searcher().search(a, .{ .text = "watched" });
+        const exact = try idx.searcher().search(a, .{ .text = "running" });
+        try testing.expectEqual(@as(usize, 1), exact.hits.len);
+        if (tk == .porter) {
+            try testing.expectEqual(@as(usize, 1), run.hits.len);
+            try testing.expectEqual(@as(usize, 1), lighthouse.hits.len);
+            try testing.expectEqual(@as(usize, 1), watched.hits.len);
+        } else {
+            try testing.expectEqual(@as(usize, 0), run.hits.len);
+            try testing.expectEqual(@as(usize, 0), lighthouse.hits.len);
+            try testing.expectEqual(@as(usize, 0), watched.hits.len);
+        }
+    }
+}
+
+test "an index keeps its tokenizer; a different one is refused unless retokenizing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [200:0]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pb, ".zig-cache/tmp/{s}/i.db", .{tmp.sub_path}, 0);
+    {
+        var idx = try SqliteIndex.open(path, .{ .tokenizer = .porter, .sync = .off });
+        defer idx.close();
+        try idx.indexer().add(doc.idFromSource("t", "1"), .{ .connector = "t", .source_id = "1", .text = "running" });
+    }
+    try testing.expectError(error.TokenizerMismatch, SqliteIndex.open(path, .{ .tokenizer = .unicode61, .sync = .off }));
+    {
+        // Without an opinion, the existing tokenizer is kept.
+        var idx = try SqliteIndex.open(path, .{ .sync = .off });
+        defer idx.close();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        try testing.expectEqual(@as(usize, 1), (try idx.searcher().search(arena.allocator(), .{ .text = "run" })).hits.len);
+    }
+    {
+        // Retokenizing empties the index; the caller refills it.
+        var idx = try SqliteIndex.open(path, .{ .tokenizer = .unicode61, .retokenize = true, .sync = .off });
+        defer idx.close();
+        try testing.expectEqual(@as(u64, 0), try idx.count());
+        try idx.indexer().add(doc.idFromSource("t", "1"), .{ .connector = "t", .source_id = "1", .text = "running" });
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        try testing.expectEqual(@as(usize, 0), (try idx.searcher().search(arena.allocator(), .{ .text = "run" })).hits.len);
+    }
+    try testing.expectError(error.TokenizerMismatch, SqliteIndex.open(path, .{ .tokenizer = .porter, .sync = .off }));
 }

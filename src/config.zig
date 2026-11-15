@@ -101,6 +101,10 @@ pub const Listener = struct {
     access_log: ?[]const u8 = null,
 };
 
+/// `unicode61` folds case and diacritics; `porter` also stems English words
+/// ("running" matches "run"). Changing it needs `dksearch rebuild`.
+pub const Tokenizer = enum { unicode61, porter };
+
 /// Settings that exist only on the administration listener.
 pub const AdminOptions = struct {
     /// Where the credential hashes live; null means `data_dir/admin-secrets.toml`.
@@ -190,6 +194,8 @@ pub const Config = struct {
     /// Administration interface; separate listener from `server`.
     admin: Listener,
     admin_options: AdminOptions = .{},
+    /// How the search index splits and normalises text (docs/decisions/0013).
+    tokenizer: Tokenizer = .unicode61,
     /// True if the file has an `[admin]` table: the administration interface
     /// is then served (and needs credentials, see docs/decisions/0012).
     admin_configured: bool,
@@ -213,7 +219,8 @@ const server_keys = [_][]const u8{
 };
 const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure" };
 const storage_keys = [_][]const u8{"data_dir"};
-const top_keys = [_][]const u8{ "server", "admin", "storage", "source" };
+const index_keys = [_][]const u8{"tokenizer"};
+const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "source" };
 
 /// Parses and validates configuration text. `source_name` is only used in
 /// diagnostics (normally the file path).
@@ -287,6 +294,16 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
                 return error.InvalidValue;
             }
             cfg.data_dir = try a.dupe(u8, s);
+        }
+    }
+
+    if (try subTable(src, root, "index", diag)) |t| {
+        try checkKeys(src, "index", t, &index_keys, diag);
+        if (try str(src, "index", t, "tokenizer", diag)) |s| {
+            cfg.tokenizer = std.meta.stringToEnum(Tokenizer, s) orelse {
+                diag.set(src, "index.tokenizer", "must be \"unicode61\" or \"porter\", got \"{s}\"", .{s});
+                return error.InvalidValue;
+            };
         }
     }
 
@@ -763,4 +780,17 @@ test "admin and access log settings" {
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[admin]\nsession_max_hours = 1000", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[server]\naccess_log = \"\"", &d));
     try testing.expectError(error.WrongType, loadFromSlice(testing.allocator, "t.toml", "[admin]\ncookie_secure = \"yes\"", &d));
+}
+
+test "index.tokenizer" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "", &d);
+    defer c.deinit();
+    try testing.expectEqual(Tokenizer.unicode61, c.tokenizer);
+    var p = try loadFromSlice(testing.allocator, "t.toml", "[index]\ntokenizer = \"porter\"", &d);
+    defer p.deinit();
+    try testing.expectEqual(Tokenizer.porter, p.tokenizer);
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[index]\ntokenizer = \"stemmer\"", &d));
+    try testing.expectEqualStrings("index.tokenizer", d.key());
+    try testing.expectError(error.UnknownKey, loadFromSlice(testing.allocator, "t.toml", "[index]\nstem = true", &d));
 }

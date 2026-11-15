@@ -69,7 +69,7 @@ Arguments: SOURCE, the name the documents were imported under. **--config** is r
 Examples: dksearch remove --config dksearch.toml old-notes --yes
 
 rebuild
-Delete the search index and rebuild it from the retained content and document records, without reading any source. Use it after deleting or losing `index.db`, or after a version change. Documents whose text was not retained (`retain_text = false`) cannot be rebuilt and are reported as skipped. It is safe to run again if interrupted. Searches made while it runs see a partial index, so stop **serve** first if that matters.
+Delete the search index and rebuild it from the retained content and document records, without reading any source. Use it after deleting or losing `index.db`, after a version change, or after changing `index.tokenizer` (rebuild is the one command that recreates the index with a new tokenizer). Documents whose text was not retained (`retain_text = false`) cannot be rebuilt and are reported as skipped. It is safe to run again if interrupted. Searches made while it runs see a partial index, so stop **serve** first if that matters.
 
 Usage: dksearch rebuild [--config FILE]
 
@@ -206,6 +206,7 @@ admin.secrets_file	String	`data_dir`/admin-secrets.toml	File holding the credent
 admin.session_idle_minutes	Integer	30	A sign-in session ends after this much inactivity, 1-1440.
 admin.session_max_hours	Integer	8	A sign-in session ends this long after it began, however active, 1-168.
 admin.cookie_secure	Boolean	false	Add `Secure` to the session cookie. Set it when a reverse proxy serves the interface over HTTPS.
+index.tokenizer	String	`unicode61`	How text is split and normalised: `unicode61` (case and diacritics folded) or `porter` (the same, plus English stemming, so "running" matches "run"). The index keeps the tokenizer it was built with; after changing this setting **serve** and **import** refuse the old index until **rebuild** recreates it.
 storage.data_dir	String	data	Directory for the index and other state. Must not be empty.
 source	Array of tables	none	Optional. Each `[[source]]` defines one connector instance; see Sources below.
 
@@ -394,7 +395,7 @@ Stability guarantees
 The `/api/v1/` API is intended to be stable within version 1 (see dksearch-api(7)). The command-line syntax, configuration keys and diagnostics text are experimental at version 0.
 
 LIMITATIONS
-Three connectors are bundled (`files`, `gutenberg` and `wikipedia`). The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. The administration interface is read-only: it cannot start or cancel imports, run **check**, or edit configuration. No TLS. No reload or request log. Only the `unicode61` tokenizer is used, so languages without word separators (such as Chinese or Japanese) are not segmented well. Index size and query time at large scale have not been measured.
+Three connectors are bundled (`files`, `gutenberg` and `wikipedia`). The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. The administration interface is read-only: it cannot start or cancel imports, run **check**, or edit configuration. No TLS. No reload or request log. Only two tokenizers exist: `unicode61` and `porter` (English stemming). Languages without word separators (such as Chinese or Japanese) are not segmented well, and stemming is English only. Index size and query time at large scale have not been measured.
 
 BUGS
 No issue tracker is published yet. When one exists it will be listed under AVAILABILITY. Include the dksearch version, the configuration file, the full diagnostic output and the request that failed.
