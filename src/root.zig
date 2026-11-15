@@ -40,5 +40,7 @@ test {
     _ = jobs;
     if (connectors.have_wikipedia) _ = connectors.wikipedia;
     if (connectors.have_feeds) _ = connectors.feeds;
+    _ = @import("htmltext.zig");
+    if (connectors.have_crawler) _ = connectors.crawl;
     _ = @import("sqlite.zig");
 }

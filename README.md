@@ -6,11 +6,11 @@ Status: version 0.0.0, pre-release. It works end to end and is tested (over 220 
 
 ## Build
 
-Needs Zig 0.17.1 and nothing else. All dependencies are vendored (SQLite, a TOML parser, and for the Wikipedia and feeds connectors Expat and, for Wikipedia, bzip2).
+Needs Zig 0.17.1 and nothing else. All dependencies are vendored (SQLite, a TOML parser, the Mozilla CA certificates, and for the Wikipedia and feeds connectors Expat and, for Wikipedia, bzip2). The web crawler uses Zig's own HTTP and TLS client.
 
     zig build -Doptimize=ReleaseSafe     # binary: zig-out/bin/dksearch
     zig build test                       # all tests; they run offline
-    zig build -Dwikipedia=false -Dfeeds=false   # leave out those connectors and the C libraries they need
+    zig build -Dwikipedia=false -Dfeeds=false -Dcrawler=false   # leave out those connectors and what they need
 
 ## Try it
 

@@ -37,3 +37,10 @@ tokenizer = "unicode61"
 #kind = "wikipedia"
 #dump = "/srv/datasets/enwiki-latest-pages-articles-multistream.xml.bz2"
 #dataset_version = "latest"
+#
+#[[source]]
+#name = "web"
+#kind = "crawl"
+#user_agent = "mysearch/1.0 (+https://example.org/about)"   # required; say who you are
+#seeds_file = "/etc/dksearch/seeds.txt"                      # one URL per line
+#delay_ms = 1000

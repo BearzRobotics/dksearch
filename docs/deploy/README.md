@@ -40,6 +40,25 @@ The `feeds` connector reads feed files from disk; it does not fetch them. A simp
 
 Fetching is your policy to set: pick a polite interval, identify yourself in the `User-Agent` only if you are comfortable doing so, and respect each site's terms. The connector indexes whatever is in the directory, so remove a file to stop indexing a feed (and `dksearch import --prune news` to drop entries whose files are gone).
 
+## Crawling
+
+The `crawl` connector fetches the URLs in a seeds file. It is polite by default (robots.txt, one request per second per host, your own user agent) but it is your crawler: set a `user_agent` with a way for site owners to reach you, keep `delay_ms` generous, and respect each site's terms.
+
+    [[source]]
+    name = "web"
+    kind = "crawl"
+    user_agent = "mysearch/1.0 (+https://example.org/about)"
+    seeds_file = "/etc/dksearch/seeds.txt"
+
+The import unit template denies all network access (`PrivateNetwork=yes`), which suits the other connectors. Give a crawl source its own instance with a drop-in that allows the network:
+
+    sudo systemctl edit dksearch-import@web.service
+    # [Service]
+    # PrivateNetwork=no
+    # RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+HTTPS verifies against the Mozilla roots embedded in the program, so no certificate store is needed in the sandbox. The crawler does not block addresses on private networks for the sites you list; list only hosts you mean to index.
+
 ## Administration
 
 Create a credential as the service user so the secrets file gets the right owner and mode:

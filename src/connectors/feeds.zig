@@ -32,7 +32,7 @@ const api = @import("../connector.zig");
 const doc = @import("../document.zig");
 const files = @import("files.zig");
 const xml = @import("../xml.zig");
-const htmltext = @import("feeds/htmltext.zig");
+const htmltext = @import("../htmltext.zig");
 const dates = @import("feeds/dates.zig");
 
 pub const kind = "feeds";

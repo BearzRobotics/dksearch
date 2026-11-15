@@ -44,6 +44,10 @@ pub fn build(b: *std.Build) void {
     const want_feeds = b.option(bool, "feeds", "Build the RSS/Atom feeds connector with vendored Expat (default: on, except on Windows)") orelse supported;
     if ((want_wikipedia or want_feeds) and !supported) @panic("the Wikipedia and feeds connectors are not supported on Windows yet; pass -Dwikipedia=false -Dfeeds=false");
     const need_expat = want_wikipedia or want_feeds;
+    // The web crawler uses Zig's standard HTTP and TLS client (no C library)
+    // and the bundled Mozilla CA file (docs/decisions/0018).
+    const want_crawler = b.option(bool, "crawler", "Build the web crawler connector with the bundled CA certificates (default: on, except on Windows)") orelse supported;
+    if (want_crawler and !supported) @panic("the crawler connector is not supported on Windows yet; pass -Dcrawler=false");
 
     const bz2_c: ?*std.Build.Module = if (want_wikipedia) blk: {
         const tc = b.addTranslateC(.{
@@ -103,6 +107,7 @@ pub fn build(b: *std.Build) void {
     const core_options = b.addOptions();
     core_options.addOption(bool, "wikipedia", want_wikipedia);
     core_options.addOption(bool, "feeds", want_feeds);
+    core_options.addOption(bool, "crawler", want_crawler);
     core_options.addOption(bool, "xml", need_expat);
 
     // The core library: search, storage and ingestion, plus the bundled
@@ -119,6 +124,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = core_options.createModule() },
         },
     });
+    if (want_crawler) core.addAnonymousImport("cacert_pem", .{ .root_source_file = b.path("vendor/cacert/cacert.pem") });
     if (bz2_c) |m| core.addImport("bz2_c", m);
     if (expat_c) |m| core.addImport("expat_c", m);
 

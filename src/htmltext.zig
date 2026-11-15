@@ -1,4 +1,4 @@
-//! HTML (as found in feed entries) to plain text, for search.
+//! HTML to plain text, for search (feed entries and fetched web pages).
 //!
 //! Tags are dropped, block-level tags (paragraphs, line breaks, list items,
 //! headings, table rows) become line breaks, `<script>` and `<style>` content
@@ -149,6 +149,42 @@ fn tidy(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
     return out.items;
 }
 
+/// The text of the first `<title>` element, or null if there is none or it is
+/// empty. Case-insensitive; the content goes through the same entity decoding
+/// and tidying as `toText`.
+pub fn titleOf(arena: Allocator, html: []const u8) Allocator.Error!?[]const u8 {
+    var from: usize = 0;
+    while (std.ascii.findIgnoreCasePos(html, from, "<title")) |open| {
+        const after = open + "<title".len;
+        // "<title" must end the tag name: "<titlefoo>" is another element.
+        if (after < html.len and html[after] != '>' and !std.ascii.isWhitespace(html[after])) {
+            from = after;
+            continue;
+        }
+        const gt = std.mem.indexOfScalarPos(u8, html, after, '>') orelse return null;
+        const close = std.ascii.findIgnoreCasePos(html, gt + 1, "</title") orelse return null;
+        const t = try toText(arena, html[gt + 1 .. close]);
+        const one_line = try collapseLines(arena, t);
+        return if (one_line.len == 0) null else one_line;
+    }
+    return null;
+}
+
+fn collapseLines(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var pending = false;
+    for (s) |ch| {
+        if (ch == '\n' or ch == '\r' or ch == '\t' or ch == ' ') {
+            pending = out.items.len > 0;
+            continue;
+        }
+        if (pending) try out.append(arena, ' ');
+        pending = false;
+        try out.append(arena, ch);
+    }
+    return out.items;
+}
+
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -211,4 +247,15 @@ test "many unclosed script tags stay linear" {
     for (0..60_000) |_| try src.appendSlice(a, "<script>x");
     const out = try toText(a, src.items);
     try testing.expect(out.len <= src.items.len);
+}
+
+test "titleOf finds the first title, decodes it and ignores lookalikes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("Tom & Jerry", (try titleOf(a, "<html><head><TITLE lang=en>\n Tom &amp;\n Jerry </TITLE></head>")).?);
+    try testing.expectEqualStrings("Real", (try titleOf(a, "<titlefoo>no</titlefoo><title>Real</title>")).?);
+    try testing.expect((try titleOf(a, "<p>none</p>")) == null);
+    try testing.expect((try titleOf(a, "<title>   </title>")) == null);
+    try testing.expect((try titleOf(a, "<title>never closed")) == null);
 }

@@ -1,0 +1,23 @@
+# 0018. Web crawler connector
+
+- Status: Accepted (2026-11-15); first step implemented (seed list), link following and sitemaps not yet
+- Date: 2026-11-15
+
+## Context
+
+ADR 0017 agreed to a polite, opt-in crawler. The user's answers to the open design questions were: HTTPS is wanted in the first version and the CA certificates are bundled; the rate limit is 1 request per second per host by default and configurable; the user agent is required configuration with no default.
+
+## Decisions
+
+1. **A `crawl` connector like the others.** It uses the normal connector interface, is off unless a source of kind `crawl` is configured, and is compiled out with `-Dcrawler=false` (default on, except on Windows, which is unsupported anyway). Nothing else in the program uses the network.
+2. **HTTP and TLS come from Zig's standard library** (`std.http.Client`, `std.crypto.tls`), not from a vendored C library. This removes a large C dependency (the earlier plan considered mbedTLS or BearSSL) and needs nothing beyond the pinned toolchain. Trade-offs: the standard TLS client is younger than the C ones and has no TLS server for offline tests, so HTTPS is exercised by hand against real sites (including bad-certificate test hosts, which are refused) while the offline suite covers everything else over HTTP on loopback. It has no read timeout, so each request runs beside a sleeping task under `Io.Select` and the loser is cancelled.
+3. **Bundled CA certificates.** `vendor/cacert/cacert.pem` is the Mozilla root store as published by curl (2026-11-05, 118 certificates, SHA-256 recorded in `vendor/cacert/README.md`), embedded in the binary. A source can choose `ca_bundle = "system"` or its own PEM file; certificate verification cannot be disabled. The bundle ages: refreshing it is a manual, documented step. The data is MPL-2.0, kept as a separate unmodified file.
+4. **Politeness rules**, all enforced in the connector: `robots.txt` (RFC 9309: longest match, `*` and `$`, groups by product token, `crawl-delay` up to 60 s) fetched once per origin per run; an unreachable or oversized `robots.txt` disallows the host for the run, a 4xx means no rules; at least `delay_ms` (default 1000, minimum 100) between requests to the same host, sequentially; the configured user agent sent unchanged (required, validated as one header line of printable ASCII with a product token); body cap (default 2 MiB) and a per-request deadline (default 30 s); redirects limited to 5 and to the same site (leading `www.` ignored), each hop re-checked against `robots.txt`. Same-site-only redirects also keep a seed on a public site from steering the fetch to an internal address.
+5. **robots.txt is parsed by a small hand-written parser.** The no-hand-written-parser rule exists for established formats where a library does; no Zig library for robots.txt exists, the grammar is a few `field: value` lines, and the matcher is iterative so hostile patterns cannot take exponential time. Covered by tests including random input.
+6. **Scope of this step**: an explicit seed file only. No link following, no sitemaps, no conditional requests (ETag, Last-Modified), no proxy, no per-site configuration. Documents record rights `unknown`. The same URL fetched again is deduplicated by the pipeline's content hash.
+7. **Encodings**: UTF-8, US-ASCII, ISO-8859-1 and Windows-1252 (read as ISO-8859-1); undeclared non-UTF-8 bytes are read as ISO-8859-1; other declared charsets are skipped, as feeds do.
+8. **Offline**: a run where nothing could be reached because of connection failures or timeouts ends as failed with Offline, so a missing network is reported, not silently empty. A certificate that fails verification is a refusal for that page, not an outage.
+
+## Not done (next steps)
+
+Sitemaps as a source of URLs; link following with depth and host limits; conditional requests; `crawl-delay` and robots caching across runs; per-host request limits across several crawl sources; a proxy option; the admin interface showing crawl failures by reason (today they are counted as skipped).

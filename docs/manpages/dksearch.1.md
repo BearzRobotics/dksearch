@@ -29,7 +29,7 @@ dksearch check-config FILE
 DESCRIPTION
 dksearch is an independently operated, self-hostable search engine. It maintains its own full-text index and does not use an external search provider.
 
-This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles four: `files`, which indexes plain-text and Markdown files from a local directory; `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded; `wikipedia`, which indexes the articles of a Wikipedia dump file you have already downloaded; and `feeds`, which indexes the entries of RSS and Atom feed files you have already downloaded. The `wikipedia` and `feeds` connectors are built by default and can be left out with `zig build -Dwikipedia=false` and `-Dfeeds=false`. A separate administration interface (sources, import jobs, counters, a query-testing page that shows ranking scores, and optionally starting and cancelling imports) is served on its own address when the configuration has an `[admin]` table and credentials exist; see **admin-token**, **admin-password** and SECURITY CONSIDERATIONS.
+This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles five: `files`, which indexes plain-text and Markdown files from a local directory; `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded; `wikipedia`, which indexes the articles of a Wikipedia dump file you have already downloaded; `feeds`, which indexes the entries of RSS and Atom feed files you have already downloaded; and `crawl`, which fetches a list of web pages you name, over HTTP or HTTPS, and is the only connector that uses the network. The `wikipedia`, `feeds` and `crawl` connectors are built by default and can be left out with `zig build -Dwikipedia=false`, `-Dfeeds=false` and `-Dcrawler=false`. A separate administration interface (sources, import jobs, counters, a query-testing page that shows ranking scores, and optionally starting and cancelling imports) is served on its own address when the configuration has an `[admin]` table and credentials exist; see **admin-token**, **admin-password** and SECURITY CONSIDERATIONS.
 
 CONVENTIONS
 Bold represents literal commands, options, and keywords.
@@ -216,7 +216,7 @@ Each `[[source]]` table has these keys. Any other key is an option of the connec
 
 Key	Type	Default	Description
 name	String	required	Unique name, 1-64 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit. Resume positions are kept per name, and it becomes the `connector` of each document, so renaming a source makes it start afresh and its old documents stay under the old name.
-kind	String	required	Connector type. This version knows `files`, `gutenberg`, `wikipedia` and `feeds` (the last two only in builds that include them).
+kind	String	required	Connector type. This version knows `files`, `gutenberg`, `wikipedia`, `feeds` and `crawl` (the last three only in builds that include them).
 enabled	Boolean	true	A disabled source stays in the file but is never run.
 retain_text	Boolean	true	Keep each document's text so the index can be rebuilt without reading the source again. Set false for a source whose terms forbid keeping its text; its documents are then skipped by **rebuild**.
 rights	String	connector default	Override the redistribution flag (`unknown`, `allowed`, `restricted`, `forbidden`) of every document from this source. Defaults are conservative guesses, not legal advice; the decision is yours. Only documents that are added or changed afterwards pick it up; unchanged ones keep the flag they were stored with.
@@ -293,6 +293,28 @@ Example:
     name = "news"
     kind = "feeds"
     path = "/srv/feeds"
+
+Kind `crawl` fetches the web pages listed in a file and indexes each as one document. It is the only connector that uses the network, and it does nothing unless a source of this kind is configured and imported. It is built to be polite: it reads `robots.txt` (RFC 9309) before any page of a host and never requests a page the file disallows; it keeps at least `delay_ms` between requests to one host, one request at a time (a larger `Crawl-delay` in `robots.txt`, up to 60 seconds, is honored); it sends exactly the user agent you configure; it follows redirects only within the same site (a leading `www.` is ignored), checking `robots.txt` again for each step, at most 5; and every request has a deadline and a size cap. A `robots.txt` that cannot be fetched (network error, server error, oversized, or redirected to another site) disallows that host for the run; an answer of 4xx means it has no rules. It fetches only the URLs listed: it does not follow links and does not read sitemaps.
+
+Key	Type	Default	Description
+user_agent	String	required	The `User-Agent` header, 1-200 printable ASCII characters starting with a product name, for example `mysearch/1.0 (+https://example.org/about)`. There is no default: choose a name and a way for site owners to reach you. The product token (up to the first `/`, space or `(`) is what `robots.txt` groups are matched against.
+seeds_file	String	required	A text file with one absolute `http://` or `https://` URL per line. Blank lines and `#` comments are skipped; lines that are not usable URLs (no host, other schemes, credentials in the URL) are ignored. At most 10000 URLs are read. Re-read at every run.
+delay_ms	Integer	1000	Minimum milliseconds between two requests to the same host, 100-3600000.
+max_page_bytes	Integer	2097152	Largest response body accepted (after decompression), 1-33554432. Larger pages are skipped.
+timeout_seconds	Integer	30	Deadline for one request (connect, send and receive), 1-300.
+ca_bundle	String	builtin	Which certificates HTTPS servers are verified against: `builtin` (the Mozilla root store embedded in the program, `vendor/cacert/README.md`), `system` (the operating system's store), or the path of a PEM file. A server whose certificate does not verify is skipped; there is no way to turn verification off.
+language	String	none	Language tag recorded for every page.
+
+Each page becomes a document identified by its final URL (after redirects, without the fragment). HTML is converted to plain text like feed entries; `text/plain` is taken as is; other media types (PDF, images) are skipped, as are non-2xx answers. The title is the page's `<title>`. Declared encodings other than UTF-8, US-ASCII, ISO-8859-1 and Windows-1252 are skipped (Windows-1252 is read as ISO-8859-1); with no declared encoding, bytes that are not valid UTF-8 are read as ISO-8859-1. Every document records rights `unknown`: a page's content belongs to its publisher. Fetching the same URLs again replaces pages whose text changed and skips the rest (there are no conditional requests yet). Positions resume by URL. A run in which not one page could be reached, because of connection failures or timeouts, ends as failed with Offline. There is no proxy support.
+
+Example:
+
+    [[source]]
+    name = "web"
+    kind = "crawl"
+    user_agent = "mysearch/1.0 (+https://example.org/about)"
+    seeds_file = "/etc/dksearch/seeds.txt"
+    delay_ms = 2000
 
 Validation, unknown keys, reload behavior, versioning, and migration rules
 The whole file is validated before anything starts, including every source's options. Unknown keys, wrong types and out-of-range values are errors that name the file and the key, for example `dksearch.toml: server.prot: unknown key`; a misspelled setting is never silently ignored. `admin` and `server` may not share the same address and port. There is no reload: configuration is read once at start, so a restart is required to apply changes. There is no configuration versioning yet.
@@ -372,7 +394,7 @@ SQLite is compiled without extension loading, so no native code is loaded at run
 
 The index directory should be writable only by the account running dksearch. The configuration file holds no secrets; the credential hashes are in the separate secrets file, which should be readable only by the account running dksearch.
 
-The `feeds` connector treats feed files as untrusted input in the same way (no XML entity expansion, document type declarations refused, bounded nesting and field sizes, HTML reduced to text and never interpreted), and reads only the files under `path`. Feed content is third-party text that becomes searchable and is shown in results.
+The `crawl` connector fetches pages as untrusted input: HTML is reduced to text and never interpreted, bodies are size-capped, redirects stay on the same site, HTTPS certificates are always verified, and the response of a site is never trusted to name where to fetch next. It does not block requests to private or loopback addresses on the sites you list, so do not list internal hosts you would not want indexed. The `feeds` connector treats feed files as untrusted input in the same way (no XML entity expansion, document type declarations refused, bounded nesting and field sizes, HTML reduced to text and never interpreted), and reads only the files under `path`. Feed content is third-party text that becomes searchable and is shown in results.
 
 The `wikipedia` connector treats the dump as untrusted input: it refuses any XML document type declaration (so entity-expansion attacks cannot work), bounds nesting depth and the size of every field and article, converts the text in time linear in its size, and executes nothing. It reads only the one file named by `dump`. The bundled bzip2 and Expat libraries are vendored, and Expat is built without general entity expansion or DTD support.
 
@@ -415,7 +437,7 @@ Stability guarantees
 The `/api/v1/` API is intended to be stable within version 1 (see dksearch-api(7)). The command-line syntax, configuration keys and diagnostics text are experimental at version 0.
 
 LIMITATIONS
-Four connectors are bundled (`files`, `gutenberg`, `wikipedia` and `feeds`); none of them fetches anything from the network. The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. The administration interface cannot run **check**, **rebuild**, **remove** or **backup**, or edit configuration; it can start and cancel imports only when `admin.actions` is true. No TLS. No reload or request log. Only two tokenizers exist: `unicode61` and `porter` (English stemming). Languages without word separators (such as Chinese or Japanese) are not segmented well, and stemming is English only. Index size and query time at large scale (millions of documents) have not been measured.
+Five connectors are bundled (`files`, `gutenberg`, `wikipedia`, `feeds` and `crawl`); only `crawl` uses the network, and only for the URLs you list. It follows no links, reads no sitemaps, sends no conditional requests, has no proxy support and understands few text encodings. The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. The administration interface cannot run **check**, **rebuild**, **remove** or **backup**, or edit configuration; it can start and cancel imports only when `admin.actions` is true. No TLS. No reload or request log. Only two tokenizers exist: `unicode61` and `porter` (English stemming). Languages without word separators (such as Chinese or Japanese) are not segmented well, and stemming is English only. Index size and query time at large scale (millions of documents) have not been measured.
 
 BUGS
 No issue tracker is published yet. When one exists it will be listed under AVAILABILITY. Include the dksearch version, the configuration file, the full diagnostic output and the request that failed.
