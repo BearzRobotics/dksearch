@@ -33,3 +33,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0014 | Admin actions |
 | 0015 | Installation targets |
 | 0016 | Feeds connector and the XML build split |
+| 0017 | Crawler direction, feed fetching, Windows, rights override |

@@ -34,6 +34,8 @@ pub const Options = struct {
     /// without reacquiring the source. Turn off for sources whose terms
     /// forbid retention.
     retain_text: bool = true,
+    /// Replaces the redistribution flag of every document, when set.
+    rights_override: ?doc.Redistribution = null,
     /// Unix time in seconds, used when a document carries no `acquired_at`.
     now: *const fn () doc.Timestamp,
 };
@@ -102,11 +104,14 @@ pub const Pipeline = struct {
         return self.submit(d);
     }
 
-    pub fn submit(self: *Pipeline, d: doc.Document) connector.Sink.Error!void {
-        d.validate() catch {
+    pub fn submit(self: *Pipeline, d_in: doc.Document) connector.Sink.Error!void {
+        d_in.validate() catch {
             self.stats.rejected += 1;
             return error.Rejected;
         };
+
+        var d = d_in;
+        if (self.options.rights_override) |r| d.rights.redistribution = r;
 
         const id = d.id();
         const hash = d.contentHash();
@@ -214,10 +219,10 @@ const Harness = struct {
     idx: FakeIndex = .{},
     pipe: Pipeline = undefined,
 
-    fn init(h: *Harness, opts: struct { retain_text: bool = true }) void {
+    fn init(h: *Harness, opts: struct { retain_text: bool = true, rights: ?doc.Redistribution = null }) void {
         h.content = .init(testing.allocator);
         h.docs = .init(testing.allocator);
-        h.pipe = .init(h.content.store(), h.docs.store(), h.idx.index(), .{ .retain_text = opts.retain_text, .now = fixedNow });
+        h.pipe = .init(h.content.store(), h.docs.store(), h.idx.index(), .{ .retain_text = opts.retain_text, .rights_override = opts.rights, .now = fixedNow });
     }
     fn deinit(h: *Harness) void {
         h.content.deinit();
@@ -303,6 +308,18 @@ test "retain_text = false indexes and records but keeps no content" {
     try testing.expectEqual(@as(u32, 1), h.idx.adds);
     try testing.expectEqual(@as(usize, 1), h.docs.count());
     try testing.expectEqual(@as(usize, 0), h.content.count());
+}
+
+test "rights override replaces the connector's redistribution flag" {
+    var h: Harness = undefined;
+    h.idx = .{};
+    h.init(.{ .rights = .forbidden });
+    defer h.deinit();
+
+    const d: doc.Document = .{ .connector = "c", .source_id = "1", .text = "x", .rights = .{ .redistribution = .allowed } };
+    try h.pipe.submit(d);
+    const e = (try h.docs.store().find(d.id())).?;
+    try testing.expectEqual(doc.Redistribution.forbidden, e.meta.rights.redistribution);
 }
 
 test "index failure writes no provenance record, so a retry is not skipped" {

@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const toml = @import("toml");
+const document = @import("document.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{
@@ -163,6 +164,9 @@ pub const Source = struct {
     /// Keep the main text so the index can be rebuilt without reacquiring it.
     /// Turn off for sources whose terms forbid retention.
     retain_text: bool = true,
+    /// When set, overrides the redistribution flag every document from this
+    /// source gets from its connector. Null keeps the connector's own choice.
+    rights: ?document.Redistribution = null,
     options: []const Option = &.{},
 
     pub fn option(self: Source, key: []const u8) ?OptionValue {
@@ -326,7 +330,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     return cfg;
 }
 
-const source_common_keys = [_][]const u8{ "name", "kind", "enabled", "retain_text" };
+const source_common_keys = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights" };
 
 fn validSourceName(name: []const u8) bool {
     if (name.len == 0 or name.len > 64) return false;
@@ -376,6 +380,12 @@ fn readSources(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnost
         var s: Source = .{ .name = try a.dupe(u8, name), .kind = try a.dupe(u8, kind) };
         if (try optBool(src, where, t, "enabled", diag)) |b| s.enabled = b;
         if (try optBool(src, where, t, "retain_text", diag)) |b| s.retain_text = b;
+        if (try str(src, where, t, "rights", diag)) |rv| {
+            s.rights = std.meta.stringToEnum(document.Redistribution, rv) orelse {
+                diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}].rights", .{i}) catch "source.rights", "must be \"unknown\", \"allowed\", \"restricted\" or \"forbidden\", got \"{s}\"", .{rv});
+                return error.InvalidValue;
+            };
+        }
 
         var opts: std.ArrayList(Option) = .empty;
         var it = t.entries.iterator();
@@ -708,6 +718,7 @@ test "sources: common keys, defaults and connector options" {
         \\kind = "gutenberg"
         \\enabled = false
         \\retain_text = false
+        \\rights = "forbidden"
     , &d);
     defer c.deinit();
     try testing.expectEqual(@as(usize, 2), c.sources.len);
@@ -726,6 +737,8 @@ test "sources: common keys, defaults and connector options" {
     const b = c.sources[1];
     try testing.expect(!b.enabled);
     try testing.expect(!b.retain_text);
+    try testing.expectEqual(@as(?document.Redistribution, .forbidden), b.rights);
+    try testing.expectEqual(@as(?document.Redistribution, null), a.rights);
     try testing.expectEqual(@as(usize, 0), b.options.len);
 }
 
@@ -734,6 +747,8 @@ test "sources: invalid entries are rejected with the entry and key in the messag
     const T = testing.allocator;
     try testing.expectError(error.InvalidValue, loadFromSlice(T, "t.toml", "[[source]]\nkind = \"files\"", &d));
     try testing.expectEqualStrings("source[0].name", d.key());
+    try testing.expectError(error.InvalidValue, loadFromSlice(T, "t.toml", "[[source]]\nname = \"a\"\nkind = \"files\"\nrights = \"free\"", &d));
+    try testing.expectEqualStrings("source[0].rights", d.key());
     try testing.expectError(error.InvalidValue, loadFromSlice(T, "t.toml", "[[source]]\nname = \"x\"", &d));
     try testing.expectEqualStrings("source[0].kind", d.key());
     try testing.expectError(error.InvalidValue, loadFromSlice(T, "t.toml", "[[source]]\nname = \"Bad Name\"\nkind = \"files\"", &d));

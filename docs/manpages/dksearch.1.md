@@ -219,6 +219,7 @@ name	String	required	Unique name, 1-64 characters of `a-z`, `0-9`, `_` and `-`, 
 kind	String	required	Connector type. This version knows `files`, `gutenberg`, `wikipedia` and `feeds` (the last two only in builds that include them).
 enabled	Boolean	true	A disabled source stays in the file but is never run.
 retain_text	Boolean	true	Keep each document's text so the index can be rebuilt without reading the source again. Set false for a source whose terms forbid keeping its text; its documents are then skipped by **rebuild**.
+rights	String	connector default	Override the redistribution flag (`unknown`, `allowed`, `restricted`, `forbidden`) of every document from this source. Defaults are conservative guesses, not legal advice; the decision is yours. Only documents that are added or changed afterwards pick it up; unchanged ones keep the flag they were stored with.
 
 Kind `files` indexes `.txt` and `.md` files (extension case-insensitive) under a directory, including subdirectories:
 

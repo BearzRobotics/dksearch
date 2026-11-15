@@ -240,6 +240,7 @@ pub const Manager = struct {
         defer inst.deinit();
         var pipe = pipeline.Pipeline.init(content.store(), state.documents(), index.indexer(), .{
             .retain_text = source.retain_text,
+            .rights_override = source.rights,
             .now = now,
         });
         const r = runner.runImport(arena, &state, &pipe, inst.connector(), source.name, control, now) catch {

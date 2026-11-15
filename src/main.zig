@@ -856,6 +856,7 @@ fn importCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, one: ?[]co
 
         var pipe = dk.pipeline.Pipeline.init(content.store(), state.documents(), index.indexer(), .{
             .retain_text = source.retain_text,
+            .rights_override = source.rights,
             .now = now,
         });
         var result_arena = std.heap.ArenaAllocator.init(gpa);
