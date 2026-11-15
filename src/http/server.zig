@@ -297,8 +297,10 @@ fn sweep(state: *State) Io.Cancelable!void {
             const d = s.deadline_ns orelse continue;
             if (!s.used or now < d) continue;
             s.deadline_ns = null;
+            // Count before cutting the connection, so anyone who sees the
+            // connection end can already see the counter.
+            _ = state.stats.timed_out.fetchAdd(1, .release);
             s.stream.shutdown(state.io, .both) catch {};
-            _ = state.stats.timed_out.fetchAdd(1, .monotonic);
         }
     }
 }
@@ -612,7 +614,9 @@ test "idle keep-alive connections are closed after the timeout" {
     const got = r.interface.allocRemaining(testing.allocator, .limited(1 << 16)) catch try testing.allocator.dupe(u8, "");
     defer testing.allocator.free(got);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK"));
-    try testing.expect(h.stats.timed_out.load(.monotonic) >= 1);
+    var waited: u32 = 0;
+    while (h.stats.timed_out.load(.acquire) < 1 and waited < 200) : (waited += 1) try testing.io.sleep(.fromMilliseconds(10), .awake);
+    try testing.expect(h.stats.timed_out.load(.acquire) >= 1);
 }
 
 test "connections beyond max_connections are refused immediately" {
