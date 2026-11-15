@@ -1,0 +1,43 @@
+# /etc/systemd/system/dksearch-import@.service
+#
+# Imports one configured source: `systemctl start dksearch-import@my-notes`.
+# The instance name is the source name. It cannot overlap another import,
+# rebuild or removal on the same data directory (they share a lock), and it
+# works while dksearch.service is running.
+[Unit]
+Description=dksearch import of source %i
+Documentation=man:dksearch(1)
+
+[Service]
+Type=oneshot
+User=dksearch
+Group=dksearch
+ExecStart=/usr/local/bin/dksearch import --config /etc/dksearch/dksearch.toml %i
+# SIGTERM cancels cleanly and saves the position, so the next run resumes.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+StateDirectory=dksearch
+StateDirectoryMode=0700
+UMask=0077
+# Directories that sources read from (read-only), for example:
+#ReadOnlyPaths=/srv/datasets
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Imports read local files only and never use the network.
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources

@@ -1,0 +1,51 @@
+# /etc/systemd/system/dksearch.service
+#
+# Runs the public search interface and (if configured) the administration
+# interface. See docs/deploy/README.md for installation.
+[Unit]
+Description=dksearch search engine
+Documentation=man:dksearch(1)
+After=network.target
+
+[Service]
+Type=simple
+User=dksearch
+Group=dksearch
+ExecStart=/usr/local/bin/dksearch serve --config /etc/dksearch/dksearch.toml
+# SIGTERM starts a graceful stop (requests in flight get shutdown_grace_ms).
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+
+# Data lives in /var/lib/dksearch (set storage.data_dir to that path).
+StateDirectory=dksearch
+StateDirectoryMode=0700
+UMask=0077
+# Directories that sources read from, if any (read-only):
+#ReadOnlyPaths=/srv/datasets
+
+# Sandboxing. Nothing here needs more than a TCP socket and its own data.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,39 @@
+# /etc/systemd/system/... runs dksearch with this file. Copy to
+# /etc/dksearch/dksearch.toml and adjust.
+
+[storage]
+data_dir = "/var/lib/dksearch"
+
+[server]
+# Loopback behind a reverse proxy (see README.md). Use 0.0.0.0 or a LAN
+# address only if you really want to expose the public search interface directly.
+address = "127.0.0.1"
+port = 8080
+# One line per request, without queries or client details:
+#access_log = "/var/lib/dksearch/access.log"
+
+[admin]
+# Present: the administration interface starts if credentials exist
+# (dksearch admin-token / admin-password). Keep it on loopback.
+address = "127.0.0.1"
+port = 8081
+# Let the interface start and cancel imports (default: read-only).
+#actions = true
+# Set when a reverse proxy serves the interface over HTTPS:
+#cookie_secure = true
+
+[index]
+# "porter" adds English stemming; changing it needs `dksearch rebuild`.
+tokenizer = "unicode61"
+
+# Sources are optional. Examples:
+#[[source]]
+#name = "notes"
+#kind = "files"
+#path = "/srv/notes"
+#
+#[[source]]
+#name = "wikipedia-en"
+#kind = "wikipedia"
+#dump = "/srv/datasets/enwiki-latest-pages-articles-multistream.xml.bz2"
+#dataset_version = "latest"

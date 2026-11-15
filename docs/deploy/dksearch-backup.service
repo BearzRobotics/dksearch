@@ -1,0 +1,24 @@
+# /etc/systemd/system/dksearch-backup.service
+#
+# Writes a verified snapshot of state.db and content.db into a new directory
+# named by date, safe while dksearch.service runs. Pair it with
+# dksearch-backup.timer. Old backups are not pruned: see README.md.
+[Unit]
+Description=dksearch backup
+Documentation=man:dksearch(1)
+
+[Service]
+Type=oneshot
+User=dksearch
+Group=dksearch
+StateDirectory=dksearch
+UMask=0077
+# Backups go here; the directory must exist and belong to the dksearch user.
+ReadWritePaths=/var/backups/dksearch
+ExecStart=/bin/sh -c 'exec /usr/local/bin/dksearch backup --config /etc/dksearch/dksearch.toml /var/backups/dksearch/$(date +%%F-%%H%%M%%S)'
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+CapabilityBoundingSet=
