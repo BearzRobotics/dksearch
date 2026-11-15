@@ -42,7 +42,8 @@ Sources are optional. With none configured, `serve` still works and serves whate
 ## Documentation
 
 - `docs/manpages/dksearch.1.md` is the full reference: commands, configuration, files, security, limitations. `docs/manpages/dksearch-api.7.md` describes the HTTP API.
-- `docs/decisions/` holds the decision records (storage, index backend, API, connectors, authentication and so on) with the reasons behind them.
+- `docs/deploy/` has the systemd units, example configuration, reverse-proxy and backup guide.
+- `docs/decisions/` (start with its README) holds the decision records (storage, index backend, API, connectors, authentication and so on) with the reasons behind them.
 - `ai/AGENTS.md` and `ai/SPEC.md` hold the project rules and specification.
 
 ## License
