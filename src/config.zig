@@ -198,11 +198,19 @@ pub const Source = struct {
 
 /// The `[search]` table: regular-expression filtering of results
 /// (docs/decisions/0020). The limits protect the server from expensive patterns.
+pub const FuzzyMode = enum { off, auto, always };
+
 pub const SearchSettings = struct {
     /// Longest a search may run, in milliseconds (0 = no limit). Common words
     /// over a very large index take seconds to rank; past this the search is
     /// stopped and answers "too broad" instead of tying up a connection.
     query_timeout_ms: u32 = 5000,
+    /// Typo tolerance: "auto" retries an exact search that finds fewer than 3
+    /// results with words one typo away; "always" expands every word; "off".
+    fuzzy: FuzzyMode = .auto,
+    /// "advanced": the query language (OR, NOT, grouping, prefix*, word~, "a b"~5, +, -);
+    /// "simple": every word is plain text, as in earlier versions.
+    advanced_syntax: bool = true,
     /// Offer the `regex` filter on the public interface and API.
     regex: bool = true,
     /// Longest pattern, in bytes.
@@ -252,7 +260,7 @@ const server_keys = [_][]const u8{
 const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions", "backup_dir" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
-const search_keys = [_][]const u8{ "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
+const search_keys = [_][]const u8{ "fuzzy", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
 const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source" };
 
 /// Parses and validates configuration text. `source_name` is only used in
@@ -350,6 +358,22 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
 
     if (try subTable(src, root, "search", diag)) |t| {
         try checkKeys(src, "search", t, &search_keys, diag);
+        if (try str(src, "search", t, "fuzzy", diag)) |v| {
+            cfg.search.fuzzy = std.meta.stringToEnum(FuzzyMode, v) orelse {
+                diag.set(src, "search.fuzzy", "must be \"auto\", \"always\" or \"off\", got \"{s}\"", .{v});
+                return error.InvalidValue;
+            };
+        }
+        if (try str(src, "search", t, "query_syntax", diag)) |v| {
+            if (std.mem.eql(u8, v, "advanced")) {
+                cfg.search.advanced_syntax = true;
+            } else if (std.mem.eql(u8, v, "simple")) {
+                cfg.search.advanced_syntax = false;
+            } else {
+                diag.set(src, "search.query_syntax", "must be \"advanced\" or \"simple\", got \"{s}\"", .{v});
+                return error.InvalidValue;
+            }
+        }
         if (try intIn(src, "search", t, "query_timeout_ms", 0, 60_000, diag)) |n| cfg.search.query_timeout_ms = @intCast(n);
         if (try optBool(src, "search", t, "regex", diag)) |b| cfg.search.regex = b;
         if (try intIn(src, "search", t, "regex_max_pattern", 1, 2000, diag)) |n| cfg.search.regex_max_pattern = @intCast(n);

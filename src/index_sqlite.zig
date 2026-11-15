@@ -27,12 +27,27 @@ const Io = std.Io;
 const idx_api = @import("indexer.zig");
 const search = @import("search.zig");
 const image_mod = @import("image.zig");
+const queryparse = @import("queryparse.zig");
 
 /// Bumped when the table layout changes. Stored in `PRAGMA user_version`.
 pub const schema_version = 1;
 
 /// Title matches count ten times as much as body matches.
 const bm25_weights = "10.0, 1.0";
+
+/// In `auto` mode, an exact search with fewer hits than this is repeated with
+/// typo tolerance (and the fuller result is used if it finds more).
+const auto_fuzzy_below = 3;
+
+/// When plain words also match words one typo away.
+pub const FuzzyMode = enum {
+    /// Never, unless the person writes `word~`.
+    off,
+    /// Only when the exact words find nothing.
+    auto,
+    /// Always.
+    always,
+};
 
 pub const Sync = enum {
     /// WAL with synchronous=NORMAL: syncs at checkpoints, not every commit.
@@ -86,6 +101,12 @@ const mapRc = sqlite.mapRc;
 
 pub const SqliteIndex = struct {
     db: *c.sqlite3,
+    /// True: the query language is off and every word is plain text (`[search] query_syntax = "simple"`).
+    simple_syntax: bool = false,
+    /// Typo tolerance when a search does not say. Off for a bare index, so that
+    /// code using the index directly gets exact words; `serve` sets it from
+    /// `[search] fuzzy` (default `auto`).
+    fuzzy_mode: FuzzyMode = .off,
     /// A time limit for each search, if set (`setQueryTimeout`).
     timeout: ?struct { io: Io, ms: u32 } = null,
 
@@ -113,6 +134,15 @@ pub const SqliteIndex = struct {
     /// Limits each search to `ms` milliseconds (0 = no limit): SQLite is told to
     /// stop, and the search fails with `error.Timeout`. Set it before sharing
     /// the index between threads.
+    /// Turns the query language off (`simple`) or on; set it before sharing the index.
+    pub fn setSimpleSyntax(self: *SqliteIndex, simple: bool) void {
+        self.simple_syntax = simple;
+    }
+
+    pub fn setFuzzyMode(self: *SqliteIndex, mode: FuzzyMode) void {
+        self.fuzzy_mode = mode;
+    }
+
     pub fn setQueryTimeout(self: *SqliteIndex, io: Io, ms: u32) void {
         self.timeout = if (ms == 0) null else .{ .io = io, .ms = ms };
     }
@@ -419,8 +449,45 @@ pub const SqliteIndex = struct {
         if (limit > search.max_limit) return error.InvalidQuery;
         if (@as(u64, q.offset) + limit > search.max_window) return error.InvalidQuery;
 
-        const match = try buildMatch(arena, q.text);
+        if (self.simple_syntax) return self.runMatch(arena, q, limit, try buildMatchSimple(arena, q.text), null, false);
 
+        // Typo tolerance: forced on or off by the search, or by the server's mode;
+        // in `auto` an exact search that finds nothing is repeated with it.
+        const forced: ?bool = switch (q.fuzzy) {
+            .on => true,
+            .off => false,
+            .default => switch (self.fuzzy_mode) {
+                .always => true,
+                .off => false,
+                .auto => null,
+            },
+        };
+        const first = try parseQuery(arena, q.text, forced orelse false);
+        const page = try self.runMatch(arena, q, limit, first.fts, interpretedOf(first), first.fuzzy_applied);
+        if (forced == null and page.hits.len < auto_fuzzy_below and q.offset == 0) {
+            if (parseQuery(arena, q.text, true)) |second| {
+                if (second.fuzzy_applied) {
+                    const again = try self.runMatch(arena, q, limit, second.fts, interpretedOf(second), true);
+                    if (again.hits.len > page.hits.len) return again;
+                }
+            } else |_| {}
+        }
+        return page;
+    }
+
+    fn parseQuery(arena: Allocator, text: []const u8, fuzzy_words: bool) search.Error!queryparse.Parsed {
+        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words }) catch |e| switch (e) {
+            error.EmptyQuery => error.EmptyQuery,
+            error.InvalidQuery => error.InvalidQuery,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
+    fn interpretedOf(p: queryparse.Parsed) ?[]const u8 {
+        return if (p.advanced or p.fuzzy_applied) p.shown else null;
+    }
+
+    fn runMatch(self: *SqliteIndex, arena: Allocator, q: search.Query, limit: u32, match: []const u8, interpreted: ?[]const u8, fuzzy: bool) search.Error!search.Page {
         const st = Stmt.prepare(self.db,
             \\SELECT d.id, d.connector, d.url, d.title,
             \\       snippet(fts, 1, ?1, ?2, '…', 16),
@@ -471,7 +538,7 @@ pub const SqliteIndex = struct {
                 .score = st.colFloat(5),
             });
         }
-        return .{ .hits = hits.items, .has_more = more };
+        return .{ .hits = hits.items, .has_more = more, .interpreted = interpreted, .fuzzy = fuzzy };
     }
 };
 
@@ -527,6 +594,15 @@ pub const SearchPool = struct {
         for (self.slots) |*sl| sl.index.close();
         self.gpa.free(self.slots);
         self.* = undefined;
+    }
+
+    /// See `SqliteIndex.setSimpleSyntax`; call before searching.
+    pub fn setSimpleSyntax(self: *SearchPool, simple: bool) void {
+        for (self.slots) |*sl| sl.index.setSimpleSyntax(simple);
+    }
+
+    pub fn setFuzzyMode(self: *SearchPool, mode: FuzzyMode) void {
+        for (self.slots) |*sl| sl.index.setFuzzyMode(mode);
     }
 
     /// See `SqliteIndex.setQueryTimeout`; call before searching.
@@ -586,7 +662,7 @@ fn dupeOpt(a: Allocator, s: ?[]const u8) Allocator.Error!?[]const u8 {
 /// input are literal text, never syntax. Words are ANDed; text inside double
 /// quotes becomes one phrase. Terms with no letters or digits (pure
 /// punctuation) are dropped because the tokenizer would discard them anyway.
-fn buildMatch(arena: Allocator, text: []const u8) search.Error![]const u8 {
+fn buildMatchSimple(arena: Allocator, text: []const u8) search.Error![]const u8 {
     if (text.len > search.max_query_bytes) return error.InvalidQuery;
     // A NUL would end the string early inside SQLite's C code.
     if (std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidQuery;
@@ -646,22 +722,22 @@ fn searchAll(arena: Allocator, idx: *SqliteIndex, text: []const u8) !search.Page
     return idx.searcher().search(arena, .{ .text = text });
 }
 
-test "buildMatch quotes every term and neutralizes syntax" {
+test "simple mode: buildMatchSimple quotes every term and neutralizes syntax" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqualStrings("\"hello\" \"world\"", try buildMatch(a, "  hello   world "));
-    try testing.expectEqualStrings("\"hello world\" \"x\"", try buildMatch(a, "\"hello world\" x"));
-    try testing.expectEqualStrings("\"title:foo\" \"OR\" \"bar*\"", try buildMatch(a, "title:foo OR bar*"));
-    try testing.expectEqualStrings("\"unterminated phrase\"", try buildMatch(a, "\"unterminated phrase"));
-    try testing.expectEqualStrings("\"café\"", try buildMatch(a, "café"));
-    try testing.expectError(error.EmptyQuery, buildMatch(a, ""));
-    try testing.expectError(error.InvalidQuery, buildMatch(a, "x\x00y"));
-    try testing.expectError(error.EmptyQuery, buildMatch(a, " !!! ... \"\" "));
+    try testing.expectEqualStrings("\"hello\" \"world\"", try buildMatchSimple(a, "  hello   world "));
+    try testing.expectEqualStrings("\"hello world\" \"x\"", try buildMatchSimple(a, "\"hello world\" x"));
+    try testing.expectEqualStrings("\"title:foo\" \"OR\" \"bar*\"", try buildMatchSimple(a, "title:foo OR bar*"));
+    try testing.expectEqualStrings("\"unterminated phrase\"", try buildMatchSimple(a, "\"unterminated phrase"));
+    try testing.expectEqualStrings("\"café\"", try buildMatchSimple(a, "café"));
+    try testing.expectError(error.EmptyQuery, buildMatchSimple(a, ""));
+    try testing.expectError(error.InvalidQuery, buildMatchSimple(a, "x\x00y"));
+    try testing.expectError(error.EmptyQuery, buildMatchSimple(a, " !!! ... \"\" "));
     const long = try a.alloc(u8, search.max_query_bytes + 1);
     @memset(long, 'a');
-    try testing.expectError(error.InvalidQuery, buildMatch(a, long));
-    try testing.expectError(error.InvalidQuery, buildMatch(a, "a b c d e f g h i j k l m n o p q r s t u v w x y z aa bb cc dd ee ff gg"));
+    try testing.expectError(error.InvalidQuery, buildMatchSimple(a, long));
+    try testing.expectError(error.InvalidQuery, buildMatchSimple(a, "a b c d e f g h i j k l m n o p q r s t u v w x y z aa bb cc dd ee ff gg"));
 }
 
 test "a search past its time limit stops with Timeout; without a limit it finishes" {
@@ -726,6 +802,106 @@ test "pictures are found by hash distance, nearest first, and forgotten with the
     // An index without the table (an older one) simply has no pictures.
     try idx.exec("DROP TABLE image_hash");
     try testing.expectEqual(@as(usize, 0), (try idx.imageSearcher().near(a, base, 64, 10)).hits.len);
+}
+
+test "the query language finds what it says: OR, NOT, grouping, prefix, fuzzy, proximity" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    _ = try put(&idx, "t", "1", "Wayland", "linux wayland compositor for the kernel");
+    _ = try put(&idx, "t", "2", "BSD", "bsd kernel module loader");
+    _ = try put(&idx, "t", "3", "Android", "linux android phone kernel");
+    _ = try put(&idx, "t", "4", "Windows", "the window manager and a tiling window layout");
+    _ = try put(&idx, "t", "5", "Tiling", "window and then several other words before manager appears");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Case = struct { q: []const u8, want: []const []const u8 };
+    const cases = [_]Case{
+        .{ .q = "linux wayland", .want = &.{"1"} },
+        .{ .q = "linux AND wayland", .want = &.{"1"} },
+        .{ .q = "wayland OR bsd", .want = &.{ "1", "2" } },
+        .{ .q = "linux NOT android", .want = &.{"1"} },
+        .{ .q = "linux -android", .want = &.{"1"} },
+        .{ .q = "+kernel -android", .want = &.{ "1", "2" } },
+        .{ .q = "(linux OR bsd) AND kernel", .want = &.{ "1", "2", "3" } },
+        .{ .q = "kernel -(android OR bsd)", .want = &.{"1"} },
+        .{ .q = "comp*", .want = &.{"1"} },
+        .{ .q = "compositer~", .want = &.{"1"} }, // one typo
+        .{ .q = "compositar~ -bsd", .want = &.{"1"} },
+        .{ .q = "\"window manager\"", .want = &.{"4"} },
+        .{ .q = "\"window manager\"~2", .want = &.{"4"} },
+        .{ .q = "\"window manager\"~8", .want = &.{ "4", "5" } },
+        .{ .q = "nomatchword OR wayland", .want = &.{"1"} },
+        .{ .q = "linux and phone", .want = &.{} }, // lower case "and" is just a word
+    };
+    for (cases) |case| {
+        const page = try searchAll(a, &idx, case.q);
+        errdefer std.debug.print("query: {s} gave {d} hits\n", .{ case.q, page.hits.len });
+        try testing.expectEqual(case.want.len, page.hits.len);
+        for (case.want) |w| {
+            var found = false;
+            for (page.hits) |h| {
+                const id = doc.idFromSource("t", w);
+                if (std.mem.eql(u8, &h.id, &id)) found = true;
+            }
+            try testing.expect(found);
+        }
+    }
+    // The page says how a language query was read, and nothing for plain words.
+    const lang = try searchAll(a, &idx, "linux OR bsd -android");
+    try testing.expectEqualStrings("linux OR bsd NOT android", lang.interpreted.?);
+    try testing.expect((try searchAll(a, &idx, "linux wayland")).interpreted == null);
+    // Only negative terms: nothing to search for.
+    try testing.expectError(error.EmptyQuery, searchAll(a, &idx, "-android"));
+
+    // Typo tolerance, as `serve` configures it by default: a misspelling finds the right page, and
+    // says it did; an exact spelling needs none; turning it off turns it off.
+    idx.setFuzzyMode(.auto);
+    const typo = try searchAll(a, &idx, "wayalnd");
+    try testing.expectEqual(@as(usize, 1), typo.hits.len);
+    try testing.expect(typo.fuzzy);
+    try testing.expectEqualStrings("wayalnd~", typo.interpreted.?);
+    try testing.expect(!(try searchAll(a, &idx, "wayland")).fuzzy);
+    const two = try searchAll(a, &idx, "compositer kernal"); // two typos in two words
+    try testing.expectEqual(@as(usize, 1), two.hits.len);
+    // Words of three letters or fewer are never guessed at.
+    try testing.expectEqual(@as(usize, 0), (try searchAll(a, &idx, "bsa")).hits.len);
+    idx.setFuzzyMode(.off);
+    try testing.expectEqual(@as(usize, 0), (try searchAll(a, &idx, "wayalnd")).hits.len);
+    idx.setFuzzyMode(.auto);
+    try testing.expectEqual(@as(usize, 0), (try idx.searcher().search(a, .{ .text = "wayalnd", .fuzzy = .off })).hits.len);
+    try testing.expect((try idx.searcher().search(a, .{ .text = "wayalnd", .fuzzy = .on })).fuzzy);
+    idx.setFuzzyMode(.always);
+    try testing.expect((try searchAll(a, &idx, "wayland")).fuzzy); // expanded even when exact would do
+    idx.setFuzzyMode(.off);
+
+    // Simple mode turns the language off: AND/OR/NOT/ - are plain words.
+    idx.setSimpleSyntax(true);
+    try testing.expectEqual(@as(usize, 0), (try searchAll(a, &idx, "wayland OR bsd")).hits.len);
+    try testing.expectEqual(@as(usize, 1), (try searchAll(a, &idx, "wayland compositor")).hits.len);
+}
+
+test "random queries never make SQLite reject the expression or crash" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    _ = try put(&idx, "t", "1", "A title", "alpha beta gamma delta window manager one two three");
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    const pieces = [_][]const u8{ "alpha", "bet*", "gam~", "AND", "OR", "NOT", "(", ")", "\"", "\"window manager\"~3", "-", "+", " ", " ", "~", "*", "title:", "NEAR(", "x", "é", "''" };
+    for (0..1500) |_| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var q: std.ArrayList(u8) = .empty;
+        for (0..rnd.uintLessThan(usize, 12) + 1) |_| try q.appendSlice(arena.allocator(), pieces[rnd.uintLessThan(usize, pieces.len)]);
+        if (searchAll(arena.allocator(), &idx, q.items)) |_| {} else |e| switch (e) {
+            error.EmptyQuery, error.InvalidQuery => {},
+            else => {
+                std.debug.print("query {s} failed with {t}\n", .{ q.items, e });
+                return e;
+            },
+        }
+    }
 }
 
 test "title matches outrank body matches; ties break by id" {

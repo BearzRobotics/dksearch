@@ -34,6 +34,7 @@ port = 8080
 
 # Search options. The regular-expression filter is on by default with strict limits.
 #[search]
+#fuzzy = "auto"            # typo tolerance: "auto" (default), "always" or "off"
 #query_timeout_ms = 5000   # stop searches that run longer (very common words on a huge index)
 #regex = true
 #regex_max_candidates = 200

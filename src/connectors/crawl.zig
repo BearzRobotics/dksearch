@@ -511,10 +511,13 @@ const Run = struct {
     }
 
     /// The (cached) robots rules for the origin of `u`.
-    fn hostFor(self: *Run, u: Url) error{ OutOfMemory, Canceled, TooManyHosts }!*Host {
+    /// `listed` is true for a page the administrator named (a seed or a sitemap
+    /// entry): such a site is always allowed; `max_hosts` bounds only sites
+    /// reached by following links and redirects.
+    fn hostFor(self: *Run, u: Url, listed: bool) error{ OutOfMemory, Canceled, TooManyHosts }!*Host {
         const origin = try originOf(self.arena, u);
         if (self.hosts.get(origin)) |h| return h;
-        if (self.hosts.count() >= self.conn.max_hosts) return error.TooManyHosts;
+        if (!listed and self.hosts.count() >= self.conn.max_hosts) return error.TooManyHosts;
         const host = try self.arena.create(Host);
         host.* = .{ .rules = .allow_all };
         try self.hosts.put(self.arena, origin, host);
@@ -574,13 +577,13 @@ const Run = struct {
 
     /// One polite GET of `start`: robots.txt, the host's turn, the request and
     /// same-site redirects. Everything is allocated in `a`.
-    fn get(self: *Run, a: Allocator, start: []const u8, site_host: []const u8, accept: []const u8, max_bytes: usize) error{OutOfMemory}!Fetched {
+    fn get(self: *Run, a: Allocator, start: []const u8, site_host: []const u8, accept: []const u8, max_bytes: usize, listed: bool) error{OutOfMemory}!Fetched {
         var url = try withoutFragment(a, start);
         var hops: u32 = 0;
         self.fetched += 1;
         while (true) {
             const u = parseUrl(url) orelse return self.skip(.limit);
-            const host = self.hostFor(u) catch |e| switch (e) {
+            const host = self.hostFor(u, listed and hops == 0) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return .stopped,
                 error.TooManyHosts => return self.skip(.limit),
@@ -676,7 +679,7 @@ const Run = struct {
         var tmp = std.heap.ArenaAllocator.init(self.conn.gpa);
         defer tmp.deinit();
         const t = tmp.allocator();
-        const got = switch (try self.get(t, url, site, accept_sitemap, max_sitemap_bytes)) {
+        const got = switch (try self.get(t, url, site, accept_sitemap, max_sitemap_bytes, level == 0)) {
             .stopped => return true,
             .skipped => return false,
             .page => |p| p,
@@ -738,7 +741,7 @@ const Run = struct {
             var page = std.heap.ArenaAllocator.init(gpa);
             defer page.deinit();
             const a = page.allocator();
-            const got = switch (try self.get(a, item.url, site, accept_pages, self.conn.max_page_bytes)) {
+            const got = switch (try self.get(a, item.url, site, accept_pages, self.conn.max_page_bytes, head == 1)) {
                 .stopped => return .stopped,
                 .skipped => continue,
                 .page => |p| p,
@@ -1478,6 +1481,37 @@ test "links to other sites are followed only when asked, and never to private ad
         _ = try conn.connector().run(g.sink(), &c, null);
         try testing.expect(hasId(&g, "/mine") and !hasId(&g, "/x"));
     }
+}
+
+test "sites you list are never cut off by max_hosts; only discovered sites count" {
+    var a_srv: TestServer = undefined;
+    try a_srv.start(&.{
+        .{ .path = "/robots.txt", .status = 404 },
+        .{ .path = "/p", .body = "<p>on the first site</p>" },
+    });
+    defer a_srv.stop();
+    var b_srv: TestServer = undefined;
+    b_srv.openAt("127.0.0.2") catch return error.SkipZigTest;
+    try b_srv.serve(&.{
+        .{ .path = "/robots.txt", .status = 404 },
+        .{ .path = "/q", .body = "<p>on the second site</p>" },
+    });
+    defer b_srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [96]u8 = undefined;
+    var b2: [96]u8 = undefined;
+    var seeds: [200]u8 = undefined;
+    const text = try std.fmt.bufPrint(&seeds, "{s}\n{s}\n", .{ a_srv.url(&b1, "/p"), b_srv.urlAt(&b2, "127.0.0.2", "/q") });
+    var conn = try testConnector(&tmp, text, "t/1");
+    defer conn.deinit();
+    conn.max_hosts = 1; // two different sites are listed, so both must be fetched
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    _ = try conn.connector().run(got.sink(), &ctl, null);
+    try testing.expectEqual(@as(usize, 2), got.ids.items.len);
+    try testing.expectEqual(@as(u64, 0), ctl.rejected.load(.monotonic));
 }
 
 test "a redirect to another site needs follow_external too" {

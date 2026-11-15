@@ -66,6 +66,8 @@ pub const Form = struct {
     regex_enabled: bool = false,
     /// A message about the regex filter (bad pattern, too busy, ...).
     regex_notice: ?[]const u8 = null,
+    /// The searcher asked for exact spelling (`fuzzy=0`); kept when paging.
+    exact_only: bool = false,
 };
 
 pub fn writeHead(w: *Writer, title: []const u8) Writer.Error!void {
@@ -88,13 +90,13 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
     try writeEscaped(w, f.connector);
     try w.writeAll("\"></label>");
     if (f.regex_enabled) {
-        try w.writeAll("<label>Regex <input name=\"regex\" maxlength=\"200\" spellcheck=\"false\" placeholder=\"e.g. \\d{3}-\\d{4}\" value=\"");
+        try w.writeAll("<label>Regex <a href=\"/help/regex\">how does this work?</a> <input name=\"regex\" maxlength=\"200\" spellcheck=\"false\" placeholder=\"e.g. \\d{3}-\\d{4}\" value=\"");
         try writeEscaped(w, f.regex);
         try w.writeAll("\"></label><label class=\"check\"><input type=\"checkbox\" name=\"regex_flags\" value=\"i\"");
         if (f.regex_ignore_case) try w.writeAll(" checked");
         try w.writeAll("> ignore case</label><small>The words above choose the documents; the regex then keeps those whose text matches it.</small>");
     }
-    try w.writeAll("</details></form>\n");
+    try w.writeAll("</details></form>\n<p class=\"tips\"><a href=\"/help/search\">Search tips</a></p>\n");
     if (f.regex_notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
         try writeEscaped(w, n);
@@ -123,6 +125,7 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     try writeHead(w, if (f.q.len > 0) f.q else "dksearch");
     try w.writeAll("<body><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
     try writeForm(w, f);
+    try writeInterpretation(w, f, page, offset);
 
     if (page.hits.len == 0) {
         try w.writeAll("<p class=\"notice\">No results for &ldquo;");
@@ -144,6 +147,35 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
         try w.writeAll("</span></nav>\n");
     }
     try w.writeAll("</main></body></html>\n");
+}
+
+/// How the query was read, and whether similar spellings were included.
+fn writeInterpretation(w: *Writer, f: Form, page: dk.search.Page, offset: u32) Writer.Error!void {
+    if (page.fuzzy) {
+        try w.writeAll("<p class=\"notice\">Showing results that include similar spellings of your words. ");
+        // Offer the strict search back, keeping the rest of the query.
+        try w.writeAll("<a href=\"/search?q=");
+        try query.writeEncoded(w, f.q);
+        if (f.language.len > 0) {
+            try w.writeAll("&amp;language=");
+            try query.writeEncoded(w, f.language);
+        }
+        if (f.connector.len > 0) {
+            try w.writeAll("&amp;connector=");
+            try query.writeEncoded(w, f.connector);
+        }
+        if (f.regex.len > 0) {
+            try w.writeAll("&amp;regex=");
+            try query.writeEncoded(w, f.regex);
+        }
+        try w.writeAll("&amp;fuzzy=0\">Search exactly as typed</a></p>\n");
+    }
+    if (page.interpreted) |text| {
+        try w.writeAll("<p class=\"muted small\">Searching for: <code>");
+        try writeEscaped(w, text);
+        try w.writeAll("</code> <a href=\"/help/search\">how this works</a></p>\n");
+    }
+    _ = offset;
 }
 
 fn writeHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
@@ -198,10 +230,75 @@ fn writePagerLink(w: *Writer, f: Form, offset: u32, label_html: []const u8) Writ
         try query.writeEncoded(w, f.regex);
         if (f.regex_ignore_case) try w.writeAll("&amp;regex_flags=i");
     }
+    if (f.exact_only) try w.writeAll("&amp;fuzzy=0");
     if (offset > 0) try w.print("&amp;offset={d}", .{offset});
     try w.writeAll("\">");
     try w.writeAll(label_html);
     try w.writeAll("</a>");
+}
+
+/// The search tips page: the query language, typo tolerance, examples.
+pub fn writeHelpSearch(w: *Writer, regex_enabled: bool) Writer.Error!void {
+    try writeHead(w, "Search tips - dksearch");
+    try w.writeAll("<body><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1><h2>Search tips</h2>\n");
+    try w.writeAll("<p>Just type words: results contain all of them, best matches first, and a title match counts more than a match in the text. Capitalised <code>AND</code>, <code>OR</code> and <code>NOT</code> and a few symbols let you say more.</p>\n");
+    try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>You type</th><th>It means</th></tr></thead><tbody>");
+    const rows = [_][2][]const u8{
+        .{ "\"kernel module\"", "the exact phrase" },
+        .{ "linux wayland", "both words (AND is the default)" },
+        .{ "linux AND wayland", "both words, spelled out" },
+        .{ "linux OR bsd", "either word" },
+        .{ "linux NOT android", "linux, but not android" },
+        .{ "linux -android", "the same, with a minus in front of the word to leave out" },
+        .{ "+linux", "linux must be there (already the default; allowed for habit)" },
+        .{ "(linux OR bsd) AND kernel", "grouping with parentheses" },
+        .{ "comp*", "words that start with comp: compositor, compiler, computer&hellip;" },
+        .{ "compositor~", "the word, or any word one typo away from it" },
+        .{ "\"window manager\"~5", "the two words within five words of each other, in any order" },
+    };
+    for (rows) |r| try w.print("<tr><td><code>{s}</code></td><td>{s}</td></tr>", .{ r[0], r[1] });
+    try w.writeAll("</tbody></table></div>\n");
+    try w.writeAll("<h3>You do not have to spell everything right</h3><p>If a search finds fewer than three results, dksearch automatically tries again with words that are one typo away (a letter missing, extra, wrong or swapped) and tells you it did, with a link to search exactly as typed. Short words (three letters or fewer) are never guessed at. To force it for one word, write <code>word~</code>.</p>\n");
+    try w.writeAll("<h3>Good to know</h3><ul><li><code>AND</code>, <code>OR</code> and <code>NOT</code> only count as operators in capital letters; <code>and</code> or <code>or</code> in lower case are ordinary words. To search for the word itself, put it in quotes: <code>\"OR\"</code>.</li><li>A search with only excluded words (<code>-android</code>) has nothing to look for: add a word you do want.</li><li>When your query used these features, the results page shows how it was read (&ldquo;Searching for: &hellip;&rdquo;).</li>");
+    if (regex_enabled) try w.writeAll("<li>For patterns that words cannot express (codes, dates, phone numbers), see <a href=\"/help/regex\">regular expressions</a>.</li>");
+    try w.writeAll("</ul><p><a href=\"/\">&larr; Back to search</a></p></main></body></html>\n");
+}
+
+/// How the regex filter works, with the limits this server applies.
+pub fn writeHelpRegex(w: *Writer, limits: ?dk.regexsearch.Limits) Writer.Error!void {
+    try writeHead(w, "Regular expressions - dksearch");
+    try w.writeAll("<body><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1><h2>Regular expressions</h2>\n");
+    try w.writeAll("<p>A regular expression (&ldquo;regex&rdquo;) describes a pattern of text, such as &ldquo;three digits, a dash, four digits&rdquo;. Use one when words cannot say what you are looking for: part numbers, dates, phone numbers, spellings like <code>colou?r</code>.</p>\n");
+    try w.writeAll("<h3>How a regex search works</h3><ol><li><strong>Your words choose the documents.</strong> Type at least one word in the search box. dksearch finds the documents that contain your words, best matches first, using its index. This is what keeps it fast.</li><li><strong>Then the regex checks their text.</strong> Each of those documents is read and tested against your pattern. Only the ones that contain a match are kept, and the match is highlighted in the result.</li><li><strong>It stops at a limit.</strong> To keep the server responsive it checks a limited number of documents; if it stopped early, the results may be incomplete, so make the words more specific.</li></ol>\n");
+    if (limits) |l| try w.print("<p class=\"muted\">On this server: patterns up to {d} characters, up to {d} documents checked, about {d} ms in total, and at most {d} regex searches at once.</p>\n", .{ l.max_pattern_bytes, l.max_candidates, l.budget_ms, l.concurrency });
+    try w.writeAll("<h3>The pattern language</h3><div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Write</th><th>Matches</th></tr></thead><tbody>");
+    const rows = [_][2][]const u8{
+        .{ "abc", "exactly abc" },
+        .{ ".", "any one character (but not a line break)" },
+        .{ "\\d &nbsp; \\w &nbsp; \\s", "a digit; a letter, digit or underscore; a space or tab" },
+        .{ "[a-z] &nbsp; [^0-9]", "one letter from a to z; one character that is not a digit" },
+        .{ "x* &nbsp; x+ &nbsp; x?", "zero or more; one or more; zero or one x" },
+        .{ "x{3} &nbsp; x{2,4}", "exactly three; two to four x" },
+        .{ "cat|dog", "cat or dog" },
+        .{ "(ab)+", "ab, abab, ababab&hellip; (parentheses group)" },
+        .{ "^ &nbsp; $", "the start; the end of a line" },
+        .{ "\\b", "a word boundary, so <code>\\bcat\\b</code> finds cat but not concatenate" },
+        .{ "(?i)", "at the start: ignore upper and lower case (or tick &ldquo;ignore case&rdquo;)" },
+        .{ ".*?", "as little as possible (the &ldquo;lazy&rdquo; form of .*)" },
+        .{ "\\. &nbsp; \\( &nbsp; \\\\", "a literal dot, parenthesis or backslash: put \\ in front of a symbol to mean the symbol itself" },
+    };
+    for (rows) |r| try w.print("<tr><td><code>{s}</code></td><td>{s}</td></tr>", .{ r[0], r[1] });
+    try w.writeAll("</tbody></table></div>\n<h3>Examples</h3><div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Pattern</th><th>Finds</th></tr></thead><tbody>");
+    const ex = [_][2][]const u8{
+        .{ "\\d{3}-\\d{4}", "a phone-style number such as 555-0142" },
+        .{ "\\b(18|19|20)\\d\\d\\b", "a year from 1800 to 2099" },
+        .{ "colou?r", "color or colour" },
+        .{ "\\w+@\\w+\\.\\w+", "something shaped like an email address" },
+        .{ "v\\d+\\.\\d+(\\.\\d+)?", "a version number such as v2.4 or v2.4.1" },
+        .{ "\\b[A-Z]{2,}\\b", "an ALL-CAPS word of two or more letters" },
+    };
+    for (ex) |r| try w.print("<tr><td><code>{s}</code></td><td>{s}</td></tr>", .{ r[0], r[1] });
+    try w.writeAll("</tbody></table></div>\n<h3>Limits to know about</h3><ul><li>The pattern is matched on bytes, not characters, so <code>.</code> matches one byte of a character like &eacute; and Unicode classes such as <code>\\p{L}</code> are not available.</li><li>A pattern that takes too long on the documents it is tried on is refused with an explanation: make it simpler, for example avoid nesting <code>(a+)+</code>.</li><li>Typing a regex does not turn off the search syntax: the words in the search box can still use quotes, OR, NOT and so on (see <a href=\"/help/search\">search tips</a>).</li></ul><p><a href=\"/\">&larr; Back to search</a></p></main></body></html>\n");
 }
 
 pub fn writeError(w: *Writer, status_text: []const u8, message: []const u8) Writer.Error!void {

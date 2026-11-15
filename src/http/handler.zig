@@ -48,11 +48,13 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { home, search_page, api_search, api_health, style, other };
+const Route = enum { help_search, help_regex, home, search_page, api_search, api_health, style, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
     if (std.mem.eql(u8, path, "/search")) return .search_page;
+    if (std.mem.eql(u8, path, "/help") or std.mem.eql(u8, path, "/help/search")) return .help_search;
+    if (std.mem.eql(u8, path, "/help/regex")) return .help_regex;
     if (std.mem.eql(u8, path, "/api/v1/search")) return .api_search;
     if (std.mem.eql(u8, path, "/api/v1/health")) return .api_health;
     if (std.mem.eql(u8, path, "/assets/style.css")) return .style;
@@ -102,6 +104,16 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regex
         },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
         .api_health => try jsonResponse(arena, .ok, .{ .status = "ok" }),
+        .help_search => blk: {
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            html.writeHelpSearch(&aw.writer, regex != null) catch return error.OutOfMemory;
+            break :blk htmlResponse(arena, .ok, aw.written());
+        },
+        .help_regex => blk: {
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            html.writeHelpRegex(&aw.writer, if (regex) |svc| svc.limits else null) catch return error.OutOfMemory;
+            break :blk htmlResponse(arena, .ok, aw.written());
+        },
         .api_search => try apiSearch(arena, searcher, regex, t.params),
         .search_page => try pageSearch(arena, searcher, regex, t.params),
         .other => unreachable,
@@ -127,6 +139,13 @@ fn parseQuery(params: query.Params, html_mode: bool) Parsed {
     }
     if (params.get("offset")) |v| if (v.len > 0) {
         q.offset = std.fmt.parseInt(u32, v, 10) catch return .{ .bad = .{ .name = "offset", .message = "must be a non-negative integer" } };
+    };
+    if (params.get("fuzzy")) |v| if (v.len > 0) {
+        if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "on") or std.mem.eql(u8, v, "true")) {
+            q.fuzzy = .on;
+        } else if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "exact")) {
+            q.fuzzy = .off;
+        } else return .{ .bad = .{ .name = "fuzzy", .message = "must be 1 (always allow typos), 0 (exact words only), or left out (the server's default)" } };
     };
     if (html_mode) {
         q.limit = html_page_size; // the page size is not user-controlled
@@ -178,7 +197,7 @@ const ApiHit = struct {
     snippet: ?[]const u8,
     score: f64,
 };
-const ApiPage = struct { hits: []const ApiHit, has_more: bool };
+const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false };
 
 pub const RegexNote = struct { status: http.Status, code: []const u8, message: []const u8 };
 
@@ -216,13 +235,13 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
         };
         const hits = try arena.alloc(ApiHit, r.page.hits.len);
         for (r.page.hits, hits) |h, *out| out.* = try apiHit(arena, h);
-        return jsonResponse(arena, .ok, .{ .hits = hits, .has_more = r.page.has_more, .regex = .{ .examined = r.examined, .truncated = r.truncated } });
+        return jsonResponse(arena, .ok, .{ .hits = hits, .has_more = r.page.has_more, .interpreted = r.page.interpreted, .fuzzy = r.page.fuzzy, .regex = .{ .examined = r.examined, .truncated = r.truncated } });
     }
     const page = searcher.search(arena, q) catch |e| return searchFailure(arena, e, true);
 
     const hits = try arena.alloc(ApiHit, page.hits.len);
     for (page.hits, hits) |h, *out| out.* = try apiHit(arena, h);
-    return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more });
+    return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy });
 }
 
 fn apiHit(arena: Allocator, h: dk.search.Hit) error{OutOfMemory}!ApiHit {
@@ -274,7 +293,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
     const q = parsed.q;
-    var form: html.Form = .{ .q = q.text, .language = q.language orelse "", .connector = q.connector orelse "", .regex_enabled = regex != null };
+    var form: html.Form = .{ .q = q.text, .language = q.language orelse "", .connector = q.connector orelse "", .regex_enabled = regex != null, .exact_only = q.fuzzy == .off };
     if (parsed.re) |req| {
         form.regex = req.pattern;
         form.regex_ignore_case = req.ignore_case;
@@ -679,4 +698,49 @@ test "the HTML page offers the regex field only when enabled, escapes it and kee
     f.fake.result = .{ .hits = &f.hits, .has_more = true };
     const paged = f.get(&ar, true, "/search?q=order&regex=order&regex_flags=i");
     try testing.expect(std.mem.indexOf(u8, paged.body, "regex=order&amp;regex_flags=i") != null or std.mem.indexOf(u8, paged.body, "regex=order") != null);
+}
+
+test "help pages explain the search syntax and regex, with this server's limits" {
+    var f: RegexFixture = undefined;
+    try f.init(.{ .max_candidates = 123, .budget_ms = 456 });
+    defer f.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const tips = f.get(&ar, true, "/help/search");
+    try testing.expectEqual(http.Status.ok, tips.status);
+    for ([_][]const u8{ "AND", "OR", "NOT", "comp*", "compositor~", "~5", "one typo away", "regular expressions" }) |needle| {
+        try testing.expect(std.mem.indexOf(u8, tips.body, needle) != null);
+    }
+    try testing.expectEqualStrings(tips.body, f.get(&ar, true, "/help").body);
+    const rx = f.get(&ar, true, "/help/regex");
+    try testing.expect(std.mem.indexOf(u8, rx.body, "How a regex search works") != null);
+    try testing.expect(std.mem.indexOf(u8, rx.body, "123 documents checked") != null);
+    try testing.expect(std.mem.indexOf(u8, rx.body, "456 ms") != null);
+    // Without regex enabled the tips page does not mention it, and the home page links the tips.
+    const tips_off = f.get(&ar, false, "/help/search");
+    try testing.expect(std.mem.indexOf(u8, tips_off.body, "/help/regex") == null);
+    try testing.expect(std.mem.indexOf(u8, f.get(&ar, true, "/").body, "href=\"/help/search\"") != null);
+    try testing.expect(std.mem.indexOf(u8, f.get(&ar, true, "/").body, "href=\"/help/regex\"") != null);
+}
+
+test "results report how the query was read and whether typos were allowed" {
+    var f: FakeSearch = .{ .result = .{ .hits = &sample_hits, .has_more = false, .interpreted = "linux OR bsd", .fuzzy = true } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const api = run(&f, .GET, "/api/v1/search?q=linux+OR+bsd&fuzzy=1", &ar);
+    try testing.expectEqual(http.Status.ok, api.status);
+    try testing.expect(std.mem.indexOf(u8, api.body, "\"interpreted\":\"linux OR bsd\"") != null);
+    try testing.expect(std.mem.indexOf(u8, api.body, "\"fuzzy\":true") != null);
+    try testing.expectEqual(dk.search.Fuzzy.on, f.last.?.fuzzy);
+    _ = run(&f, .GET, "/api/v1/search?q=x&fuzzy=0", &ar);
+    try testing.expectEqual(dk.search.Fuzzy.off, f.last.?.fuzzy);
+    _ = run(&f, .GET, "/api/v1/search?q=x", &ar);
+    try testing.expectEqual(dk.search.Fuzzy.default, f.last.?.fuzzy);
+    const bad = run(&f, .GET, "/api/v1/search?q=x&fuzzy=maybe", &ar);
+    try testing.expectEqual(http.Status.bad_request, bad.status);
+    // The page tells the person, and offers the exact search back.
+    const page = run(&f, .GET, "/search?q=linux+OR+bsd", &ar);
+    try testing.expect(std.mem.indexOf(u8, page.body, "similar spellings") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "&amp;fuzzy=0\">Search exactly as typed") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "Searching for: <code>linux OR bsd</code>") != null);
 }

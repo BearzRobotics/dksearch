@@ -22,10 +22,22 @@ pub const max_limit = 100;
 /// `offset + limit` may not exceed this: deep pagination is expensive.
 pub const max_window = 10_000;
 
+/// Typo tolerance for one search.
+pub const Fuzzy = enum {
+    /// Whatever the server is configured to do (`[search] fuzzy`).
+    default,
+    /// Plain words also match words one typo away, always.
+    on,
+    /// Exact words only.
+    off,
+};
+
 pub const Query = struct {
-    /// What the user typed. Plain words are ANDed; "double quotes" make a
-    /// phrase. Anything else (operators, punctuation, field names) is treated
-    /// literally, never as query syntax.
+    fuzzy: Fuzzy = .default,
+    /// What the user typed: words (ANDed), "phrases", and the query language of
+    /// `queryparse.zig` (OR, NOT, parentheses, prefix*, word~, "a b"~5, +, -).
+    /// Anything else (column filters, punctuation) is searched as plain text,
+    /// never interpreted by the index.
     text: []const u8,
     /// Exact-match filters; null means any.
     language: ?[]const u8 = null,
@@ -51,6 +63,12 @@ pub const Page = struct {
     hits: []const Hit,
     /// True if at least one more hit follows this page.
     has_more: bool,
+    /// How the query was understood, when it used the query language (AND, OR,
+    /// NOT, grouping, prefix, fuzzy, proximity); null for plain words.
+    interpreted: ?[]const u8 = null,
+    /// True if these results include words one typo away from the ones typed
+    /// (asked for, or tried because the exact words found nothing).
+    fuzzy: bool = false,
 };
 
 pub const Error = error{

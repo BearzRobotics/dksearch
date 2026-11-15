@@ -615,6 +615,17 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     // before the connection's own deadline cuts it off.
     if (pool) |*p| p.setQueryTimeout(cfg.search.query_timeout_ms);
     index.setQueryTimeout(io, cfg.search.query_timeout_ms);
+    const fuzzy_mode: dk.index_sqlite.FuzzyMode = switch (cfg.search.fuzzy) {
+        .off => .off,
+        .auto => .auto,
+        .always => .always,
+    };
+    if (pool) |*p| {
+        p.setFuzzyMode(fuzzy_mode);
+        p.setSimpleSyntax(!cfg.search.advanced_syntax);
+    }
+    index.setFuzzyMode(fuzzy_mode);
+    index.setSimpleSyntax(!cfg.search.advanced_syntax);
     const searcher = if (pool) |*p| p.searcher() else index.searcher();
 
     // Regular-expression filtering reads the stored texts through its own

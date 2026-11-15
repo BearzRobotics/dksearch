@@ -39,3 +39,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0020 | Regular-expression search |
 | 0021 | A time limit for searches |
 | 0022 | Administration interface: look, live progress, maintenance, source editing |
+| 0024 | Query language and typo tolerance |

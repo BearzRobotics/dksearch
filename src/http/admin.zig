@@ -124,7 +124,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/sources", "/sources/edit", "/actions/sources", "/maintenance", "/actions/maintenance", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/maintenance", "/actions/maintenance", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -132,13 +132,14 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, sources_page, source_edit, action_sources, maintenance, action_maintenance, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, sources_page, sources_new, source_edit, action_sources, maintenance, action_maintenance, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
             .{ "/", .dashboard },
             .{ "/jobs", .jobs },
             .{ "/sources", .sources_page },
+            .{ "/sources/new", .sources_new },
             .{ "/sources/edit", .source_edit },
             .{ "/actions/sources", .action_sources },
             .{ "/maintenance", .maintenance },
@@ -220,6 +221,7 @@ pub const App = struct {
             .api_status => self.apiStatus(arena),
             .api_sources => if (req.method == .POST) self.editSources(arena, req, auth, true) else self.apiSources(arena),
             .sources_page => self.pageSources(arena, csrf, t.params),
+            .sources_new => self.pageSourcesNew(arena, csrf),
             .source_edit => self.pageSourceEdit(arena, csrf, t.params),
             .action_sources => self.editSources(arena, req, auth, false),
             .api_jobs => self.apiJobs(arena),
@@ -482,13 +484,24 @@ pub const App = struct {
         return handler.htmlResponse(arena, .ok, aw.written());
     }
 
+    fn pageSourcesNew(self: *App, arena: Allocator, csrf: ?[]const u8) error{OutOfMemory}!Response {
+        if (!self.canEditSources()) return handler.htmlError(arena, .conflict, "Not available", "Editing sources needs `admin.actions = true` and a server started with --config.");
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "Add a source", csrf, "sources") catch return error.OutOfMemory;
+        writeKindChooser(w) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
+    }
+
     fn pageSourceEdit(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
         if (!self.canEditSources()) return handler.htmlError(arena, .conflict, "Not available", "Editing sources needs `admin.actions = true` and a server started with --config.");
         var spec: dk.sourceedit.Spec = .{ .name = "", .kind = "" };
         var original: ?[]const u8 = null;
-        if (params.get("name")) |name| if (name.len > 0) {
+        const existing = params.get("name") orelse "";
+        if (existing.len > 0) {
             const found = for (self.sources()) |src| {
-                if (std.mem.eql(u8, src.name, name)) break src;
+                if (std.mem.eql(u8, src.name, existing)) break src;
             } else return handler.htmlError(arena, .not_found, "Not found", "No such source.");
             spec = .{
                 .name = found.name,
@@ -499,7 +512,12 @@ pub const App = struct {
                 .options = try dk.sourceedit.optionsText(arena, found),
             };
             original = found.name;
-        };
+        } else if (params.get("kind")) |k| {
+            // A new source of this kind: a working starting point to adjust.
+            if (kindInfo(k)) |info| {
+                spec = .{ .name = try suggestName(self, arena, k), .kind = info.kind, .options = info.template };
+            }
+        }
         return self.renderSourceForm(arena, csrf, spec, original, null, .ok);
     }
 
@@ -1408,7 +1426,7 @@ fn writeSources(app: *App, w: *Io.Writer, snap: App.Snapshot, csrf: ?[]const u8,
         try w.writeAll("</tbody></table></div>\n");
     }
     if (editable) {
-        try w.writeAll("<p><a class=\"btn\" href=\"/sources/edit\">Add a source</a></p><p class=\"muted\">Changes are written to the configuration file (the previous version is kept as <code>.bak</code>) and take effect at once. Deleting a source only removes it from the file; its documents stay until you remove them under Maintenance.</p>\n");
+        try w.writeAll("<p><a class=\"btn\" href=\"/sources/new\">Add a source</a></p><p class=\"muted\">Changes are written to the configuration file (the previous version is kept as <code>.bak</code>) and take effect at once. Deleting a source only removes it from the file; its documents stay until you remove them under Maintenance.</p>\n");
     } else if (app.opts.jobs == null) {
         try w.writeAll("<p class=\"muted\">Editing sources from here is turned off (<code>admin.actions</code> is false). Edit the configuration file and restart, or see <code>dksearch help config</code>.</p>\n");
     } else if (app.opts.config_path == null) {
@@ -1418,14 +1436,93 @@ fn writeSources(app: *App, w: *Io.Writer, snap: App.Snapshot, csrf: ?[]const u8,
     }
 }
 
-const kind_hints = [_]struct { []const u8, []const u8 }{
-    .{ "files", "path = \"/home/me/notes\"   # required: a folder of .txt and .md files\nlanguage = \"en\"\nmax_file_bytes = 1048576" },
-    .{ "gutenberg", "catalog = \"/data/pg_catalog.csv\"   # required\nbooks = \"/data/books\"             # required\nlanguage = \"en\"" },
-    .{ "wikipedia", "dump = \"/data/enwiki-latest-pages-articles-multistream.xml.bz2\"   # required\nlanguage = \"en\"\ndataset_version = \"20260101\"" },
-    .{ "feeds", "path = \"/srv/feeds\"   # required: a feed file or a folder of them\nlanguage = \"en\"" },
-    .{ "crawl", "user_agent = \"mysearch/1.0 (+https://example.org/about)\"   # required\nseeds_file = \"/etc/dksearch/seeds.txt\"   # required: one URL per line\ndelay_ms = 1000\nmax_depth = 3\nmax_pages = 1000\nfollow_external = false" },
-    .{ "archive", "query = \"collection:prelinger AND mediatype:movies\"   # required\nuser_agent = \"mysearch/1.0 (+https://example.org/about)\"   # required\nmax_items = 10000" },
+const KindInfo = struct {
+    kind: []const u8,
+    title: []const u8,
+    /// One or two sentences for the chooser.
+    blurb: []const u8,
+    /// What it needs, in a line.
+    needs: []const u8,
+    /// A starting point that is valid as it stands (paths and names are examples to change).
+    template: []const u8,
 };
+
+const kind_infos = [_]KindInfo{
+    .{
+        .kind = "files",
+        .title = "A folder of text files",
+        .blurb = "Indexes the .txt and Markdown files in a folder on this machine, such as your notes.",
+        .needs = "The folder's path.",
+        .template = "path = \"/home/me/notes\"   # the folder to index (change this)\n",
+    },
+    .{
+        .kind = "wikipedia",
+        .title = "A Wikipedia dump",
+        .blurb = "Indexes the articles of a Wikipedia dump file you have already downloaded (the .xml.bz2 from dumps.wikimedia.org).",
+        .needs = "The dump file's path.",
+        .template = "dump = \"/data/enwiki-latest-pages-articles-multistream.xml.bz2\"   # the downloaded file (change this)\n",
+    },
+    .{
+        .kind = "gutenberg",
+        .title = "Project Gutenberg books",
+        .blurb = "Indexes Project Gutenberg books from its catalog file and a folder of book files you have downloaded.",
+        .needs = "The catalog CSV and the books folder.",
+        .template = "catalog = \"/data/pg_catalog.csv\"   # change these two paths\nbooks = \"/data/books\"\n",
+    },
+    .{
+        .kind = "feeds",
+        .title = "RSS and Atom feeds",
+        .blurb = "Indexes the entries of feed files you have downloaded (a file, or a folder of them). It never fetches anything itself.",
+        .needs = "The path of a feed file or a folder of them.",
+        .template = "path = \"/srv/feeds\"   # a feed file or a folder of them (change this)\n",
+    },
+    .{
+        .kind = "crawl",
+        .title = "A list of web pages (crawler)",
+        .blurb = "Fetches the web pages you list in a text file, one address per line, and can follow links on the same site. Polite by default: it obeys robots.txt and waits between requests.",
+        .needs = "A seeds file (one URL per line) and who you are (user agent).",
+        .template = "seeds_file = \"/etc/dksearch/seeds.txt\"   # one URL per line (change this)\nuser_agent = \"mysearch/1.0 (+https://example.org/about)\"   # who you are, so site owners can reach you\nmax_depth = 1       # 0 = only the listed pages; 1 = also pages they link to on the same site\nmax_pages = 500\n",
+    },
+    .{
+        .kind = "archive",
+        .title = "Internet Archive items",
+        .blurb = "Indexes the descriptions (titles, creators, subjects) of items at archive.org that match a search you give it, such as a whole collection. It does not download the items themselves.",
+        .needs = "A search query, and who you are (user agent).",
+        .template = "query = \"collection:prelinger AND mediatype:movies\"   # any archive.org search (change this)\nuser_agent = \"mysearch/1.0 (+https://example.org/about)\"   # who you are; archive.org asks for this\nmax_items = 1000    # a safety limit; raise it for bigger collections\n",
+    },
+};
+
+fn kindInfo(kind: []const u8) ?KindInfo {
+    for (kind_infos) |k| if (std.mem.eql(u8, k.kind, kind)) return k;
+    return null;
+}
+
+/// A free name like "archive-2" for a new source of `kind`.
+fn suggestName(app: *App, arena: Allocator, kind: []const u8) Allocator.Error![]const u8 {
+    var n: u32 = 1;
+    while (n < 1000) : (n += 1) {
+        const name = if (n == 1) try arena.dupe(u8, kind) else try std.fmt.allocPrint(arena, "{s}-{d}", .{ kind, n });
+        const taken = for (app.sources()) |s| {
+            if (std.mem.eql(u8, s.name, name)) break true;
+        } else false;
+        if (!taken) return name;
+    }
+    return kind;
+}
+
+fn writeKindChooser(w: *Io.Writer) !void {
+    try w.writeAll("<p class=\"muted\">What do you want to index? Pick one; the next page is filled in with an example you only need to adjust.</p><div class=\"cards\">");
+    for (kind_infos) |k| {
+        if (!kindAvailable(k.kind)) continue;
+        try w.print("<a class=\"choice\" href=\"/sources/edit?kind={s}\"><strong>{s}</strong><span>{s}</span><small>Needs: {s}</small></a>", .{ k.kind, k.title, k.blurb, k.needs });
+    }
+    try w.writeAll("</div><p><a class=\"btn secondary\" href=\"/sources\">Cancel</a></p>\n");
+}
+
+fn kindAvailable(kind: []const u8) bool {
+    for (dk.connectors.kinds) |k| if (std.mem.eql(u8, k, kind)) return true;
+    return false;
+}
 
 fn writeSourceForm(w: *Io.Writer, csrf: []const u8, spec: dk.sourceedit.Spec, original: ?[]const u8, problem: ?[]const u8) !void {
     if (problem) |p| {
@@ -1457,13 +1554,14 @@ fn writeSourceForm(w: *Io.Writer, csrf: []const u8, spec: dk.sourceedit.Spec, or
     try html.writeEscaped(w, spec.options);
     try w.writeAll("</textarea><small>One <code>key = value</code> per line, text in double quotes. See the examples below for each kind.</small></label>");
     try w.writeAll("<p><button type=\"submit\" class=\"btn\">Save</button> <a class=\"btn secondary\" href=\"/sources\">Cancel</a></p></form>\n");
-    try w.writeAll("<details><summary>Options for each kind</summary>");
-    for (kind_hints) |h| {
-        try w.print("<h3>{s}</h3><pre><code>", .{h[0]});
-        try html.writeEscaped(w, h[1]);
-        try w.writeAll("</code></pre>");
+    if (kindInfo(spec.kind)) |info| {
+        try w.print("<details open><summary>About {s}</summary><p>", .{info.title});
+        try html.writeEscaped(w, info.blurb);
+        try w.writeAll("</p><p class=\"muted\">Needs: ");
+        try html.writeEscaped(w, info.needs);
+        try w.writeAll("</p></details>\n");
     }
-    try w.writeAll("<p class=\"muted\">All keys are described in <code>man dksearch</code>.</p></details>\n");
+    try w.writeAll("<p class=\"muted\">Every option of every kind is described in <code>man dksearch</code>. The text after a <code>#</code> is a note and is ignored. If something is wrong, saving tells you what.</p>\n");
 }
 
 fn opTitle(op: dk.jobs.Op) []const u8 {
@@ -2264,6 +2362,50 @@ test "sources can be added, edited, disabled and deleted from the interface, and
     try testing.expectEqual(http.Status.conflict, none.status);
     try testing.expect(std.mem.indexOf(u8, none.body, "no_config_file") != null);
     f.manager.opts.store = null;
+}
+
+test "every kind's starting template is valid as it stands, and the chooser leads to it" {
+    // Whoever picks a kind and saves without editing must get a valid source.
+    for (kind_infos) |k| {
+        errdefer std.debug.print("template for {s} is not valid\n", .{k.kind});
+        var problem: dk.sourceedit.Problem = .{};
+        const out = try dk.sourceedit.apply(testing.allocator, "", .{ .save = .{ .original = null, .spec = .{ .name = "demo", .kind = k.kind, .options = k.template } } }, &problem);
+        testing.allocator.free(out);
+    }
+    // Every kind this build has appears in the chooser, with a link that prefills the form.
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.toml", .data = "" });
+    var pb: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}/c.toml", .{tmp.sub_path});
+    var d: dk.config.Diagnostic = .{};
+    var cfg0 = try dk.config.loadFromSlice(testing.allocator, path, "", &d);
+    defer cfg0.deinit();
+    var store = dk.sourcestore.Store.init(testing.allocator, testing.io, cfg0.sources);
+    defer store.deinit();
+    f.app.opts.store = &store;
+    f.app.opts.config_path = path;
+    f.manager.opts.store = &store;
+    defer f.manager.opts.store = null;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const chooser = try f.call(a, .GET, "/sources/new", .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.ok, chooser.status);
+    for (kind_infos) |k| {
+        if (!kindAvailable(k.kind)) continue;
+        const link = try std.fmt.allocPrint(a, "href=\"/sources/edit?kind={s}\"", .{k.kind});
+        try testing.expect(std.mem.indexOf(u8, chooser.body, link) != null);
+    }
+    const form = try f.call(a, .GET, "/sources/edit?kind=archive", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, form.body, "collection:prelinger") != null);
+    try testing.expect(std.mem.indexOf(u8, form.body, "value=\"archive\"") != null); // a suggested name
+    try testing.expect(std.mem.indexOf(u8, form.body, "About Internet Archive items") != null);
 }
 
 test "a form post with the session's token starts an import; a busy data directory is refused" {

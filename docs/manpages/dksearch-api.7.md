@@ -12,7 +12,7 @@ GET /api/v1/health
 
 GET /, GET /search?q=TEXT[&language=L][&connector=C][&offset=N]
 
-GET /assets/style.css
+GET /help/search and GET /help/regex\nHTML pages that explain the query language (with typo tolerance) and, when the server offers it, the regular-expression filter with the limits this server applies. `/help` is the same as `/help/search`. The search form links to both.\n\nGET /assets/style.css
 
 DESCRIPTION
 The public, read-only interface served by dksearch(1). It needs no authentication. Every endpoint accepts GET and HEAD only; any other method receives 405 with `Allow: GET, HEAD`. Request bodies are refused with 400 and the connection is closed.
@@ -28,7 +28,10 @@ Run a search.
 
 Parameters:
 q
-: Required. The text to search for. Words are combined with AND. Text in double quotes is a phrase. Everything else, including `AND`, `OR`, `NEAR`, `*`, `-`, parentheses and `column:` prefixes, is searched as ordinary text and has no special meaning. At most 1024 bytes and 32 terms. A query with no letters or digits is an `empty_query` error.
+: Required. The text to search for, in a small query language. Words are combined with AND. Text in double quotes is a phrase. `OR` and `NOT` (capitals; `AND` too) combine terms, parentheses group them, a leading `-` excludes a word and a leading `+` is accepted (the word is required, as it already is), `comp*` matches words starting with comp, `word~` matches the word or any word one typo away, and `"two words"~5` matches the words within five positions of each other. In lower case `and`, `or` and `not` are ordinary words, and any operator can be searched for literally by quoting it. Column filters (`title:x`), `^`, `NEAR(...)` and all other index syntax are never interpreted: they are searched as ordinary text. The parser is forgiving: a stray `)` is ignored and a missing one supplied. A query needs at least one word that is not excluded. At most 1024 bytes, 32 terms and 8 levels of parentheses. A query with nothing searchable is an `empty_query` error. A server can turn the language off (`[search] query_syntax = "simple"`), in which case every word is plain text.
+
+fuzzy
+: Optional typo tolerance. By default (`[search] fuzzy = "auto"`) a search that finds fewer than three results is repeated with every word of four or more letters also matching words one typo away (a letter missing, extra, wrong or swapped), and the response says so. `fuzzy=1` always allows typos and `fuzzy=0` allows none (exact words only); anything else is `invalid_parameter`.
 
 language, content_type, connector
 : Optional exact-match filters on the document's language tag, media type and source connector. At most 64 bytes, no control characters. An empty value means no filter.
@@ -55,16 +58,18 @@ Response: 200 with `application/json`:
           "score": 0.42
         }
       ],
-      "has_more": false
+      "has_more": false,
+      "interpreted": null,
+      "fuzzy": false
     }
 
-`id` is the 32-hex-digit stable document id. `url`, `title` and `snippet` may be null. `score` is higher for better matches and is comparable only within one response. Hits are ordered by score, ties by id, so paging an unchanged index is stable. `has_more` says whether another page follows. `snippet` brackets matched text with the control characters U+0002 and U+0003 (JSON `\u0002`, `\u0003`); a client must escape the text for its output format first and only then replace the markers with its own markup. Snippets come from untrusted documents and may themselves contain such characters.
+`interpreted` is how the query was read, as text like `linux OR bsd NOT android`, when it used the query language or typo tolerance, and null for plain words. `fuzzy` is true when the results include words one typo away from those typed. `id` is the 32-hex-digit stable document id. `url`, `title` and `snippet` may be null. `score` is higher for better matches and is comparable only within one response. Hits are ordered by score, ties by id, so paging an unchanged index is stable. `has_more` says whether another page follows. `snippet` brackets matched text with the control characters U+0002 and U+0003 (JSON `\u0002`, `\u0003`); a client must escape the text for its output format first and only then replace the markers with its own markup. Snippets come from untrusted documents and may themselves contain such characters.
 
 GET /api/v1/health
 Returns 200 and `{"status":"ok"}`. It reports that the process is serving requests and nothing about the index.
 
 GET /search and GET /
-HTML pages. `/` is the search form. `/search` takes `q`, `language`, `connector`, `offset` and, when the server offers it, `regex` and `regex_flags` (the search form has a Regex field under Filters); the page size is fixed at 10 and any `limit` is ignored. Result URLs are links only if they begin with `http://` or `https://`; otherwise they are shown as text. An empty `q` shows the form again.
+HTML pages. `/` is the search form. `/search` takes `q`, `language`, `connector`, `offset`, `fuzzy` and, when the server offers it, `regex` and `regex_flags` (the search form has a Regex field under Filters); the page size is fixed at 10 and any `limit` is ignored. Result URLs are links only if they begin with `http://` or `https://`; otherwise they are shown as text. An empty `q` shows the form again.
 
 GET /assets/style.css
 The stylesheet, cacheable for one hour. All other responses are `Cache-Control: no-store`.

@@ -253,6 +253,7 @@ pub const config_topic =
     \\    tokenizer = "unicode61"        # or "porter" for English stemming (then run rebuild)
     \\
     \\    [search]
+    \\    fuzzy = "auto"                 # typo tolerance (default): "auto", "always" or "off"
     \\    regex = true                   # the regex filter on the search page and API (default on)
     \\    # regex_max_candidates = 200   # limits keep expensive patterns cheap; see the manual
     \\
