@@ -715,6 +715,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
                     .porter => .porter,
                 },
                 .sources = cfg.sources,
+                .backup_dir = cfg.admin_options.backup_dir,
             });
             job_manager_ready = true;
         }

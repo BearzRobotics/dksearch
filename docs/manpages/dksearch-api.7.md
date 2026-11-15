@@ -168,9 +168,12 @@ POST /api/v1/admin/imports
 : Starts an import of the source named by the form field `source` (`application/x-www-form-urlencoded` body). Returns 202 with `started`. Errors: 404 `unknown_source`, 409 `source_disabled`, `already_running` or `locked` (another import, rebuild or removal holds the data directory), 403 `actions_disabled`.
 
 POST /api/v1/admin/imports/cancel
-: Asks the running import to stop at its next safe point (its position is saved). Returns 200 with `cancelling` (false if nothing was running).
+: Asks the running import or maintenance operation to stop at its next safe point (an import's position is saved). Returns 200 with `cancelling` (false if nothing was running).
 
-The HTML pages `/` (dashboard) and `/jobs`, `POST /login` (field `credential`: the password or the token), `POST /logout` and, with actions enabled, `POST /actions/import` (fields `source`) and `POST /actions/cancel` are for browsers; the last three carry the per-session form token in the field `csrf`. The same compatibility rules apply: fields may be added within `v1`.
+POST /api/v1/admin/maintenance
+: With actions enabled, starts a maintenance operation in the background (only one import or operation runs at a time; they share the data directory's writer lock). Form fields: `op` is `check` (verify the stored data, read-only), `backup` (write verified copies of `state.db` and `content.db` into a new folder under `[admin] backup_dir`; 409 `not_configured` if that is not set) or `remove` (delete every document of `source`; also needs `confirm=yes`, or from the page the source's name typed again, else 400 `confirmation_required`). Returns 202 with `started`. Progress and the result appear in `GET /api/v1/admin/imports` as `running` and `last`, each with an `op` member (`import`, `check`, `backup` or `remove`), and `last` also has a `summary` text (the check's findings, the backup's location, how many documents were removed). Errors: 409 `already_running` or `locked`, 400 `unknown_operation`, 403 `actions_disabled`.
+
+The HTML pages `/` (dashboard) and `/jobs`, `POST /login` (field `credential`: the password or the token), `POST /logout` and, with actions enabled, `POST /actions/import` (fields `source`), `POST /actions/maintenance` (fields `op`, `source`, `confirm`) and `POST /actions/cancel` are for browsers; the page `/maintenance` shows the buttons; the last three carry the per-session form token in the field `csrf`. The same compatibility rules apply: fields may be added within `v1`.
 
 LIMITATIONS
 No document endpoints. The administration API can start and cancel imports only when enabled, and cannot rebuild, remove, back up or change configuration. No sorting options, total counts, or faceting. The public API has no authentication or rate limiting; the administration API requires a credential.

@@ -116,7 +116,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/maintenance", "/actions/maintenance", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -124,12 +124,15 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, maintenance, action_maintenance, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
             .{ "/", .dashboard },
             .{ "/jobs", .jobs },
+            .{ "/maintenance", .maintenance },
+            .{ "/actions/maintenance", .action_maintenance },
+            .{ "/api/v1/admin/maintenance", .api_maintenance },
             .{ "/login", .login },
             .{ "/logout", .logout },
             .{ "/assets/style.css", .style },
@@ -179,7 +182,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .api_maintenance;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (!post_only and route != .api_imports and !head_ok) return methodNotAllowed(arena, is_api, "GET, HEAD");
@@ -199,6 +202,9 @@ pub const App = struct {
         return switch (route) {
             .dashboard => self.pageDashboard(arena, csrf),
             .jobs => self.pageJobs(arena, csrf),
+            .maintenance => self.pageMaintenance(arena, csrf),
+            .action_maintenance => self.startOperation(arena, req, auth, false),
+            .api_maintenance => self.startOperation(arena, req, auth, true),
             .api_status => self.apiStatus(arena),
             .api_sources => self.apiSources(arena),
             .api_jobs => self.apiJobs(arena),
@@ -305,11 +311,12 @@ pub const App = struct {
         self.opts.jobs.?.start(name) catch |e| return actionFailure(arena, is_api, switch (e) {
             error.UnknownSource => .{ .status = .not_found, .code = "unknown_source", .message = "no such source" },
             error.SourceDisabled => .{ .status = .conflict, .code = "source_disabled", .message = "that source is disabled in the configuration" },
-            error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "an import is already running" },
+            error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "an import or other operation is already running" },
             error.LockHeld => .{ .status = .conflict, .code = "locked", .message = "another import, rebuild or removal is running on this data directory" },
             error.DataDirUnavailable => .{ .status = .internal_server_error, .code = "data_dir_unavailable", .message = "the data directory or its lock file cannot be used; see the server's error output" },
             error.OutOfMemory => return error.OutOfMemory,
             error.NoConcurrency => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start a background task" },
+            error.NotConfigured, error.BadArgument => .{ .status = .bad_request, .code = "bad_request", .message = "a source name is required" },
         });
         if (is_api) {
             var r = try handler.jsonResponse(arena, .accepted, .{ .started = name });
@@ -317,6 +324,42 @@ pub const App = struct {
             return r;
         }
         return redirect(arena, "/", null);
+    }
+
+    /// Starts a maintenance operation: check, backup or remove. Removal needs
+    /// `confirm=yes` and, from the page, the source's name typed to confirm.
+    fn startOperation(self: *App, arena: Allocator, req: server.Request, auth: Auth, is_api: bool) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, is_api)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const op_text = params.get("op") orelse "";
+        const op: dk.jobs.Op = if (std.mem.eql(u8, op_text, "check")) .check else if (std.mem.eql(u8, op_text, "backup")) .backup else if (std.mem.eql(u8, op_text, "remove")) .remove else return actionFailure(arena, is_api, .{ .status = .bad_request, .code = "unknown_operation", .message = "op must be check, backup or remove" });
+        const source = params.get("source") orelse "";
+        if (op == .remove) {
+            const typed = params.get("confirm") orelse "";
+            // From the API `confirm=yes`; from the page the source name typed again.
+            if (!std.mem.eql(u8, typed, "yes") and !(typed.len > 0 and std.mem.eql(u8, typed, source))) {
+                return actionFailure(arena, is_api, .{ .status = .bad_request, .code = "confirmation_required", .message = "removing documents needs confirmation: send confirm=yes (or type the source name to confirm)" });
+            }
+        }
+        self.opts.jobs.?.startOp(op, if (op == .check or op == .backup) null else source) catch |e| return actionFailure(arena, is_api, switch (e) {
+            error.UnknownSource => .{ .status = .not_found, .code = "unknown_source", .message = "no such source" },
+            error.SourceDisabled => .{ .status = .conflict, .code = "source_disabled", .message = "that source is disabled in the configuration" },
+            error.NotConfigured => .{ .status = .conflict, .code = "not_configured", .message = "backups from the interface need a backup directory: set [admin] backup_dir" },
+            error.BadArgument => .{ .status = .bad_request, .code = "bad_argument", .message = "a source name is required" },
+            error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "another operation is already running" },
+            error.LockHeld => .{ .status = .conflict, .code = "locked", .message = "another import, rebuild or removal is running on this data directory" },
+            error.DataDirUnavailable => .{ .status = .internal_server_error, .code = "data_dir_unavailable", .message = "the data directory or its lock file cannot be used; see the server's error output" },
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NoConcurrency => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start a background task" },
+        });
+        if (is_api) {
+            var r = try handler.jsonResponse(arena, .accepted, .{ .started = op_text });
+            r.status = .accepted;
+            return r;
+        }
+        return redirect(arena, "/maintenance", null);
     }
 
     fn cancelImport(self: *App, arena: Allocator, req: server.Request, auth: Auth, is_api: bool) error{OutOfMemory}!Response {
@@ -330,13 +373,13 @@ pub const App = struct {
     }
 
     fn apiImports(self: *App, arena: Allocator) error{OutOfMemory}!Response {
-        const JsonLast = struct { source: []const u8, state: []const u8, submitted: u64, rejected: u64, skip_reasons: JsonReasons, failure: ?[]const u8, finished_at: i64 };
-        const JsonRunning = struct { source: []const u8, started_at: i64, submitted: u64, progress_done: u64, progress_total: u64 };
+        const JsonLast = struct { op: []const u8, summary: ?[]const u8, source: []const u8, state: []const u8, submitted: u64, rejected: u64, skip_reasons: JsonReasons, failure: ?[]const u8, finished_at: i64 };
+        const JsonRunning = struct { op: []const u8, source: []const u8, started_at: i64, submitted: u64, progress_done: u64, progress_total: u64 };
         var running: ?JsonRunning = null;
         var last: ?JsonLast = null;
         if (self.opts.jobs) |m| {
-            if (try m.current(arena)) |c| running = .{ .source = c.source, .started_at = c.started_at, .submitted = c.submitted, .progress_done = c.progress_done, .progress_total = c.progress_total };
-            if (try m.lastResult(arena)) |l| last = .{ .source = l.source, .state = @tagName(l.state), .submitted = l.submitted, .rejected = l.rejected, .skip_reasons = jsonReasons(l.reasons), .failure = l.failure, .finished_at = l.finished_at };
+            if (try m.current(arena)) |c| running = .{ .op = @tagName(c.op), .source = c.source, .started_at = c.started_at, .submitted = c.submitted, .progress_done = c.progress_done, .progress_total = c.progress_total };
+            if (try m.lastResult(arena)) |l| last = .{ .op = @tagName(l.op), .summary = l.summary, .source = l.source, .state = @tagName(l.state), .submitted = l.submitted, .rejected = l.rejected, .skip_reasons = jsonReasons(l.reasons), .failure = l.failure, .finished_at = l.finished_at };
         }
         return handler.jsonResponse(arena, .ok, .{ .actions = self.opts.jobs != null, .running = running, .last = last });
     }
@@ -737,6 +780,16 @@ pub const App = struct {
         return handler.htmlResponse(arena, .ok, aw.written());
     }
 
+    fn pageMaintenance(self: *App, arena: Allocator, csrf: ?[]const u8) error{OutOfMemory}!Response {
+        const snap = self.snapshot(arena, 1);
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "Maintenance", csrf, "maintenance") catch return error.OutOfMemory;
+        writeMaintenance(self, arena, w, snap, csrf) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
+    }
+
     fn pageJobs(self: *App, arena: Allocator, csrf: ?[]const u8) error{OutOfMemory}!Response {
         const snap = self.snapshot(arena, 50);
         var aw: Io.Writer.Allocating = .init(arena);
@@ -798,6 +851,7 @@ fn renderLogin(arena: Allocator, status: http.Status, notice: ?[]const u8) error
 const nav_items = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "dashboard", "/", "Dashboard" },
     .{ "jobs", "/jobs", "Jobs" },
+    .{ "maintenance", "/maintenance", "Maintenance" },
     .{ "search", "/search", "Search test" },
 };
 
@@ -964,15 +1018,25 @@ fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const 
         return;
     };
     if (try m.current(arena)) |c| {
-        try w.writeAll("<section class=\"card running\" id=\"import-live\" data-running=\"1\"><h2>Importing <strong>");
-        try html.writeEscaped(w, c.source);
-        try w.writeAll("</strong></h2>");
+        try w.writeAll("<section class=\"card running\" id=\"import-live\" data-running=\"1\"><h2>");
+        switch (c.op) {
+            .import => try w.writeAll("Importing "),
+            .check => try w.writeAll("Checking the stored data"),
+            .backup => try w.writeAll("Backing up"),
+            .remove => try w.writeAll("Removing "),
+        }
+        if (c.op == .import or c.op == .remove) {
+            try w.writeAll("<strong>");
+            try html.writeEscaped(w, c.source);
+            try w.writeAll("</strong>");
+        }
+        try w.writeAll("</h2>");
         if (c.progress_total > 0) {
             try w.print("<progress id=\"import-bar\" max=\"{d}\" value=\"{d}\"></progress> <span data-f=\"percent\" class=\"muted\">{d:.1} %</span>", .{ c.progress_total, @min(c.progress_done, c.progress_total), 100.0 * @as(f64, @floatFromInt(@min(c.progress_done, c.progress_total))) / @as(f64, @floatFromInt(c.progress_total)) });
         } else {
             try w.writeAll("<progress id=\"import-bar\"></progress> <span data-f=\"percent\" class=\"muted\">size unknown</span>");
         }
-        try w.print("<dl class=\"facts\"><div><dt>Documents</dt><dd data-f=\"docs\">{d}</dd></div><div><dt>Speed</dt><dd data-f=\"rate\">measuring</dd></div><div><dt>Time left</dt><dd data-f=\"eta\">estimating</dd></div><div><dt>Running for</dt><dd data-f=\"elapsed\">", .{c.submitted});
+        try w.print("<dl class=\"facts\"><div><dt>{s}</dt><dd data-f=\"docs\">{d}</dd></div><div><dt>Speed</dt><dd data-f=\"rate\">measuring</dd></div><div><dt>Time left</dt><dd data-f=\"eta\">estimating</dd></div><div><dt>Running for</dt><dd data-f=\"elapsed\">", .{ if (c.op == .remove) "Removed" else "Documents", c.submitted });
         try writeDuration(w, @intCast(@max(0, unixNow(app.io) - c.started_at)));
         try w.writeAll("</dd></div></dl>\n<noscript><p class=\"muted\">Without JavaScript the numbers above only update when you reload the page.</p></noscript>");
         if (csrf) |token| {
@@ -1002,11 +1066,15 @@ fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const 
         try w.writeAll("<p class=\"muted\">Sign in with the password to use the buttons, or use the API.</p>");
     }
     if (try m.lastResult(arena)) |l| {
-        try w.writeAll("<p class=\"muted\">Last import started from here: ");
+        try w.print("<p class=\"muted\">Last operation started from here: {s} ", .{opTitle(l.op).ptr[0..opTitle(l.op).len]});
         try html.writeEscaped(w, l.source);
         try w.writeAll(" ");
         try writeBadge(w, l.state);
-        try w.print(" {d} submitted, {d} skipped", .{ l.submitted, l.rejected });
+        if (l.op == .import) try w.print(" {d} submitted, {d} skipped", .{ l.submitted, l.rejected });
+        if (l.summary) |sm| {
+            try w.writeAll(" &mdash; ");
+            try html.writeEscaped(w, sm);
+        }
         {
             var rb: [256]u8 = undefined;
             var rw: Io.Writer = .fixed(&rb);
@@ -1129,6 +1197,57 @@ fn writeDashboard(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot
     }
     try w.writeAll("</tbody></table></div></details>\n");
     try w.print("<p class=\"muted\">{d} active session(s). A job shown as running may belong to an import that was killed; the next command that opens the data marks it interrupted.</p>\n", .{app.sessionCount()});
+}
+
+fn opTitle(op: dk.jobs.Op) []const u8 {
+    return switch (op) {
+        .import => "Import",
+        .check => "Check of the stored data",
+        .backup => "Backup",
+        .remove => "Removal",
+    };
+}
+
+fn writeMaintenance(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot, csrf: ?[]const u8) !void {
+    const m = app.opts.jobs orelse {
+        try w.writeAll("<section class=\"card\"><h2>Maintenance</h2><p class=\"muted\">Running maintenance from here is turned off (<code>admin.actions</code> is false). Use the command line: <code>dksearch check</code>, <code>backup</code>, <code>remove</code>, <code>rebuild</code>, <code>restore</code> (see <code>dksearch help</code>).</p></section>\n");
+        return;
+    };
+    try writeImportsPanel(app, arena, w, csrf);
+    const idle = (try m.current(arena)) == null;
+    const token = csrf orelse {
+        try w.writeAll("<p class=\"muted\">Sign in with the password to use the buttons, or use the API (<code>POST /api/v1/admin/maintenance</code>).</p>\n");
+        return;
+    };
+    const off = if (idle) "" else " disabled";
+
+    try w.writeAll("<section class=\"card\"><h2>Check the stored data</h2><p class=\"muted\">Verifies the databases and every stored text against its record (read-only). It can take a long time on a large index; the progress bar shows how far it is.</p>");
+    try w.print("<form action=\"/actions/maintenance\" method=\"post\"><input type=\"hidden\" name=\"op\" value=\"check\"><input type=\"hidden\" name=\"csrf\" value=\"{s}\"><button type=\"submit\" class=\"btn\"{s}>Run the check</button></form></section>\n", .{ token, off });
+
+    try w.writeAll("<section class=\"card\"><h2>Back up</h2>");
+    if (m.opts.backup_dir) |dir| {
+        try w.writeAll("<p class=\"muted\">Writes verified copies of <code>state.db</code> and <code>content.db</code> (the only copies of what was imported) into a new folder under <code>");
+        try html.writeEscaped(w, dir);
+        try w.print("</code>. The server keeps working. The index is not copied; <code>dksearch restore</code> recreates it.</p><form action=\"/actions/maintenance\" method=\"post\"><input type=\"hidden\" name=\"op\" value=\"backup\"><input type=\"hidden\" name=\"csrf\" value=\"{s}\"><button type=\"submit\" class=\"btn\"{s}>Back up now</button></form>", .{ token, off });
+    } else {
+        try w.writeAll("<p class=\"muted\">Not set up: add <code>backup_dir = \"/path/to/backups\"</code> to the <code>[admin]</code> table of the configuration (a folder you control; the interface never writes anywhere else) and restart.</p>");
+    }
+    try w.writeAll("</section>\n");
+
+    try w.writeAll("<section class=\"card\"><h2>Remove a source&rsquo;s documents</h2><p class=\"muted\">Deletes every document the source imported from the index, the stored text and the records, and forgets its import history. This cannot be undone (restore from a backup). Type the source&rsquo;s name to confirm.</p>");
+    var any = false;
+    for (snap.counts) |c| {
+        any = true;
+        try w.print("<form class=\"inline\" action=\"/actions/maintenance\" method=\"post\"><input type=\"hidden\" name=\"op\" value=\"remove\"><input type=\"hidden\" name=\"csrf\" value=\"{s}\"><input type=\"hidden\" name=\"source\" value=\"", .{token});
+        try html.writeEscaped(w, c.source);
+        try w.print("\"><strong>", .{});
+        try html.writeEscaped(w, c.source);
+        try w.print("</strong> ({d} documents) <input name=\"confirm\" placeholder=\"type the name\" autocomplete=\"off\" maxlength=\"64\"> <button type=\"submit\" class=\"btn danger\"{s}>Remove</button></form><br>", .{ c.documents, off });
+    }
+    if (!any) try w.writeAll("<p class=\"muted\">No documents have been imported yet.</p>");
+    try w.writeAll("</section>\n");
+
+    try w.writeAll("<section class=\"card\"><h2>Rebuild and restore</h2><p class=\"muted\">These stay on the command line: <code>dksearch rebuild</code> recreates the index (stop <code>serve</code> first), and <code>dksearch restore DIR</code> recreates the stored data from a backup. Both replace files the running server is using.</p></section>\n");
 }
 
 fn writeJobs(w: *Io.Writer, jobs: []const dk.state_sqlite.Job) Io.Writer.Error!void {
@@ -1714,7 +1833,81 @@ test "start an import through the API, watch it finish, and see it on the dashbo
     try testing.expect(std.mem.indexOf(u8, dash.body, "action=\"/actions/import\"") != null);
     try testing.expect(std.mem.indexOf(u8, dash.body, "Import notes") != null);
     try testing.expect(std.mem.indexOf(u8, dash.body, "Import wiki") == null); // disabled sources get no button
-    try testing.expect(std.mem.indexOf(u8, dash.body, "Last import started from here") != null);
+    try testing.expect(std.mem.indexOf(u8, dash.body, "Last operation started from here") != null);
+}
+
+test "maintenance: check, backup, confirmed removal, and the page" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var backups = testing.tmpDir(.{});
+    defer backups.cleanup();
+    var bp: [160]u8 = undefined;
+    const bdir = try std.fmt.bufPrint(&bp, ".zig-cache/tmp/{s}", .{backups.sub_path});
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const auth = try f.bearer(a);
+
+    // Nothing is possible without credentials.
+    const anon = try f.call(a, .POST, "/api/v1/admin/maintenance", .{ .body = "op=check" });
+    try testing.expectEqual(http.Status.unauthorized, anon.status);
+    const get = try f.call(a, .GET, "/api/v1/admin/maintenance", .{ .auth = auth });
+    try testing.expectEqual(http.Status.method_not_allowed, get.status);
+
+    _ = try f.call(a, .POST, "/api/v1/admin/imports", .{ .auth = auth, .body = "source=notes" });
+    try f.waitIdle();
+
+    const unknown = try f.call(a, .POST, "/api/v1/admin/maintenance", .{ .auth = auth, .body = "op=format" });
+    try testing.expectEqual(http.Status.bad_request, unknown.status);
+    try testing.expect(std.mem.indexOf(u8, unknown.body, "unknown_operation") != null);
+
+    const check = try f.call(a, .POST, "/api/v1/admin/maintenance", .{ .auth = auth, .body = "op=check" });
+    try testing.expectEqual(http.Status.accepted, check.status);
+    try f.waitIdle();
+    const after = try f.call(a, .GET, "/api/v1/admin/imports", .{ .auth = auth });
+    try testing.expect(std.mem.indexOf(u8, after.body, "\"op\":\"check\"") != null);
+    try testing.expect(std.mem.indexOf(u8, after.body, "state.db ok: 5 documents") != null); // the fixture's own records
+
+    // Backup needs a configured folder.
+    const nobak = try f.call(a, .POST, "/api/v1/admin/maintenance", .{ .auth = auth, .body = "op=backup" });
+    try testing.expectEqual(http.Status.conflict, nobak.status);
+    try testing.expect(std.mem.indexOf(u8, nobak.body, "not_configured") != null);
+    f.manager.opts.backup_dir = bdir;
+    const bak = try f.call(a, .POST, "/api/v1/admin/maintenance", .{ .auth = auth, .body = "op=backup" });
+    try testing.expectEqual(http.Status.accepted, bak.status);
+    try f.waitIdle();
+
+    // Removal must be confirmed.
+    const noconf = try f.call(a, .POST, "/api/v1/admin/maintenance", .{ .auth = auth, .body = "op=remove&source=notes" });
+    try testing.expectEqual(http.Status.bad_request, noconf.status);
+    try testing.expect(std.mem.indexOf(u8, noconf.body, "confirmation_required") != null);
+    const wrong = try f.call(a, .POST, "/api/v1/admin/maintenance", .{ .auth = auth, .body = "op=remove&source=notes&confirm=nope" });
+    try testing.expectEqual(http.Status.bad_request, wrong.status);
+
+    // The page shows the buttons only to a signed-in session, with its token.
+    const cookie = try f.signIn(a);
+    const page = try f.call(a, .GET, "/maintenance", .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.ok, page.status);
+    try testing.expect(std.mem.indexOf(u8, page.body, "Run the check") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "Back up now") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "type the name") != null);
+    const csrf = csrfOf(page.body);
+    const form = try std.fmt.allocPrint(a, "op=remove&source=notes&confirm=notes&csrf={s}", .{csrf});
+    const bad_csrf = try f.call(a, .POST, "/actions/maintenance", .{ .cookie = cookie, .body = "op=remove&source=notes&confirm=notes&csrf=wrong" });
+    try testing.expectEqual(http.Status.forbidden, bad_csrf.status);
+    const done = try f.call(a, .POST, "/actions/maintenance", .{ .cookie = cookie, .body = form });
+    try testing.expectEqual(http.Status.see_other, done.status);
+    try f.waitIdle();
+    const last = try f.call(a, .GET, "/api/v1/admin/imports", .{ .auth = auth });
+    try testing.expect(std.mem.indexOf(u8, last.body, "\"op\":\"remove\"") != null);
+    // The fixture's database already held two records for "notes", plus the two imported files.
+    try testing.expect(std.mem.indexOf(u8, last.body, "Removed 4 documents of notes") != null);
+
+    // Without a session (token only) the page explains how to proceed.
+    const tok = try f.call(a, .GET, "/maintenance", .{ .auth = auth });
+    try testing.expect(std.mem.indexOf(u8, tok.body, "Sign in with the password") != null);
 }
 
 test "a form post with the session's token starts an import; a busy data directory is refused" {

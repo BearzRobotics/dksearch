@@ -29,10 +29,12 @@ port = 8080
 #[admin]
 #address = "127.0.0.1"
 #port = 8081
-#actions = true    # also allow starting and cancelling imports from the pages
+#actions = true    # also allow starting/cancelling imports, and check/backup/remove, from the pages
+#backup_dir = "/var/backups/dksearch"   # where the Maintenance page's backups go (a folder you control)
 
 # Search options. The regular-expression filter is on by default with strict limits.
 #[search]
+#query_timeout_ms = 5000   # stop searches that run longer (very common words on a huge index)
 #regex = true
 #regex_max_candidates = 200
 

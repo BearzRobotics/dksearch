@@ -117,6 +117,9 @@ pub const AdminOptions = struct {
     /// Let the interface start and cancel imports (docs/decisions/0014).
     /// Off by default: the interface is then strictly read-only.
     actions: bool = false,
+    /// A folder the interface may write backups into (a new subdirectory per
+    /// backup). Null: backups from the interface are off.
+    backup_dir: ?[]const u8 = null,
 };
 
 /// An integer setting of a listener: its key, range, and where it lives.
@@ -246,7 +249,7 @@ const server_keys = [_][]const u8{
     "max_requests_per_connection", "shutdown_grace_ms",
     "access_log",
 };
-const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions" };
+const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions", "backup_dir" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
 const search_keys = [_][]const u8{ "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
@@ -304,6 +307,13 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     cfg.server = try readListener(a, src, root, "server", &server_keys, cfg.server, diag);
     cfg.admin = try readListener(a, src, root, "admin", &admin_keys, cfg.admin, diag);
     if (try subTable(src, root, "admin", diag)) |t| {
+        if (try str(src, "admin", t, "backup_dir", diag)) |bd| {
+            if (bd.len == 0) {
+                diag.set(src, "admin.backup_dir", "must not be empty (omit the key to turn backups from the interface off)", .{});
+                return error.InvalidValue;
+            }
+            cfg.admin_options.backup_dir = try a.dupe(u8, bd);
+        }
         if (try str(src, "admin", t, "secrets_file", diag)) |s| {
             if (s.len == 0) {
                 diag.set(src, "admin.secrets_file", "must not be empty", .{});

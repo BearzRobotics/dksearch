@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const connector = @import("connector.zig");
 const Allocator = std.mem.Allocator;
 const sqlite = @import("sqlite.zig");
 const c = sqlite.c;
@@ -40,6 +41,8 @@ pub const FileState = enum {
 };
 
 pub const Report = struct {
+    /// The check was stopped before it finished; the figures are partial.
+    cancelled: bool = false,
     index: FileState = .absent,
     state: FileState = .absent,
     content: FileState = .absent,
@@ -61,6 +64,7 @@ pub const Report = struct {
     /// No damage and nothing refused to open. Absent files and the notes
     /// below are not problems.
     pub fn healthy(self: Report) bool {
+        if (self.cancelled) return false;
         for ([_]FileState{ self.index, self.state, self.content }) |f| {
             switch (f) {
                 .absent, .ok => {},
@@ -117,6 +121,12 @@ fn mapOpen(e: sqlite.MigrateError) FileState {
 }
 
 pub fn check(gpa: Allocator, io: Io, paths: Paths) CheckError!Report {
+    return checkWith(gpa, io, paths, null);
+}
+
+/// Like `check`, reporting progress through `control` (documents verified of
+/// all) and stopping early, with `Report.cancelled` set, if it is cancelled.
+pub fn checkWith(gpa: Allocator, io: Io, paths: Paths, control: ?*connector.Control) CheckError!Report {
     var r: Report = .{};
 
     var state: ?state_sqlite.SqliteStateStore = null;
@@ -168,8 +178,19 @@ pub fn check(gpa: Allocator, io: Io, paths: Paths) CheckError!Report {
             content: storage.ContentStore,
             gpa: Allocator,
             report: *Report,
+            control: ?*connector.Control,
+            seen: u64 = 0,
+            cancelled: bool = false,
             fn visit(ptr: *anyopaque, rec: storage.Record) storage.Error!void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.seen += 1;
+                if (self.control) |ctl| {
+                    if (self.seen % 256 == 0) ctl.setProgress(self.seen, self.report.documents);
+                    if (ctl.isCancelled()) {
+                        self.cancelled = true;
+                        return error.Io;
+                    }
+                }
                 const text = self.content.get(self.gpa, rec.id) catch |e| switch (e) {
                     error.NotFound => {
                         self.report.without_text += 1;
@@ -184,10 +205,14 @@ pub fn check(gpa: Allocator, io: Io, paths: Paths) CheckError!Report {
                 self.gpa.free(text);
             }
         };
-        var ctx: Ctx = .{ .content = content.?.store(), .gpa = gpa, .report = &r };
+        var ctx: Ctx = .{ .content = content.?.store(), .gpa = gpa, .report = &r, .control = control };
         state.?.documents().forEach(.{ .ptr = &ctx, .visit = Ctx.visit }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => r.state = .damaged,
+            else => if (ctx.cancelled) {
+                r.cancelled = true;
+            } else {
+                r.state = .damaged;
+            },
         };
         const referenced = r.documents -| r.without_text;
         r.orphan_texts = r.texts -| referenced;
