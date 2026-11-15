@@ -56,6 +56,7 @@ const usage =
     \\       dksearch admin-token [--config FILE]
     \\       dksearch admin-password [--config FILE]
     \\       dksearch backup [--config FILE] DIR
+    \\       dksearch restore [--config FILE] [--no-index] DIR
     \\       dksearch check-config FILE
     \\
 ;
@@ -145,6 +146,29 @@ fn run(init: std.process.Init) u8 {
         }
         if (eq(first, "check")) return checkCmd(io, gpa, config_path);
         return backupCmd(io, gpa, config_path, dir orelse return usageError(io, "backup needs a destination DIR"));
+    }
+
+    if (eq(first, "restore")) {
+        var config_path: ?[]const u8 = null;
+        var dir: ?[]const u8 = null;
+        var rebuild_index = true;
+        while (args.next()) |a| {
+            if (eq(a, "--config")) {
+                config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+            } else if (std.mem.startsWith(u8, a, "--config=")) {
+                config_path = a["--config=".len..];
+            } else if (eq(a, "--no-index")) {
+                rebuild_index = false;
+            } else if (std.mem.startsWith(u8, a, "-")) {
+                err(io, "unknown option for restore: {s}", .{a});
+                return exit_usage;
+            } else if (dir == null) {
+                dir = a;
+            } else {
+                return usageError(io, "too many arguments");
+            }
+        }
+        return restoreCmd(io, gpa, config_path, dir orelse return usageError(io, "restore needs the backup DIR"), rebuild_index);
     }
 
     if (eq(first, "serve") or eq(first, "rebuild")) {
@@ -758,6 +782,58 @@ fn backupCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, dest_dir:
     }
     out(io, "backup complete and verified. index.db is not backed up: `dksearch rebuild` recreates it\n", .{});
     return exit_ok;
+}
+
+fn restoreCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, backup_dir: []const u8, rebuild_index: bool) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dest = Paths.make(a, cfg.data_dir) catch return exit_io;
+    const from = Paths.make(a, backup_dir) catch return exit_io;
+
+    // The backup must be there and sound before anything is written.
+    for ([_][:0]const u8{ from.state, from.content }) |p| {
+        Io.Dir.cwd().access(io, p, .{}) catch {
+            err(io, "{s} does not exist; {s} is not a backup made by `dksearch backup`", .{ p, backup_dir });
+            return exit_io;
+        };
+    }
+    const report = dk.maintenance.check(gpa, io, .{ .index = from.index, .state = from.state, .content = from.content }) catch return exit_io;
+    if (!report.healthy() or report.state != .ok or report.content != .ok) {
+        err(io, "the backup in {s} is damaged or unreadable (run `dksearch check` on it by pointing data_dir at it); nothing was restored", .{backup_dir});
+        return exit_failure;
+    }
+
+    // Restoring never overwrites: the target must have none of the three files.
+    for ([_][:0]const u8{ dest.state, dest.content, dest.index }) |p| {
+        if (Io.Dir.cwd().access(io, p, .{})) |_| {
+            err(io, "{s} already exists; restore never overwrites. Move it away (or point data_dir at an empty directory) first", .{p});
+            return exit_failure;
+        } else |_| {}
+    }
+    if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
+    {
+        const lock = lockWriters(io, cfg.data_dir, "restore") orelse return exit_io;
+        defer lock.release(io);
+        // content.db first, state.db last: a data directory with a state.db is complete.
+        const pairs = [_][2][:0]const u8{ .{ from.content, dest.content }, .{ from.state, dest.state } };
+        for (pairs) |pair| {
+            dk.maintenance.restoreFile(io, pair[0], pair[1], true) catch |e| {
+                err(io, "restoring {s} failed: {t}. Nothing half-written is left under that name; fix the cause and run restore again", .{ pair[1], e });
+                return exit_io;
+            };
+            out(io, "{s} -> {s}\n", .{ pair[0], pair[1] });
+        }
+    }
+    out(io, "restored {d} documents ({d} retained texts)\n", .{ report.documents, report.texts });
+    if (!rebuild_index) {
+        out(io, "index.db was not created: run `dksearch rebuild` before serving searches\n", .{});
+        return exit_ok;
+    }
+    return rebuildCmd(io, gpa, config_path);
 }
 
 fn removeCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, source: []const u8, yes: bool) u8 {

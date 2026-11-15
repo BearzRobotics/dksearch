@@ -16,8 +16,12 @@
 
 ## Not done
 
-Scheduling, retention, encryption of backups, restoring through a command (the manual procedure is in the manpage).
+Scheduling, retention, encryption of backups. (Restoring through a command was added later, see the addendum below.)
 
 ## Addendum: writer lock
 
 `import` and `rebuild` take an exclusive `flock`-style lock on `data_dir/write.lock` (`maintenance.WriterLock`) before opening any store, and refuse to start if it is held. The OS drops it when the process dies, so there are no stale locks to clean up. `check` and `backup` do not take it. `serve` does not either: it only reads the index.
+
+## Addendum: `dksearch restore` (2026-11-15)
+
+`dksearch restore [--config FILE] [--no-index] DIR` recreates `state.db` and `content.db` from a backup and then runs the normal rebuild for `index.db`. The backup is verified first with the same `check` used elsewhere; the target must contain none of the three database files (restore never overwrites, like backup); each file is written by SQLite's own copy (`VACUUM INTO`, so no raw copying of WAL files) under a temporary name, verified, then renamed, `content.db` first and `state.db` last. Tested with a unit test and end to end on the 286,047-article Simple English Wikipedia data (identical search results after restore). Not done: restoring a single source, point-in-time recovery, and restoring while `serve` runs (stop it first).

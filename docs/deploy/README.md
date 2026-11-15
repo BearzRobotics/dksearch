@@ -101,7 +101,7 @@ If you also publish the administration interface through a proxy, restrict it by
     sudo cp docs/deploy/dksearch-backup.service docs/deploy/dksearch-backup.timer /etc/systemd/system/
     sudo systemctl enable --now dksearch-backup.timer
 
-Each run writes a new directory holding `state.db` and `content.db` (the only copies of what was imported; the index is rebuilt with `dksearch rebuild`). Nothing prunes old backups: delete old directories yourself, and copy backups to another machine. To restore, stop the service, copy the two files into `data_dir` (remove stale `*-wal` and `*-shm` files next to them), run `dksearch rebuild`, and start the service. Run `dksearch check` now and then, and after a restore.
+Each run writes a new directory holding `state.db` and `content.db` (the only copies of what was imported; the index is rebuilt with `dksearch rebuild`). Nothing prunes old backups: delete old directories yourself, and copy backups to another machine. To restore, stop the service, move the damaged files out of `data_dir`, run `sudo -u dksearch dksearch restore --config /etc/dksearch/dksearch.toml /var/backups/dksearch/DIRECTORY` (it verifies the backup, copies it in and rebuilds the index), and start the service. Run `dksearch check` now and then, and after a restore.
 
 ## Updating
 

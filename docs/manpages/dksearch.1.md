@@ -91,6 +91,15 @@ Arguments: DIR, the destination directory. Use a new directory for each backup.
 
 Examples: dksearch backup --config dksearch.toml /backups/dksearch-2026-11-14
 
+restore
+Recreate `state.db` and `content.db` in `data_dir` from a backup directory DIR made by **backup**, then rebuild the search index from them. The backup is checked first (SQLite integrity and every text against its record) and nothing is written if it is damaged. It never overwrites: if `state.db`, `content.db` or `index.db` already exists in `data_dir` it stops before writing anything, so move the old files away or point `data_dir` at an empty directory. Each file is written under a temporary name and renamed into place only once complete and verified, `content.db` first and `state.db` last, so a `state.db` in `data_dir` always belongs to a complete restore; an interrupted restore can simply be run again. It takes the same write lock as **import** and **rebuild**. Stop **serve** first if it uses the same `data_dir`. Restoring and then rebuilding 286,047 Simple English Wikipedia articles took 2 minutes 20 seconds, and the restored index returned identical results.
+
+Usage: dksearch restore [--config FILE] [--no-index] DIR
+
+Arguments: DIR, a directory written by **backup**. **--no-index** skips the rebuild (run **rebuild** yourself before serving).
+
+Examples: dksearch restore --config dksearch.toml /backups/dksearch-2026-11-14
+
 admin-token
 Create a new bearer token for the administration interface. It prints the token (`dks_` and 43 characters) to standard output, once, and stores only its SHA-256 hash in the secrets file (`admin.secrets_file`, mode 0600, replaced atomically). Any earlier token stops working at once, and sessions made with it end. Scripts send it as `Authorization: Bearer TOKEN`. The administration interface does not start until at least one credential exists.
 
@@ -346,7 +355,7 @@ Prints `dksearch.toml: ok (N sources)` and exits 0, or prints the reason and exi
 Check the stored data, and back it up
     dksearch check --config dksearch.toml
     dksearch backup --config dksearch.toml /backups/dksearch-$(date +%F)
-**check** prints one line per database and the verification totals, then `ok` and exit status 0, or a `problem:` line and exit status 1 when it finds damage. To restore, stop dksearch, copy `state.db` and `content.db` from the backup into `data_dir` (removing any `state.db-wal`, `state.db-shm`, `content.db-wal` and `content.db-shm` left there), and run `dksearch rebuild` to recreate the index.
+**check** prints one line per database and the verification totals, then `ok` and exit status 0, or a `problem:` line and exit status 1 when it finds damage. To restore, stop dksearch, move the damaged files out of `data_dir`, and run `dksearch restore --config dksearch.toml /backups/dksearch-2026-11-14`; it verifies the backup, copies it in and recreates the index.
 
 Ask the running server
     curl 'http://127.0.0.1:8080/api/v1/search?q=truth&limit=5'

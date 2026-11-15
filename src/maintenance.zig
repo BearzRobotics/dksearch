@@ -225,6 +225,23 @@ pub fn backupFile(src: [:0]const u8, dest: [:0]const u8, durable: bool) BackupEr
     if (!(sqlite.integrityOk(copy) catch false)) return error.VerifyFailed;
 }
 
+pub const RestoreError = BackupError || error{DestinationExists};
+
+/// Restores the database `src` (a backup) to the new path `dest`: the copy is
+/// written under a temporary name, verified, and only then renamed into
+/// place, so `dest` either does not exist or is complete. Refuses if `dest`
+/// exists. `src` is opened read-only and never changed.
+pub fn restoreFile(io: Io, src: [:0]const u8, dest: [:0]const u8, durable: bool) RestoreError!void {
+    if (exists(io, dest)) return error.DestinationExists;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp = std.fmt.bufPrintSentinel(&buf, "{s}.restoring", .{dest}, 0) catch return error.Io;
+    // A leftover of an interrupted restore is ours to replace.
+    Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    errdefer Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    try backupFile(src, tmp, durable);
+    Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), dest, io) catch return error.Io;
+}
+
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -412,4 +429,42 @@ test "the writer lock is exclusive and is released" {
     a.release(testing.io);
     const b = try WriterLock.acquire(testing.io, tmp.dir, "write.lock");
     b.release(testing.io);
+}
+
+test "restoreFile recreates a database from a backup and never overwrites" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [3][160]u8 = undefined;
+    const paths = try populate(&tmp, 4, &pb);
+    var b1: [160]u8 = undefined;
+    var b2: [160]u8 = undefined;
+    var b3: [160]u8 = undefined;
+    var b4: [160]u8 = undefined;
+    const bak_state = try tmpPath(&b1, &tmp, "bak_state.db");
+    const bak_content = try tmpPath(&b2, &tmp, "bak_content.db");
+    try backupFile(paths.state, bak_state, false);
+    try backupFile(paths.content, bak_content, false);
+
+    const new_state = try tmpPath(&b3, &tmp, "new_state.db");
+    const new_content = try tmpPath(&b4, &tmp, "new_content.db");
+    try restoreFile(testing.io, bak_state, new_state, false);
+    try restoreFile(testing.io, bak_content, new_content, false);
+    try testing.expectError(error.DestinationExists, restoreFile(testing.io, bak_state, new_state, false));
+
+    // The restored pair checks out and holds the same documents; no temp file is left.
+    var nb: [160]u8 = undefined;
+    const no_index = try tmpPath(&nb, &tmp, "none.db");
+    const r = try check(testing.allocator, testing.io, .{ .index = no_index, .state = new_state, .content = new_content });
+    try testing.expect(r.healthy());
+    try testing.expectEqual(@as(u64, 4), r.documents);
+    try testing.expectEqual(@as(u64, 4), r.texts);
+    var tb: [170]u8 = undefined;
+    const leftover = try std.fmt.bufPrintSentinel(&tb, "{s}.restoring", .{new_state}, 0);
+    try testing.expect(!exists(testing.io, leftover));
+
+    // A missing backup fails and creates nothing.
+    var mb: [160]u8 = undefined;
+    var db: [160]u8 = undefined;
+    try testing.expectError(error.Io, restoreFile(testing.io, try tmpPath(&mb, &tmp, "nope.db"), try tmpPath(&db, &tmp, "dest.db"), false));
+    try testing.expect(!exists(testing.io, try tmpPath(&db, &tmp, "dest.db")));
 }
