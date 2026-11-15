@@ -668,11 +668,6 @@ const Run = struct {
     fn sitemapPages(self: *Run, a: Allocator, url: []const u8, site: []const u8, level: u32, n_files: *u32, out: *std.ArrayList([]const u8)) error{OutOfMemory}!bool {
         if (n_files.* >= max_sitemap_files or self.fetched >= self.conn.max_pages) return false;
         n_files.* += 1;
-        // Compressed sitemaps are not supported yet.
-        if (std.ascii.endsWithIgnoreCase(url, ".gz")) {
-            _ = self.reject();
-            return false;
-        }
         var tmp = std.heap.ArenaAllocator.init(self.conn.gpa);
         defer tmp.deinit();
         const t = tmp.allocator();
@@ -681,13 +676,19 @@ const Run = struct {
             .skipped => return false,
             .page => |p| p,
         };
+        // A sitemap may be served gzip-compressed as a file (sitemap.xml.gz),
+        // which is not the same as a Content-Encoding the HTTP client undoes.
+        const body = if (isGzip(got.resp.body)) (gunzip(t, got.resp.body, max_sitemap_bytes) orelse {
+            _ = self.reject();
+            return false;
+        }) else got.resp.body;
         var h: SitemapHandler = .{ .arena = a, .urls = .empty };
         defer h.text.deinit(self.conn.gpa);
         h.gpa = self.conn.gpa;
         var parser: xml.Parser(SitemapHandler) = undefined;
         parser.init(&h) catch return error.OutOfMemory;
         defer parser.deinit();
-        parser.feed(got.resp.body, true) catch |e| switch (e) {
+        parser.feed(body, true) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             // Too many entries stops the parser on purpose; keep what we have.
             error.Stopped => {},
@@ -802,6 +803,20 @@ const Run = struct {
         return .{ .result = .stored, .links = scanned.links };
     }
 };
+
+fn isGzip(bytes: []const u8) bool {
+    return bytes.len > 2 and bytes[0] == 0x1f and bytes[1] == 0x8b;
+}
+
+/// The decompressed bytes of a gzip file, or null if it is damaged or would
+/// expand past `limit` (so a small file cannot become a huge one).
+fn gunzip(a: Allocator, gz: []const u8, limit: usize) ?[]const u8 {
+    const flate = std.compress.flate;
+    var in: std.Io.Reader = .fixed(gz);
+    const window = a.alloc(u8, flate.max_window_len) catch return null;
+    var d = flate.Decompress.init(&in, .gzip, window);
+    return d.reader.allocRemaining(a, .limited(limit)) catch null;
+}
 
 /// Collects the `<loc>` values of a sitemap or sitemap index.
 const SitemapHandler = struct {
@@ -1501,8 +1516,7 @@ test "sitemaps and sitemap indexes list pages, only for their own site" {
     try testing.expectEqual(@as(usize, 2), got.ids.items.len);
     try testing.expect(hasId(&got, "/p1") and hasId(&got, "/p2"));
     try testing.expectEqual(@as(usize, 0), srv.count("/linked"));
-    // The .gz sitemap is refused without being requested.
-    try testing.expectEqual(@as(usize, 0), srv.count("/map2.xml.gz"));
+    try testing.expectEqual(@as(usize, 1), srv.count("/map2.xml.gz")); // asked for, not there
     try testing.expect(ctl.rejected.load(.monotonic) >= 1);
 
     // A malformed sitemap is skipped, not fatal.
@@ -1643,4 +1657,34 @@ test "a redirect to another site needs follow_external too" {
         try testing.expectEqual(@as(usize, 1), g.ids.items.len);
         try testing.expect(hasId(&g, "/landing"));
     }
+}
+
+test "gzip-compressed sitemaps are read, and a decompression bomb is refused" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/robots.txt", .status = 404 },
+        .{ .path = "/s.xml.gz", .content_type = "application/gzip", .body = @embedFile("testdata/crawl/sitemap.xml.gz") },
+        .{ .path = "/bomb.xml.gz", .content_type = "application/gzip", .body = @embedFile("testdata/crawl/bomb.xml.gz") },
+        .{ .path = "/gz1", .body = "<p>gz one</p>" },
+        .{ .path = "/gz2", .body = "<p>gz two</p>" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [96]u8 = undefined;
+    var line: [140]u8 = undefined;
+
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    try crawlWith(&srv, &tmp, try std.fmt.bufPrint(&line, "sitemap {s}\n", .{srv.url(&b, "/s.xml.gz")}), 0, 100, &got, &ctl);
+    try testing.expectEqual(@as(usize, 2), got.ids.items.len);
+    try testing.expect(hasId(&got, "/gz1") and hasId(&got, "/gz2"));
+
+    var got2: Collect = .{};
+    defer got2.deinit();
+    var ctl2: api.Control = .{};
+    try crawlWith(&srv, &tmp, try std.fmt.bufPrint(&line, "sitemap {s}\n", .{srv.url(&b, "/bomb.xml.gz")}), 0, 100, &got2, &ctl2);
+    try testing.expectEqual(@as(usize, 0), got2.ids.items.len);
+    try testing.expect(ctl2.rejected.load(.monotonic) >= 1);
 }
