@@ -47,6 +47,60 @@ pub const Sink = struct {
     }
 };
 
+/// Why a connector refused an item, for the connectors that can say. A
+/// refusal without a reason is still counted in `Control.rejected`.
+pub const Reason = enum {
+    /// The site's robots.txt disallows the page, or could not be read.
+    robots,
+    /// Could not connect, or the connection broke or timed out.
+    network,
+    /// A TLS certificate that did not verify.
+    certificate,
+    /// An answer other than success (404, 500, ...), or a bad response.
+    http_status,
+    /// A media type that is not indexed (PDF, image, ...).
+    wrong_type,
+    /// Larger than the size cap.
+    too_large,
+    /// An encoding the connector does not understand.
+    encoding,
+    /// No text, or text the page asked not to be indexed (`noindex`).
+    no_text,
+    /// A redirect that was refused (loop, too long, other site, bad target).
+    redirect,
+    /// A limit of the run (pages, sites) was reached, or the URL is unusable.
+    limit,
+};
+
+pub const reason_count = std.enums.values(Reason).len;
+
+/// A count per `Reason`.
+pub const ReasonCounts = [reason_count]u64;
+
+/// "robots=3, network=1" for the non-zero counts; empty if there are none.
+pub fn formatReasons(counts: ReasonCounts, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var first = true;
+    for (std.enums.values(Reason), 0..) |r, i| {
+        if (counts[i] > 0) {
+            if (!first) try w.writeAll(", ");
+            first = false;
+            try w.print("{s}={d}", .{ @tagName(r), counts[i] });
+        }
+    }
+}
+
+/// The inverse of `formatReasons`; entries it does not know are ignored.
+pub fn parseReasons(text: []const u8) ReasonCounts {
+    var counts: ReasonCounts = @splat(0);
+    var it = std.mem.tokenizeAny(u8, text, ", ");
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const r = std.meta.stringToEnum(Reason, pair[0..eq]) orelse continue;
+        counts[@backingInt(r)] = std.fmt.parseInt(u64, pair[eq + 1 ..], 10) catch continue;
+    }
+    return counts;
+}
+
 /// Cooperative control and progress, shared between the runner and a connector.
 pub const Control = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
@@ -56,6 +110,20 @@ pub const Control = struct {
     /// unreadable, malformed). Documents the *sink* rejects are not counted
     /// here: the sink counts those.
     rejected: std.atomic.Value(u64) = .init(0),
+    /// How many of `rejected` had which reason (only those a connector gave).
+    reasons: [reason_count]std.atomic.Value(u64) = @splat(.init(0)),
+
+    /// Counts one refused item, with its reason.
+    pub fn reject(self: *Control, why: Reason) void {
+        _ = self.rejected.fetchAdd(1, .monotonic);
+        _ = self.reasons[@backingInt(why)].fetchAdd(1, .monotonic);
+    }
+
+    pub fn reasonCounts(self: *const Control) ReasonCounts {
+        var out: ReasonCounts = undefined;
+        for (&out, 0..) |*o, i| o.* = self.reasons[i].load(.monotonic);
+        return out;
+    }
 
     pub fn cancel(self: *Control) void {
         self.cancelled.store(true, .release);

@@ -41,6 +41,9 @@ const migrations = [_][:0]const u8{
     \\  error       TEXT
     \\);
     \\CREATE INDEX jobs_source ON jobs(source, id);
+    ,
+    // 2: why items were refused, as "reason=count, ..." text (see connector.formatReasons).
+    \\ALTER TABLE jobs ADD COLUMN reasons TEXT;
 };
 
 pub const OpenError = sqlite.MigrateError;
@@ -63,6 +66,9 @@ pub const Job = struct {
     finished_at: ?doc.Timestamp,
     submitted: u64,
     rejected: u64,
+    /// "robots=3, network=1": why some of the rejected items were refused, if
+    /// the connector said. Null when it gave no reasons.
+    reasons: ?[]const u8,
     /// The connector's opaque resume position, as last saved.
     checkpoint: ?[]const u8,
     error_message: ?[]const u8,
@@ -282,13 +288,14 @@ pub const SqliteStateStore = struct {
     /// Saves progress. Call it as often as losing that much work would hurt.
     /// A null `checkpoint` updates only the counters and keeps the position
     /// saved earlier.
-    pub fn saveCheckpoint(self: *SqliteStateStore, job: i64, checkpoint: ?[]const u8, submitted: u64, rejected: u64) sqlite.Error!void {
-        const st = try Stmt.prepare(self.db, "UPDATE jobs SET checkpoint = COALESCE(?2, checkpoint), submitted = ?3, rejected = ?4 WHERE id = ?1");
+    pub fn saveCheckpoint(self: *SqliteStateStore, job: i64, checkpoint: ?[]const u8, submitted: u64, rejected: u64, reasons: ?[]const u8) sqlite.Error!void {
+        const st = try Stmt.prepare(self.db, "UPDATE jobs SET checkpoint = COALESCE(?2, checkpoint), submitted = ?3, rejected = ?4, reasons = ?5 WHERE id = ?1");
         defer st.deinit();
         try st.int(1, job);
         try st.blob(2, checkpoint);
         try st.int(3, @intCast(submitted));
         try st.int(4, @intCast(rejected));
+        try st.text(5, reasons);
         _ = try st.step();
     }
 
@@ -361,7 +368,7 @@ pub const SqliteStateStore = struct {
         return try rowToJob(arena, st);
     }
 
-    const job_select = "SELECT id, source, connector, state, started_at, finished_at, submitted, rejected, checkpoint, error FROM jobs";
+    const job_select = "SELECT id, source, connector, state, started_at, finished_at, submitted, rejected, checkpoint, error, reasons FROM jobs";
 
     fn rowToJob(arena: Allocator, st: Stmt) storage.Error!Job {
         const state_text = st.colText(3) orelse return error.Corrupt;
@@ -376,6 +383,7 @@ pub const SqliteStateStore = struct {
             .rejected = @intCast(st.colInt(7)),
             .checkpoint = if (st.colBlob(8)) |b| try arena.dupe(u8, b) else null,
             .error_message = if (st.colText(9)) |t| try arena.dupe(u8, t) else null,
+            .reasons = if (st.colText(10)) |t| try arena.dupe(u8, t) else null,
         };
     }
 };
@@ -513,9 +521,9 @@ test "job lifecycle with checkpoints and counters" {
     try testing.expectEqual(JobState.running, job.state);
     try testing.expectEqual(@as(doc.Timestamp, 100), job.started_at);
 
-    try s.saveCheckpoint(j, "row:400", 400, 1);
-    try s.saveCheckpoint(j, "row:500", 500, 3);
-    try s.saveCheckpoint(j, null, 510, 4); // counters only: the position stays
+    try s.saveCheckpoint(j, "row:400", 400, 1, null);
+    try s.saveCheckpoint(j, "row:500", 500, 3, null);
+    try s.saveCheckpoint(j, null, 510, 4, "robots=2, network=1"); // counters only: the position stays
     try s.finishJob(j, .completed, 200, null);
     job = (try s.getJob(a, j)).?;
     try testing.expectEqual(JobState.completed, job.state);
@@ -523,6 +531,7 @@ test "job lifecycle with checkpoints and counters" {
     try testing.expectEqual(@as(u64, 510), job.submitted);
     try testing.expectEqual(@as(u64, 4), job.rejected);
     try testing.expectEqualStrings("row:500", job.checkpoint.?);
+    try testing.expectEqualStrings("robots=2, network=1", job.reasons.?);
     try testing.expect((try s.getJob(a, 9999)) == null);
 
     const j2 = try s.startJob("gutenberg-local", "gutenberg", 300);
@@ -541,7 +550,7 @@ test "resume point: only after an unfinished job that saved a checkpoint" {
     try testing.expect((try s.resumePoint(a, "src")) == null); // never ran
 
     const j1 = try s.startJob("src", "gutenberg", 1);
-    try s.saveCheckpoint(j1, "pos-10", 10, 0);
+    try s.saveCheckpoint(j1, "pos-10", 10, 0, null);
     try s.finishJob(j1, .cancelled, 2, null);
     try testing.expectEqualStrings("pos-10", (try s.resumePoint(a, "src")).?);
 
@@ -550,7 +559,7 @@ test "resume point: only after an unfinished job that saved a checkpoint" {
     try testing.expect((try s.resumePoint(a, "src")) == null);
 
     const j3 = try s.startJob("src", "gutenberg", 5);
-    try s.saveCheckpoint(j3, "pos-99", 99, 0);
+    try s.saveCheckpoint(j3, "pos-99", 99, 0, null);
     try s.finishJob(j3, .completed, 6, null);
     try testing.expect((try s.resumePoint(a, "src")) == null); // finished: next run starts over
 
@@ -569,7 +578,7 @@ test "jobs left running by a crash are found and marked interrupted on reopen" {
         defer s.close();
         try testing.expectEqual(@as(u64, 0), s.recovered_jobs);
         job_id = try s.startJob("wiki", "wikipedia", 10);
-        try s.saveCheckpoint(job_id, "offset:123456", 42, 1);
+        try s.saveCheckpoint(job_id, "offset:123456", 42, 1, null);
         // No finishJob: the process "dies" here.
     }
     var s = try open(path);

@@ -482,8 +482,8 @@ const Run = struct {
 
     const Result = enum { stored, skipped, stopped };
 
-    fn reject(self: *Run) Result {
-        _ = self.control.rejected.fetchAdd(1, .monotonic);
+    fn reject(self: *Run, why: api.Reason) Result {
+        self.control.reject(why);
         return .skipped;
     }
 
@@ -576,13 +576,13 @@ const Run = struct {
         var hops: u32 = 0;
         self.fetched += 1;
         while (true) {
-            const u = parseUrl(url) orelse return self.skip();
+            const u = parseUrl(url) orelse return self.skip(.limit);
             const host = self.hostFor(u) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return .stopped,
-                error.TooManyHosts => return self.skip(),
+                error.TooManyHosts => return self.skip(.limit),
             };
-            if (!host.rules.allowed(try targetOf(a, u))) return self.skip();
+            if (!host.rules.allowed(try targetOf(a, u))) return self.skip(.robots);
             if (!self.waitTurn(host)) return .stopped;
 
             const resp = fetch.get(self.client, a, .{
@@ -597,22 +597,24 @@ const Run = struct {
                 error.Canceled => return .stopped,
                 error.Network, error.Timeout => {
                     self.network_failures += 1;
-                    return self.skip();
+                    return self.skip(.network);
                 },
                 // A certificate that does not verify is a refusal, not an outage.
-                else => return self.skip(),
+                error.Tls => return self.skip(.certificate),
+                error.TooLarge => return self.skip(.too_large),
+                else => return self.skip(.http_status),
             };
 
             if (got.status >= 300 and got.status < 400) {
                 hops += 1;
-                const loc = got.location orelse return self.skip();
-                const next = (try resolveRedirect(a, url, loc)) orelse return self.skip();
-                const there = parseUrl(next) orelse return self.skip();
-                if (hops > max_redirects or !self.mayVisit(site_host, there.host)) return self.skip();
+                const loc = got.location orelse return self.skip(.redirect);
+                const next = (try resolveRedirect(a, url, loc)) orelse return self.skip(.redirect);
+                const there = parseUrl(next) orelse return self.skip(.redirect);
+                if (hops > max_redirects or !self.mayVisit(site_host, there.host)) return self.skip(.redirect);
                 url = next;
                 continue;
             }
-            if (got.status < 200 or got.status >= 300) return self.skip();
+            if (got.status < 200 or got.status >= 300) return self.skip(.http_status);
             return .{ .page = .{ .url = url, .resp = got } };
         }
     }
@@ -627,8 +629,8 @@ const Run = struct {
         return self.conn.allow_private or !isPrivateHost(host);
     }
 
-    fn skip(self: *Run) Fetched {
-        _ = self.control.rejected.fetchAdd(1, .monotonic);
+    fn skip(self: *Run, why: api.Reason) Fetched {
+        self.control.reject(why);
         return .skipped;
     }
 
@@ -643,7 +645,7 @@ const Run = struct {
     }
 
     fn crawlSeed(self: *Run, seed: Seed) error{OutOfMemory}!Result {
-        const u = parseUrl(seed.url) orelse return self.reject();
+        const u = parseUrl(seed.url) orelse return self.reject(.limit);
         if (!seed.sitemap) return self.crawlTree(seed.url, 0, u.host);
 
         // A sitemap lists pages: fetch each of them, and follow no links from
@@ -679,7 +681,7 @@ const Run = struct {
         // A sitemap may be served gzip-compressed as a file (sitemap.xml.gz),
         // which is not the same as a Content-Encoding the HTTP client undoes.
         const body = if (isGzip(got.resp.body)) (gunzip(t, got.resp.body, max_sitemap_bytes) orelse {
-            _ = self.reject();
+            _ = self.reject(.too_large);
             return false;
         }) else got.resp.body;
         var h: SitemapHandler = .{ .arena = a, .urls = .empty };
@@ -693,7 +695,7 @@ const Run = struct {
             // Too many entries stops the parser on purpose; keep what we have.
             error.Stopped => {},
             error.Malformed => {
-                _ = self.reject();
+                _ = self.reject(.wrong_type);
                 return false;
             },
         };
@@ -767,14 +769,14 @@ const Run = struct {
     fn store(self: *Run, a: Allocator, url: []const u8, got: fetch.Response) error{OutOfMemory}!Stored {
         const ct = parseContentType(got.content_type);
         const is_html = ct.media.len == 0 or std.mem.eql(u8, ct.media, "text/html") or std.mem.eql(u8, ct.media, "application/xhtml+xml");
-        if (!is_html and !std.mem.eql(u8, ct.media, "text/plain")) return .{ .result = self.reject() };
+        if (!is_html and !std.mem.eql(u8, ct.media, "text/plain")) return .{ .result = self.reject(.wrong_type) };
 
-        const utf8 = (try toUtf8(a, got.body, ct.charset)) orelse return .{ .result = self.reject() };
+        const utf8 = (try toUtf8(a, got.body, ct.charset)) orelse return .{ .result = self.reject(.encoding) };
         const scanned: htmltext.Scan = if (is_html) try htmltext.scan(a, utf8, max_links_per_page) else .{};
         // The page may say "do not index" yet still lead to pages that are fine.
-        if (scanned.noindex) return .{ .result = self.reject(), .links = scanned.links };
+        if (scanned.noindex) return .{ .result = self.reject(.no_text), .links = scanned.links };
         const text = if (is_html) try htmltext.toText(a, utf8) else std.mem.trim(u8, utf8, " \t\r\n");
-        if (text.len == 0) return .{ .result = self.reject(), .links = scanned.links };
+        if (text.len == 0) return .{ .result = self.reject(.no_text), .links = scanned.links };
         const title: ?[]const u8 = if (is_html) try htmltext.titleOf(a, utf8) else null;
 
         const u = parseUrl(url).?;
@@ -1207,6 +1209,11 @@ test "fetches seeds, obeys robots.txt, converts HTML, identifies itself" {
     try testing.expectEqualStrings("caf\u{e9}", got.texts.items[2]);
     try testing.expectEqual(@as(u64, 3), ctl.submitted.load(.monotonic));
     try testing.expectEqual(@as(u64, 3), ctl.rejected.load(.monotonic)); // robots, pdf, 404
+    // ...and each is explained.
+    const why = ctl.reasonCounts();
+    try testing.expectEqual(@as(u64, 1), why[@backingInt(api.Reason.robots)]);
+    try testing.expectEqual(@as(u64, 1), why[@backingInt(api.Reason.wrong_type)]);
+    try testing.expectEqual(@as(u64, 1), why[@backingInt(api.Reason.http_status)]);
 
     try testing.expectEqual(@as(usize, 0), srv.count("/private/b")); // never requested
     try testing.expectEqual(@as(usize, 1), srv.count("/robots.txt")); // once per host

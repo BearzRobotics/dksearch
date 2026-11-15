@@ -64,6 +64,7 @@ pub const Finished = struct {
     state: state_sqlite.JobState,
     submitted: u64,
     rejected: u64,
+    reasons: connector.ReasonCounts,
     failure: ?[]const u8,
     finished_at: document.Timestamp,
 };
@@ -95,6 +96,7 @@ pub const Manager = struct {
         state: state_sqlite.JobState,
         submitted: u64,
         rejected: u64,
+        reasons: connector.ReasonCounts,
         failure: ?[]const u8,
         finished_at: document.Timestamp,
     };
@@ -185,6 +187,7 @@ pub const Manager = struct {
             .state = l.state,
             .submitted = l.submitted,
             .rejected = l.rejected,
+            .reasons = l.reasons,
             .failure = if (l.failure) |f| try arena.dupe(u8, f) else null,
             .finished_at = l.finished_at,
         };
@@ -198,6 +201,7 @@ pub const Manager = struct {
         state: state_sqlite.JobState,
         submitted: u64 = 0,
         rejected: u64 = 0,
+        reasons: connector.ReasonCounts = @splat(0),
         failure: ?[]const u8 = null,
     };
 
@@ -250,6 +254,7 @@ pub const Manager = struct {
         out.state = r.state;
         out.submitted = r.submitted;
         out.rejected = r.rejected;
+        out.reasons = r.reasons;
         if (r.failure) |f| out.failure = self.gpa.dupe(u8, f) catch null; // `f` lives in the arena
     }
 
@@ -275,6 +280,7 @@ pub const Manager = struct {
             .state = o.state,
             .submitted = o.submitted,
             .rejected = o.rejected,
+            .reasons = o.reasons,
             .failure = o.failure, // ownership moves here
             .finished_at = now(),
         };

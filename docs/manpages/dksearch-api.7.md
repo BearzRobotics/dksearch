@@ -153,13 +153,13 @@ GET /api/v1/admin/sources
 : Returns `sources`: one entry per configured source (`name`, `kind`, `enabled`, `configured: true`, `documents`, `last_job`) and one per name that has documents but is no longer configured (`configured: false`).
 
 GET /api/v1/admin/jobs
-: Returns `jobs`: the 50 most recent import jobs, newest first (`id`, `source`, `kind`, `state`, `started_at`, `finished_at` as Unix seconds or null, `submitted`, `rejected`, `error_message`). A job shown as `running` may belong to an import that was killed; it is marked interrupted the next time a command opens the data.
+: Returns `jobs`: the 50 most recent import jobs, newest first (`id`, `source`, `kind`, `state`, `started_at`, `finished_at` as Unix seconds or null, `submitted`, `rejected`, `skip_reasons` (an object with the counts `robots`, `network`, `certificate`, `http_status`, `wrong_type`, `too_large`, `encoding`, `no_text`, `redirect` and `limit`; they add up to at most `rejected`, because only some connectors say why they skipped something), `error_message`). A job shown as `running` may belong to an import that was killed; it is marked interrupted the next time a command opens the data.
 
 GET /api/v1/admin/search
 : Runs a search like the public API (`q`, optional `language` and `connector`, at most 20 results) and returns `hits` with their ranking `score`, plus `tokenizer`, `title_weight` and `body_weight`, so ranking can be inspected. Same errors as the public search (`empty_query`, `invalid_query`). The HTML page `/search` is the same thing for people.
 
 GET /api/v1/admin/imports
-: Returns `actions` (whether imports can be started), `running` (`source`, `started_at`, `submitted` so far, or null) and `last` (the last import started through this interface since the process began: `source`, `state`, `submitted`, `rejected`, `failure`, `finished_at`, or null).
+: Returns `actions` (whether imports can be started), `running` (`source`, `started_at`, `submitted` so far, or null) and `last` (the last import started through this interface since the process began: `source`, `state`, `submitted`, `rejected`, `skip_reasons` (as for jobs), `failure`, `finished_at`, or null).
 
 POST /api/v1/admin/imports
 : Starts an import of the source named by the form field `source` (`application/x-www-form-urlencoded` body). Returns 202 with `started`. Errors: 404 `unknown_source`, 409 `source_disabled`, `already_running` or `locked` (another import, rebuild or removal holds the data directory), 403 `actions_disabled`.

@@ -952,6 +952,12 @@ fn importCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, one: ?[]co
             r.rejected,
             r.job_id,
         });
+        {
+            var rb: [256]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&rb);
+            dk.connector.formatReasons(r.reasons, &w) catch {};
+            if (w.end > 0) out(io, "{s}: skipped because: {s}\n", .{ source.name, rb[0..w.end] });
+        }
         if (r.failure) |why| err(io, "{s}: {s}", .{ source.name, why });
         if (r.state != .completed) worst = exit_failure;
         if (prune) {

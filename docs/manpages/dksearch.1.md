@@ -59,6 +59,8 @@ Options: **--prune** also removes the source's documents whose items are no long
 
 Examples: dksearch import --config dksearch.toml my-notes
 
+Connectors that can say why they skipped something (currently `crawl`) add a line such as `web: skipped because: robots=3, http_status=2`. The reasons are `robots` (disallowed by robots.txt, or robots.txt unreadable), `network` (could not connect, or timed out), `certificate` (a TLS certificate that did not verify), `http_status` (an answer other than success), `wrong_type` (not HTML or text), `too_large`, `encoding`, `no_text` (empty, or marked `noindex`), `redirect` (refused or looping) and `limit` (page or site limit, or an unusable URL). They are also kept with each job and shown in the administration interface.
+
 remove
 Remove every document of the source named SOURCE from the index, the retained text and the document records, and forget the source's import history, so a later import of that name starts afresh. SOURCE need not be in the configuration file, which is the usual case after deleting a source from it. Without **--yes** nothing is changed: it reports how many documents the source has. Removal works in batches that are committed one at a time, and is safe to interrupt (SIGINT) or repeat: what was not removed yet is removed by the next run. The documents can be restored by importing the source again.
 

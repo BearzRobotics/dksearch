@@ -28,6 +28,8 @@ pub const Result = struct {
     /// Items not imported: documents the pipeline refused plus items the
     /// connector itself refused (too large, malformed, unreadable).
     rejected: u64,
+    /// How many of `rejected` had which reason, for connectors that say.
+    reasons: connector_mod.ReasonCounts,
     /// Where the next run would resume, if the run did not complete.
     checkpoint: ?[]const u8,
     /// Why a failed run failed (an error name or reason; not for end users to parse).
@@ -102,7 +104,8 @@ const JobSink = struct {
         self.committed_rejected = self.totalRejected();
         // Not being able to record progress means a crash would lose work we
         // think is safe, so treat it like a full disk: stop.
-        self.state.saveCheckpoint(self.job, position, self.submitted, self.totalRejected()) catch return error.Stopped;
+        var rb: [reasons_text_max]u8 = undefined;
+        self.state.saveCheckpoint(self.job, position, self.submitted, self.totalRejected(), reasonsText(&rb, self.control.reasonCounts())) catch return error.Stopped;
         if (position) |p| self.last_checkpoint = self.arena.dupe(u8, p) catch return error.OutOfMemory;
     }
 
@@ -115,6 +118,15 @@ const JobSink = struct {
         try self.flush(position);
     }
 };
+
+const reasons_text_max = 256;
+
+/// The reasons as stored text, or null if there are none.
+fn reasonsText(buf: *[reasons_text_max]u8, counts: connector_mod.ReasonCounts) ?[]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    connector_mod.formatReasons(counts, &w) catch return null;
+    return if (w.end == 0) null else buf[0..w.end];
+}
 
 /// Runs `connector` for `source` (the configured source name, which is what
 /// jobs and resume points are keyed by) until it finishes, is cancelled
@@ -180,7 +192,9 @@ pub fn runImport(
     }
 
     // Final counters, plus the last position when the connector handed one back.
-    state.saveCheckpoint(job, checkpoint, js.submitted, js.totalRejected()) catch return error.StateUnavailable;
+    var rb: [reasons_text_max]u8 = undefined;
+    const reasons = control.reasonCounts();
+    state.saveCheckpoint(job, checkpoint, js.submitted, js.totalRejected(), reasonsText(&rb, reasons)) catch return error.StateUnavailable;
     state.finishJob(job, final, now(), failure) catch return error.StateUnavailable;
 
     return .{
@@ -188,6 +202,7 @@ pub fn runImport(
         .state = final,
         .submitted = js.submitted,
         .rejected = js.totalRejected(),
+        .reasons = reasons,
         // A completed run has nothing to resume from.
         .checkpoint = if (final == .completed) null else checkpoint,
         .failure = failure,

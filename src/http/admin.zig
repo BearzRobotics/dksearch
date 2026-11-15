@@ -309,13 +309,13 @@ pub const App = struct {
     }
 
     fn apiImports(self: *App, arena: Allocator) error{OutOfMemory}!Response {
-        const JsonLast = struct { source: []const u8, state: []const u8, submitted: u64, rejected: u64, failure: ?[]const u8, finished_at: i64 };
+        const JsonLast = struct { source: []const u8, state: []const u8, submitted: u64, rejected: u64, skip_reasons: JsonReasons, failure: ?[]const u8, finished_at: i64 };
         const JsonRunning = struct { source: []const u8, started_at: i64, submitted: u64 };
         var running: ?JsonRunning = null;
         var last: ?JsonLast = null;
         if (self.opts.jobs) |m| {
             if (try m.current(arena)) |c| running = .{ .source = c.source, .started_at = c.started_at, .submitted = c.submitted };
-            if (try m.lastResult(arena)) |l| last = .{ .source = l.source, .state = @tagName(l.state), .submitted = l.submitted, .rejected = l.rejected, .failure = l.failure, .finished_at = l.finished_at };
+            if (try m.lastResult(arena)) |l| last = .{ .source = l.source, .state = @tagName(l.state), .submitted = l.submitted, .rejected = l.rejected, .skip_reasons = jsonReasons(l.reasons), .failure = l.failure, .finished_at = l.finished_at };
         }
         return handler.jsonResponse(arena, .ok, .{ .actions = self.opts.jobs != null, .running = running, .last = last });
     }
@@ -578,11 +578,37 @@ pub const App = struct {
         finished_at: ?i64,
         submitted: u64,
         rejected: u64,
+        skip_reasons: JsonReasons,
         error_message: ?[]const u8,
     };
 
     fn jsonJob(j: dk.state_sqlite.Job) JsonJob {
-        return .{ .id = j.id, .source = j.source, .kind = j.connector, .state = @tagName(j.state), .started_at = j.started_at, .finished_at = j.finished_at, .submitted = j.submitted, .rejected = j.rejected, .error_message = j.error_message };
+        const counts = if (j.reasons) |t| dk.connector.parseReasons(t) else @as(dk.connector.ReasonCounts, @splat(0));
+        return .{ .id = j.id, .source = j.source, .kind = j.connector, .state = @tagName(j.state), .started_at = j.started_at, .finished_at = j.finished_at, .submitted = j.submitted, .rejected = j.rejected, .skip_reasons = jsonReasons(counts), .error_message = j.error_message };
+    }
+
+    /// Why items were skipped, one field per reason (all present, so clients
+    /// can rely on the shape). The sum can be less than `rejected`: only some
+    /// connectors say why.
+    const JsonReasons = struct {
+        robots: u64,
+        network: u64,
+        certificate: u64,
+        http_status: u64,
+        wrong_type: u64,
+        too_large: u64,
+        encoding: u64,
+        no_text: u64,
+        redirect: u64,
+        limit: u64,
+    };
+
+    fn jsonReasons(c: dk.connector.ReasonCounts) JsonReasons {
+        var out: JsonReasons = undefined;
+        inline for (@typeInfo(JsonReasons).@"struct".field_names) |name| {
+            @field(out, name) = c[@backingInt(@field(dk.connector.Reason, name))];
+        }
+        return out;
     }
 
     const JsonCounters = struct {
@@ -824,7 +850,12 @@ fn writeBytes(w: *Io.Writer, n: ?u64) Io.Writer.Error!void {
 fn writeJobCells(w: *Io.Writer, j: dk.state_sqlite.Job) Io.Writer.Error!void {
     try w.print("<td>{s}</td><td>", .{@tagName(j.state)});
     try writeTime(w, j.started_at);
-    try w.print("</td><td>{d}</td><td>{d}</td>", .{ j.submitted, j.rejected });
+    try w.print("</td><td>{d}</td><td>{d}", .{ j.submitted, j.rejected });
+    if (j.reasons) |t| {
+        // Our own "reason=count" text, never connector- or site-supplied.
+        try w.print(" <span class=\"muted\">({s})</span>", .{t});
+    }
+    try w.writeAll("</td>");
 }
 
 fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8) !void {
@@ -865,7 +896,14 @@ fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const 
     if (try m.lastResult(arena)) |l| {
         try w.writeAll("<p class=\"muted\">Last import started from here: ");
         try html.writeEscaped(w, l.source);
-        try w.print(", {s}, {d} submitted, {d} rejected, finished ", .{ @tagName(l.state), l.submitted, l.rejected });
+        try w.print(", {s}, {d} submitted, {d} rejected", .{ @tagName(l.state), l.submitted, l.rejected });
+        {
+            var rb: [256]u8 = undefined;
+            var rw: Io.Writer = .fixed(&rb);
+            dk.connector.formatReasons(l.reasons, &rw) catch {};
+            if (rw.end > 0) try w.print(" ({s})", .{rb[0..rw.end]});
+        }
+        try w.writeAll(", finished ");
         try writeTime(w, l.finished_at);
         if (l.failure) |f| {
             try w.writeAll(". Problem: ");
@@ -1014,7 +1052,7 @@ const Fixture = struct {
                 try docs.upsert(.{ .id = dk.document.idFromSource(d[0], d[1]), .content_hash = null, .acquired_at = 1, .meta = .{ .connector = d[0], .source_id = d[1] } });
             }
             const j = try state.startJob("notes", "files", 1709634030);
-            try state.saveCheckpoint(j, null, 2, 0);
+            try state.saveCheckpoint(j, null, 2, 3, "robots=2, http_status=1");
             try state.finishJob(j, .completed, 1709634040, null);
         }
 
@@ -1182,6 +1220,10 @@ test "api: sources and jobs" {
     const jobs = try f.call(a, .GET, "/api/v1/admin/jobs", .{ .auth = auth });
     try testing.expect(std.mem.indexOf(u8, jobs.body, "\"submitted\":2") != null);
     try testing.expect(std.mem.indexOf(u8, jobs.body, "\"started_at\":1709634030") != null);
+    // Why items were skipped: every reason is present, with its count.
+    try testing.expect(std.mem.indexOf(u8, jobs.body, "\"skip_reasons\":{\"robots\":2,\"network\":0,\"certificate\":0,\"http_status\":1,") != null);
+    const page = try f.call(a, .GET, "/jobs", .{ .auth = auth });
+    try testing.expect(std.mem.indexOf(u8, page.body, "(robots=2, http_status=1)") != null);
 }
 
 test "password login creates a session that works until it expires" {
