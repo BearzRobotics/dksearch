@@ -35,6 +35,9 @@ pub const Decoder = struct {
     active: bool = false,
     /// Set when a stream finished: the file offset where the next one starts.
     boundary: ?u64 = null,
+    /// True once `read` has reached the clean end of the file. A `read` that
+    /// returns 0 bytes is not the end unless this is set.
+    eof: bool = false,
 
     /// Starts decoding at `offset`, which must be the start of a bzip2 stream.
     pub fn init(gpa: Allocator, io: Io, file: Io.File, offset: u64) Allocator.Error!Decoder {
@@ -72,7 +75,8 @@ pub const Decoder = struct {
         self.in_pos = 0;
     }
 
-    /// Decompressed bytes, 0 at the clean end of the file. Never returns
+    /// Decompressed bytes. May return 0 bytes at the end of a stream (see
+    /// `eof` for the real end of the file). Never returns
     /// bytes of two streams in one call.
     pub fn read(self: *Decoder, out: []u8) Error!usize {
         std.debug.assert(out.len > 0);
@@ -81,7 +85,9 @@ pub const Decoder = struct {
                 try self.fill();
                 if (self.in_pos >= self.in_len) {
                     // End of file. Fine between streams, an error inside one.
-                    return if (self.active) error.Corrupt else 0;
+                    if (self.active) return error.Corrupt;
+                    self.eof = true;
+                    return 0;
                 }
             }
             if (!self.active) {

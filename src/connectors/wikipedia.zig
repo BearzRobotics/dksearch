@@ -245,7 +245,9 @@ pub const WikipediaConnector = struct {
                 break :blk got;
             };
 
-            const final = n == 0;
+            // For bzip2 only the decoder knows the real end: a stream can end
+            // without a byte of output, which must not look like end of file.
+            const final = if (dec) |*d| d.eof else n == 0;
             parser.feed(buf[0..n], final) catch |e| {
                 if (h.fail) |f| return self.finish(f);
                 return switch (e) {
@@ -862,16 +864,39 @@ test "bzip2 decoder: boundaries are reported once per stream" {
     var last: u64 = 0;
     while (true) {
         const n = try dec.read(&buf);
-        if (n == 0) break;
         total += n;
         if (dec.takeBoundary()) |b| {
             boundaries += 1;
             last = b;
         }
+        if (dec.eof) break;
     }
     try testing.expectEqual(fx_xml.len, total);
     try testing.expectEqual(@as(u32, 3), boundaries);
     try testing.expectEqual(@as(u64, fx_bz2.len), last);
+}
+
+test "bzip2 decoder: a stream ending exactly at the end of the output buffer is not the end of the file" {
+    // A real dump failed once, after 112,946 articles, because a stream's
+    // last byte fell exactly at the end of the read buffer: the decoder then
+    // reported the stream end with no bytes, which looked like end of file.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "d.bz2", .data = fx_bz2 });
+    const file = try tmp.dir.openFile(testing.io, "d.bz2", .{});
+    defer file.close(testing.io);
+    var storage: [fx_xml.len + 2]u8 = undefined;
+    for (1..storage.len + 1) |size| {
+        var dec = try bz2.Decoder.init(testing.allocator, testing.io, file, 0);
+        defer dec.deinit();
+        var total: usize = 0;
+        while (true) {
+            const n = try dec.read(storage[0..size]);
+            total += n;
+            if (dec.eof) break;
+        }
+        try testing.expectEqual(fx_xml.len, total);
+    }
 }
 
 test "bzip2 decoder: corrupted and truncated copies of a real file never crash" {
@@ -899,7 +924,7 @@ test "bzip2 decoder: corrupted and truncated copies of a real file never crash" 
         var total: usize = 0;
         while (true) {
             const n = dec.read(&buf) catch break; // an error is the expected outcome for damage
-            if (n == 0) break;
+            if (dec.eof) break;
             total += n;
             if (total > 100 * fx_xml.len) return error.TestUnexpectedResult; // output stays bounded
         }
