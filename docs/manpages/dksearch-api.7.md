@@ -143,8 +143,22 @@ JSON (RFC 8259); HTTP semantics (RFC 9110) as far as implemented.
 Stability guarantees
 Within `/api/v1/`: adding response fields or optional parameters is allowed, so clients must ignore unknown fields. Removing a field, changing its meaning, or changing error codes requires a new version `/api/v2/`. A superseded version stays available for a documented period. The HTML pages and their markup are not part of the stable API.
 
+ADMINISTRATION API
+The administration interface is a separate listener (see dksearch(1), `admin.*`), not part of the public API above. It has the same conventions (JSON, `error` objects with stable codes, `no-store`), accepts GET and HEAD for data, and requires authentication: `Authorization: Bearer TOKEN` (see **dksearch admin-token**) or a session cookie from signing in at `/login`. Without it the API answers 401 with `WWW-Authenticate: Bearer` and code `unauthorized`; pages redirect to `/login`. All endpoints are read-only.
+
+GET /api/v1/admin/status
+: Returns `version`, `uptime_seconds`, `documents` (total), `data_bytes` (`index`, `state`, `content`, null when a file is absent), `auth` (`token`, `password`: whether set; `sessions`: live sessions), and the counters `public` and `admin`, each with `requests`, `status_2xx` to `status_5xx`, `latency_le_10ms`, `latency_le_50ms`, `latency_le_250ms`, `latency_le_1000ms`, `latency_over_1000ms`, `connections_accepted`, `connections_refused_busy`, `connections_timed_out` (all since the process started).
+
+GET /api/v1/admin/sources
+: Returns `sources`: one entry per configured source (`name`, `kind`, `enabled`, `configured: true`, `documents`, `last_job`) and one per name that has documents but is no longer configured (`configured: false`).
+
+GET /api/v1/admin/jobs
+: Returns `jobs`: the 50 most recent import jobs, newest first (`id`, `source`, `kind`, `state`, `started_at`, `finished_at` as Unix seconds or null, `submitted`, `rejected`, `error_message`). A job shown as `running` may belong to an import that was killed; it is marked interrupted the next time a command opens the data.
+
+The HTML pages `/` (dashboard) and `/jobs`, `POST /login` (field `credential`: the password or the token) and `POST /logout` (field `csrf`) are for browsers. The same compatibility rules apply: fields may be added within `v1`.
+
 LIMITATIONS
-Read-only; no document or administration endpoints yet. No sorting options, total counts, or faceting. No authentication or rate limiting.
+Read-only; no document endpoints. The administration API cannot start imports or change anything. No sorting options, total counts, or faceting. The public API has no authentication or rate limiting; the administration API requires a credential.
 
 BUGS
 See dksearch(1).

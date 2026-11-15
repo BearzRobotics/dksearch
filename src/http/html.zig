@@ -62,7 +62,7 @@ pub const Form = struct {
     connector: []const u8 = "",
 };
 
-fn writeHead(w: *Writer, title: []const u8) Writer.Error!void {
+pub fn writeHead(w: *Writer, title: []const u8) Writer.Error!void {
     try w.writeAll("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">" ++
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
         "<title>");

@@ -18,6 +18,10 @@ dksearch rebuild [--config FILE]
 
 dksearch check [--config FILE]
 
+dksearch admin-token [--config FILE]
+
+dksearch admin-password [--config FILE]
+
 dksearch backup [--config FILE] DIR
 
 dksearch check-config FILE
@@ -25,7 +29,7 @@ dksearch check-config FILE
 DESCRIPTION
 dksearch is an independently operated, self-hostable search engine. It maintains its own full-text index and does not use an external search provider.
 
-This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles three: `files`, which indexes plain-text and Markdown files from a local directory; `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded; and `wikipedia`, which indexes the articles of a Wikipedia dump file you have already downloaded. The `wikipedia` connector is built by default and can be left out with `zig build -Dwikipedia=false`. The administration interface is not implemented; the `[admin]` configuration table is validated but nothing listens on it.
+This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles three: `files`, which indexes plain-text and Markdown files from a local directory; `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded; and `wikipedia`, which indexes the articles of a Wikipedia dump file you have already downloaded. The `wikipedia` connector is built by default and can be left out with `zig build -Dwikipedia=false`. A separate, read-only administration interface (sources, import jobs, counters) is served on its own address when the configuration has an `[admin]` table and credentials exist; see **admin-token**, **admin-password** and SECURITY CONSIDERATIONS.
 
 CONVENTIONS
 Bold represents literal commands, options, and keywords.
@@ -87,6 +91,16 @@ Arguments: DIR, the destination directory. Use a new directory for each backup.
 
 Examples: dksearch backup --config dksearch.toml /backups/dksearch-2026-11-14
 
+admin-token
+Create a new bearer token for the administration interface. It prints the token (`dks_` and 43 characters) to standard output, once, and stores only its SHA-256 hash in the secrets file (`admin.secrets_file`, mode 0600, replaced atomically). Any earlier token stops working at once, and sessions made with it end. Scripts send it as `Authorization: Bearer TOKEN`. The administration interface does not start until at least one credential exists.
+
+Usage: dksearch admin-token [--config FILE]
+
+admin-password
+Set the administration password, the fallback for people using a browser. The password is read without echo and asked twice on a terminal, or as one line from standard input (so `dksearch admin-password < file` works); it is never taken from an argument or the environment. Only an Argon2id hash is stored. Changing it signs everyone out. On the sign-in page a person can enter either the password or the token.
+
+Usage: dksearch admin-password [--config FILE]
+
 check-config
 Load and validate FILE exactly as **serve** and **import** would, including the options of every source (enabled or not), report the result, and exit without starting anything or touching any data.
 
@@ -129,7 +143,7 @@ Standard output
 **--help**, **--version** and the `ok` line of **check-config** (`FILE: ok`). Nothing else is written to standard output.
 
 Standard error
-All diagnostics, each prefixed `dksearch: `. **import** and **rebuild** write their one-line result to standard output. **serve** writes a startup line giving the address and index path, and `stopped` after a graceful stop. If the configuration has an `[admin]` table it also notes that the administration interface is not implemented. Request logging is not implemented. The format of diagnostic lines is not stable.
+All diagnostics, each prefixed `dksearch: `. **import** and **rebuild** write their one-line result to standard output. **serve** writes a startup line giving the address and index path, and `stopped` after a graceful stop. If the configuration has an `[admin]` table it also reports that the administration interface is serving, or why it was not started (no credentials, unreadable secrets file, address in use). Request logging is off unless `access_log` is set; see PRIVACY. The format of diagnostic lines is not stable.
 
 EXIT STATUS
 Status	Meaning
@@ -149,6 +163,9 @@ dksearch.toml (any name, passed with **--config**)
 
 *data_dir*/index.db
 : The search index (SQLite, written in WAL mode), with companion files `index.db-wal` and `index.db-shm` while open. *data_dir* is `storage.data_dir`, default `data`, created with parents if missing. The index is derived data: delete it freely and run **rebuild**.
+
+*data_dir*/admin-secrets.toml
+: The administration credential hashes (default location; see `admin.secrets_file`). Mode 0600. Created by **admin-token** or **admin-password**. Back it up with your other secrets; losing it just means creating new credentials.
 
 *data_dir*/state.db
 : Document metadata and provenance, and the record of import runs with their resume positions. This is source-of-truth data: it cannot be rebuilt from anything else. Created by **import**. When a newer version of dksearch upgrades its layout, the old file is first copied to `state.db.pre-vN`.
@@ -183,7 +200,12 @@ server.write_timeout_ms	Integer	10000	Time allowed to send one response. 100-600
 server.max_connections	Integer	256	Simultaneous connections, 1-65535. Further connections are closed immediately.
 server.max_requests_per_connection	Integer	100	Requests served on one connection before it is closed, 1-10000.
 server.shutdown_grace_ms	Integer	5000	On SIGINT or SIGTERM, how long requests already being handled may take to finish, 0-600000.
-admin.*	-	-	Accepts the same keys as `server.*` (default port 8081). Validated only; not served yet.
+server.access_log	String	none	`stderr` or a file path (appended to): write one line per request to the public listener's access log. Off when absent. See PRIVACY for exactly what a line holds.
+admin.*	-	-	The administration listener accepts the same keys as `server.*` (default port 8081, loopback) and the keys below. It must not share an address and port with `server`.
+admin.secrets_file	String	`data_dir`/admin-secrets.toml	File holding the credential hashes. Must not be readable by group or others.
+admin.session_idle_minutes	Integer	30	A sign-in session ends after this much inactivity, 1-1440.
+admin.session_max_hours	Integer	8	A sign-in session ends this long after it began, however active, 1-168.
+admin.cookie_secure	Boolean	false	Add `Secure` to the session cookie. Set it when a reverse proxy serves the interface over HTTPS.
 storage.data_dir	String	data	Directory for the index and other state. Must not be empty.
 source	Array of tables	none	Optional. Each `[[source]]` defines one connector instance; see Sources below.
 
@@ -321,13 +343,15 @@ dksearch: cannot listen on ADDRESS:PORT: REASON
 : The address is in use, not local, or needs privileges. Exit status 4.
 
 SECURITY CONSIDERATIONS
-The HTTP listener has no authentication; the search API is read-only and intended to be public if the administrator exposes it. It listens on loopback by default. To expose it, set `server.address` explicitly. Prefer a reverse proxy for TLS (not implemented here) and rate limiting.
+The public HTTP listener has no authentication; the search API is read-only and intended to be public if the administrator exposes it. It listens on loopback by default. To expose it, set `server.address` explicitly. Prefer a reverse proxy for TLS (not implemented here) and rate limiting.
+
+The administration interface is a separate listener (default 127.0.0.1:8081) and separate code; nothing on the public listener reaches it. Everything on it except the sign-in page and the style sheet needs a credential: a bearer token (for scripts) or a session obtained by signing in with the password or the token. Credentials are kept only as hashes (SHA-256 for the token, Argon2id for the password) in `admin.secrets_file`, never in the main configuration, and the file is refused if group or others can read it. The secrets file is read again for every check, so replacing a credential takes effect immediately and ends all sessions. Sessions live only in memory (a restart signs everyone out), use an unguessable 256-bit id in an `HttpOnly`, `SameSite=Strict` cookie, expire after the idle and absolute limits, and every state-changing request is a POST that also carries a per-session form token. Failed attempts are slowed down for the whole process (none for the first three, then 250 ms doubling to 30 s, forgotten after 15 quiet minutes) and at most two password checks run at once; there is no per-client tracking, because client addresses are not recorded, so an attacker who keeps failing also slows the administrator's own sign-ins down. If the `[admin]` table exists but there is no credential, the administration interface does not start and the reason is printed; there is no default password. The first version is read-only: it cannot start imports, change configuration or delete anything. It transmits the token or password in clear text unless HTTPS is provided by a reverse proxy, so keep it on loopback or put it behind one (and set `admin.cookie_secure = true`).
 
 Trust boundaries: all request data is untrusted. Request heads are size-limited and must complete within a deadline; a client sending data slowly cannot hold a connection open past it. Request bodies are refused. Query text is never interpreted as search-engine syntax: operators, column filters and punctuation are searched as ordinary text, and queries are limited to 1024 bytes and 32 terms. Result pages escape all text, link only http and https URLs, and are sent with a Content-Security-Policy that forbids scripts and external resources. Database error details are never sent to clients. These properties are covered by the project's tests; they are not an audit.
 
 SQLite is compiled without extension loading, so no native code is loaded at run time.
 
-The index directory should be writable only by the account running dksearch. There are no secrets in the configuration at present.
+The index directory should be writable only by the account running dksearch. The configuration file holds no secrets; the credential hashes are in the separate secrets file, which should be readable only by the account running dksearch.
 
 The `wikipedia` connector treats the dump as untrusted input: it refuses any XML document type declaration (so entity-expansion attacks cannot work), bounds nesting depth and the size of every field and article, converts the text in time linear in its size, and executes nothing. It reads only the one file named by `dump`. The bundled bzip2 and Expat libraries are vendored, and Expat is built without general entity expansion or DTD support.
 
@@ -336,7 +360,7 @@ The `gutenberg` connector treats the catalog and the book files as untrusted inp
 The `files` connector treats the directory tree as untrusted input. It never follows symbolic links, skips hidden entries, reads only regular files with the expected extensions, enforces a size limit, rejects invalid text, and executes nothing. It indexes only what its account can read, and the text of every indexed file becomes searchable and is shown in results, so point it only at directories whose contents may be searched by everyone who can reach the server. Result URLs for these files are `file://` URLs, which the HTML page shows as plain text, not links.
 
 PRIVACY
-dksearch sends no telemetry and contacts no external service. Queries are not logged in this version (there is no request log). **import** records, in `state.db`, the name, time, counts and last position of each run; it does not record file contents beyond what is indexed. Anything placed in front of it, such as a reverse proxy, has its own logging.
+dksearch sends no telemetry and contacts no external service. Nothing about requests is written anywhere unless you set `access_log`. In memory only, the server keeps counters (requests by status class, response-time buckets, connections accepted, refused and timed out), shown on the administration dashboard and lost at exit. With `access_log` set, each request adds one line with exactly these fields: UTC time, method, a fixed route label such as `/search` (never the actual URL), status, duration in milliseconds, and response bytes. Query text, URLs, client addresses, user agents, cookies and credentials are never logged. Rotating the log is up to the operator (logrotate with `copytruncate` works; restarting reopens it). **import** records, in `state.db`, the name, time, counts and last position of each run; it does not record file contents beyond what is indexed. Anything placed in front of it, such as a reverse proxy, has its own logging.
 
 RESOURCE USAGE
 **import** processes one document at a time and holds one batch open (at most 1000 documents, or fewer when the connector saves positions more often) in database transactions before committing it. The `files` connector keeps the sorted list of file paths in memory and reads one file at a time. **serve** memory per connection is the configured `max_header_bytes` read buffer, a 4096-byte write buffer, and the arena for the current request, whose size is bounded by the response (at most 100 hits). Each connection uses one task. At most `max_connections` connections exist at once. These are design bounds, not measurements; no benchmarks have been run.
@@ -370,7 +394,7 @@ Stability guarantees
 The `/api/v1/` API is intended to be stable within version 1 (see dksearch-api(7)). The command-line syntax, configuration keys and diagnostics text are experimental at version 0.
 
 LIMITATIONS
-Three connectors are bundled (`files`, `gutenberg` and `wikipedia`). The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. No administration interface. No TLS. No reload or request log. Only the `unicode61` tokenizer is used, so languages without word separators (such as Chinese or Japanese) are not segmented well. Index size and query time at large scale have not been measured.
+Three connectors are bundled (`files`, `gutenberg` and `wikipedia`). The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. The administration interface is read-only: it cannot start or cancel imports, run **check**, or edit configuration. No TLS. No reload or request log. Only the `unicode61` tokenizer is used, so languages without word separators (such as Chinese or Japanese) are not segmented well. Index size and query time at large scale have not been measured.
 
 BUGS
 No issue tracker is published yet. When one exists it will be listed under AVAILABILITY. Include the dksearch version, the configuration file, the full diagnostic output and the request that failed.

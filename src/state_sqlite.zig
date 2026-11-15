@@ -326,6 +326,41 @@ pub const SqliteStateStore = struct {
         return try arena.dupe(u8, cp);
     }
 
+    /// The most recent jobs, newest first, strings allocated from `arena`.
+    pub fn recentJobs(self: *SqliteStateStore, arena: Allocator, limit: u32) storage.Error![]Job {
+        const st = try Stmt.prepare(self.db, job_select ++ " ORDER BY id DESC LIMIT ?1");
+        defer st.deinit();
+        try st.int(1, limit);
+        var out: std.ArrayList(Job) = .empty;
+        while (try st.step()) try out.append(arena, try rowToJob(arena, st));
+        return out.items;
+    }
+
+    pub const SourceCount = struct { source: []const u8, documents: u64 };
+
+    /// Document counts per source name (the `connector` of each record).
+    pub fn countsBySource(self: *SqliteStateStore, arena: Allocator) storage.Error![]SourceCount {
+        const st = try Stmt.prepare(self.db, "SELECT connector, count(*) FROM documents GROUP BY connector ORDER BY connector");
+        defer st.deinit();
+        var out: std.ArrayList(SourceCount) = .empty;
+        while (try st.step()) {
+            try out.append(arena, .{
+                .source = try arena.dupe(u8, st.colText(0) orelse return error.Corrupt),
+                .documents = @intCast(st.colInt(1)),
+            });
+        }
+        return out.items;
+    }
+
+    /// The newest job of `source`, if any.
+    pub fn lastJob(self: *SqliteStateStore, arena: Allocator, source: []const u8) storage.Error!?Job {
+        const st = try Stmt.prepare(self.db, job_select ++ " WHERE source = ?1 ORDER BY id DESC LIMIT 1");
+        defer st.deinit();
+        try st.text(1, source);
+        if (!try st.step()) return null;
+        return try rowToJob(arena, st);
+    }
+
     const job_select = "SELECT id, source, connector, state, started_at, finished_at, submitted, rejected, checkpoint, error FROM jobs";
 
     fn rowToJob(arena: Allocator, st: Stmt) storage.Error!Job {
@@ -608,4 +643,41 @@ test "full pipeline over the persistent stores, then a rebuild from them" {
         try testing.expectEqual(a.hits[0].id, b.hits[0].id);
         try testing.expectEqualStrings(a.hits[0].title.?, b.hits[0].title.?);
     }
+}
+
+test "recent jobs, last job and counts by source" {
+    var s = try SqliteStateStore.open(testing.allocator, ":memory:", true);
+    defer s.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqual(@as(usize, 0), (try s.recentJobs(a, 10)).len);
+    try testing.expect((try s.lastJob(a, "x")) == null);
+
+    const j1 = try s.startJob("alpha", "files", 100);
+    try s.finishJob(j1, .completed, 110, null);
+    const j2 = try s.startJob("beta", "files", 120);
+    try s.finishJob(j2, .failed, 130, "boom");
+    const j3 = try s.startJob("alpha", "files", 140);
+    _ = j3;
+
+    const recent = try s.recentJobs(a, 2);
+    try testing.expectEqual(@as(usize, 2), recent.len);
+    try testing.expectEqualStrings("alpha", recent[0].source); // newest first
+    try testing.expectEqual(JobState.running, recent[0].state);
+    try testing.expectEqualStrings("beta", recent[1].source);
+    try testing.expectEqualStrings("boom", recent[1].error_message.?);
+    const last = (try s.lastJob(a, "alpha")).?;
+    try testing.expectEqual(@as(i64, 3), last.id);
+
+    const docs = s.documents();
+    try docs.upsert(.{ .id = doc.idFromSource("alpha", "1"), .content_hash = null, .acquired_at = 1, .meta = .{ .connector = "alpha", .source_id = "1" } });
+    try docs.upsert(.{ .id = doc.idFromSource("alpha", "2"), .content_hash = null, .acquired_at = 1, .meta = .{ .connector = "alpha", .source_id = "2" } });
+    try docs.upsert(.{ .id = doc.idFromSource("beta", "1"), .content_hash = null, .acquired_at = 1, .meta = .{ .connector = "beta", .source_id = "1" } });
+    const counts = try s.countsBySource(a);
+    try testing.expectEqual(@as(usize, 2), counts.len);
+    try testing.expectEqualStrings("alpha", counts[0].source);
+    try testing.expectEqual(@as(u64, 2), counts[0].documents);
+    try testing.expectEqual(@as(u64, 1), counts[1].documents);
 }

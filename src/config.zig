@@ -95,6 +95,20 @@ pub const Listener = struct {
     /// On SIGINT/SIGTERM, how long requests already being handled may take
     /// to finish before the process stops.
     shutdown_grace_ms: u32 = 5_000,
+    /// "stderr" or a file path: write one line per request (time, method,
+    /// route label, status, duration, bytes; never queries or client
+    /// details). Null, the default, writes no log (docs/decisions/0012).
+    access_log: ?[]const u8 = null,
+};
+
+/// Settings that exist only on the administration listener.
+pub const AdminOptions = struct {
+    /// Where the credential hashes live; null means `data_dir/admin-secrets.toml`.
+    secrets_file: ?[]const u8 = null,
+    session_idle_minutes: u32 = 30,
+    session_max_hours: u32 = 8,
+    /// Mark the session cookie `Secure` (set when a proxy serves HTTPS).
+    cookie_secure: bool = false,
 };
 
 /// An integer setting of a listener: its key, range, and where it lives.
@@ -175,8 +189,9 @@ pub const Config = struct {
     server: Listener,
     /// Administration interface; separate listener from `server`.
     admin: Listener,
-    /// True if the file has an `[admin]` table. Lets the program say that the
-    /// administration interface is not served yet only when someone asked.
+    admin_options: AdminOptions = .{},
+    /// True if the file has an `[admin]` table: the administration interface
+    /// is then served (and needs credentials, see docs/decisions/0012).
     admin_configured: bool,
     /// Directory for operational state, retained content and indexes.
     data_dir: []const u8,
@@ -194,7 +209,9 @@ const server_keys = [_][]const u8{
     "max_header_bytes",            "request_timeout_ms",
     "write_timeout_ms",            "max_connections",
     "max_requests_per_connection", "shutdown_grace_ms",
+    "access_log",
 };
+const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure" };
 const storage_keys = [_][]const u8{"data_dir"};
 const top_keys = [_][]const u8{ "server", "admin", "storage", "source" };
 
@@ -247,8 +264,20 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     errdefer cfg.arena.deinit();
     const a = cfg.arena.allocator();
 
-    cfg.server = try readListener(a, src, root, "server", cfg.server, diag);
-    cfg.admin = try readListener(a, src, root, "admin", cfg.admin, diag);
+    cfg.server = try readListener(a, src, root, "server", &server_keys, cfg.server, diag);
+    cfg.admin = try readListener(a, src, root, "admin", &admin_keys, cfg.admin, diag);
+    if (try subTable(src, root, "admin", diag)) |t| {
+        if (try str(src, "admin", t, "secrets_file", diag)) |s| {
+            if (s.len == 0) {
+                diag.set(src, "admin.secrets_file", "must not be empty", .{});
+                return error.InvalidValue;
+            }
+            cfg.admin_options.secrets_file = try a.dupe(u8, s);
+        }
+        if (try intIn(src, "admin", t, "session_idle_minutes", 1, 1440, diag)) |n| cfg.admin_options.session_idle_minutes = @intCast(n);
+        if (try intIn(src, "admin", t, "session_max_hours", 1, 168, diag)) |n| cfg.admin_options.session_max_hours = @intCast(n);
+        if (try optBool(src, "admin", t, "cookie_secure", diag)) |b| cfg.admin_options.cookie_secure = b;
+    }
 
     if (try subTable(src, root, "storage", diag)) |t| {
         try checkKeys(src, "storage", t, &storage_keys, diag);
@@ -370,13 +399,20 @@ fn optBool(src: []const u8, where: []const u8, t: *toml.Table, key: []const u8, 
     };
 }
 
-fn readListener(a: Allocator, src: []const u8, root: *toml.Table, name: []const u8, def: Listener, diag: *Diagnostic) Error!Listener {
+fn readListener(a: Allocator, src: []const u8, root: *toml.Table, name: []const u8, keys: []const []const u8, def: Listener, diag: *Diagnostic) Error!Listener {
     var out = def;
     out.address = try a.dupe(u8, def.address);
     const t = (try subTable(src, root, name, diag)) orelse return out;
-    try checkKeys(src, name, t, &server_keys, diag);
+    try checkKeys(src, name, t, keys, diag);
 
     var kbuf: [96]u8 = undefined;
+    if (try str(src, name, t, "access_log", diag)) |s| {
+        if (s.len == 0) {
+            diag.set(src, std.fmt.bufPrint(&kbuf, "{s}.access_log", .{name}) catch name, "must not be empty (omit the key for no log)", .{});
+            return error.InvalidValue;
+        }
+        out.access_log = try a.dupe(u8, s);
+    }
     if (try str(src, name, t, "address", diag)) |s| {
         if (s.len == 0) {
             diag.set(src, std.fmt.bufPrint(&kbuf, "{s}.address", .{name}) catch name, "must not be empty", .{});
@@ -691,4 +727,40 @@ test "sources: invalid entries are rejected with the entry and key in the messag
         \\kind = "files"
     , &d));
     try testing.expectEqualStrings("source[1].name", d.key());
+}
+
+test "admin and access log settings" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "", &d);
+    defer c.deinit();
+    try testing.expect(c.server.access_log == null);
+    try testing.expect(c.admin.access_log == null);
+    try testing.expectEqual(@as(u32, 30), c.admin_options.session_idle_minutes);
+    try testing.expectEqual(@as(u32, 8), c.admin_options.session_max_hours);
+    try testing.expect(!c.admin_options.cookie_secure);
+    try testing.expect(c.admin_options.secrets_file == null);
+
+    var c2 = try loadFromSlice(testing.allocator, "t.toml",
+        \\[server]
+        \\access_log = "stderr"
+        \\[admin]
+        \\access_log = "/var/log/dk-admin.log"
+        \\secrets_file = "/etc/dksearch/secrets.toml"
+        \\session_idle_minutes = 5
+        \\session_max_hours = 2
+        \\cookie_secure = true
+    , &d);
+    defer c2.deinit();
+    try testing.expectEqualStrings("stderr", c2.server.access_log.?);
+    try testing.expectEqualStrings("/var/log/dk-admin.log", c2.admin.access_log.?);
+    try testing.expectEqualStrings("/etc/dksearch/secrets.toml", c2.admin_options.secrets_file.?);
+    try testing.expectEqual(@as(u32, 5), c2.admin_options.session_idle_minutes);
+    try testing.expect(c2.admin_options.cookie_secure);
+
+    // These keys exist only on [admin]; bad values are named.
+    try testing.expectError(error.UnknownKey, loadFromSlice(testing.allocator, "t.toml", "[server]\ncookie_secure = true", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[admin]\nsession_idle_minutes = 0", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[admin]\nsession_max_hours = 1000", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[server]\naccess_log = \"\"", &d));
+    try testing.expectError(error.WrongType, loadFromSlice(testing.allocator, "t.toml", "[admin]\ncookie_secure = \"yes\"", &d));
 }

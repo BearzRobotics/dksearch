@@ -53,6 +53,8 @@ const usage =
     \\       dksearch remove --config FILE SOURCE [--yes]
     \\       dksearch rebuild [--config FILE]
     \\       dksearch check [--config FILE]
+    \\       dksearch admin-token [--config FILE]
+    \\       dksearch admin-password [--config FILE]
     \\       dksearch backup [--config FILE] DIR
     \\       dksearch check-config FILE
     \\
@@ -107,6 +109,21 @@ fn run(init: std.process.Init) u8 {
         cfg.deinit();
         out(io, "{s}: ok ({d} source{s})\n", .{ path, n, if (n == 1) "" else "s" });
         return exit_ok;
+    }
+
+    if (eq(first, "admin-token") or eq(first, "admin-password")) {
+        var config_path: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (eq(a, "--config")) {
+                config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+            } else if (std.mem.startsWith(u8, a, "--config=")) {
+                config_path = a["--config=".len..];
+            } else {
+                err(io, "unknown option for {s}: {s}", .{ first, a });
+                return exit_usage;
+            }
+        }
+        return adminCredentialCmd(io, gpa, config_path, eq(first, "admin-token"));
     }
 
     if (eq(first, "check") or eq(first, "backup")) {
@@ -301,6 +318,140 @@ fn openContent(io: Io, gpa: std.mem.Allocator, path: [:0]const u8) ?dk.content_s
     };
 }
 
+/// Where the admin credential hashes live.
+fn secretsPath(arena: std.mem.Allocator, cfg: dk.config.Config) ![]const u8 {
+    return cfg.admin_options.secrets_file orelse try std.fmt.allocPrint(arena, "{s}/admin-secrets.toml", .{cfg.data_dir});
+}
+
+fn secretsProblem(io: Io, path: []const u8, e: dk.secrets.Error) void {
+    switch (e) {
+        error.InsecurePermissions => err(io, "{s} can be read by other users; run `chmod 600 {s}` (or create new credentials, which rewrites it safely)", .{ path, path }),
+        error.Malformed => err(io, "{s} is not a valid credentials file; fix or delete it and create credentials again", .{path}),
+        error.OutOfMemory => err(io, "out of memory", .{}),
+        else => err(io, "cannot read {s}: {t}", .{ path, e }),
+    }
+}
+
+/// Reads a password. On a terminal it is read without echo and asked twice;
+/// otherwise one line is read from standard input. Never from an argument.
+fn readPassword(io: Io, gpa: std.mem.Allocator) ?[]u8 {
+    const stdin = Io.File.stdin();
+    const tty = stdin.isTty(io) catch false;
+    var restore: ?std.posix.termios = null;
+    if (tty) {
+        if (std.posix.tcgetattr(stdin.handle)) |orig| {
+            var raw = orig;
+            raw.lflag.ECHO = false;
+            std.posix.tcsetattr(stdin.handle, .FLUSH, raw) catch {};
+            restore = orig;
+        } else |_| {}
+    }
+    defer if (restore) |orig| std.posix.tcsetattr(stdin.handle, .FLUSH, orig) catch {};
+
+    const first = readLine(io, gpa, if (tty) "New password: " else null) orelse return null;
+    if (tty) {
+        const second = readLine(io, gpa, "Repeat password: ") orelse {
+            std.crypto.secureZero(u8, first);
+            gpa.free(first);
+            return null;
+        };
+        defer {
+            std.crypto.secureZero(u8, second);
+            gpa.free(second);
+        }
+        if (!std.mem.eql(u8, first, second)) {
+            std.crypto.secureZero(u8, first);
+            gpa.free(first);
+            err(io, "the passwords do not match; nothing was changed", .{});
+            return null;
+        }
+    }
+    return first;
+}
+
+fn readLine(io: Io, gpa: std.mem.Allocator, prompt: ?[]const u8) ?[]u8 {
+    if (prompt) |p| {
+        Io.File.stderr().writeStreamingAll(io, p) catch {};
+    }
+    var line: std.ArrayList(u8) = .empty;
+    var byte: [1]u8 = undefined;
+    while (line.items.len <= dk.secrets.max_password_bytes) {
+        var bufs = [_][]u8{&byte};
+        const n = Io.File.stdin().readStreaming(io, &bufs) catch break;
+        if (n == 0) break;
+        if (byte[0] == '\n') break;
+        line.append(gpa, byte[0]) catch return null;
+    }
+    if (prompt != null) Io.File.stderr().writeStreamingAll(io, "\n") catch {};
+    if (line.items.len > 0 and line.items[line.items.len - 1] == '\r') _ = line.pop();
+    return line.toOwnedSlice(gpa) catch null;
+}
+
+fn adminCredentialCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, want_token: bool) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const path = secretsPath(arena_state.allocator(), cfg) catch return exit_io;
+    if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
+
+    var s = dk.secrets.load(gpa, io, Io.Dir.cwd(), path) catch |e| {
+        secretsProblem(io, path, e);
+        return exit_io;
+    };
+    defer s.deinit(gpa);
+
+    if (want_token) {
+        var buf: [dk.secrets.token_len]u8 = undefined;
+        s.token_hash = @splat(0);
+        const token = s.newToken(io, &buf) catch |e| {
+            err(io, "cannot create a token: {t}", .{e});
+            return exit_io;
+        };
+        dk.secrets.save(io, Io.Dir.cwd(), path, s) catch |e| {
+            err(io, "cannot write {s}: {t}", .{ path, e });
+            return exit_io;
+        };
+        out(io, "{s}\n", .{token});
+        err(io, "new admin token written (as a hash) to {s}. This is the only time it is shown; any earlier token no longer works. Send it as: Authorization: Bearer TOKEN", .{path});
+    } else {
+        const password = readPassword(io, gpa) orelse {
+            err(io, "no password was read; nothing was changed", .{});
+            return exit_usage;
+        };
+        defer {
+            std.crypto.secureZero(u8, password);
+            gpa.free(password);
+        }
+        s.setPassword(gpa, io, password) catch |e| {
+            err(io, "cannot set the password: {t} (it must be 1 to {d} bytes)", .{ e, dk.secrets.max_password_bytes });
+            return exit_usage;
+        };
+        dk.secrets.save(io, Io.Dir.cwd(), path, s) catch |e| {
+            err(io, "cannot write {s}: {t}", .{ path, e });
+            return exit_io;
+        };
+        err(io, "admin password hash written to {s}; existing sessions are signed out", .{path});
+    }
+    return exit_ok;
+}
+
+fn adminServeTask(
+    gpa: std.mem.Allocator,
+    io: Io,
+    listener: *Io.net.Server,
+    app: *dkhttp.admin.App,
+    access_log: ?*dkhttp.server.AccessLog,
+    limits: dkhttp.server.Limits,
+    stats: *dkhttp.server.Stats,
+) Io.Cancelable!void {
+    dkhttp.server.serveWith(gpa, io, listener, app.dispatcher(), access_log, limits, stats, &stop_control) catch |e| switch (e) {
+        error.Canceled => return error.Canceled,
+        else => err(io, "admin server stopped: {t}", .{e}),
+    };
+}
+
 fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     var diag: dk.config.Diagnostic = .{};
     var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
@@ -325,7 +476,6 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     defer listener.deinit(io);
 
     err(io, "serving search on http://{f}/ (index: {s})", .{ listener.socket.address, paths.index });
-    if (cfg.admin_configured) err(io, "note: the administration interface is not implemented yet; [admin] is validated but not served", .{});
 
     const limits: dkhttp.server.Limits = .{
         .max_header_bytes = cfg.server.max_header_bytes,
@@ -336,13 +486,92 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         .shutdown_grace_ms = cfg.server.shutdown_grace_ms,
     };
     var stats: dkhttp.server.Stats = .{};
+    var admin_stats: dkhttp.server.Stats = .{};
+
+    var public_log: ?dkhttp.server.AccessLog = null;
+    defer if (public_log) |*l| l.close();
+    if (cfg.server.access_log) |dest| {
+        public_log = dkhttp.server.AccessLog.open(io, dest) catch |e| {
+            err(io, "cannot open the access log {s}: {t}", .{ dest, e });
+            return exit_io;
+        };
+    }
+
+    // The administration interface: only with credentials (docs/decisions/0012).
+    var admin_listener: ?Io.net.Server = null;
+    defer if (admin_listener) |*l| l.deinit(io);
+    var admin_log: ?dkhttp.server.AccessLog = null;
+    defer if (admin_log) |*l| l.close();
+    var admin_app: dkhttp.admin.App = undefined;
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    if (cfg.admin_configured) admin: {
+        const spath = secretsPath(arena_state.allocator(), cfg) catch return exit_io;
+        var creds = dk.secrets.load(gpa, io, Io.Dir.cwd(), spath) catch |e| {
+            secretsProblem(io, spath, e);
+            err(io, "the administration interface was not started", .{});
+            break :admin;
+        };
+        defer creds.deinit(gpa);
+        if (!creds.any()) {
+            err(io, "the administration interface was not started: {s} has no credentials. Create one with `dksearch admin-token` or `dksearch admin-password`", .{spath});
+            break :admin;
+        }
+        const a_address = Io.net.IpAddress.parse(cfg.admin.address, cfg.admin.port) catch unreachable;
+        admin_listener = dkhttp.server.listen(io, a_address) catch |e| {
+            err(io, "cannot listen for administration on {s}:{d}: {t}; the administration interface was not started", .{ cfg.admin.address, cfg.admin.port, e });
+            break :admin;
+        };
+        if (cfg.admin.access_log) |dest| {
+            admin_log = dkhttp.server.AccessLog.open(io, dest) catch |e| {
+                err(io, "cannot open the admin access log {s}: {t}; the administration interface was not started", .{ dest, e });
+                admin_listener.?.deinit(io);
+                admin_listener = null;
+                break :admin;
+            };
+        }
+        admin_app = dkhttp.admin.App.init(gpa, io, .{
+            .index_path = paths.index,
+            .state_path = paths.state,
+            .content_path = paths.content,
+            .secrets_path = spath,
+            .sources = cfg.sources,
+            .version = build_options.version,
+            .session_idle_ms = @as(u64, cfg.admin_options.session_idle_minutes) * 60 * 1000,
+            .session_max_ms = @as(u64, cfg.admin_options.session_max_hours) * 60 * 60 * 1000,
+            .cookie_secure = cfg.admin_options.cookie_secure,
+            .public_stats = &stats,
+            .admin_stats = &admin_stats,
+        });
+        const admin_limits: dkhttp.server.Limits = .{
+            .max_header_bytes = cfg.admin.max_header_bytes,
+            .request_head_timeout_ms = cfg.admin.request_timeout_ms,
+            .write_timeout_ms = cfg.admin.write_timeout_ms,
+            .max_connections = cfg.admin.max_connections,
+            .max_requests_per_connection = cfg.admin.max_requests_per_connection,
+            .max_body_bytes = 4096,
+            .shutdown_grace_ms = cfg.admin.shutdown_grace_ms,
+        };
+        group.concurrent(io, adminServeTask, .{ gpa, io, &admin_listener.?, &admin_app, if (admin_log) |*l| l else null, admin_limits, &admin_stats }) catch {
+            err(io, "cannot start the administration server (no concurrency available)", .{});
+            admin_listener.?.deinit(io);
+            admin_listener = null;
+            break :admin;
+        };
+        err(io, "serving administration on http://{f}/ (sign in with the token or password; read-only)", .{admin_listener.?.socket.address});
+    }
+
     installSignalHandlers(onServeSignal);
-    dkhttp.server.serve(gpa, io, &listener, index.searcher(), limits, &stats, &stop_control) catch |e| {
+    var result: u8 = exit_ok;
+    dkhttp.server.servePublic(gpa, io, &listener, index.searcher(), if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
-        return exit_failure;
+        result = exit_failure;
     };
+    // Stop the admin listener too (when the public server failed on its own).
+    stop_control.requestStop();
+    group.await(io) catch {};
     err(io, "stopped", .{});
-    return exit_ok;
+    return result;
 }
 
 /// Takes the data directory's writer lock, or explains why not.

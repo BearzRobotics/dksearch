@@ -6,10 +6,14 @@ pub const handler = @import("handler.zig");
 pub const query = @import("query.zig");
 pub const html = @import("html.zig");
 pub const server = @import("server.zig");
+pub const admin = @import("admin.zig");
+pub const accesslog = @import("accesslog.zig");
 
 test {
     _ = handler;
     _ = query;
     _ = html;
     _ = server;
+    _ = accesslog;
+    _ = admin;
 }

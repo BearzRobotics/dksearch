@@ -26,6 +26,9 @@ const http = std.http;
 const Allocator = std.mem.Allocator;
 const dk = @import("dksearch");
 const handler = @import("handler.zig");
+const accesslog = @import("accesslog.zig");
+
+pub const AccessLog = accesslog.AccessLog;
 
 pub const Limits = struct {
     /// Largest request head (request line plus headers) accepted.
@@ -37,6 +40,10 @@ pub const Limits = struct {
     write_timeout_ms: u32 = 10_000,
     max_connections: u32 = 256,
     max_requests_per_connection: u32 = 100,
+    /// Largest request body accepted. Zero (the public interface) refuses
+    /// every body without reading it; the admin interface allows a few KiB
+    /// for its login form. Chunked bodies are never accepted.
+    max_body_bytes: u32 = 0,
     /// On a graceful stop, how long requests already being handled may take.
     shutdown_grace_ms: u32 = 5_000,
 };
@@ -59,6 +66,66 @@ pub const Stats = struct {
     /// Connections cut off by a deadline.
     timed_out: std.atomic.Value(u64) = .init(0),
     requests: std.atomic.Value(u64) = .init(0),
+    /// Responses by status class: index 2 counts 2xx, and so on (0, 1 unused).
+    by_class: [6]std.atomic.Value(u64) = @splat(.init(0)),
+    /// Request-to-response time in buckets: <= 10 ms, <= 50, <= 250, <= 1000, slower.
+    latency: [5]std.atomic.Value(u64) = @splat(.init(0)),
+
+    pub const latency_bounds_ms = [_]u64{ 10, 50, 250, 1000 };
+
+    fn record(self: *Stats, status: u16, duration_ms: u64) void {
+        const class: usize = @min(status / 100, 5);
+        _ = self.by_class[class].fetchAdd(1, .monotonic);
+        var bucket: usize = latency_bounds_ms.len;
+        for (latency_bounds_ms, 0..) |b, i| if (duration_ms <= b) {
+            bucket = i;
+            break;
+        };
+        _ = self.latency[bucket].fetchAdd(1, .monotonic);
+    }
+};
+
+/// What a dispatcher sees of a request. Strings live in the request's arena.
+pub const Request = struct {
+    method: http.Method,
+    /// Request target: path and query.
+    target: []const u8,
+    /// The `Authorization` header, if any.
+    authorization: ?[]const u8 = null,
+    /// The `Cookie` header, if any.
+    cookie: ?[]const u8 = null,
+    /// The body (at most `Limits.max_body_bytes`), empty if none.
+    body: []const u8 = "",
+};
+
+/// The application behind a listener: turns requests into responses.
+pub const Dispatcher = struct {
+    ptr: *anyopaque,
+    handle: *const fn (ptr: *anyopaque, arena: Allocator, req: Request) handler.Response,
+    /// A short fixed label for the request, for the access log: never the URL.
+    label: *const fn (target: []const u8) []const u8,
+};
+
+const PublicApp = struct {
+    searcher: dk.search.Searcher,
+
+    fn handle(ptr: *anyopaque, arena: Allocator, req: Request) handler.Response {
+        const self: *PublicApp = @ptrCast(@alignCast(ptr));
+        return handler.handle(arena, self.searcher, req.method, req.target);
+    }
+
+    var dummy_for_tests: PublicApp = .{ .searcher = FixedSearch.searcher() };
+    fn handleForTests(_: *anyopaque, arena: Allocator, req: Request) handler.Response {
+        return handler.handle(arena, FixedSearch.searcher(), req.method, req.target);
+    }
+
+    fn label(target: []const u8) []const u8 {
+        const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
+        for ([_][]const u8{ "/", "/search", "/api/v1/search", "/api/v1/health", "/assets/style.css" }) |known| {
+            if (std.mem.eql(u8, path, known)) return known;
+        }
+        return "other";
+    }
 };
 
 const Slot = struct {
@@ -74,7 +141,8 @@ const Slot = struct {
 const State = struct {
     gpa: Allocator,
     io: Io,
-    searcher: dk.search.Searcher,
+    dispatcher: Dispatcher,
+    access_log: ?*AccessLog,
     limits: Limits,
     stats: *Stats,
     listener: *net.Server,
@@ -149,11 +217,24 @@ pub fn listen(io: Io, address: net.IpAddress) net.IpAddress.ListenError!net.Serv
 /// a normal return) or the task is cancelled (immediate; returns
 /// `error.Canceled`).
 pub fn serve(gpa: Allocator, io: Io, listener: *net.Server, searcher: dk.search.Searcher, limits: Limits, stats: *Stats, control: *Control) ServeError!void {
+    return servePublic(gpa, io, listener, searcher, null, limits, stats, control);
+}
+
+/// The public search interface, with an optional access log.
+pub fn servePublic(gpa: Allocator, io: Io, listener: *net.Server, searcher: dk.search.Searcher, access_log: ?*AccessLog, limits: Limits, stats: *Stats, control: *Control) ServeError!void {
+    var app: PublicApp = .{ .searcher = searcher };
+    const d: Dispatcher = .{ .ptr = &app, .handle = PublicApp.handle, .label = PublicApp.label };
+    return serveWith(gpa, io, listener, d, access_log, limits, stats, control);
+}
+
+/// Like `serve`, for any application behind a `Dispatcher`, with an optional
+/// access log.
+pub fn serveWith(gpa: Allocator, io: Io, listener: *net.Server, dispatcher: Dispatcher, access_log: ?*AccessLog, limits: Limits, stats: *Stats, control: *Control) ServeError!void {
     const slots = try gpa.alloc(Slot, limits.max_connections);
     defer gpa.free(slots);
     @memset(slots, .{});
 
-    var state: State = .{ .gpa = gpa, .io = io, .searcher = searcher, .limits = limits, .stats = stats, .listener = listener, .control = control, .slots = slots };
+    var state: State = .{ .gpa = gpa, .io = io, .dispatcher = dispatcher, .access_log = access_log, .limits = limits, .stats = stats, .listener = listener, .control = control, .slots = slots };
 
     var group: Io.Group = .init;
     defer group.cancel(io);
@@ -259,12 +340,19 @@ fn connection(state: *State, slot: usize, stream: net.Stream) Io.Cancelable!void
         state.setBusy(slot, true);
         defer state.setBusy(slot, false);
         state.setDeadline(slot, lim.write_timeout_ms);
+        const started = state.nowNs();
 
-        // Nothing here accepts a request body. Refuse rather than read it.
-        const has_body = (req.head.content_length orelse 0) > 0 or req.head.transfer_encoding != .none;
-        if (has_body) {
-            req.respond("request bodies are not accepted\n", .{
-                .status = .bad_request,
+        var arena = std.heap.ArenaAllocator.init(state.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // Chunked bodies, `Expect: 100-continue`, and bodies larger than this
+        // listener allows are refused unread; the public listener allows none.
+        const clen = req.head.content_length orelse 0;
+        const too_big = clen > lim.max_body_bytes or req.head.transfer_encoding != .none or req.head.expect != null;
+        if (too_big) {
+            req.respond("request body not accepted\n", .{
+                .status = if (lim.max_body_bytes == 0) .bad_request else .payload_too_large,
                 .keep_alive = false,
                 .extra_headers = &.{.{ .name = "content-type", .value = "text/plain; charset=utf-8" }},
             }) catch {};
@@ -272,11 +360,24 @@ fn connection(state: *State, slot: usize, stream: net.Stream) Io.Cancelable!void
             return;
         }
 
-        var arena = std.heap.ArenaAllocator.init(state.gpa);
-        defer arena.deinit();
-        const a = arena.allocator();
+        // Copy what the dispatcher needs before reading the body, which
+        // invalidates the head's strings.
+        var dreq: Request = .{ .method = req.head.method, .target = a.dupe(u8, req.head.target) catch return };
+        var hdrs = req.iterateHeaders();
+        while (hdrs.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
+                dreq.authorization = a.dupe(u8, h.value) catch return;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "cookie")) {
+                dreq.cookie = a.dupe(u8, h.value) catch return;
+            }
+        }
+        if (clen > 0) {
+            var bbuf: [512]u8 = undefined;
+            const br = req.readerExpectNone(&bbuf);
+            dreq.body = br.readAlloc(a, @intCast(clen)) catch return;
+        }
 
-        const resp = handler.handle(a, state.searcher, req.head.method, req.head.target);
+        const resp = state.dispatcher.handle(state.dispatcher.ptr, a, dreq);
         const headers = a.alloc(http.Header, resp.headers.len + 1) catch return;
         headers[0] = .{ .name = "content-type", .value = resp.content_type };
         @memcpy(headers[1..], resp.headers);
@@ -284,6 +385,12 @@ fn connection(state: *State, slot: usize, stream: net.Stream) Io.Cancelable!void
         const keep = req.head.keep_alive and served < lim.max_requests_per_connection and
             !state.draining.load(.acquire);
         req.respond(resp.body, .{ .status = resp.status, .keep_alive = keep, .extra_headers = headers }) catch return;
+        const elapsed_ms: u64 = @intCast(@divFloor(@max(state.nowNs() - started, 0), std.time.ns_per_ms));
+        state.stats.record(@backingInt(resp.status), elapsed_ms);
+        if (state.access_log) |log| {
+            const body_len: u64 = if (req.head.method == .HEAD) 0 else resp.body.len;
+            log.record(@tagName(dreq.method), state.dispatcher.label(dreq.target), @backingInt(resp.status), elapsed_ms, body_len);
+        }
         if (!keep) return;
     }
 }
@@ -348,6 +455,14 @@ const Harness = struct {
         h.control = .{};
         h.port = h.listener.socket.address.getPort();
         h.future = try testing.io.concurrent(serve, .{ testing.allocator, testing.io, &h.listener, searcher, limits, &h.stats, &h.control });
+    }
+
+    fn startDispatch(h: *Harness, d: Dispatcher, log: ?*AccessLog, limits: Limits) !void {
+        h.listener = try listen(testing.io, try net.IpAddress.parseIp4("127.0.0.1", 0));
+        h.stats = .{};
+        h.control = .{};
+        h.port = h.listener.socket.address.getPort();
+        h.future = try testing.io.concurrent(serveWith, .{ testing.allocator, testing.io, &h.listener, d, log, limits, &h.stats, &h.control });
     }
 
     fn stop(h: *Harness) void {
@@ -581,4 +696,89 @@ test "graceful stop lets a request already in flight finish" {
 
     try h.future.await(testing.io);
     h.listener.deinit(testing.io);
+}
+
+/// A dispatcher that reports what it was given.
+const EchoApp = struct {
+    fn handle(_: *anyopaque, arena: Allocator, req: Request) handler.Response {
+        const text = std.fmt.allocPrint(arena, "method={s} target={s} auth={s} cookie={s} body={s}", .{
+            @tagName(req.method), req.target, req.authorization orelse "-", req.cookie orelse "-", req.body,
+        }) catch return handler.plain(.service_unavailable, "oom");
+        return handler.plain(.ok, text);
+    }
+    fn label(target: []const u8) []const u8 {
+        return if (std.mem.startsWith(u8, target, "/echo")) "/echo" else "other";
+    }
+    var dummy: u8 = 0;
+    fn dispatcher() Dispatcher {
+        return .{ .ptr = &dummy, .handle = handle, .label = label };
+    }
+};
+
+test "a dispatcher sees the method, target, credentials headers and a small body" {
+    var h: Harness = undefined;
+    try h.startDispatch(EchoApp.dispatcher(), null, .{ .max_body_bytes = 64 });
+    defer h.stop();
+    const out = try h.exchange("POST /echo?x=1 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer abc\r\nCookie: a=b\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 200 OK"));
+    try testing.expect(std.mem.indexOf(u8, out, "method=POST target=/echo?x=1 auth=Bearer abc cookie=a=b body=hello") != null);
+}
+
+test "bodies over the limit, chunked bodies and Expect are refused unread" {
+    var h: Harness = undefined;
+    try h.startDispatch(EchoApp.dispatcher(), null, .{ .max_body_bytes = 8 });
+    defer h.stop();
+    const big = try h.exchange("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\nConnection: close\r\n\r\n123456789");
+    defer testing.allocator.free(big);
+    try testing.expect(std.mem.startsWith(u8, big, "HTTP/1.1 413"));
+    const chunked = try h.exchange("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n0\r\n\r\n");
+    defer testing.allocator.free(chunked);
+    try testing.expect(std.mem.startsWith(u8, chunked, "HTTP/1.1 413"));
+    const expect = try h.exchange("POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+    defer testing.allocator.free(expect);
+    // The standard library may announce "100 Continue" before the refusal; the
+    // final status is what matters, and the body is never read.
+    try testing.expect(std.mem.indexOf(u8, expect, "HTTP/1.1 413") != null);
+    // Within the limit still works on the same listener.
+    const ok = try h.exchange("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678");
+    defer testing.allocator.free(ok);
+    try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
+}
+
+test "counters by status class and latency, and an access log that leaves out everything private" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [200]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/access.log", .{tmp.sub_path});
+    var log = try AccessLog.open(testing.io, path);
+    defer log.close();
+
+    var h: Harness = undefined;
+    try h.startDispatch(.{ .ptr = &PublicApp.dummy_for_tests, .handle = PublicApp.handleForTests, .label = PublicApp.label }, &log, .{});
+    defer h.stop();
+
+    const ok = try h.exchange("GET /api/v1/health?token=SECRETQUERY HTTP/1.1\r\nHost: x\r\nCookie: dks_session=SECRETCOOKIE\r\nAuthorization: Bearer SECRETBEARER\r\nUser-Agent: SECRETAGENT\r\nConnection: close\r\n\r\n");
+    defer testing.allocator.free(ok);
+    try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
+    const missing = try h.exchange("GET /nowhere/SECRETPATH HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    defer testing.allocator.free(missing);
+    try testing.expect(std.mem.startsWith(u8, missing, "HTTP/1.1 404"));
+
+    // The server records after responding: give it a moment.
+    var waited: u32 = 0;
+    while (h.stats.by_class[4].load(.acquire) < 1 and waited < 200) : (waited += 1) try testing.io.sleep(.fromMilliseconds(10), .awake);
+    try testing.expectEqual(@as(u64, 1), h.stats.by_class[2].load(.acquire));
+    try testing.expectEqual(@as(u64, 1), h.stats.by_class[4].load(.acquire));
+    var total_latency: u64 = 0;
+    for (&h.stats.latency) |*l| total_latency += l.load(.acquire);
+    try testing.expectEqual(@as(u64, 2), total_latency);
+
+    const text = try tmp.dir.readFileAlloc(testing.io, "access.log", testing.allocator, .limited(4096));
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "GET /api/v1/health 200 ") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "GET other 404 ") != null);
+    for ([_][]const u8{ "SECRET", "127.0.0.1", "token", "dks_session", "Bearer", "x=" }) |forbidden| {
+        try testing.expect(std.mem.indexOf(u8, text, forbidden) == null);
+    }
 }

@@ -28,20 +28,20 @@ const csp = "default-src 'none'; style-src 'self'; img-src 'self'; form-action '
     "base-uri 'none'; frame-ancestors 'none'";
 
 /// Sent with every response.
-const common_headers = [_]Header{
+pub const common_headers = [_]Header{
     .{ .name = "x-content-type-options", .value = "nosniff" },
     .{ .name = "referrer-policy", .value = "no-referrer" },
     .{ .name = "content-security-policy", .value = csp },
     .{ .name = "cross-origin-resource-policy", .value = "same-origin" },
 };
-const no_store = Header{ .name = "cache-control", .value = "no-store" };
+pub const no_store = Header{ .name = "cache-control", .value = "no-store" };
 const asset_cache = Header{ .name = "cache-control", .value = "public, max-age=3600" };
 
-const html_ct = "text/html; charset=utf-8";
+pub const html_ct = "text/html; charset=utf-8";
 const json_ct = "application/json";
 const css_ct = "text/css; charset=utf-8";
 
-fn headersWith(arena: Allocator, extra: []const Header) []const Header {
+pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     const out = arena.alloc(Header, common_headers.len + extra.len) catch return &common_headers;
     @memcpy(out[0..common_headers.len], &common_headers);
     @memcpy(out[common_headers.len..], extra);
@@ -181,7 +181,7 @@ fn searchFailure(arena: Allocator, e: dk.search.Error, api: bool) error{OutOfMem
     return if (api) apiError(arena, status, code, msg) else htmlError(arena, status, "Search problem", msg);
 }
 
-fn jsonResponse(arena: Allocator, status: http.Status, value: anytype) error{OutOfMemory}!Response {
+pub fn jsonResponse(arena: Allocator, status: http.Status, value: anytype) error{OutOfMemory}!Response {
     var aw: std.Io.Writer.Allocating = .init(arena);
     std.json.Stringify.value(value, .{}, &aw.writer) catch return error.OutOfMemory;
     aw.writer.writeByte('\n') catch return error.OutOfMemory;
@@ -193,7 +193,7 @@ fn jsonResponse(arena: Allocator, status: http.Status, value: anytype) error{Out
     };
 }
 
-fn apiError(arena: Allocator, status: http.Status, code: []const u8, message: []const u8) error{OutOfMemory}!Response {
+pub fn apiError(arena: Allocator, status: http.Status, code: []const u8, message: []const u8) error{OutOfMemory}!Response {
     return jsonResponse(arena, status, .{ .@"error" = .{ .code = code, .message = message } });
 }
 
@@ -227,17 +227,17 @@ fn renderHtml(arena: Allocator, status: http.Status, comptime f: fn (*std.Io.Wri
     return htmlResponse(arena, status, aw.written());
 }
 
-fn htmlResponse(arena: Allocator, status: http.Status, body: []const u8) Response {
+pub fn htmlResponse(arena: Allocator, status: http.Status, body: []const u8) Response {
     return .{ .status = status, .content_type = html_ct, .body = body, .headers = headersWith(arena, &.{no_store}) };
 }
 
-fn htmlError(arena: Allocator, status: http.Status, title: []const u8, message: []const u8) error{OutOfMemory}!Response {
+pub fn htmlError(arena: Allocator, status: http.Status, title: []const u8, message: []const u8) error{OutOfMemory}!Response {
     var aw: std.Io.Writer.Allocating = .init(arena);
     html.writeError(&aw.writer, title, message) catch return error.OutOfMemory;
     return htmlResponse(arena, status, aw.written());
 }
 
-fn plain(status: http.Status, body: []const u8) Response {
+pub fn plain(status: http.Status, body: []const u8) Response {
     return .{ .status = status, .content_type = "text/plain; charset=utf-8", .body = body, .headers = &common_headers };
 }
 

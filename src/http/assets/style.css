@@ -68,3 +68,17 @@ ol.results li { margin: 0 0 1.5rem; }
 .snippet mark { background: var(--mark); color: inherit; }
 .source { color: var(--muted); font-size: 0.8rem; }
 nav.pager { display: flex; justify-content: space-between; }
+
+/* Administration interface */
+.admin main { max-width: 64rem; text-align: left; }
+.admin.home main { max-width: 26rem; text-align: center; }
+.adminbar { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; margin-bottom: 1rem; }
+.adminbar .brand { font-size: 1.1rem; margin: 0; font-weight: 600; }
+.adminbar nav { flex: 1; display: flex; gap: 1rem; }
+.adminbar nav a[aria-current="page"] { font-weight: 600; color: var(--fg); }
+.adminbar button { font: inherit; padding: 0.3rem 0.8rem; color: inherit; background: none; border: 1px solid var(--border); border-radius: 0.4rem; cursor: pointer; }
+.admin h1 { font-size: 1.4rem; }
+.admin h2 { font-size: 1.1rem; margin-top: 1.5rem; }
+.admin table { border-collapse: collapse; width: 100%; font-size: 0.9rem; display: block; overflow-x: auto; }
+.admin th, .admin td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.muted { color: var(--muted); }
