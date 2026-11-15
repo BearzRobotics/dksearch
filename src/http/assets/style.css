@@ -154,6 +154,20 @@ details { margin: 1.4rem 0 0.6rem; }
 details > summary { cursor: pointer; font-weight: 600; margin-bottom: 0.6rem; }
 code { background: var(--card); border: 1px solid var(--border); border-radius: 0.3rem; padding: 0 0.3rem; }
 
+.notice { padding: 0.5rem 0.8rem; border: 1px solid var(--border); border-radius: 0.5rem; background: var(--card); }
+.notice.ok { border-color: var(--ok); }
+.notice.err { border-color: var(--err); color: var(--err); }
+form.stack { display: flex; flex-direction: column; gap: 0.9rem; max-width: 40rem; }
+form.stack label { display: flex; flex-direction: column; gap: 0.25rem; font-weight: 600; }
+form.stack label.check { flex-direction: row; align-items: center; gap: 0.5rem; font-weight: 400; }
+form.stack small { font-weight: 400; color: var(--muted); }
+form.stack input[type="text"], form.stack input:not([type]), form.stack select, form.stack textarea {
+  font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--border); border-radius: 0.4rem; padding: 0.4rem 0.6rem;
+}
+form.stack textarea { font-family: ui-monospace, monospace; font-size: 0.9rem; }
+td.actions { white-space: nowrap; }
+td.actions a.btn { text-decoration: none; display: inline-block; }
+pre { background: var(--card); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.6rem 0.8rem; overflow-x: auto; }
 @media (max-width: 40rem) {
   .adminbar-inner { gap: 0.4rem; }
   .stat-n { font-size: 1.3rem; }

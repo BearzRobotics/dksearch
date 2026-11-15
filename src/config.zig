@@ -376,7 +376,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
 
 const source_common_keys = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights" };
 
-fn validSourceName(name: []const u8) bool {
+pub fn validSourceName(name: []const u8) bool {
     if (name.len == 0 or name.len > 64) return false;
     for (name, 0..) |ch, i| {
         const ok = (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or (i > 0 and (ch == '_' or ch == '-'));

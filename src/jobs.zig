@@ -22,6 +22,7 @@ const state_sqlite = @import("state_sqlite.zig");
 const pipeline = @import("pipeline.zig");
 const runner = @import("runner.zig");
 const maintenance = @import("maintenance.zig");
+const sourcestore = @import("sourcestore.zig");
 
 /// The runner wants a clock without a context argument; one process runs one
 /// manager, so the clock's `Io` is kept here.
@@ -40,6 +41,9 @@ pub const Options = struct {
     tokenizer: index_sqlite.Tokenizer = .unicode61,
     /// The configured sources; must outlive the manager.
     sources: []const config.Source,
+    /// When set, the sources are read from here instead (so they can be
+    /// replaced while the server runs); `sources` is then only the initial list.
+    store: ?*sourcestore.Store = null,
     /// Where backups made from the interface go (a new subdirectory per
     /// backup). Null turns the backup operation off.
     backup_dir: ?[]const u8 = null,
@@ -153,6 +157,11 @@ pub const Manager = struct {
         if (l.summary) |t| self.gpa.free(t);
     }
 
+    /// The current sources.
+    pub fn sources(self: *Manager) []const config.Source {
+        return if (self.opts.store) |st| st.snapshot() else self.opts.sources;
+    }
+
     /// Starts importing `name` in the background and returns at once.
     pub fn start(self: *Manager, name: []const u8) StartError!void {
         return self.startOp(.import, name);
@@ -165,7 +174,7 @@ pub const Manager = struct {
         switch (op) {
             .import => {
                 const name = arg orelse return error.BadArgument;
-                source = for (self.opts.sources) |s| {
+                source = for (self.sources()) |s| {
                     if (std.mem.eql(u8, s.name, name)) break s;
                 } else return error.UnknownSource;
                 if (!source.enabled) return error.SourceDisabled;

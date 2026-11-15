@@ -213,9 +213,14 @@ pub const admin_topic =
     \\   - Command line:
     \\       curl -H "Authorization: Bearer TOKEN" http://127.0.0.1:8081/api/v1/admin/status
     \\
-    \\What it shows: a dashboard, your sources and their last imports, import jobs with
-    \\why pages were skipped, counters, and a query-testing page that shows each result's
-    \\ranking score. Starting and cancelling imports is off unless `actions = true`.
+    \\What it shows: a dashboard with a live progress bar for a running import, your
+    \\sources and their last imports, import jobs with why pages were skipped, counters,
+    \\and a query-testing page that shows each result's ranking score.
+    \\
+    \\With `actions = true` (and the server started with --config) you can also, from
+    \\the pages: start and cancel imports; add, edit, enable, disable and delete
+    \\sources (it rewrites the [[source]] tables of your config file, keeping a .bak
+    \\copy); and run check, backup (set `backup_dir` in [admin]) and remove-a-source.
     \\
     \\Security: never expose it over plain HTTP beyond this machine (the token and
     \\password would cross the network in clear text). For remote use, put it behind an

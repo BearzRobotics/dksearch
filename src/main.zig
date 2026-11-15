@@ -674,6 +674,9 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     var admin_log: ?dkhttp.server.AccessLog = null;
     defer if (admin_log) |*l| l.close();
     var admin_app: dkhttp.admin.App = undefined;
+    // The sources, shared so that editing them in the interface takes effect at once.
+    var source_store = dk.sourcestore.Store.init(gpa, io, cfg.sources);
+    defer source_store.deinit();
     var job_manager: dk.jobs.Manager = undefined;
     var job_manager_ready = false;
     defer if (job_manager_ready) job_manager.deinit();
@@ -706,6 +709,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         }
         if (cfg.admin_options.actions) {
             job_manager = dk.jobs.Manager.init(gpa, io, .{
+                .store = &source_store,
                 .data_dir = cfg.data_dir,
                 .index_path = paths.index,
                 .state_path = paths.state,
@@ -720,6 +724,8 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             job_manager_ready = true;
         }
         admin_app = dkhttp.admin.App.init(gpa, io, .{
+            .store = &source_store,
+            .config_path = config_path,
             .jobs = if (job_manager_ready) &job_manager else null,
             .searcher = searcher,
             .regex = if (admin_regex_service) |*r| r else null,

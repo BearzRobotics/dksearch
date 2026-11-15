@@ -10,6 +10,8 @@ pub const memory = @import("memory.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const search = @import("search.zig");
 pub const evaluate = @import("evaluate.zig");
+pub const sourcestore = @import("sourcestore.zig");
+pub const sourceedit = @import("sourceedit.zig");
 pub const regexsearch = @import("regexsearch.zig");
 pub const help = @import("help.zig");
 pub const rebuild = @import("rebuild.zig");
@@ -33,6 +35,8 @@ test {
     _ = pipeline;
     _ = search;
     _ = evaluate;
+    _ = sourcestore;
+    _ = sourceedit;
     _ = regexsearch;
     _ = help;
     _ = rebuild;

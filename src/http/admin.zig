@@ -39,6 +39,12 @@ pub const Options = struct {
     content_path: [:0]const u8,
     secrets_path: []const u8,
     sources: []const dk.config.Source,
+    /// When set, the sources are read from here (and can be edited from the
+    /// interface); `sources` is then only the initial list.
+    store: ?*dk.sourcestore.Store = null,
+    /// The configuration file the server was started with, for editing sources.
+    /// Null: sources cannot be edited from the interface.
+    config_path: ?[]const u8 = null,
     version: []const u8,
     session_idle_ms: u64 = 30 * 60 * 1000,
     session_max_ms: u64 = 8 * 60 * 60 * 1000,
@@ -78,6 +84,8 @@ pub const App = struct {
     opts: Options,
     started_unix: i64,
     mutex: Io.Mutex = .init,
+    /// Serialises edits of the configuration file's sources.
+    edit_mutex: Io.Mutex = .init,
     sessions: [max_sessions]?Session = @splat(null),
     failures: u32 = 0,
     last_failure_ns: i96 = 0,
@@ -116,7 +124,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/maintenance", "/actions/maintenance", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/sources", "/sources/edit", "/actions/sources", "/maintenance", "/actions/maintenance", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -124,12 +132,15 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, maintenance, action_maintenance, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, sources_page, source_edit, action_sources, maintenance, action_maintenance, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
             .{ "/", .dashboard },
             .{ "/jobs", .jobs },
+            .{ "/sources", .sources_page },
+            .{ "/sources/edit", .source_edit },
+            .{ "/actions/sources", .action_sources },
             .{ "/maintenance", .maintenance },
             .{ "/actions/maintenance", .action_maintenance },
             .{ "/api/v1/admin/maintenance", .api_maintenance },
@@ -182,10 +193,11 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .api_maintenance;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .api_maintenance or route == .action_sources;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
-        if (!post_only and route != .api_imports and !head_ok) return methodNotAllowed(arena, is_api, "GET, HEAD");
+        if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
+        if (!post_only and route != .api_imports and route != .api_sources and !head_ok) return methodNotAllowed(arena, is_api, "GET, HEAD");
         const auth = try self.authenticate(arena, req);
         if (auth == .none) {
             if (is_api) {
@@ -206,7 +218,10 @@ pub const App = struct {
             .action_maintenance => self.startOperation(arena, req, auth, false),
             .api_maintenance => self.startOperation(arena, req, auth, true),
             .api_status => self.apiStatus(arena),
-            .api_sources => self.apiSources(arena),
+            .api_sources => if (req.method == .POST) self.editSources(arena, req, auth, true) else self.apiSources(arena),
+            .sources_page => self.pageSources(arena, csrf, t.params),
+            .source_edit => self.pageSourceEdit(arena, csrf, t.params),
+            .action_sources => self.editSources(arena, req, auth, false),
             .api_jobs => self.apiJobs(arena),
             .api_imports => if (req.method == .POST) self.startImport(arena, req, auth, true) else self.apiImports(arena),
             .action_import => self.startImport(arena, req, auth, false),
@@ -360,6 +375,144 @@ pub const App = struct {
             return r;
         }
         return redirect(arena, "/maintenance", null);
+    }
+
+    // --------------------------------------------------- editing sources
+
+    fn spec_from(params: query.Params) dk.sourceedit.Spec {
+        const checked = struct {
+            fn on(v: ?[]const u8) bool {
+                const t = v orelse return false;
+                return std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "on") or std.mem.eql(u8, t, "true");
+            }
+        }.on;
+        return .{
+            .name = params.get("name") orelse "",
+            .kind = params.get("kind") orelse "",
+            // An unchecked box sends nothing, so the form carries a hidden marker
+            // saying the checkboxes were present; the API sends explicit values.
+            .enabled = if (params.get("form") != null) checked(params.get("enabled")) else (if (params.get("enabled")) |v| checked(v) else true),
+            .retain_text = if (params.get("form") != null) checked(params.get("retain_text")) else (if (params.get("retain_text")) |v| checked(v) else true),
+            .rights = if (params.get("rights")) |r| (if (r.len > 0) r else null) else null,
+            .options = params.get("options") orelse "",
+        };
+    }
+
+    /// Adds, replaces, enables/disables or deletes a `[[source]]` in the
+    /// configuration file, validated as a whole, and applies it at once.
+    fn editSources(self: *App, arena: Allocator, req: server.Request, auth: Auth, is_api: bool) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, is_api)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const path = self.opts.config_path orelse return actionFailure(arena, is_api, .{ .status = .conflict, .code = "no_config_file", .message = "the server was started without --config, so there is no configuration file to edit" });
+        const store = self.opts.store orelse return actionFailure(arena, is_api, .{ .status = .conflict, .code = "no_config_file", .message = "editing sources is not available here" });
+
+        const op = params.get("op") orelse "save";
+        const spec = spec_from(params);
+        const original: ?[]const u8 = if (params.get("original")) |o| (if (o.len > 0) o else null) else null;
+        const edit: dk.sourceedit.Edit = if (std.mem.eql(u8, op, "save"))
+            .{ .save = .{ .original = original, .spec = spec } }
+        else if (std.mem.eql(u8, op, "delete"))
+            .{ .delete = spec.name }
+        else if (std.mem.eql(u8, op, "toggle"))
+            .{ .set_enabled = .{ .name = spec.name, .enabled = if (params.get("enabled")) |v| std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") else false } }
+        else
+            return actionFailure(arena, is_api, .{ .status = .bad_request, .code = "unknown_operation", .message = "op must be save, delete or toggle" });
+
+        self.edit_mutex.lockUncancelable(self.io);
+        defer self.edit_mutex.unlock(self.io);
+
+        // Always start from the file as it is now, so edits made by hand meanwhile are kept.
+        const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return actionFailure(arena, is_api, .{ .status = .internal_server_error, .code = "config_unreadable", .message = "cannot read the configuration file" }),
+        };
+        var problem: dk.sourceedit.Problem = .{};
+        const new_text = dk.sourceedit.apply(arena, text, edit, &problem) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => {
+                const msg = try arena.dupe(u8, problem.message());
+                if (is_api or !std.mem.eql(u8, op, "save")) return actionFailure(arena, is_api, .{ .status = .bad_request, .code = "invalid_source", .message = msg });
+                return self.renderSourceForm(arena, try csrfCopy(arena, auth), spec, original, msg, .bad_request);
+            },
+        };
+        dk.sourceedit.writeFile(self.io, arena, path, new_text) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Io => return actionFailure(arena, is_api, .{ .status = .internal_server_error, .code = "config_not_writable", .message = "the configuration file could not be written (check its permissions); nothing was changed" }),
+        };
+        // Make it current. The text was validated, so this cannot fail on content.
+        var d: dk.config.Diagnostic = .{};
+        const cfg = dk.config.loadFromSlice(self.gpa, path, new_text, &d) catch return actionFailure(arena, is_api, .{ .status = .internal_server_error, .code = "reload_failed", .message = "the file was saved but could not be reloaded; restart the server" });
+        store.replace(cfg) catch return error.OutOfMemory;
+
+        const done: []const u8 = if (std.mem.eql(u8, op, "delete")) "deleted" else if (std.mem.eql(u8, op, "toggle")) (if (spec_enabled_after(edit)) "enabled" else "disabled") else "saved";
+        if (is_api) return handler.jsonResponse(arena, .ok, .{ .done = done, .name = spec.name });
+        return redirect(arena, try std.fmt.allocPrint(arena, "/sources?done={s}", .{done}), null);
+    }
+
+    fn spec_enabled_after(edit: dk.sourceedit.Edit) bool {
+        return switch (edit) {
+            .set_enabled => |se| se.enabled,
+            else => true,
+        };
+    }
+
+    /// The session's form token, copied into `arena` (null for a bearer token).
+    fn csrfCopy(arena: Allocator, auth: Auth) Allocator.Error!?[]const u8 {
+        return switch (auth) {
+            .session => |s| try arena.dupe(u8, &s.csrf),
+            else => null,
+        };
+    }
+
+    /// True when sources can be edited here: actions are on, a configuration
+    /// file is known and the list is replaceable.
+    fn canEditSources(self: *App) bool {
+        return self.opts.jobs != null and self.opts.config_path != null and self.opts.store != null;
+    }
+
+    fn pageSources(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
+        const snap = self.snapshot(arena, 0);
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "Sources", csrf, "sources") catch return error.OutOfMemory;
+        writeSources(self, w, snap, csrf, params.get("done")) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
+    }
+
+    fn pageSourceEdit(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
+        if (!self.canEditSources()) return handler.htmlError(arena, .conflict, "Not available", "Editing sources needs `admin.actions = true` and a server started with --config.");
+        var spec: dk.sourceedit.Spec = .{ .name = "", .kind = "" };
+        var original: ?[]const u8 = null;
+        if (params.get("name")) |name| if (name.len > 0) {
+            const found = for (self.sources()) |src| {
+                if (std.mem.eql(u8, src.name, name)) break src;
+            } else return handler.htmlError(arena, .not_found, "Not found", "No such source.");
+            spec = .{
+                .name = found.name,
+                .kind = found.kind,
+                .enabled = found.enabled,
+                .retain_text = found.retain_text,
+                .rights = if (found.rights) |r| @tagName(r) else null,
+                .options = try dk.sourceedit.optionsText(arena, found),
+            };
+            original = found.name;
+        };
+        return self.renderSourceForm(arena, csrf, spec, original, null, .ok);
+    }
+
+    fn renderSourceForm(self: *App, arena: Allocator, csrf: ?[]const u8, spec: dk.sourceedit.Spec, original: ?[]const u8, problem: ?[]const u8, status: http.Status) error{OutOfMemory}!Response {
+        _ = self;
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, if (original != null) "Edit source" else "Add a source", csrf, "sources") catch return error.OutOfMemory;
+        writeSourceForm(w, csrf orelse "", spec, original, problem) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        var r = handler.htmlResponse(arena, status, aw.written());
+        r.status = status;
+        return r;
     }
 
     fn cancelImport(self: *App, arena: Allocator, req: server.Request, auth: Auth, is_api: bool) error{OutOfMemory}!Response {
@@ -596,16 +749,19 @@ pub const App = struct {
     // ------------------------------------------------------------------ data
 
     const Snapshot = struct {
+        /// The sources this snapshot describes (one list for the whole request).
+        sources: []const dk.config.Source = &.{},
         counts: []const dk.state_sqlite.SqliteStateStore.SourceCount,
         jobs: []const dk.state_sqlite.Job,
-        /// Last job per configured source, same order as `opts.sources`.
+        /// Last job per source, same order as `sources`.
         last: []const ?dk.state_sqlite.Job,
         sizes: [3]?u64,
     };
 
     /// Reads state.db read-only: safe while an import runs, never changes it.
     fn snapshot(self: *App, arena: Allocator, jobs_limit: u32) Snapshot {
-        var snap: Snapshot = .{ .counts = &.{}, .jobs = &.{}, .last = &.{}, .sizes = .{ null, null, null } };
+        const srcs = self.sources();
+        var snap: Snapshot = .{ .sources = srcs, .counts = &.{}, .jobs = &.{}, .last = &.{}, .sizes = .{ null, null, null } };
         const paths = [_][]const u8{ self.opts.index_path, self.opts.state_path, self.opts.content_path };
         for (paths, 0..) |p, i| {
             const st = Io.Dir.cwd().statFile(self.io, p, .{}) catch continue;
@@ -615,10 +771,14 @@ pub const App = struct {
         defer state.close();
         snap.counts = state.countsBySource(arena) catch &.{};
         snap.jobs = state.recentJobs(arena, jobs_limit) catch &.{};
-        const last = arena.alloc(?dk.state_sqlite.Job, self.opts.sources.len) catch return snap;
-        for (self.opts.sources, last) |s, *out| out.* = (state.lastJob(arena, s.name) catch null);
+        const last = arena.alloc(?dk.state_sqlite.Job, srcs.len) catch return snap;
+        for (srcs, last) |s, *out| out.* = (state.lastJob(arena, s.name) catch null);
         snap.last = last;
         return snap;
+    }
+
+    fn sources(self: *App) []const dk.config.Source {
+        return if (self.opts.store) |st| st.snapshot() else self.opts.sources;
     }
 
     fn docsFor(snap: Snapshot, name: []const u8) u64 {
@@ -740,7 +900,7 @@ pub const App = struct {
         const snap = self.snapshot(arena, 0);
         const Item = struct { name: []const u8, kind: []const u8, enabled: bool, configured: bool, documents: u64, last_job: ?JsonJob };
         var out: std.ArrayList(Item) = .empty;
-        for (self.opts.sources, 0..) |s, i| {
+        for (snap.sources, 0..) |s, i| {
             try out.append(arena, .{
                 .name = s.name,
                 .kind = s.kind,
@@ -753,7 +913,7 @@ pub const App = struct {
         // Documents under names the configuration no longer has.
         for (snap.counts) |c| {
             var known = false;
-            for (self.opts.sources) |s| if (std.mem.eql(u8, s.name, c.source)) {
+            for (snap.sources) |s| if (std.mem.eql(u8, s.name, c.source)) {
                 known = true;
             };
             if (!known) try out.append(arena, .{ .name = c.source, .kind = "", .enabled = false, .configured = false, .documents = c.documents, .last_job = null });
@@ -850,6 +1010,7 @@ fn renderLogin(arena: Allocator, status: http.Status, notice: ?[]const u8) error
 /// The pages of the interface, in navigation order: key, path, label.
 const nav_items = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "dashboard", "/", "Dashboard" },
+    .{ "sources", "/sources", "Sources" },
     .{ "jobs", "/jobs", "Jobs" },
     .{ "maintenance", "/maintenance", "Maintenance" },
     .{ "search", "/search", "Search test" },
@@ -1050,7 +1211,7 @@ fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const 
     try w.writeAll("<section class=\"card\"><h2>Imports</h2>");
     if (csrf) |token| {
         var any = false;
-        for (app.opts.sources) |s| {
+        for (app.sources()) |s| {
             if (!s.enabled) continue;
             any = true;
             try w.writeAll("<form class=\"inline\" action=\"/actions/import\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
@@ -1111,7 +1272,7 @@ fn writeDashboard(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot
     var nb: [32]u8 = undefined;
     try writeStat(w, std.fmt.bufPrint(&nb, "{d}", .{total}) catch "?", "documents");
     var sb: [32]u8 = undefined;
-    try writeStat(w, std.fmt.bufPrint(&sb, "{d}", .{app.opts.sources.len}) catch "?", "sources");
+    try writeStat(w, std.fmt.bufPrint(&sb, "{d}", .{snap.sources.len}) catch "?", "sources");
     {
         var bb: [48]u8 = undefined;
         var bw: Io.Writer = .fixed(&bb);
@@ -1130,11 +1291,11 @@ fn writeDashboard(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot
     try writeImportsPanel(app, arena, w, csrf);
 
     try w.writeAll("<h2>Sources</h2>\n");
-    if (app.opts.sources.len == 0 and snap.counts.len == 0) {
+    if (snap.sources.len == 0 and snap.counts.len == 0) {
         try w.writeAll("<p>No sources are configured. dksearch works without them; add a <code>[[source]]</code> to the configuration to import documents (see <code>dksearch help config</code>).</p>\n");
     } else {
         try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Name</th><th>Kind</th><th>Documents</th><th>Last import</th><th>Started</th><th class=\"num\">Submitted</th><th class=\"num\">Skipped</th></tr></thead><tbody>\n");
-        for (app.opts.sources, 0..) |s, i| {
+        for (snap.sources, 0..) |s, i| {
             try w.writeAll("<tr><td><strong>");
             try html.writeEscaped(w, s.name);
             try w.writeAll("</strong>");
@@ -1150,7 +1311,7 @@ fn writeDashboard(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot
         }
         for (snap.counts) |c| {
             var known = false;
-            for (app.opts.sources) |s| if (std.mem.eql(u8, s.name, c.source)) {
+            for (snap.sources) |s| if (std.mem.eql(u8, s.name, c.source)) {
                 known = true;
             };
             if (known) continue;
@@ -1197,6 +1358,112 @@ fn writeDashboard(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot
     }
     try w.writeAll("</tbody></table></div></details>\n");
     try w.print("<p class=\"muted\">{d} active session(s). A job shown as running may belong to an import that was killed; the next command that opens the data marks it interrupted.</p>\n", .{app.sessionCount()});
+}
+
+fn writeSources(app: *App, w: *Io.Writer, snap: App.Snapshot, csrf: ?[]const u8, done: ?[]const u8) !void {
+    if (done) |d| {
+        // Only fixed words are ever shown, never the request's own text.
+        const msg: ?[]const u8 = if (std.mem.eql(u8, d, "saved")) "Saved. The change is in effect now; the previous file is kept next to it as .bak." else if (std.mem.eql(u8, d, "deleted")) "Deleted from the configuration. Documents it imported stay until you remove them under Maintenance." else if (std.mem.eql(u8, d, "enabled")) "Enabled." else if (std.mem.eql(u8, d, "disabled")) "Disabled." else null;
+        if (msg) |m| try w.print("<p class=\"notice ok\" role=\"status\">{s}</p>\n", .{m});
+    }
+    const editable = app.canEditSources() and csrf != null;
+    if (snap.sources.len == 0) {
+        try w.writeAll("<p>No sources are configured. dksearch works without them; a source tells it what to index.</p>\n");
+    } else {
+        try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Name</th><th>Kind</th><th>Where from</th><th>Documents</th><th>State</th>");
+        if (editable) try w.writeAll("<th></th>");
+        try w.writeAll("</tr></thead><tbody>\n");
+        for (snap.sources) |s| {
+            try w.writeAll("<tr><td><strong>");
+            try html.writeEscaped(w, s.name);
+            try w.writeAll("</strong></td><td>");
+            try html.writeEscaped(w, s.kind);
+            try w.writeAll("</td><td class=\"muted\">");
+            // The one option that says where the source comes from, if there is one.
+            for ([_][]const u8{ "path", "dump", "catalog", "seeds_file", "query" }) |k| {
+                if (s.optionString(k)) |v| {
+                    try html.writeEscaped(w, v);
+                    break;
+                }
+            }
+            try w.print("</td><td class=\"num\">{d}</td><td>", .{App.docsFor(snap, s.name)});
+            try w.writeAll(if (s.enabled) "<span class=\"badge ok\">enabled</span>" else "<span class=\"badge off\">disabled</span>");
+            try w.writeAll("</td>");
+            if (editable) {
+                try w.writeAll("<td class=\"actions\"><a class=\"btn secondary\" href=\"/sources/edit?name=");
+                try query.writeEncoded(w, s.name);
+                try w.writeAll("\">Edit</a> ");
+                for ([_]struct { []const u8, []const u8, []const u8, []const u8 }{
+                    .{ "toggle", if (s.enabled) "0" else "1", if (s.enabled) "Disable" else "Enable", "secondary" },
+                    .{ "delete", "", "Delete", "danger" },
+                }) |b| {
+                    try w.print("<form class=\"inline\" action=\"/actions/sources\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"{s}\"><input type=\"hidden\" name=\"op\" value=\"{s}\"><input type=\"hidden\" name=\"enabled\" value=\"{s}\"><input type=\"hidden\" name=\"name\" value=\"", .{ csrf.?, b[0], b[1] });
+                    try html.writeEscaped(w, s.name);
+                    try w.print("\"><button type=\"submit\" class=\"btn {s}\">{s}</button></form> ", .{ b[3], b[2] });
+                }
+                try w.writeAll("</td>");
+            }
+            try w.writeAll("</tr>\n");
+        }
+        try w.writeAll("</tbody></table></div>\n");
+    }
+    if (editable) {
+        try w.writeAll("<p><a class=\"btn\" href=\"/sources/edit\">Add a source</a></p><p class=\"muted\">Changes are written to the configuration file (the previous version is kept as <code>.bak</code>) and take effect at once. Deleting a source only removes it from the file; its documents stay until you remove them under Maintenance.</p>\n");
+    } else if (app.opts.jobs == null) {
+        try w.writeAll("<p class=\"muted\">Editing sources from here is turned off (<code>admin.actions</code> is false). Edit the configuration file and restart, or see <code>dksearch help config</code>.</p>\n");
+    } else if (app.opts.config_path == null) {
+        try w.writeAll("<p class=\"muted\">The server was started without <code>--config</code>, so there is no configuration file to edit here.</p>\n");
+    } else {
+        try w.writeAll("<p class=\"muted\">Sign in with the password to edit sources.</p>\n");
+    }
+}
+
+const kind_hints = [_]struct { []const u8, []const u8 }{
+    .{ "files", "path = \"/home/me/notes\"   # required: a folder of .txt and .md files\nlanguage = \"en\"\nmax_file_bytes = 1048576" },
+    .{ "gutenberg", "catalog = \"/data/pg_catalog.csv\"   # required\nbooks = \"/data/books\"             # required\nlanguage = \"en\"" },
+    .{ "wikipedia", "dump = \"/data/enwiki-latest-pages-articles-multistream.xml.bz2\"   # required\nlanguage = \"en\"\ndataset_version = \"20260101\"" },
+    .{ "feeds", "path = \"/srv/feeds\"   # required: a feed file or a folder of them\nlanguage = \"en\"" },
+    .{ "crawl", "user_agent = \"mysearch/1.0 (+https://example.org/about)\"   # required\nseeds_file = \"/etc/dksearch/seeds.txt\"   # required: one URL per line\ndelay_ms = 1000\nmax_depth = 3\nmax_pages = 1000\nfollow_external = false" },
+    .{ "archive", "query = \"collection:prelinger AND mediatype:movies\"   # required\nuser_agent = \"mysearch/1.0 (+https://example.org/about)\"   # required\nmax_items = 10000" },
+};
+
+fn writeSourceForm(w: *Io.Writer, csrf: []const u8, spec: dk.sourceedit.Spec, original: ?[]const u8, problem: ?[]const u8) !void {
+    if (problem) |p| {
+        try w.writeAll("<p class=\"notice err\" role=\"alert\">");
+        try html.writeEscaped(w, p);
+        try w.writeAll("</p>\n");
+    }
+    try w.writeAll("<form class=\"stack\" action=\"/actions/sources\" method=\"post\"><input type=\"hidden\" name=\"op\" value=\"save\"><input type=\"hidden\" name=\"form\" value=\"1\"><input type=\"hidden\" name=\"csrf\" value=\"");
+    try html.writeEscaped(w, csrf);
+    try w.writeAll("\"><input type=\"hidden\" name=\"original\" value=\"");
+    if (original) |o| try html.writeEscaped(w, o);
+    try w.writeAll("\"><label>Name <input name=\"name\" required maxlength=\"64\" pattern=\"[a-z0-9][a-z0-9_\\-]*\" autocomplete=\"off\" value=\"");
+    try html.writeEscaped(w, spec.name);
+    try w.writeAll("\"><small>Letters a-z, digits, - and _. Renaming a source starts its import history afresh.</small></label>");
+    try w.writeAll("<label>Kind <select name=\"kind\" required>");
+    for (dk.connectors.kinds) |k| {
+        try w.print("<option value=\"{s}\"{s}>{s}</option>", .{ k, if (std.mem.eql(u8, k, spec.kind)) " selected" else "", k });
+    }
+    try w.writeAll("</select></label>");
+    try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{s}> enabled</label>", .{if (spec.enabled) " checked" else ""});
+    try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"retain_text\" value=\"1\"{s}> keep each document&rsquo;s text (needed to rebuild the index without the source)</label>", .{if (spec.retain_text) " checked" else ""});
+    try w.writeAll("<label>Rights <select name=\"rights\">");
+    for ([_][]const u8{ "", "unknown", "allowed", "restricted", "forbidden" }) |r| {
+        const sel = if (spec.rights) |cur| std.mem.eql(u8, cur, r) else r.len == 0;
+        try w.print("<option value=\"{s}\"{s}>{s}</option>", .{ r, if (sel) " selected" else "", if (r.len == 0) "the connector&rsquo;s default" else r });
+    }
+    try w.writeAll("</select><small>What may be done with the content. This is your decision, not legal advice.</small></label>");
+    try w.writeAll("<label>Options <textarea name=\"options\" rows=\"8\" spellcheck=\"false\" maxlength=\"16384\">");
+    try html.writeEscaped(w, spec.options);
+    try w.writeAll("</textarea><small>One <code>key = value</code> per line, text in double quotes. See the examples below for each kind.</small></label>");
+    try w.writeAll("<p><button type=\"submit\" class=\"btn\">Save</button> <a class=\"btn secondary\" href=\"/sources\">Cancel</a></p></form>\n");
+    try w.writeAll("<details><summary>Options for each kind</summary>");
+    for (kind_hints) |h| {
+        try w.print("<h3>{s}</h3><pre><code>", .{h[0]});
+        try html.writeEscaped(w, h[1]);
+        try w.writeAll("</code></pre>");
+    }
+    try w.writeAll("<p class=\"muted\">All keys are described in <code>man dksearch</code>.</p></details>\n");
 }
 
 fn opTitle(op: dk.jobs.Op) []const u8 {
@@ -1908,6 +2175,95 @@ test "maintenance: check, backup, confirmed removal, and the page" {
     // Without a session (token only) the page explains how to proceed.
     const tok = try f.call(a, .GET, "/maintenance", .{ .auth = auth });
     try testing.expect(std.mem.indexOf(u8, tok.body, "Sign in with the password") != null);
+}
+
+test "sources can be added, edited, disabled and deleted from the interface, and apply at once" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A configuration file with one source, loaded the way `serve` would.
+    const original =
+        \\# my config
+        \\[[source]]
+        \\name = "notes"
+        \\kind = "files"
+        \\path = "/home/me/notes"
+        \\
+    ;
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "cfg.toml", .data = original });
+    var pb: [200]u8 = undefined;
+    const cfg_path = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}/cfg.toml", .{f.tmp.sub_path});
+    var d: dk.config.Diagnostic = .{};
+    var cfg0 = try dk.config.loadFromSlice(testing.allocator, cfg_path, original, &d);
+    defer cfg0.deinit();
+    var store = dk.sourcestore.Store.init(testing.allocator, testing.io, cfg0.sources);
+    defer store.deinit();
+    f.app.opts.store = &store;
+    f.app.opts.config_path = cfg_path;
+    f.manager.opts.store = &store;
+
+    const cookie = try f.signIn(a);
+    const list = try f.call(a, .GET, "/sources", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, list.body, "Add a source") != null);
+    const csrf = csrfOf(list.body);
+
+    // The add form is there; saving a valid source takes effect at once.
+    const form = try f.call(a, .GET, "/sources/edit", .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.ok, form.status);
+    try testing.expect(std.mem.indexOf(u8, form.body, "name=\"options\"") != null);
+    const add = try std.fmt.allocPrint(a, "op=save&form=1&csrf={s}&original=&name=news&kind=feeds&enabled=1&retain_text=1&rights=restricted&options=path+%3D+%22%2Fsrv%2Ffeeds%22", .{csrf});
+    const saved = try f.call(a, .POST, "/actions/sources", .{ .cookie = cookie, .body = add });
+    try testing.expectEqual(http.Status.see_other, saved.status);
+    try testing.expectEqualStrings("/sources?done=saved", Fixture.header(saved, "location").?);
+    try testing.expectEqual(@as(usize, 2), store.snapshot().len);
+    const file = try f.tmp.dir.readFileAlloc(testing.io, "cfg.toml", a, .limited(10_000));
+    try testing.expect(std.mem.indexOf(u8, file, "# my config") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "name = \"news\"") != null);
+    const bak = try f.tmp.dir.readFileAlloc(testing.io, "cfg.toml.bak", a, .limited(10_000));
+    try testing.expectEqualStrings(original, bak);
+    const after = try f.call(a, .GET, "/sources?done=saved", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, after.body, "news") != null);
+    try testing.expect(std.mem.indexOf(u8, after.body, "Saved.") != null);
+    // The dashboard's import buttons follow the new list.
+    const dash = try f.call(a, .GET, "/", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, dash.body, "Import news") != null);
+
+    // A bad edit is refused with the reason, the form comes back filled in, the file is untouched.
+    const before_bad = try f.tmp.dir.readFileAlloc(testing.io, "cfg.toml", a, .limited(10_000));
+    const bad = try std.fmt.allocPrint(a, "op=save&form=1&csrf={s}&original=&name=oops&kind=files&enabled=1&retain_text=1&options=bogus+%3D+1", .{csrf});
+    const refused = try f.call(a, .POST, "/actions/sources", .{ .cookie = cookie, .body = bad });
+    try testing.expectEqual(http.Status.bad_request, refused.status);
+    try testing.expect(std.mem.indexOf(u8, refused.body, "unknown option") != null);
+    try testing.expect(std.mem.indexOf(u8, refused.body, "value=\"oops\"") != null);
+    const after_bad = try f.tmp.dir.readFileAlloc(testing.io, "cfg.toml", a, .limited(10_000));
+    try testing.expectEqualStrings(before_bad, after_bad);
+    try testing.expectEqual(@as(usize, 2), store.snapshot().len);
+
+    // Wrong or missing token: refused. Bearer tokens use the API.
+    const nocsrf = try f.call(a, .POST, "/actions/sources", .{ .cookie = cookie, .body = "op=delete&name=news&csrf=nope" });
+    try testing.expectEqual(http.Status.forbidden, nocsrf.status);
+    const auth = try f.bearer(a);
+    const off = try f.call(a, .POST, "/api/v1/admin/sources", .{ .auth = auth, .body = "op=toggle&name=news&enabled=0" });
+    try testing.expectEqual(http.Status.ok, off.status);
+    try testing.expect(!store.snapshot()[1].enabled);
+    const gone = try f.call(a, .POST, "/api/v1/admin/sources", .{ .auth = auth, .body = "op=delete&name=news" });
+    try testing.expectEqual(http.Status.ok, gone.status);
+    try testing.expectEqual(@as(usize, 1), store.snapshot().len);
+    const missing = try f.call(a, .POST, "/api/v1/admin/sources", .{ .auth = auth, .body = "op=delete&name=ghost" });
+    try testing.expectEqual(http.Status.bad_request, missing.status);
+    try testing.expect(std.mem.indexOf(u8, missing.body, "invalid_source") != null);
+
+    // Without a configuration file there is nothing to edit.
+    f.app.opts.config_path = null;
+    const none = try f.call(a, .POST, "/api/v1/admin/sources", .{ .auth = auth, .body = "op=delete&name=notes" });
+    try testing.expectEqual(http.Status.conflict, none.status);
+    try testing.expect(std.mem.indexOf(u8, none.body, "no_config_file") != null);
+    f.manager.opts.store = null;
 }
 
 test "a form post with the session's token starts an import; a busy data directory is refused" {

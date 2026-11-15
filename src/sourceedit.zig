@@ -1,0 +1,371 @@
+//! Editing the `[[source]]` tables of a configuration file.
+//!
+//! The file is parsed with the TOML library, changed through its document
+//! model (so every value is escaped properly and comments elsewhere in the
+//! file are kept), written back to text, and that text is validated as a whole
+//! (syntax, every setting, every source's options) before anything is written
+//! to disk. `writeFile` then replaces the file atomically and keeps the
+//! previous version as `FILE.bak`.
+//!
+//! Only sources are edited here; every other setting is changed by hand and
+//! takes effect at the next start (docs/decisions/0022).
+
+const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+const toml = @import("toml");
+const config = @import("config.zig");
+const connectors = @import("connectors.zig");
+
+/// What the edit form collects for one source.
+pub const Spec = struct {
+    name: []const u8,
+    kind: []const u8,
+    enabled: bool = true,
+    retain_text: bool = true,
+    /// "unknown", "allowed", "restricted" or "forbidden"; null keeps the connector's default.
+    rights: ?[]const u8 = null,
+    /// The connector's options as TOML, one `key = value` per line.
+    options: []const u8 = "",
+};
+
+pub const Edit = union(enum) {
+    /// Add a source (`original` null) or replace the source named `original`.
+    save: struct { original: ?[]const u8, spec: Spec },
+    delete: []const u8,
+    set_enabled: struct { name: []const u8, enabled: bool },
+};
+
+pub const Error = error{
+    OutOfMemory,
+    /// The edit cannot be made; see `Problem.message`.
+    Invalid,
+};
+
+/// Why an edit was refused, in words for the person who asked.
+pub const Problem = struct {
+    buf: [400]u8 = undefined,
+    len: usize = 0,
+
+    pub fn message(self: *const Problem) []const u8 {
+        return self.buf[0..self.len];
+    }
+    fn set(self: *Problem, comptime fmt: []const u8, args: anytype) Error {
+        self.len = if (std.fmt.bufPrint(&self.buf, fmt, args)) |w| w.len else |_| self.buf.len;
+        return error.Invalid;
+    }
+};
+
+const reserved = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights" };
+
+/// Applies `edit` to the configuration text and returns the new text (caller
+/// frees it). The result has been validated as a whole configuration.
+pub fn apply(gpa: Allocator, text: []const u8, edit: Edit, problem: *Problem) Error![]u8 {
+    var tdiag: toml.Diagnostic = .{};
+    var doc = toml.Document.parse(gpa, text, .{}, &tdiag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return problem.set("the configuration file has a syntax error (line {d}: {s}) and cannot be edited here; fix it by hand first", .{ tdiag.line, tdiag.message }),
+    };
+    defer doc.deinit();
+    const a = doc.allocator();
+
+    // The array of [[source]] tables, created if the file has none.
+    const array: *toml.Array = blk: {
+        if (doc.root.getPtr("source")) |v| switch (v.*) {
+            .array => |arr| {
+                if (!arr.is_table_array) return problem.set("this file defines its sources in a form the editor cannot change (not [[source]] tables); edit it by hand", .{});
+                break :blk arr;
+            },
+            else => return problem.set("`source` in this file is not a list of [[source]] tables; edit it by hand", .{}),
+        };
+        const arr = try a.create(toml.Array);
+        arr.* = .{ .is_table_array = true };
+        try doc.root.entries.put(a, try doc.dupe("source"), .{ .array = arr });
+        break :blk arr;
+    };
+
+    switch (edit) {
+        .delete => |name| {
+            const i = indexOf(array, name) orelse return problem.set("there is no source named \"{s}\"", .{name});
+            _ = array.items.orderedRemove(i);
+        },
+        .set_enabled => |se| {
+            const i = indexOf(array, se.name) orelse return problem.set("there is no source named \"{s}\"", .{se.name});
+            const t = array.items.items[i].table;
+            if (se.enabled) {
+                _ = t.entries.orderedRemove("enabled");
+            } else {
+                try t.entries.put(a, try doc.dupe("enabled"), .{ .boolean = false });
+            }
+        },
+        .save => |sv| {
+            const spec = sv.spec;
+            if (!config.validSourceName(spec.name)) return problem.set("the name must be 1-64 characters of a-z, 0-9, '-' and '_', starting with a letter or digit", .{});
+            if (spec.kind.len == 0) return problem.set("choose a kind", .{});
+            const existing = if (sv.original) |o| (indexOf(array, o) orelse return problem.set("there is no source named \"{s}\"", .{o})) else null;
+            if (indexOf(array, spec.name)) |same| {
+                if (existing == null or existing.? != same) return problem.set("a source named \"{s}\" already exists", .{spec.name});
+            }
+            const t: *toml.Table = if (existing) |i| blk: {
+                const old = array.items.items[i].table;
+                old.entries.clearRetainingCapacity();
+                old.key_comments.clearRetainingCapacity();
+                break :blk old;
+            } else blk: {
+                const nt = try a.create(toml.Table);
+                nt.* = .{ .kind = .explicit };
+                try array.items.append(a, .{ .table = nt });
+                break :blk nt;
+            };
+            try t.entries.put(a, try doc.dupe("name"), .{ .string = try doc.dupe(spec.name) });
+            try t.entries.put(a, try doc.dupe("kind"), .{ .string = try doc.dupe(spec.kind) });
+            if (!spec.enabled) try t.entries.put(a, try doc.dupe("enabled"), .{ .boolean = false });
+            if (!spec.retain_text) try t.entries.put(a, try doc.dupe("retain_text"), .{ .boolean = false });
+            if (spec.rights) |r| if (r.len > 0) try t.entries.put(a, try doc.dupe("rights"), .{ .string = try doc.dupe(r) });
+
+            // The options: TOML text, scalars only, none of the fields above.
+            var odiag: toml.Diagnostic = .{};
+            var opts = toml.Document.parse(gpa, spec.options, .{ .max_bytes = 16 * 1024, .max_depth = 4 }, &odiag) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return problem.set("the options are not valid TOML (line {d}: {s}); write one `key = value` per line, text in double quotes", .{ odiag.line, odiag.message }),
+            };
+            defer opts.deinit();
+            var it = opts.root.entries.iterator();
+            while (it.next()) |e| {
+                const key = e.key_ptr.*;
+                for (reserved) |r| if (std.mem.eql(u8, key, r)) return problem.set("\"{s}\" is set with its own field, not in the options", .{key});
+                const v: toml.Value = switch (e.value_ptr.*) {
+                    .string => |s| .{ .string = try doc.dupe(s) },
+                    .integer => |n| .{ .integer = n },
+                    .boolean => |b| .{ .boolean = b },
+                    else => return problem.set("option \"{s}\": only text, whole numbers and true/false are allowed", .{key}),
+                };
+                try t.entries.put(a, try doc.dupe(key), v);
+            }
+        },
+    }
+
+    // An array left empty would write nothing; drop the key so the file stays tidy.
+    if (array.items.items.len == 0) _ = doc.root.entries.orderedRemove("source");
+
+    const out = doc.toOwnedString(gpa) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return problem.set("the new configuration could not be written", .{}),
+    };
+    errdefer gpa.free(out);
+    try validate(gpa, out, problem);
+    return out;
+}
+
+fn indexOf(array: *const toml.Array, name: []const u8) ?usize {
+    for (array.items.items, 0..) |v, i| switch (v) {
+        .table => |t| if (t.getString("name")) |n| if (std.mem.eql(u8, n, name)) return i,
+        else => {},
+    };
+    return null;
+}
+
+/// The whole text must load as a configuration and every source must be valid
+/// for its kind, exactly as at startup.
+pub fn validate(gpa: Allocator, text: []const u8, problem: *Problem) Error!void {
+    var d: config.Diagnostic = .{};
+    var cfg = config.loadFromSlice(gpa, "the configuration", text, &d) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return problem.set("{s}{s}{s}", .{ d.key(), if (d.key().len > 0) ": " else "", d.message() }),
+    };
+    defer cfg.deinit();
+    connectors.validateAll(cfg.sources, &d) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return problem.set("{s}{s}{s}", .{ d.key(), if (d.key().len > 0) ": " else "", d.message() }),
+    };
+}
+
+/// The connector options of `source` as editable TOML text, one per line.
+pub fn optionsText(gpa: Allocator, source: config.Source) Allocator.Error![]u8 {
+    var doc = try toml.Document.init(gpa);
+    defer doc.deinit();
+    const a = doc.allocator();
+    for (source.options) |o| {
+        const v: toml.Value = switch (o.value) {
+            .string => |s| .{ .string = try doc.dupe(s) },
+            .integer => |n| .{ .integer = n },
+            .boolean => |b| .{ .boolean = b },
+        };
+        try doc.root.entries.put(a, try doc.dupe(o.key), v);
+    }
+    return doc.toOwnedString(gpa) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => try gpa.dupe(u8, ""),
+    };
+}
+
+pub const WriteError = error{ OutOfMemory, Io };
+
+/// Replaces the file at `path` with `text`, atomically, keeping the previous
+/// contents as `path.bak` and the previous permissions.
+pub fn writeFile(io: Io, gpa: Allocator, path: []const u8, text: []const u8) WriteError!void {
+    const cwd = Io.Dir.cwd();
+    const old = cwd.readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Io,
+    };
+    defer gpa.free(old);
+    const mode = (cwd.statFile(io, path, .{}) catch return error.Io).permissions;
+
+    const bak = std.fmt.allocPrint(gpa, "{s}.bak", .{path}) catch return error.OutOfMemory;
+    defer gpa.free(bak);
+    const tmp = std.fmt.allocPrint(gpa, "{s}.new", .{path}) catch return error.OutOfMemory;
+    defer gpa.free(tmp);
+
+    try replaceWith(io, bak, old, mode);
+    try replaceWith(io, tmp, text, mode);
+    cwd.rename(tmp, cwd, path, io) catch {
+        cwd.deleteFile(io, tmp) catch {};
+        return error.Io;
+    };
+}
+
+fn replaceWith(io: Io, path: []const u8, data: []const u8, mode: Io.File.Permissions) WriteError!void {
+    const f = Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = mode }) catch return error.Io;
+    defer f.close(io);
+    f.setPermissions(io, mode) catch {};
+    f.writePositionalAll(io, data, 0) catch return error.Io;
+    f.sync(io) catch return error.Io;
+}
+
+// ------------------------------------------------------------------ tests
+
+const testing = std.testing;
+
+const base =
+    \\# my search
+    \\[storage]
+    \\data_dir = "data"   # keep it here
+    \\
+    \\# notes
+    \\[[source]]
+    \\name = "notes"
+    \\kind = "files"
+    \\path = "/home/me/notes"
+    \\
+;
+
+test "add, update, toggle and delete a source; other comments survive" {
+    var p: Problem = .{};
+    const added = try apply(testing.allocator, base, .{ .save = .{ .original = null, .spec = .{
+        .name = "feeds1",
+        .kind = "feeds",
+        .options = "path = \"/srv/feeds\"\nmax_file_bytes = 1000000\n",
+        .rights = "restricted",
+    } } }, &p);
+    defer testing.allocator.free(added);
+    try testing.expect(std.mem.indexOf(u8, added, "# my search") != null);
+    try testing.expect(std.mem.indexOf(u8, added, "# keep it here") != null);
+    try testing.expect(std.mem.indexOf(u8, added, "name = \"feeds1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, added, "rights = \"restricted\"") != null);
+    try testing.expect(std.mem.indexOf(u8, added, "max_file_bytes = 1000000") != null);
+
+    const updated = try apply(testing.allocator, added, .{ .save = .{ .original = "feeds1", .spec = .{
+        .name = "news",
+        .kind = "feeds",
+        .retain_text = false,
+        .options = "path = \"/srv/news\"",
+    } } }, &p);
+    defer testing.allocator.free(updated);
+    try testing.expect(std.mem.indexOf(u8, updated, "name = \"news\"") != null);
+    try testing.expect(std.mem.indexOf(u8, updated, "feeds1") == null);
+    try testing.expect(std.mem.indexOf(u8, updated, "retain_text = false") != null);
+    try testing.expect(std.mem.indexOf(u8, updated, "# notes") != null); // the other source's comment is intact
+
+    const off = try apply(testing.allocator, updated, .{ .set_enabled = .{ .name = "news", .enabled = false } }, &p);
+    defer testing.allocator.free(off);
+    try testing.expect(std.mem.indexOf(u8, off, "enabled = false") != null);
+    const on = try apply(testing.allocator, off, .{ .set_enabled = .{ .name = "news", .enabled = true } }, &p);
+    defer testing.allocator.free(on);
+    try testing.expect(std.mem.indexOf(u8, on, "enabled") == null);
+
+    const gone = try apply(testing.allocator, on, .{ .delete = "notes" }, &p);
+    defer testing.allocator.free(gone);
+    try testing.expect(std.mem.indexOf(u8, gone, "notes") == null or std.mem.indexOf(u8, gone, "# notes") != null);
+    try testing.expect(std.mem.indexOf(u8, gone, "name = \"news\"") != null);
+    const none = try apply(testing.allocator, gone, .{ .delete = "news" }, &p);
+    defer testing.allocator.free(none);
+    try testing.expect(std.mem.indexOf(u8, none, "[[source]]") == null);
+    try testing.expect(std.mem.indexOf(u8, none, "data_dir") != null);
+}
+
+test "refused edits say why and produce nothing" {
+    var p: Problem = .{};
+    const cases = [_]struct { edit: Edit, why: []const u8 }{
+        .{ .edit = .{ .save = .{ .original = null, .spec = .{ .name = "notes", .kind = "files", .options = "path = \"/x\"" } } }, .why = "already exists" },
+        .{ .edit = .{ .save = .{ .original = null, .spec = .{ .name = "Bad Name", .kind = "files" } } }, .why = "name must be" },
+        .{ .edit = .{ .save = .{ .original = null, .spec = .{ .name = "x", .kind = "carrier-pigeon" } } }, .why = "unknown connector kind" },
+        .{ .edit = .{ .save = .{ .original = null, .spec = .{ .name = "x", .kind = "files", .options = "path = [1, 2]" } } }, .why = "only text, whole numbers" },
+        .{ .edit = .{ .save = .{ .original = null, .spec = .{ .name = "x", .kind = "files", .options = "name = \"y\"\npath = \"/x\"" } } }, .why = "own field" },
+        .{ .edit = .{ .save = .{ .original = null, .spec = .{ .name = "x", .kind = "files", .options = "this is not toml" } } }, .why = "not valid TOML" },
+        .{ .edit = .{ .save = .{ .original = null, .spec = .{ .name = "x", .kind = "files", .options = "path = \"/x\"\nbogus = 1" } } }, .why = "unknown option" },
+        .{ .edit = .{ .save = .{ .original = null, .spec = .{ .name = "x", .kind = "files" } } }, .why = "required" }, // no path
+        .{ .edit = .{ .save = .{ .original = null, .spec = .{ .name = "x", .kind = "files", .rights = "free", .options = "path = \"/x\"" } } }, .why = "rights" },
+        .{ .edit = .{ .delete = "ghost" }, .why = "no source named" },
+        .{ .edit = .{ .save = .{ .original = "ghost", .spec = .{ .name = "z", .kind = "files", .options = "path = \"/x\"" } } }, .why = "no source named" },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("case wanted: {s}; got: {s}\n", .{ c.why, p.message() });
+        try testing.expectError(error.Invalid, apply(testing.allocator, base, c.edit, &p));
+        try testing.expect(std.mem.indexOf(u8, p.message(), c.why) != null);
+    }
+    // A file that is not valid TOML is never rewritten.
+    try testing.expectError(error.Invalid, apply(testing.allocator, "[storage\n", .{ .delete = "x" }, &p));
+    try testing.expect(std.mem.indexOf(u8, p.message(), "syntax error") != null);
+}
+
+test "values with quotes and newlines cannot break out of the file" {
+    var p: Problem = .{};
+    const out = try apply(testing.allocator, "", .{ .save = .{ .original = null, .spec = .{
+        .name = "evil",
+        .kind = "files",
+        .options = "path = \"/tmp/x\\\"\\n[admin]\\nactions = true\"",
+    } } }, &p);
+    defer testing.allocator.free(out);
+    // It is one string value, and the result still loads with no admin table.
+    var d: config.Diagnostic = .{};
+    var cfg = try config.loadFromSlice(testing.allocator, "t", out, &d);
+    defer cfg.deinit();
+    try testing.expect(!cfg.admin_configured);
+    try testing.expectEqual(@as(usize, 1), cfg.sources.len);
+    try testing.expect(std.mem.indexOf(u8, cfg.sources[0].optionString("path").?, "[admin]") != null);
+}
+
+test "options round-trip through their text form" {
+    var p: Problem = .{};
+    const text = try apply(testing.allocator, "", .{ .save = .{ .original = null, .spec = .{ .name = "w", .kind = "files", .options = "path = \"/a b\"\nmax_file_bytes = 5\nlanguage = \"en\"" } } }, &p);
+    defer testing.allocator.free(text);
+    var d: config.Diagnostic = .{};
+    var cfg = try config.loadFromSlice(testing.allocator, "t", text, &d);
+    defer cfg.deinit();
+    const shown = try optionsText(testing.allocator, cfg.sources[0]);
+    defer testing.allocator.free(shown);
+    try testing.expect(std.mem.indexOf(u8, shown, "path = \"/a b\"") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "max_file_bytes = 5") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "language = \"en\"") != null);
+}
+
+test "writeFile replaces atomically and keeps a backup" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.toml", .data = "old = 1\n" });
+    var pb: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}/c.toml", .{tmp.sub_path});
+    try writeFile(testing.io, testing.allocator, path, "new = 2\n");
+    const now = try tmp.dir.readFileAlloc(testing.io, "c.toml", testing.allocator, .limited(100));
+    defer testing.allocator.free(now);
+    const bak = try tmp.dir.readFileAlloc(testing.io, "c.toml.bak", testing.allocator, .limited(100));
+    defer testing.allocator.free(bak);
+    try testing.expectEqualStrings("new = 2\n", now);
+    try testing.expectEqualStrings("old = 1\n", bak);
+    _ = tmp.dir.statFile(testing.io, "c.toml.new", .{}) catch |e| {
+        try testing.expect(e == error.FileNotFound);
+        return;
+    };
+    return error.TestUnexpectedResult; // the temporary file must be gone
+}
