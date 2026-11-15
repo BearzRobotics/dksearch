@@ -80,3 +80,34 @@ pub const Searcher = struct {
         return self.vtable.search(self.ptr, arena, q);
     }
 };
+
+/// A picture found by `ImageSearcher.near`: how many of the 64 hash bits differ
+/// from the query picture's (0 = identical hash).
+pub const ImageHit = struct {
+    id: doc.Id,
+    connector: []const u8,
+    url: ?[]const u8,
+    title: ?[]const u8,
+    distance: u8,
+};
+
+pub const ImagePage = struct {
+    hits: []const ImageHit,
+};
+
+/// Finds indexed pictures whose perceptual hash is close to a given one
+/// (`image.zig`). Separate from `Searcher` because it asks a different question.
+pub const ImageSearcher = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Pictures within `max_distance` bits of `hash`, nearest first, ties by
+        /// id, at most `limit` of them. Allocated from `arena`.
+        near: *const fn (ptr: *anyopaque, arena: Allocator, hash: u64, max_distance: u8, limit: u32) Error!ImagePage,
+    };
+
+    pub fn near(self: ImageSearcher, arena: Allocator, hash: u64, max_distance: u8, limit: u32) Error!ImagePage {
+        return self.vtable.near(self.ptr, arena, hash, max_distance, limit);
+    }
+};

@@ -10,6 +10,8 @@ pub const memory = @import("memory.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const search = @import("search.zig");
 pub const evaluate = @import("evaluate.zig");
+pub const image = @import("image.zig");
+pub const exif = @import("exif.zig");
 pub const sourcestore = @import("sourcestore.zig");
 pub const sourceedit = @import("sourceedit.zig");
 pub const regexsearch = @import("regexsearch.zig");
@@ -35,6 +37,8 @@ test {
     _ = pipeline;
     _ = search;
     _ = evaluate;
+    _ = image;
+    _ = exif;
     _ = sourcestore;
     _ = sourceedit;
     _ = regexsearch;

@@ -48,6 +48,10 @@ pub fn build(b: *std.Build) void {
     // and the bundled Mozilla CA file (docs/decisions/0018).
     const want_crawler = b.option(bool, "crawler", "Build the web crawler connector with the bundled CA certificates (default: on, except on Windows)") orelse supported;
     if (want_crawler and !supported) @panic("the crawler connector is not supported on Windows yet; pass -Dcrawler=false");
+    // Image decoding (search by image) uses the vendored Wuffs, compiled only
+    // with the image modules (docs/decisions/0023).
+    const want_media = b.option(bool, "media", "Build image decoding (search by image) with vendored Wuffs (default: on, except on Windows)") orelse supported;
+    if (want_media and !supported) @panic("image support is not supported on Windows yet; pass -Dmedia=false");
     // The crawler reads sitemaps with Expat too.
     const need_expat = want_wikipedia or want_feeds or want_crawler;
 
@@ -106,10 +110,29 @@ pub fn build(b: *std.Build) void {
         break :blk m;
     } else null;
 
+    const wuffs_c: ?*std.Build.Module = if (want_media) blk: {
+        const tc = b.addTranslateC(.{
+            .root_source_file = b.path("vendor/wuffs_c.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const m = tc.createModule();
+        m.addCSourceFiles(.{
+            .root = b.path("vendor/wuffs"),
+            .files = &.{"impl.c"},
+            // Generated code in its own style: silence style warnings only.
+            .flags = &.{"-w"},
+        });
+        m.addIncludePath(b.path("vendor/wuffs"));
+        break :blk m;
+    } else null;
+
     const core_options = b.addOptions();
     core_options.addOption(bool, "wikipedia", want_wikipedia);
     core_options.addOption(bool, "feeds", want_feeds);
     core_options.addOption(bool, "crawler", want_crawler);
+    core_options.addOption(bool, "media", want_media);
     core_options.addOption(bool, "xml", need_expat);
 
     // The core library: search, storage and ingestion, plus the bundled
@@ -128,6 +151,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     if (want_crawler) core.addAnonymousImport("cacert_pem", .{ .root_source_file = b.path("vendor/cacert/cacert.pem") });
+    if (wuffs_c) |m| core.addImport("wuffs_c", m);
     if (bz2_c) |m| core.addImport("bz2_c", m);
     if (expat_c) |m| core.addImport("expat_c", m);
 

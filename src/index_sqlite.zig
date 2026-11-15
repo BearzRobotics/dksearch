@@ -26,6 +26,7 @@ const doc = @import("document.zig");
 const Io = std.Io;
 const idx_api = @import("indexer.zig");
 const search = @import("search.zig");
+const image_mod = @import("image.zig");
 
 /// Bumped when the table layout changes. Stored in `PRAGMA user_version`.
 pub const schema_version = 1;
@@ -99,6 +100,7 @@ pub const SqliteIndex = struct {
         }
         var self: SqliteIndex = .{ .db = db.? };
         errdefer self.close();
+        registerFunctions(self.db);
         try self.initSchema(options);
         return self;
     }
@@ -108,8 +110,6 @@ pub const SqliteIndex = struct {
         self.* = undefined;
     }
 
-    /// Opens an existing index for searching only: read-only, nothing is
-    /// created or changed. Used by `SearchPool`.
     /// Limits each search to `ms` milliseconds (0 = no limit): SQLite is told to
     /// stop, and the search fails with `error.Timeout`. Set it before sharing
     /// the index between threads.
@@ -117,12 +117,27 @@ pub const SqliteIndex = struct {
         self.timeout = if (ms == 0) null else .{ .io = io, .ms = ms };
     }
 
+    /// Opens an existing index for searching only: read-only, nothing is
+    /// created or changed. Used by `SearchPool`.
     pub fn openReadOnly(path: [:0]const u8) OpenError!SqliteIndex {
         const db = sqlite.openReadOnly(path) catch |e| return e;
         var self: SqliteIndex = .{ .db = db };
         errdefer self.close();
         try self.exec("PRAGMA query_only = 1;");
+        registerFunctions(db);
         return self;
+    }
+
+    /// SQL functions the queries use: `dk_hamming(a, b)`, the number of differing bits.
+    fn registerFunctions(db: *c.sqlite3) void {
+        _ = c.sqlite3_create_function(db, "dk_hamming", 2, c.SQLITE_UTF8 | c.SQLITE_DETERMINISTIC, null, hammingFn, null, null);
+    }
+
+    fn hammingFn(ctx: ?*c.sqlite3_context, argc: c_int, argv: [*c]?*c.sqlite3_value) callconv(.c) void {
+        _ = argc;
+        const a: u64 = @bitCast(c.sqlite3_value_int64(argv[0]));
+        const b: u64 = @bitCast(c.sqlite3_value_int64(argv[1]));
+        c.sqlite3_result_int(ctx, @popCount(a ^ b));
     }
 
     fn exec(self: SqliteIndex, sql: [:0]const u8) idx_api.Error!void {
@@ -177,6 +192,14 @@ pub const SqliteIndex = struct {
             \\CREATE INDEX IF NOT EXISTS docs_connector ON docs(connector);
         );
         try self.exec(create);
+        // Perceptual hashes of pictures, for search by image. Created if missing
+        // (older indexes get it on their next write); it never changes the schema version.
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS image_hash(
+            \\  id   BLOB PRIMARY KEY,
+            \\  hash INTEGER NOT NULL
+            \\) WITHOUT ROWID;
+        );
         if (v == 0) try self.exec("PRAGMA user_version = 1");
     }
 
@@ -195,6 +218,50 @@ pub const SqliteIndex = struct {
 
     pub fn searcher(self: *SqliteIndex) search.Searcher {
         return .{ .ptr = self, .vtable = &.{ .search = searchImpl } };
+    }
+
+    pub fn imageSearcher(self: *SqliteIndex) search.ImageSearcher {
+        return .{ .ptr = self, .vtable = &.{ .near = nearImpl } };
+    }
+
+    /// Pictures whose hash is within `max_distance` bits of `hash`, nearest first.
+    /// An index with no hashes (or an older one without the table) has none.
+    pub fn nearImpl(ptr: *anyopaque, arena: Allocator, hash: u64, max_distance: u8, limit: u32) search.Error!search.ImagePage {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
+        if (limit == 0 or limit > search.max_limit) return error.InvalidQuery;
+        const st = Stmt.prepare(self.db,
+            \\SELECT d.id, d.connector, d.url, d.title, dk_hamming(i.hash, ?1) AS dist
+            \\FROM image_hash i JOIN docs d ON d.id = i.id
+            \\WHERE dist <= ?2
+            \\ORDER BY dist, d.id
+            \\LIMIT ?3
+        ) catch return .{ .hits = &.{} };
+        defer st.deinit();
+        st.int(1, @bitCast(hash)) catch |e| return searchError(e);
+        st.int(2, max_distance) catch |e| return searchError(e);
+        st.int(3, limit) catch |e| return searchError(e);
+        var deadline: Deadline = undefined;
+        if (self.timeout) |t| {
+            deadline = .{ .io = t.io, .deadline_ns = Io.Timestamp.now(t.io, .awake).nanoseconds + @as(i96, t.ms) * std.time.ns_per_ms };
+            c.sqlite3_progress_handler(self.db, 2000, progressCallback, &deadline);
+        } else deadline = .{ .io = undefined, .deadline_ns = 0 };
+        defer if (self.timeout != null) c.sqlite3_progress_handler(self.db, 0, null, null);
+
+        var hits: std.ArrayList(search.ImageHit) = .empty;
+        while (st.step() catch |e| return if (deadline.fired) error.Timeout else searchError(e)) {
+            const idb = c.sqlite3_column_blob(st.s, 0) orelse return error.Io;
+            if (c.sqlite3_column_bytes(st.s, 0) != @sizeOf(doc.Id)) return error.Io;
+            var id: doc.Id = undefined;
+            @memcpy(&id, @as([*]const u8, @ptrCast(idb))[0..@sizeOf(doc.Id)]);
+            try hits.append(arena, .{
+                .id = id,
+                .connector = try arena.dupe(u8, st.colText(1) orelse ""),
+                .url = try dupeOpt(arena, st.colText(2)),
+                .title = try dupeOpt(arena, st.colText(3)),
+                .distance = @intCast(st.colInt(4)),
+            });
+        }
+        return .{ .hits = hits.items };
     }
 
     /// Number of indexed documents.
@@ -275,6 +342,24 @@ pub const SqliteIndex = struct {
             try st.text(3, d.text orelse d.summary orelse "");
             _ = try st.step();
         }
+        // A picture's perceptual hash (extra "phash", 16 hex digits), replacing
+        // any earlier one; a document without it has none.
+        {
+            const st = try Stmt.prepare(self.db, "DELETE FROM image_hash WHERE id = ?1");
+            defer st.deinit();
+            try st.blob(1, &id);
+            _ = try st.step();
+        }
+        for (d.extra) |e| if (std.mem.eql(u8, e.key, "phash")) {
+            if (image_mod.fromHex(e.value)) |h| {
+                const st = try Stmt.prepare(self.db, "INSERT INTO image_hash(id, hash) VALUES(?1, ?2)");
+                defer st.deinit();
+                try st.blob(1, &id);
+                try st.int(2, @bitCast(h));
+                _ = try st.step();
+            }
+            break;
+        };
         try self.commit();
     }
 
@@ -294,6 +379,12 @@ pub const SqliteIndex = struct {
             try st.blob(1, &id);
             _ = try st.step();
         }
+        {
+            const st = try Stmt.prepare(self.db, "DELETE FROM image_hash WHERE id = ?1");
+            defer st.deinit();
+            try st.blob(1, &id);
+            _ = try st.step();
+        }
         try self.commit();
     }
 
@@ -301,7 +392,7 @@ pub const SqliteIndex = struct {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
         try self.begin();
         errdefer self.rollback();
-        try self.exec("DELETE FROM fts; DELETE FROM docs;");
+        try self.exec("DELETE FROM fts; DELETE FROM docs; DELETE FROM image_hash;");
         try self.commit();
     }
 
@@ -447,6 +538,23 @@ pub const SearchPool = struct {
         return .{ .ptr = self, .vtable = &.{ .search = poolSearch } };
     }
 
+    pub fn imageSearcher(self: *SearchPool) search.ImageSearcher {
+        return .{ .ptr = self, .vtable = &.{ .near = poolNear } };
+    }
+
+    fn poolNear(ptr: *anyopaque, arena: Allocator, hash: u64, max_distance: u8, limit: u32) search.Error!search.ImagePage {
+        const self: *SearchPool = @ptrCast(@alignCast(ptr));
+        self.idle.waitUncancelable(self.io);
+        defer self.idle.post(self.io);
+        for (self.slots) |*slot| {
+            if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                defer slot.busy.store(false, .release);
+                return SqliteIndex.nearImpl(&slot.index, arena, hash, max_distance, limit);
+            }
+        }
+        unreachable;
+    }
+
     fn poolSearch(ptr: *anyopaque, arena: Allocator, q: search.Query) search.Error!search.Page {
         const self: *SearchPool = @ptrCast(@alignCast(ptr));
         // A permit means at least one slot is idle; claim it.
@@ -573,6 +681,51 @@ test "a search past its time limit stops with Timeout; without a limit it finish
     idx.setQueryTimeout(testing.io, 0);
     const page = try searchAll(arena.allocator(), &idx, "common");
     try testing.expectEqual(@as(usize, 10), page.hits.len);
+}
+
+test "pictures are found by hash distance, nearest first, and forgotten with their document" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const base: u64 = 0xF0F0_F0F0_0F0F_0F0F;
+    const hashes = [_]u64{ base, base ^ 0b111, base ^ 0xFFFF, ~base }; // 0, 3, 16 and 64 bits away
+    var ids: [4]doc.Id = undefined;
+    for (hashes, 0..) |h, i| {
+        var nb: [8]u8 = undefined;
+        const hex = image_mod.toHex(h);
+        const d: doc.Document = .{
+            .connector = "t",
+            .source_id = try std.fmt.bufPrint(&nb, "img{d}", .{i}),
+            .title = "a picture",
+            .text = "a picture",
+            .extra = &.{.{ .key = "phash", .value = &hex }},
+        };
+        ids[i] = d.id();
+        try idx.indexer().add(ids[i], d);
+    }
+    // A document without a hash is never an image hit.
+    _ = try put(&idx, "t", "text", "words", "just words");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const near = try idx.imageSearcher().near(a, base, 10, 10);
+    try testing.expectEqual(@as(usize, 2), near.hits.len);
+    try testing.expectEqual(ids[0], near.hits[0].id);
+    try testing.expectEqual(@as(u8, 0), near.hits[0].distance);
+    try testing.expectEqual(ids[1], near.hits[1].id);
+    try testing.expectEqual(@as(u8, 3), near.hits[1].distance);
+    try testing.expectEqual(@as(usize, 3), (try idx.imageSearcher().near(a, base, 16, 10)).hits.len);
+    try testing.expectEqual(@as(usize, 1), (try idx.imageSearcher().near(a, base, 64, 1)).hits.len); // limit applies
+
+    // Re-adding a document without a hash drops its hash; removing drops it too.
+    const again: doc.Document = .{ .connector = "t", .source_id = "img1", .title = "a picture", .text = "a picture" };
+    try idx.indexer().add(again.id(), again);
+    try idx.indexer().remove(ids[0]);
+    const left = try idx.imageSearcher().near(a, base, 64, 10);
+    try testing.expectEqual(@as(usize, 2), left.hits.len); // img2 and img3 remain
+    // An index without the table (an older one) simply has no pictures.
+    try idx.exec("DROP TABLE image_hash");
+    try testing.expectEqual(@as(usize, 0), (try idx.imageSearcher().near(a, base, 64, 10)).hits.len);
 }
 
 test "title matches outrank body matches; ties break by id" {
