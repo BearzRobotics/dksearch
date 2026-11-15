@@ -144,7 +144,7 @@ Stability guarantees
 Within `/api/v1/`: adding response fields or optional parameters is allowed, so clients must ignore unknown fields. Removing a field, changing its meaning, or changing error codes requires a new version `/api/v2/`. A superseded version stays available for a documented period. The HTML pages and their markup are not part of the stable API.
 
 ADMINISTRATION API
-The administration interface is a separate listener (see dksearch(1), `admin.*`), not part of the public API above. It has the same conventions (JSON, `error` objects with stable codes, `no-store`), accepts GET and HEAD for data, and requires authentication: `Authorization: Bearer TOKEN` (see **dksearch admin-token**) or a session cookie from signing in at `/login`. Without it the API answers 401 with `WWW-Authenticate: Bearer` and code `unauthorized`; pages redirect to `/login`. All endpoints are read-only.
+The administration interface is a separate listener (see dksearch(1), `admin.*`), not part of the public API above. It has the same conventions (JSON, `error` objects with stable codes, `no-store`), accepts GET and HEAD for data, and requires authentication: `Authorization: Bearer TOKEN` (see **dksearch admin-token**) or a session cookie from signing in at `/login`. Without it the API answers 401 with `WWW-Authenticate: Bearer` and code `unauthorized`; pages redirect to `/login`. The endpoints below are read-only except the two that start and cancel imports, which work only when the server is configured with `admin.actions = true` (otherwise they answer 403 with code `actions_disabled`).
 
 GET /api/v1/admin/status
 : Returns `version`, `uptime_seconds`, `documents` (total), `data_bytes` (`index`, `state`, `content`, null when a file is absent), `auth` (`token`, `password`: whether set; `sessions`: live sessions), and the counters `public` and `admin`, each with `requests`, `status_2xx` to `status_5xx`, `latency_le_10ms`, `latency_le_50ms`, `latency_le_250ms`, `latency_le_1000ms`, `latency_over_1000ms`, `connections_accepted`, `connections_refused_busy`, `connections_timed_out` (all since the process started).
@@ -155,10 +155,19 @@ GET /api/v1/admin/sources
 GET /api/v1/admin/jobs
 : Returns `jobs`: the 50 most recent import jobs, newest first (`id`, `source`, `kind`, `state`, `started_at`, `finished_at` as Unix seconds or null, `submitted`, `rejected`, `error_message`). A job shown as `running` may belong to an import that was killed; it is marked interrupted the next time a command opens the data.
 
-The HTML pages `/` (dashboard) and `/jobs`, `POST /login` (field `credential`: the password or the token) and `POST /logout` (field `csrf`) are for browsers. The same compatibility rules apply: fields may be added within `v1`.
+GET /api/v1/admin/imports
+: Returns `actions` (whether imports can be started), `running` (`source`, `started_at`, `submitted` so far, or null) and `last` (the last import started through this interface since the process began: `source`, `state`, `submitted`, `rejected`, `failure`, `finished_at`, or null).
+
+POST /api/v1/admin/imports
+: Starts an import of the source named by the form field `source` (`application/x-www-form-urlencoded` body). Returns 202 with `started`. Errors: 404 `unknown_source`, 409 `source_disabled`, `already_running` or `locked` (another import, rebuild or removal holds the data directory), 403 `actions_disabled`.
+
+POST /api/v1/admin/imports/cancel
+: Asks the running import to stop at its next safe point (its position is saved). Returns 200 with `cancelling` (false if nothing was running).
+
+The HTML pages `/` (dashboard) and `/jobs`, `POST /login` (field `credential`: the password or the token), `POST /logout` and, with actions enabled, `POST /actions/import` (fields `source`) and `POST /actions/cancel` are for browsers; the last three carry the per-session form token in the field `csrf`. The same compatibility rules apply: fields may be added within `v1`.
 
 LIMITATIONS
-Read-only; no document endpoints. The administration API cannot start imports or change anything. No sorting options, total counts, or faceting. The public API has no authentication or rate limiting; the administration API requires a credential.
+No document endpoints. The administration API can start and cancel imports only when enabled, and cannot rebuild, remove, back up or change configuration. No sorting options, total counts, or faceting. The public API has no authentication or rate limiting; the administration API requires a credential.
 
 BUGS
 See dksearch(1).

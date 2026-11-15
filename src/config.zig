@@ -113,6 +113,9 @@ pub const AdminOptions = struct {
     session_max_hours: u32 = 8,
     /// Mark the session cookie `Secure` (set when a proxy serves HTTPS).
     cookie_secure: bool = false,
+    /// Let the interface start and cancel imports (docs/decisions/0014).
+    /// Off by default: the interface is then strictly read-only.
+    actions: bool = false,
 };
 
 /// An integer setting of a listener: its key, range, and where it lives.
@@ -217,7 +220,7 @@ const server_keys = [_][]const u8{
     "max_requests_per_connection", "shutdown_grace_ms",
     "access_log",
 };
-const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure" };
+const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
 const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "source" };
@@ -284,6 +287,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
         if (try intIn(src, "admin", t, "session_idle_minutes", 1, 1440, diag)) |n| cfg.admin_options.session_idle_minutes = @intCast(n);
         if (try intIn(src, "admin", t, "session_max_hours", 1, 168, diag)) |n| cfg.admin_options.session_max_hours = @intCast(n);
         if (try optBool(src, "admin", t, "cookie_secure", diag)) |b| cfg.admin_options.cookie_secure = b;
+        if (try optBool(src, "admin", t, "actions", diag)) |b| cfg.admin_options.actions = b;
     }
 
     if (try subTable(src, root, "storage", diag)) |t| {
@@ -761,6 +765,7 @@ test "admin and access log settings" {
     try testing.expectEqual(@as(u32, 30), c.admin_options.session_idle_minutes);
     try testing.expectEqual(@as(u32, 8), c.admin_options.session_max_hours);
     try testing.expect(!c.admin_options.cookie_secure);
+    try testing.expect(!c.admin_options.actions);
     try testing.expect(c.admin_options.secrets_file == null);
 
     var c2 = try loadFromSlice(testing.allocator, "t.toml",
@@ -772,6 +777,7 @@ test "admin and access log settings" {
         \\session_idle_minutes = 5
         \\session_max_hours = 2
         \\cookie_secure = true
+        \\actions = true
     , &d);
     defer c2.deinit();
     try testing.expectEqualStrings("stderr", c2.server.access_log.?);
@@ -779,6 +785,7 @@ test "admin and access log settings" {
     try testing.expectEqualStrings("/etc/dksearch/secrets.toml", c2.admin_options.secrets_file.?);
     try testing.expectEqual(@as(u32, 5), c2.admin_options.session_idle_minutes);
     try testing.expect(c2.admin_options.cookie_secure);
+    try testing.expect(c2.admin_options.actions);
 
     // These keys exist only on [admin]; bad values are named.
     try testing.expectError(error.UnknownKey, loadFromSlice(testing.allocator, "t.toml", "[server]\ncookie_secure = true", &d));

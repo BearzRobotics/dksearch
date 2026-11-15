@@ -519,6 +519,9 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     var admin_log: ?dkhttp.server.AccessLog = null;
     defer if (admin_log) |*l| l.close();
     var admin_app: dkhttp.admin.App = undefined;
+    var job_manager: dk.jobs.Manager = undefined;
+    var job_manager_ready = false;
+    defer if (job_manager_ready) job_manager.deinit();
     var group: Io.Group = .init;
     defer group.cancel(io);
     if (cfg.admin_configured) admin: {
@@ -546,7 +549,22 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
                 break :admin;
             };
         }
+        if (cfg.admin_options.actions) {
+            job_manager = dk.jobs.Manager.init(gpa, io, .{
+                .data_dir = cfg.data_dir,
+                .index_path = paths.index,
+                .state_path = paths.state,
+                .content_path = paths.content,
+                .tokenizer = switch (cfg.tokenizer) {
+                    .unicode61 => .unicode61,
+                    .porter => .porter,
+                },
+                .sources = cfg.sources,
+            });
+            job_manager_ready = true;
+        }
         admin_app = dkhttp.admin.App.init(gpa, io, .{
+            .jobs = if (job_manager_ready) &job_manager else null,
             .index_path = paths.index,
             .state_path = paths.state,
             .content_path = paths.content,
@@ -574,7 +592,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             admin_listener = null;
             break :admin;
         };
-        err(io, "serving administration on http://{f}/ (sign in with the token or password; read-only)", .{admin_listener.?.socket.address});
+        err(io, "serving administration on http://{f}/ (sign in with the token or password; {s})", .{ admin_listener.?.socket.address, if (job_manager_ready) "imports can be started and cancelled" else "read-only" });
     }
 
     installSignalHandlers(onServeSignal);

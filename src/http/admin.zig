@@ -45,6 +45,9 @@ pub const Options = struct {
     cookie_secure: bool = false,
     public_stats: *const server.Stats,
     admin_stats: *const server.Stats,
+    /// Present only when actions are enabled (`admin.actions`): lets the
+    /// interface start and cancel imports. Null means strictly read-only.
+    jobs: ?*dk.jobs.Manager = null,
 };
 
 const Session = struct {
@@ -105,7 +108,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/login", "/logout", "/assets/style.css", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/login", "/logout", "/actions/import", "/actions/cancel", "/assets/style.css", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -113,7 +116,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, login, logout, style, api_status, api_sources, api_jobs, other };
+    const Route = enum { dashboard, jobs, login, logout, style, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -125,6 +128,10 @@ pub const App = struct {
             .{ "/api/v1/admin/status", .api_status },
             .{ "/api/v1/admin/sources", .api_sources },
             .{ "/api/v1/admin/jobs", .api_jobs },
+            .{ "/actions/import", .action_import },
+            .{ "/actions/cancel", .action_cancel },
+            .{ "/api/v1/admin/imports", .api_imports },
+            .{ "/api/v1/admin/imports/cancel", .api_imports_cancel },
         };
         for (table) |t| if (std.mem.eql(u8, path, t[0])) return t[1];
         return .other;
@@ -160,7 +167,10 @@ pub const App = struct {
             else => {},
         }
 
-        if (!head_ok) return methodNotAllowed(arena, is_api, "GET, HEAD");
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel;
+        if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
+        if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
+        if (!post_only and route != .api_imports and !head_ok) return methodNotAllowed(arena, is_api, "GET, HEAD");
         const auth = try self.authenticate(arena, req);
         if (auth == .none) {
             if (is_api) {
@@ -180,8 +190,85 @@ pub const App = struct {
             .api_status => self.apiStatus(arena),
             .api_sources => self.apiSources(arena),
             .api_jobs => self.apiJobs(arena),
+            .api_imports => if (req.method == .POST) self.startImport(arena, req, auth, true) else self.apiImports(arena),
+            .action_import => self.startImport(arena, req, auth, false),
+            .api_imports_cancel => self.cancelImport(arena, req, auth, true),
+            .action_cancel => self.cancelImport(arena, req, auth, false),
             else => unreachable,
         };
+    }
+
+    // ------------------------------------------------------------- actions
+
+    const ActionError = struct { status: http.Status, code: []const u8, message: []const u8 };
+
+    fn actionFailure(arena: Allocator, is_api: bool, e: ActionError) error{OutOfMemory}!Response {
+        return if (is_api)
+            handler.apiError(arena, e.status, e.code, e.message)
+        else
+            handler.htmlError(arena, e.status, "Not done", e.message);
+    }
+
+    /// Checks that actions are enabled and, for a session, the form token.
+    /// Returns the parsed form on success.
+    fn checkAction(self: *App, arena: Allocator, req: server.Request, auth: Auth, is_api: bool) error{OutOfMemory}!union(enum) { ok: query.Params, refused: Response } {
+        if (self.opts.jobs == null) return .{ .refused = try actionFailure(arena, is_api, .{ .status = .forbidden, .code = "actions_disabled", .message = "actions are disabled (admin.actions is false); use the command line" }) };
+        const form_target = try std.fmt.allocPrint(arena, "/?{s}", .{std.mem.trimEnd(u8, req.body, "\r\n")});
+        const t = query.parseTarget(arena, form_target) catch return .{ .refused = try actionFailure(arena, is_api, .{ .status = .bad_request, .code = "bad_form", .message = "the form could not be read" }) };
+        switch (auth) {
+            .session => |s| {
+                const presented = t.params.get("csrf") orelse "";
+                if (presented.len != 32 or !std.crypto.timing_safe.eql([32]u8, s.csrf, presented[0..32].*)) {
+                    return .{ .refused = try actionFailure(arena, is_api, .{ .status = .forbidden, .code = "bad_csrf", .message = "the request did not carry a valid form token" }) };
+                }
+            },
+            else => {}, // a bearer token is not an ambient credential: no form token needed
+        }
+        return .{ .ok = t.params };
+    }
+
+    fn startImport(self: *App, arena: Allocator, req: server.Request, auth: Auth, is_api: bool) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, is_api)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const name = params.get("source") orelse "";
+        self.opts.jobs.?.start(name) catch |e| return actionFailure(arena, is_api, switch (e) {
+            error.UnknownSource => .{ .status = .not_found, .code = "unknown_source", .message = "no such source" },
+            error.SourceDisabled => .{ .status = .conflict, .code = "source_disabled", .message = "that source is disabled in the configuration" },
+            error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "an import is already running" },
+            error.LockHeld => .{ .status = .conflict, .code = "locked", .message = "another import, rebuild or removal is running on this data directory" },
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NoConcurrency => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start a background task" },
+        });
+        if (is_api) {
+            var r = try handler.jsonResponse(arena, .accepted, .{ .started = name });
+            r.status = .accepted;
+            return r;
+        }
+        return redirect(arena, "/", null);
+    }
+
+    fn cancelImport(self: *App, arena: Allocator, req: server.Request, auth: Auth, is_api: bool) error{OutOfMemory}!Response {
+        switch (try self.checkAction(arena, req, auth, is_api)) {
+            .ok => {},
+            .refused => |r| return r,
+        }
+        const was_running = self.opts.jobs.?.cancel();
+        if (is_api) return handler.jsonResponse(arena, .ok, .{ .cancelling = was_running });
+        return redirect(arena, "/", null);
+    }
+
+    fn apiImports(self: *App, arena: Allocator) error{OutOfMemory}!Response {
+        const JsonLast = struct { source: []const u8, state: []const u8, submitted: u64, rejected: u64, failure: ?[]const u8, finished_at: i64 };
+        const JsonRunning = struct { source: []const u8, started_at: i64, submitted: u64 };
+        var running: ?JsonRunning = null;
+        var last: ?JsonLast = null;
+        if (self.opts.jobs) |m| {
+            if (try m.current(arena)) |c| running = .{ .source = c.source, .started_at = c.started_at, .submitted = c.submitted };
+            if (try m.lastResult(arena)) |l| last = .{ .source = l.source, .state = @tagName(l.state), .submitted = l.submitted, .rejected = l.rejected, .failure = l.failure, .finished_at = l.finished_at };
+        }
+        return handler.jsonResponse(arena, .ok, .{ .actions = self.opts.jobs != null, .running = running, .last = last });
     }
 
     // ------------------------------------------------------- authentication
@@ -497,6 +584,7 @@ pub const App = struct {
         return handler.jsonResponse(arena, .ok, .{
             .version = self.opts.version,
             .uptime_seconds = self.uptimeSeconds(),
+            .actions = self.opts.jobs != null,
             .documents = total,
             .data_bytes = .{ .index = snap.sizes[0], .state = snap.sizes[1], .content = snap.sizes[2] },
             .auth = .{
@@ -548,7 +636,7 @@ pub const App = struct {
         var aw: Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         writePage(w, "Dashboard", csrf, "dashboard") catch return error.OutOfMemory;
-        writeDashboard(self, w, snap) catch return error.OutOfMemory;
+        writeDashboard(self, arena, w, snap, csrf) catch return error.OutOfMemory;
         w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
         return handler.htmlResponse(arena, .ok, aw.written());
     }
@@ -649,10 +737,63 @@ fn writeJobCells(w: *Io.Writer, j: dk.state_sqlite.Job) Io.Writer.Error!void {
     try w.print("</td><td>{d}</td><td>{d}</td>", .{ j.submitted, j.rejected });
 }
 
-fn writeDashboard(app: *App, w: *Io.Writer, snap: App.Snapshot) Io.Writer.Error!void {
+fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8) !void {
+    try w.writeAll("<h2>Imports</h2>\n");
+    const m = app.opts.jobs orelse {
+        try w.writeAll("<p class=\"muted\">Starting imports from here is turned off (<code>admin.actions</code> is false). Use <code>dksearch import</code> on the command line.</p>\n");
+        return;
+    };
+    if (try m.current(arena)) |c| {
+        try w.writeAll("<p>Running: <strong>");
+        try html.writeEscaped(w, c.source);
+        try w.print("</strong>, {d} documents so far, started ", .{c.submitted});
+        try writeTime(w, c.started_at);
+        try w.writeAll(".</p>\n");
+        if (csrf) |token| {
+            try w.writeAll("<form action=\"/actions/cancel\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+            try html.writeEscaped(w, token);
+            try w.writeAll("\"><button type=\"submit\">Cancel the running import</button></form>\n");
+        }
+    } else if (csrf) |token| {
+        var any = false;
+        for (app.opts.sources) |s| {
+            if (!s.enabled) continue;
+            any = true;
+            try w.writeAll("<form class=\"inline\" action=\"/actions/import\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+            try html.writeEscaped(w, token);
+            try w.writeAll("\"><input type=\"hidden\" name=\"source\" value=\"");
+            try html.writeEscaped(w, s.name);
+            try w.writeAll("\"><button type=\"submit\">Import ");
+            try html.writeEscaped(w, s.name);
+            try w.writeAll("</button></form> ");
+        }
+        if (!any) try w.writeAll("<p>No enabled sources.</p>");
+        try w.writeAll("\n");
+    } else {
+        try w.writeAll("<p class=\"muted\">Sign in with the password to use the buttons, or use the API.</p>\n");
+    }
+    if (try m.lastResult(arena)) |l| {
+        try w.writeAll("<p class=\"muted\">Last import started from here: ");
+        try html.writeEscaped(w, l.source);
+        try w.print(", {s}, {d} submitted, {d} rejected, finished ", .{ @tagName(l.state), l.submitted, l.rejected });
+        try writeTime(w, l.finished_at);
+        if (l.failure) |f| {
+            try w.writeAll(". Problem: ");
+            try html.writeEscaped(w, f);
+        }
+        try w.writeAll(".</p>\n");
+    }
+}
+
+fn writeDashboard(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot, csrf: ?[]const u8) !void {
     var total: u64 = 0;
     for (snap.counts) |c| total += c.documents;
-    try w.print("<p class=\"muted\">dksearch {s}. Up {d} s. {d} documents. Read-only view: use the command line to import, rebuild, check or back up.</p>\n", .{ app.opts.version, app.uptimeSeconds(), total });
+    try w.print("<p class=\"muted\">dksearch {s}. Up {d} s. {d} documents. {s}</p>\n", .{
+        app.opts.version,
+        app.uptimeSeconds(),
+        total,
+        if (app.opts.jobs != null) "Imports can be started below; rebuild, check, backup and removal are command-line only." else "Read-only view: use the command line to import, rebuild, check or back up.",
+    });
 
     try w.writeAll("<h2>Sources</h2>\n");
     if (app.opts.sources.len == 0 and snap.counts.len == 0) {
@@ -682,6 +823,8 @@ fn writeDashboard(app: *App, w: *Io.Writer, snap: App.Snapshot) Io.Writer.Error!
         }
         try w.writeAll("</tbody></table>\n");
     }
+
+    try writeImportsPanel(app, arena, w, csrf);
 
     try w.writeAll("<h2>Data</h2><table><tbody><tr><th>index.db</th><td>");
     try writeBytes(w, snap.sizes[0]);
@@ -748,9 +891,15 @@ const Fixture = struct {
     admin_stats: server.Stats = .{},
     app: App = undefined,
     sources: [2]dk.config.Source,
+    notes: ?testing.TmpDir = null,
+    note_opts: [1]dk.config.Option = undefined,
+    manager: dk.jobs.Manager = undefined,
+    manager_ready: bool = false,
 
     fn init(f: *Fixture) !void {
         f.tmp = testing.tmpDir(.{});
+        f.notes = null; // a struct made with `undefined` gets no field defaults
+        f.manager_ready = false;
         f.sources = .{
             .{ .name = "notes", .kind = "files" },
             .{ .name = "wiki", .kind = "wikipedia", .enabled = false },
@@ -801,7 +950,44 @@ const Fixture = struct {
     }
 
     fn deinit(f: *Fixture) void {
+        if (f.manager_ready) f.manager.deinit();
+        if (f.notes) |*n| {
+            testing.allocator.free(f.note_opts[0].value.string);
+            n.cleanup();
+        }
         f.tmp.cleanup();
+    }
+
+    /// Turns on actions: a job manager over a small directory of notes.
+    fn enableJobs(f: *Fixture) !void {
+        f.notes = testing.tmpDir(.{ .iterate = true });
+        try f.notes.?.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "the keeper trims the lamp" });
+        try f.notes.?.dir.writeFile(testing.io, .{ .sub_path = "b.txt", .data = "gulls over the rocks" });
+        var np: [160]u8 = undefined;
+        const path = try std.fmt.bufPrint(&np, ".zig-cache/tmp/{s}", .{f.notes.?.sub_path});
+        f.note_opts = .{.{ .key = "path", .value = .{ .string = try testing.allocator.dupe(u8, path) } }};
+        f.sources[0].options = &f.note_opts;
+        f.manager = dk.jobs.Manager.init(testing.allocator, testing.io, .{
+            .data_dir = f.secrets_path[0 .. f.secrets_len - "/admin.toml".len],
+            .index_path = std.mem.sliceTo(&f.index_path, 0),
+            .state_path = std.mem.sliceTo(&f.state_path, 0),
+            .content_path = std.mem.sliceTo(&f.content_path, 0),
+            .sources = &f.sources,
+            .sync_off = true,
+        });
+        f.manager_ready = true;
+        f.app.opts.jobs = &f.manager;
+    }
+
+    fn waitIdle(f: *Fixture) !void {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var waited: u32 = 0;
+        while (waited < 3000) : (waited += 1) {
+            if ((try f.manager.current(arena.allocator())) == null) return;
+            try testing.io.sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.TestTimedOut;
     }
 
     fn call(f: *Fixture, arena: Allocator, method: http.Method, target: []const u8, opts: struct { auth: ?[]const u8 = null, cookie: ?[]const u8 = null, body: []const u8 = "" }) !Response {
@@ -1168,4 +1354,117 @@ test "responses carry the security headers; access labels never include queries"
     try testing.expect(Fixture.header(r, "content-security-policy") != null);
     try testing.expectEqualStrings("/login", App.label("/login?secret=1"));
     try testing.expectEqualStrings("other", App.label("/api/v1/admin/status/../x"));
+}
+
+test "actions are refused when they are not enabled" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const api = try f.call(a, .POST, "/api/v1/admin/imports", .{ .auth = try f.bearer(a), .body = "source=notes" });
+    try testing.expectEqual(http.Status.forbidden, api.status);
+    try testing.expect(std.mem.indexOf(u8, api.body, "actions_disabled") != null);
+    const cookie = try f.signIn(a);
+    const dash = try f.call(a, .GET, "/", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, dash.body, "turned off") != null);
+    try testing.expect(std.mem.indexOf(u8, dash.body, "/actions/import") == null); // no buttons
+    const form = try f.call(a, .POST, "/actions/import", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&source=notes", .{csrfOf(dash.body)}) });
+    try testing.expectEqual(http.Status.forbidden, form.status);
+    const st = try f.call(a, .GET, "/api/v1/admin/status", .{ .auth = try f.bearer(a) });
+    try testing.expect(std.mem.indexOf(u8, st.body, "\"actions\":false") != null);
+}
+
+test "actions need authentication, the right method, and for sessions a form token" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No credentials: nothing starts.
+    try testing.expectEqual(http.Status.unauthorized, (try f.call(a, .POST, "/api/v1/admin/imports", .{ .body = "source=notes" })).status);
+    try testing.expectEqual(http.Status.see_other, (try f.call(a, .POST, "/actions/import", .{ .body = "source=notes" })).status);
+    // Wrong methods.
+    try testing.expectEqual(http.Status.method_not_allowed, (try f.call(a, .GET, "/actions/import", .{ .auth = try f.bearer(a) })).status);
+    try testing.expectEqual(http.Status.method_not_allowed, (try f.call(a, .GET, "/api/v1/admin/imports/cancel", .{ .auth = try f.bearer(a) })).status);
+    try testing.expectEqual(http.Status.method_not_allowed, (try f.call(a, .PUT, "/api/v1/admin/imports", .{ .auth = try f.bearer(a) })).status);
+
+    // A session without (or with a wrong) form token is refused, and nothing ran.
+    const cookie = try f.signIn(a);
+    const none = try f.call(a, .POST, "/actions/import", .{ .cookie = cookie, .body = "source=notes" });
+    try testing.expectEqual(http.Status.forbidden, none.status);
+    const wrong = try f.call(a, .POST, "/actions/import", .{ .cookie = cookie, .body = "csrf=00000000000000000000000000000000&source=notes" });
+    try testing.expectEqual(http.Status.forbidden, wrong.status);
+    try testing.expect((try f.manager.lastResult(a)) == null);
+    try testing.expect((try f.manager.current(a)) == null);
+}
+
+test "start an import through the API, watch it finish, and see it on the dashboard" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const auth = try f.bearer(a);
+
+    const bad = try f.call(a, .POST, "/api/v1/admin/imports", .{ .auth = auth, .body = "source=nope" });
+    try testing.expectEqual(http.Status.not_found, bad.status);
+    const off = try f.call(a, .POST, "/api/v1/admin/imports", .{ .auth = auth, .body = "source=wiki" });
+    try testing.expectEqual(http.Status.conflict, off.status); // disabled in the configuration
+    try testing.expect(std.mem.indexOf(u8, off.body, "source_disabled") != null);
+
+    const ok = try f.call(a, .POST, "/api/v1/admin/imports", .{ .auth = auth, .body = "source=notes" });
+    try testing.expectEqual(http.Status.accepted, ok.status);
+    try testing.expect(std.mem.indexOf(u8, ok.body, "\"started\":\"notes\"") != null);
+    try f.waitIdle();
+
+    const cur = try f.call(a, .GET, "/api/v1/admin/imports", .{ .auth = auth });
+    try testing.expect(std.mem.indexOf(u8, cur.body, "\"actions\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, cur.body, "\"running\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, cur.body, "\"state\":\"completed\"") != null);
+    try testing.expect(std.mem.indexOf(u8, cur.body, "\"submitted\":2") != null);
+
+    // The dashboard offers the button and reports the result.
+    const cookie = try f.signIn(a);
+    const dash = try f.call(a, .GET, "/", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, dash.body, "action=\"/actions/import\"") != null);
+    try testing.expect(std.mem.indexOf(u8, dash.body, "Import notes") != null);
+    try testing.expect(std.mem.indexOf(u8, dash.body, "Import wiki") == null); // disabled sources get no button
+    try testing.expect(std.mem.indexOf(u8, dash.body, "Last import started from here") != null);
+}
+
+test "a form post with the session's token starts an import; a busy data directory is refused" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const dash = try f.call(a, .GET, "/", .{ .cookie = cookie });
+    const csrf = csrfOf(dash.body);
+
+    // Another process holds the writer lock.
+    const held = try dk.maintenance.WriterLock.acquire(testing.io, f.tmp.dir, "write.lock");
+    const locked = try f.call(a, .POST, "/actions/import", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&source=notes", .{csrf}) });
+    try testing.expectEqual(http.Status.conflict, locked.status);
+    held.release(testing.io);
+
+    const r = try f.call(a, .POST, "/actions/import", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&source=notes", .{csrf}) });
+    try testing.expectEqual(http.Status.see_other, r.status);
+    try testing.expectEqualStrings("/", Fixture.header(r, "location").?);
+    try f.waitIdle();
+    try testing.expect((try f.manager.lastResult(a)) != null);
+
+    // Cancelling with nothing running is harmless.
+    const c = try f.call(a, .POST, "/api/v1/admin/imports/cancel", .{ .auth = try f.bearer(a) });
+    try testing.expectEqual(http.Status.ok, c.status);
+    try testing.expect(std.mem.indexOf(u8, c.body, "\"cancelling\":false") != null);
 }
