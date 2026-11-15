@@ -29,7 +29,7 @@ dksearch check-config FILE
 DESCRIPTION
 dksearch is an independently operated, self-hostable search engine. It maintains its own full-text index and does not use an external search provider.
 
-This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles five: `files`, which indexes plain-text and Markdown files from a local directory; `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded; `wikipedia`, which indexes the articles of a Wikipedia dump file you have already downloaded; `feeds`, which indexes the entries of RSS and Atom feed files you have already downloaded; and `crawl`, which fetches a list of web pages you name, over HTTP or HTTPS, and is the only connector that uses the network. The `wikipedia`, `feeds` and `crawl` connectors are built by default and can be left out with `zig build -Dwikipedia=false`, `-Dfeeds=false` and `-Dcrawler=false`. A separate administration interface (sources, import jobs, counters, a query-testing page that shows ranking scores, and optionally starting and cancelling imports) is served on its own address when the configuration has an `[admin]` table and credentials exist; see **admin-token**, **admin-password** and SECURITY CONSIDERATIONS.
+This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles six: `files`, which indexes plain-text and Markdown files from a local directory; `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded; `wikipedia`, which indexes the articles of a Wikipedia dump file you have already downloaded; `feeds`, which indexes the entries of RSS and Atom feed files you have already downloaded; `crawl`, which fetches a list of web pages you name, over HTTP or HTTPS; and `archive`, which indexes the metadata of Internet Archive items matching a search. `crawl` and `archive` are the only connectors that use the network. The `wikipedia`, `feeds`, `crawl` and `archive` connectors are built by default and can be left out with `zig build -Dwikipedia=false`, `-Dfeeds=false` and `-Dcrawler=false` (the last one removes both network connectors). A separate administration interface (sources, import jobs, counters, a query-testing page that shows ranking scores, and optionally starting and cancelling imports) is served on its own address when the configuration has an `[admin]` table and credentials exist; see **admin-token**, **admin-password** and SECURITY CONSIDERATIONS.
 
 CONVENTIONS
 Bold represents literal commands, options, and keywords.
@@ -227,7 +227,7 @@ Each `[[source]]` table has these keys. Any other key is an option of the connec
 
 Key	Type	Default	Description
 name	String	required	Unique name, 1-64 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit. Resume positions are kept per name, and it becomes the `connector` of each document, so renaming a source makes it start afresh and its old documents stay under the old name.
-kind	String	required	Connector type. This version knows `files`, `gutenberg`, `wikipedia`, `feeds` and `crawl` (the last three only in builds that include them).
+kind	String	required	Connector type. This version knows `files`, `gutenberg`, `wikipedia`, `feeds`, `crawl` and `archive` (the last four only in builds that include them).
 enabled	Boolean	true	A disabled source stays in the file but is never run.
 retain_text	Boolean	true	Keep each document's text so the index can be rebuilt without reading the source again. Set false for a source whose terms forbid keeping its text; its documents are then skipped by **rebuild**.
 rights	String	connector default	Override the redistribution flag (`unknown`, `allowed`, `restricted`, `forbidden`) of every document from this source. Defaults are conservative guesses, not legal advice; the decision is yours. Only documents that are added or changed afterwards pick it up; unchanged ones keep the flag they were stored with.
@@ -333,6 +333,30 @@ Example:
     delay_ms = 2000
     max_depth = 3
     max_pages = 500
+
+Kind `archive` indexes the metadata of Internet Archive items (title, creator, description, subjects, dates, license fields) for the items that match a search query. It does not download the items themselves, only what the Archive's search service says about them. It uses the Archive's "scrape" search interface, which pages through any number of results with a cursor, so a run can resume where it stopped. It waits `delay_ms` between requests, identifies itself with the user agent you set, gives every request a deadline and a size cap, and verifies HTTPS against the bundled certificates.
+
+Key	Type	Default	Description
+query	String	required	An Internet Archive search query, as on archive.org's advanced search, for example `collection:gutenberg AND mediatype:texts` or `subject:lighthouses`.
+user_agent	String	required	The `User-Agent` header, as for `crawl`: printable ASCII starting with a product name and a way to reach you.
+max_items	Integer	10000	Most items indexed in one run, 1-100000000. The default is small on purpose: some collections hold millions of items. When the limit is reached the run ends normally and the next run starts from the beginning again, so raise it to index more.
+count	Integer	1000	Items asked for per request, 1000-10000. The service documents a minimum of 100, but pages of 200 or fewer returned wrong results when this was tried, so the connector never asks for fewer than 1000.
+delay_ms	Integer	1000	Milliseconds between requests, 100-3600000.
+timeout_seconds	Integer	30	Deadline for one request, 1-300.
+base_url	String	`https://archive.org`	Where the service is; for a mirror. Must start with http:// or https:// and have no trailing slash.
+ca_bundle	String	builtin	As for `crawl`.
+language	String	none	Language tag recorded for every item (the Archive's own language field is kept as `archive_language`).
+
+Each item becomes one document identified by its Archive identifier, with the URL `https://archive.org/details/IDENTIFIER`. Its text is the title, the creator, the description (converted from HTML to text) and the subjects. The date, the date added to the Archive, the media type, the creator as author and a `licenseurl` are recorded. Rights are `unknown`: the Archive's metadata says what an item is, not what you may do with its content, and each item has its own terms. Items without a usable identifier or without any text are counted as skipped. A request that fails after some pages were indexed ends the run as failed, with the position saved; the next run resumes from it. A first request that cannot connect ends the run as Offline. The service may return fewer items than exist, or change between pages, as the Archive notes; run again to pick up changes.
+
+Example:
+
+    [[source]]
+    name = "prelinger"
+    kind = "archive"
+    user_agent = "mysearch/1.0 (+https://example.org/about)"
+    query = "collection:prelinger AND mediatype:movies"
+    max_items = 2000
 
 Validation, unknown keys, reload behavior, versioning, and migration rules
 The whole file is validated before anything starts, including every source's options. Unknown keys, wrong types and out-of-range values are errors that name the file and the key, for example `dksearch.toml: server.prot: unknown key`; a misspelled setting is never silently ignored. `admin` and `server` may not share the same address and port. There is no reload: configuration is read once at start, so a restart is required to apply changes. There is no configuration versioning yet.
@@ -455,7 +479,7 @@ Stability guarantees
 The `/api/v1/` API is intended to be stable within version 1 (see dksearch-api(7)). The command-line syntax, configuration keys and diagnostics text are experimental at version 0.
 
 LIMITATIONS
-Five connectors are bundled (`files`, `gutenberg`, `wikipedia`, `feeds` and `crawl`); only `crawl` uses the network, and only for the URLs you list. It follows only same-site links up to `max_depth` unless `follow_external` is set, reads uncompressed sitemaps, sends no conditional requests, has no proxy support and understands few text encodings. The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. The administration interface cannot run **check**, **rebuild**, **remove** or **backup**, or edit configuration; it can start and cancel imports only when `admin.actions` is true. No TLS. No reload or request log. Only two tokenizers exist: `unicode61` and `porter` (English stemming). Languages without word separators (such as Chinese or Japanese) are not segmented well, and stemming is English only. Index size and query time at large scale (millions of documents) have not been measured.
+Six connectors are bundled (`files`, `gutenberg`, `wikipedia`, `feeds`, `crawl` and `archive`); only `crawl` (for the URLs you list) and `archive` (for the Archive's search service) use the network. It follows only same-site links up to `max_depth` unless `follow_external` is set, reads uncompressed sitemaps, sends no conditional requests, has no proxy support and understands few text encodings. The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. The administration interface cannot run **check**, **rebuild**, **remove** or **backup**, or edit configuration; it can start and cancel imports only when `admin.actions` is true. No TLS. No reload or request log. Only two tokenizers exist: `unicode61` and `porter` (English stemming). Languages without word separators (such as Chinese or Japanese) are not segmented well, and stemming is English only. Index size and query time at large scale (millions of documents) have not been measured.
 
 BUGS
 No issue tracker is published yet. When one exists it will be listed under AVAILABILITY. Include the dksearch version, the configuration file, the full diagnostic output and the request that failed.

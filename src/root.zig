@@ -42,5 +42,6 @@ test {
     if (connectors.have_feeds) _ = connectors.feeds;
     _ = @import("htmltext.zig");
     if (connectors.have_crawler) _ = connectors.crawl;
+    if (connectors.have_crawler) _ = connectors.archive;
     _ = @import("sqlite.zig");
 }

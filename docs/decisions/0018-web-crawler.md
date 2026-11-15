@@ -25,3 +25,5 @@ ADR 0017 agreed to a polite, opt-in crawler. The user's answers to the open desi
 ## Not done (next steps)
 
 conditional requests; resuming a large crawl (today `max_pages` only bounds a run); `crawl-delay` and robots caching across runs; per-host request limits across several crawl sources; a proxy option; 
+
+(The Internet Archive connector, ADR 0019, shares this HTTP client and the `-Dcrawler` build option.)

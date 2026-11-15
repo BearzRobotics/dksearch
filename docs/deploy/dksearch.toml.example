@@ -47,3 +47,10 @@ tokenizer = "unicode61"
 #max_depth = 3                                               # links to follow from each URL (same site only)
 #max_pages = 1000                                            # most pages per run
 #follow_external = false                                     # true: also follow links to other sites (see the manual)
+#
+#[[source]]
+#name = "prelinger"
+#kind = "archive"                                           # Internet Archive item metadata
+#user_agent = "mysearch/1.0 (+https://example.org/about)"
+#query = "collection:prelinger AND mediatype:movies"
+#max_items = 2000
