@@ -44,3 +44,5 @@ tokenizer = "unicode61"
 #user_agent = "mysearch/1.0 (+https://example.org/about)"   # required; say who you are
 #seeds_file = "/etc/dksearch/seeds.txt"                      # one URL per line
 #delay_ms = 1000
+#max_depth = 3                                               # links to follow from each URL (same site only)
+#max_pages = 1000                                            # most pages per run

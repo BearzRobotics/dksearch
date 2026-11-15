@@ -31,6 +31,7 @@ const htmltext = @import("../htmltext.zig");
 const robots = @import("crawl/robots.zig");
 const fetch = @import("crawl/fetch.zig");
 const cabundle = @import("crawl/cabundle.zig");
+const xml = @import("../xml.zig");
 
 pub const kind = "crawl";
 pub const default_delay_ms: u32 = 1000;
@@ -38,9 +39,21 @@ pub const min_delay_ms: u32 = 100;
 pub const max_delay_ms: u32 = 3_600_000;
 pub const default_max_page_bytes: u32 = 2 * 1024 * 1024;
 pub const hard_max_page_bytes: u32 = 32 * 1024 * 1024;
+pub const default_max_depth: u32 = 3;
+pub const hard_max_depth: u32 = 10;
+pub const default_max_pages: u32 = 1000;
+pub const hard_max_pages: u32 = 1_000_000;
 pub const default_timeout_s: u32 = 30;
 pub const max_timeout_s: u32 = 300;
 const max_redirects = 5;
+/// Links taken from one page, pending URLs per tree, and URLs remembered per run.
+const max_links_per_page = 2000;
+const max_queue = 50_000;
+const max_visited = 2_000_000;
+const max_sitemap_urls = 50_000;
+const max_sitemap_bytes = 10 * 1024 * 1024;
+const max_sitemap_files = 50;
+const accept_sitemap = "application/xml,text/xml;q=0.9,text/plain;q=0.5";
 const max_seeds = 10_000;
 const max_seeds_file_bytes = 4 * 1024 * 1024;
 /// A site's `crawl-delay` is honored up to this many seconds.
@@ -50,7 +63,7 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "timeout_seconds", "ca_bundle", "language" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "timeout_seconds", "ca_bundle", "language" };
 
 // ------------------------------------------------------------ validation
 
@@ -124,6 +137,8 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     _ = (try needString(source, "seeds_file", true, diag)).?;
     try intOption(source, "delay_ms", min_delay_ms, max_delay_ms, diag);
     try intOption(source, "max_page_bytes", 1, hard_max_page_bytes, diag);
+    try intOption(source, "max_depth", 0, hard_max_depth, diag);
+    try intOption(source, "max_pages", 1, hard_max_pages, diag);
     try intOption(source, "timeout_seconds", 1, max_timeout_s, diag);
     _ = try needString(source, "ca_bundle", false, diag);
     if (try needString(source, "language", false, diag)) |l| if (!files.validLanguageTag(l)) {
@@ -142,6 +157,8 @@ pub const CrawlConnector = struct {
     seeds_file: []const u8,
     delay_ms: u32,
     max_page_bytes: u32,
+    max_depth: u32,
+    max_pages: u32,
     timeout_s: u32,
     ca: cabundle.Choice,
     language: ?[]const u8,
@@ -175,6 +192,8 @@ pub const CrawlConnector = struct {
             .seeds_file = seeds_file,
             .delay_ms = @intCast(source.optionInt("delay_ms") orelse default_delay_ms),
             .max_page_bytes = @intCast(source.optionInt("max_page_bytes") orelse default_max_page_bytes),
+            .max_depth = @intCast(source.optionInt("max_depth") orelse default_max_depth),
+            .max_pages = @intCast(source.optionInt("max_pages") orelse default_max_pages),
             .timeout_s = @intCast(source.optionInt("timeout_seconds") orelse default_timeout_s),
             .ca = ca,
             .language = language,
@@ -224,12 +243,12 @@ pub const CrawlConnector = struct {
 
         var start: usize = 0;
         if (resume_from) |at| {
-            for (seeds, 0..) |s, i| if (std.mem.eql(u8, s, at)) {
+            for (seeds, 0..) |sd, i| if (std.mem.eql(u8, sd.line, at)) {
                 start = i + 1;
             };
         }
 
-        var done: ?[]const u8 = if (start > 0) seeds[start - 1] else null;
+        var done: ?[]const u8 = if (start > 0) seeds[start - 1].line else null;
         var since: u32 = 0;
         for (seeds[start..]) |seed| {
             if (control.isCancelled()) return self.stopped(done);
@@ -237,11 +256,12 @@ pub const CrawlConnector = struct {
                 .stopped => return self.stopped(done),
                 .stored, .skipped => {},
             }
-            done = seed;
+            if (r.exhausted) break; // the page budget for this run is spent
+            done = seed.line;
             since += 1;
             if (since >= checkpoint_every) {
                 since = 0;
-                sink.checkpoint(seed) catch |e| switch (e) {
+                sink.checkpoint(seed.line) catch |e| switch (e) {
                     error.Stopped => return self.stopped(done),
                     else => return error.SourceFailed,
                 };
@@ -259,22 +279,36 @@ pub const CrawlConnector = struct {
         return .{ .interrupted = true, .checkpoint = self.checkpoint_buf.items };
     }
 
-    /// One absolute http(s) URL per line; blank lines and `#` comments are
-    /// skipped, lines that are not usable URLs are ignored.
-    fn readSeeds(self: *CrawlConnector, arena: Allocator) ![]const []const u8 {
+    /// One entry per line: an absolute http(s) URL, or `sitemap URL`. Blank
+    /// lines and `#` comments are skipped, lines that are not usable are
+    /// ignored.
+    fn readSeeds(self: *CrawlConnector, arena: Allocator) ![]const Seed {
         const data = try Io.Dir.cwd().readFileAlloc(self.io, self.seeds_file, arena, .limited(max_seeds_file_bytes));
-        var out: std.ArrayList([]const u8) = .empty;
+        var out: std.ArrayList(Seed) = .empty;
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |raw| {
             var line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0 or line[0] == '#') continue;
             if (std.mem.indexOfScalar(u8, line, '#')) |h| line = std.mem.trim(u8, line[0..h], " \t");
-            if (parseUrl(line) == null) continue;
+            var url = line;
+            var sitemap = false;
+            if (line.len > 8 and std.ascii.eqlIgnoreCase(line[0..7], "sitemap") and (line[7] == ' ' or line[7] == '\t')) {
+                sitemap = true;
+                url = std.mem.trim(u8, line[8..], " \t");
+            }
+            if (parseUrl(url) == null) continue;
             if (out.items.len >= max_seeds) break;
-            try out.append(arena, line);
+            try out.append(arena, .{ .line = line, .url = url, .sitemap = sitemap });
         }
         return out.items;
     }
+};
+
+const Seed = struct {
+    /// The whole line, which is also the resume position.
+    line: []const u8,
+    url: []const u8,
+    sitemap: bool,
 };
 
 // ------------------------------------------------------------------ URLs
@@ -381,6 +415,11 @@ const Run = struct {
     sink: api.Sink,
     control: *api.Control,
     hosts: std.StringHashMapUnmanaged(*Host) = .empty,
+    /// Every URL fetched or queued this run, so none is requested twice.
+    visited: std.StringHashMapUnmanaged(void) = .empty,
+    /// Page requests made (robots.txt excluded), against `max_pages`.
+    fetched: u64 = 0,
+    exhausted: bool = false,
     stored: u64 = 0,
     network_failures: u64 = 0,
 
@@ -465,27 +504,33 @@ const Run = struct {
         }
     }
 
-    fn crawlSeed(self: *Run, seed: []const u8) error{OutOfMemory}!Result {
-        var page = std.heap.ArenaAllocator.init(self.conn.gpa);
-        defer page.deinit();
-        const a = page.allocator();
+    const Fetched = union(enum) {
+        /// `url` is where the answer came from, after redirects.
+        page: struct { url: []const u8, resp: fetch.Response },
+        skipped,
+        stopped,
+    };
 
-        var url = try withoutFragment(a, seed);
+    /// One polite GET of `start`: robots.txt, the host's turn, the request and
+    /// same-site redirects. Everything is allocated in `a`.
+    fn get(self: *Run, a: Allocator, start: []const u8, accept: []const u8, max_bytes: usize) error{OutOfMemory}!Fetched {
+        var url = try withoutFragment(a, start);
         var hops: u32 = 0;
+        self.fetched += 1;
         while (true) {
-            const u = parseUrl(url) orelse return self.reject();
+            const u = parseUrl(url) orelse return self.skip();
             const host = self.hostFor(u) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return .stopped,
             };
-            if (!host.rules.allowed(try targetOf(a, u))) return self.reject();
+            if (!host.rules.allowed(try targetOf(a, u))) return self.skip();
             if (!self.waitTurn(host)) return .stopped;
 
             const resp = fetch.get(self.client, a, .{
                 .url = url,
                 .user_agent = self.conn.user_agent,
-                .accept = accept_pages,
-                .max_body_bytes = self.conn.max_page_bytes,
+                .accept = accept,
+                .max_body_bytes = max_bytes,
             }, self.timeout());
             host.last = Io.Timestamp.now(self.conn.io, .awake);
             const got = resp catch |e| switch (e) {
@@ -493,34 +538,173 @@ const Run = struct {
                 error.Canceled => return .stopped,
                 error.Network, error.Timeout => {
                     self.network_failures += 1;
-                    return self.reject();
+                    return self.skip();
                 },
                 // A certificate that does not verify is a refusal, not an outage.
-                else => return self.reject(),
+                else => return self.skip(),
             };
 
             if (got.status >= 300 and got.status < 400) {
                 hops += 1;
-                const loc = got.location orelse return self.reject();
-                const next = (try resolveRedirect(a, url, loc)) orelse return self.reject();
-                const there = parseUrl(next) orelse return self.reject();
-                if (hops > max_redirects or !sameSite(u.host, there.host)) return self.reject();
+                const loc = got.location orelse return self.skip();
+                const next = (try resolveRedirect(a, url, loc)) orelse return self.skip();
+                const there = parseUrl(next) orelse return self.skip();
+                if (hops > max_redirects or !sameSite(u.host, there.host)) return self.skip();
                 url = next;
                 continue;
             }
-            if (got.status < 200 or got.status >= 300) return self.reject();
-            return self.store(a, url, got);
+            if (got.status < 200 or got.status >= 300) return self.skip();
+            return .{ .page = .{ .url = url, .resp = got } };
         }
     }
 
-    fn store(self: *Run, a: Allocator, url: []const u8, got: fetch.Response) error{OutOfMemory}!Result {
+    fn skip(self: *Run) Fetched {
+        _ = self.control.rejected.fetchAdd(1, .monotonic);
+        return .skipped;
+    }
+
+    /// True the first time `url` is seen this run; remembers it. Also false
+    /// once the table is full, which keeps memory bounded.
+    fn firstVisit(self: *Run, url: []const u8) error{OutOfMemory}!?[]const u8 {
+        if (self.visited.count() >= max_visited) return null;
+        const gop = try self.visited.getOrPut(self.arena, url);
+        if (gop.found_existing) return null;
+        gop.key_ptr.* = try self.arena.dupe(u8, url);
+        return gop.key_ptr.*;
+    }
+
+    fn crawlSeed(self: *Run, seed: Seed) error{OutOfMemory}!Result {
+        const u = parseUrl(seed.url) orelse return self.reject();
+        if (!seed.sitemap) return self.crawlTree(seed.url, 0, u.host);
+
+        // A sitemap lists pages: fetch each of them, and follow no links from
+        // them (the sitemap already says what the site wants indexed).
+        var arena = std.heap.ArenaAllocator.init(self.conn.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var pages: std.ArrayList([]const u8) = .empty;
+        var n_files: u32 = 0;
+        if (try self.sitemapPages(a, seed.url, u.host, 0, &n_files, &pages)) return .stopped;
+        var last: Result = .skipped;
+        for (pages.items) |page| {
+            last = try self.crawlTree(page, self.conn.max_depth, u.host);
+            if (last == .stopped) return .stopped;
+            if (self.exhausted) break;
+        }
+        return last;
+    }
+
+    /// Expands the sitemap (or sitemap index) at `url` into page URLs on the
+    /// sitemap's own site. Returns true if the run was stopped.
+    fn sitemapPages(self: *Run, a: Allocator, url: []const u8, site: []const u8, level: u32, n_files: *u32, out: *std.ArrayList([]const u8)) error{OutOfMemory}!bool {
+        if (n_files.* >= max_sitemap_files or self.fetched >= self.conn.max_pages) return false;
+        n_files.* += 1;
+        // Compressed sitemaps are not supported yet.
+        if (std.ascii.endsWithIgnoreCase(url, ".gz")) {
+            _ = self.reject();
+            return false;
+        }
+        var tmp = std.heap.ArenaAllocator.init(self.conn.gpa);
+        defer tmp.deinit();
+        const t = tmp.allocator();
+        const got = switch (try self.get(t, url, accept_sitemap, max_sitemap_bytes)) {
+            .stopped => return true,
+            .skipped => return false,
+            .page => |p| p,
+        };
+        var h: SitemapHandler = .{ .arena = a, .urls = .empty };
+        defer h.text.deinit(self.conn.gpa);
+        h.gpa = self.conn.gpa;
+        var parser: xml.Parser(SitemapHandler) = undefined;
+        parser.init(&h) catch return error.OutOfMemory;
+        defer parser.deinit();
+        parser.feed(got.resp.body, true) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Too many entries stops the parser on purpose; keep what we have.
+            error.Stopped => {},
+            error.Malformed => {
+                _ = self.reject();
+                return false;
+            },
+        };
+        for (h.urls.items) |loc| {
+            const target = (try resolveRedirect(a, got.url, loc)) orelse continue;
+            const tu = parseUrl(target) orelse continue;
+            if (!sameSite(tu.host, site)) continue; // a sitemap may only name its own site
+            if (h.is_index) {
+                if (level >= 2) continue;
+                if (try self.sitemapPages(a, target, site, level + 1, n_files, out)) return true;
+            } else if (out.items.len < max_sitemap_urls) {
+                try out.append(a, target);
+            }
+        }
+        return false;
+    }
+
+    /// Breadth-first from `root`, following same-site links down to
+    /// `max_depth`. `depth0` is the depth of `root` itself.
+    fn crawlTree(self: *Run, root: []const u8, depth0: u32, site: []const u8) error{OutOfMemory}!Result {
+        const gpa = self.conn.gpa;
+        var queue: std.ArrayList(Item) = .empty;
+        defer queue.deinit(gpa);
+        const first = (try self.firstVisit(root)) orelse return .skipped;
+        try queue.append(gpa, .{ .url = first, .depth = depth0 });
+        var any = false;
+        var head: usize = 0;
+        while (head < queue.items.len) {
+            if (self.control.isCancelled()) return .stopped;
+            if (self.fetched >= self.conn.max_pages) {
+                self.exhausted = true;
+                break;
+            }
+            const item = queue.items[head];
+            head += 1;
+
+            var page = std.heap.ArenaAllocator.init(gpa);
+            defer page.deinit();
+            const a = page.allocator();
+            const got = switch (try self.get(a, item.url, accept_pages, self.conn.max_page_bytes)) {
+                .stopped => return .stopped,
+                .skipped => continue,
+                .page => |p| p,
+            };
+            // A redirect target counts as seen too.
+            if (!std.mem.eql(u8, got.url, item.url)) _ = try self.firstVisit(got.url);
+
+            const stored = try self.store(a, got.url, got.resp);
+            switch (stored.result) {
+                .stopped => return .stopped,
+                .stored => any = true,
+                .skipped => {},
+            }
+            if (item.depth >= self.conn.max_depth) continue;
+            for (stored.links) |link| {
+                if (queue.items.len - head >= max_queue) break;
+                const target = (try resolveRedirect(a, got.url, link)) orelse continue;
+                const tu = parseUrl(target) orelse continue;
+                if (!sameSite(tu.host, site) or looksBinary(tu.uri.path)) continue;
+                const keep = (try self.firstVisit(target)) orelse continue;
+                try queue.append(gpa, .{ .url = keep, .depth = item.depth + 1 });
+            }
+        }
+        return if (any) .stored else .skipped;
+    }
+
+    const Item = struct { url: []const u8, depth: u32 };
+
+    const Stored = struct { result: Result, links: []const []const u8 = &.{} };
+
+    fn store(self: *Run, a: Allocator, url: []const u8, got: fetch.Response) error{OutOfMemory}!Stored {
         const ct = parseContentType(got.content_type);
         const is_html = ct.media.len == 0 or std.mem.eql(u8, ct.media, "text/html") or std.mem.eql(u8, ct.media, "application/xhtml+xml");
-        if (!is_html and !std.mem.eql(u8, ct.media, "text/plain")) return self.reject();
+        if (!is_html and !std.mem.eql(u8, ct.media, "text/plain")) return .{ .result = self.reject() };
 
-        const utf8 = (try toUtf8(a, got.body, ct.charset)) orelse return self.reject();
+        const utf8 = (try toUtf8(a, got.body, ct.charset)) orelse return .{ .result = self.reject() };
+        const scanned: htmltext.Scan = if (is_html) try htmltext.scan(a, utf8, max_links_per_page) else .{};
+        // The page may say "do not index" yet still lead to pages that are fine.
+        if (scanned.noindex) return .{ .result = self.reject(), .links = scanned.links };
         const text = if (is_html) try htmltext.toText(a, utf8) else std.mem.trim(u8, utf8, " \t\r\n");
-        if (text.len == 0) return self.reject();
+        if (text.len == 0) return .{ .result = self.reject(), .links = scanned.links };
         const title: ?[]const u8 = if (is_html) try htmltext.titleOf(a, utf8) else null;
 
         const u = parseUrl(url).?;
@@ -540,15 +724,70 @@ const Run = struct {
             },
         };
         self.sink.submit(d) catch |e| switch (e) {
-            error.Rejected => return .skipped, // the pipeline counts and reports it
-            error.Stopped => return .stopped,
+            error.Rejected => return .{ .result = .skipped, .links = scanned.links }, // the pipeline counts it
+            error.Stopped => return .{ .result = .stopped },
             error.OutOfMemory => return error.OutOfMemory,
         };
         _ = self.control.submitted.fetchAdd(1, .monotonic);
         self.stored += 1;
-        return .stored;
+        return .{ .result = .stored, .links = scanned.links };
     }
 };
+
+/// Collects the `<loc>` values of a sitemap or sitemap index.
+const SitemapHandler = struct {
+    arena: Allocator,
+    gpa: Allocator = undefined,
+    urls: std.ArrayList([]const u8),
+    text: std.ArrayList(u8) = .empty,
+    in_loc: bool = false,
+    is_index: bool = false,
+    const P = xml.Parser(SitemapHandler);
+
+    fn local(name: []const u8) []const u8 {
+        return if (std.mem.lastIndexOfScalar(u8, name, ':')) |i| name[i + 1 ..] else name;
+    }
+
+    pub fn startElement(self: *SitemapHandler, _: *P, name: []const u8, _: xml.Attrs) void {
+        const n = local(name);
+        if (std.mem.eql(u8, n, "sitemapindex")) self.is_index = true;
+        if (std.mem.eql(u8, n, "loc")) {
+            self.in_loc = true;
+            self.text.clearRetainingCapacity();
+        }
+    }
+
+    pub fn characters(self: *SitemapHandler, p: *P, bytes: []const u8) void {
+        if (!self.in_loc) return;
+        if (self.text.items.len + bytes.len > 4096) return; // too long to be a URL; dropped at the end
+        self.text.appendSlice(self.gpa, bytes) catch p.stop();
+    }
+
+    pub fn endElement(self: *SitemapHandler, p: *P, name: []const u8) void {
+        if (!std.mem.eql(u8, local(name), "loc")) return;
+        self.in_loc = false;
+        const v = std.mem.trim(u8, self.text.items, " \t\r\n");
+        if (v.len == 0 or v.len >= 4096) return;
+        if (self.urls.items.len >= max_sitemap_urls) return p.stop();
+        const copy = self.arena.dupe(u8, v) catch return p.stop();
+        self.urls.append(self.arena, copy) catch p.stop();
+    }
+};
+
+/// Links to files that are not pages are not worth a request.
+fn looksBinary(path: std.Uri.Component) bool {
+    const text = componentText(path);
+    const dot = std.mem.lastIndexOfScalar(u8, text, '.') orelse return false;
+    if (std.mem.indexOfScalarPos(u8, text, dot, '/') != null) return false;
+    const ext = text[dot + 1 ..];
+    const skip = [_][]const u8{
+        "jpg", "jpeg", "png",  "gif", "webp", "svg",   "ico", "bmp", "tif", "tiff", "pdf", "zip",  "gz",  "tgz",  "bz2",  "xz",
+        "7z",  "rar",  "exe",  "dmg", "iso",  "msi",   "apk", "mp3", "mp4", "mkv",  "avi", "mov",  "wav", "ogg",  "flac", "webm",
+        "css", "js",   "json", "xml", "woff", "woff2", "ttf", "eot", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub",
+    };
+    for (skip) |x| if (std.ascii.eqlIgnoreCase(ext, x)) return true;
+    return false;
+}
 
 const ContentType = struct { media: []const u8, charset: ?[]const u8 };
 
@@ -698,13 +937,23 @@ const TestServer = struct {
     times: std.ArrayList(i96) = .empty,
 
     fn start(s: *TestServer, routes: []const Route) !void {
+        try s.open();
+        try s.serve(routes);
+    }
+
+    /// Listens, so the port is known before the routes are (bodies may name it).
+    fn open(s: *TestServer) !void {
         s.* = .{
             .listener = try (try net.IpAddress.parseIp4("127.0.0.1", 0)).listen(testing.io, .{ .reuse_address = true }),
             .port = 0,
-            .routes = routes,
+            .routes = &.{},
             .future = undefined,
         };
         s.port = s.listener.socket.address.getPort();
+    }
+
+    fn serve(s: *TestServer, routes: []const Route) !void {
+        s.routes = routes;
         s.future = try testing.io.concurrent(loop, .{s});
     }
 
@@ -1036,4 +1285,154 @@ test "cancelling stops the run and reports where to resume" {
     _ = try conn.connector().run(got2.sink(), &ctl2, out.checkpoint);
     try testing.expectEqual(@as(usize, 2), got2.ids.items.len);
     try testing.expect(std.mem.endsWith(u8, got2.ids.items[0], "/2"));
+}
+
+/// Runs a crawl of `seeds` against `srv` and returns what was stored.
+fn crawlWith(srv: *TestServer, tmp: *testing.TmpDir, seeds_text: []const u8, depth: u32, pages: u32, got: *Collect, ctl: *api.Control) !void {
+    var conn = try testConnector(tmp, seeds_text, "t/1");
+    defer conn.deinit();
+    conn.max_depth = depth;
+    conn.max_pages = pages;
+    _ = srv;
+    _ = try conn.connector().run(got.sink(), ctl, null);
+}
+
+fn hasId(got: *const Collect, suffix: []const u8) bool {
+    for (got.ids.items) |id| if (std.mem.endsWith(u8, id, suffix)) return true;
+    return false;
+}
+
+const site_routes = [_]Route{
+    .{ .path = "/robots.txt", .status = 404 },
+    .{ .path = "/", .body = "<title>Home</title><p>home</p><a href=\"/a\">a</a> <a href=\"b.html\">b</a> <a href=\"http://elsewhere.invalid/x\">out</a> <a href=\"/pic.png\">pic</a> <a rel=\"nofollow\" href=\"/nofollow\">nf</a> <a href=\"/a#frag\">again</a> <a href=\"mailto:x@y\">mail</a>" },
+    .{ .path = "/a", .body = "<p>page a</p><a href=\"/\">home</a><a href=\"/deep1\">d1</a>" },
+    .{ .path = "/b.html", .body = "<p>page b</p>" },
+    .{ .path = "/deep1", .body = "<p>deep one</p><a href=\"/deep2\">d2</a>" },
+    .{ .path = "/deep2", .body = "<p>deep two</p><a href=\"/deep3\">d3</a>" },
+    .{ .path = "/deep3", .body = "<p>deep three</p>" },
+    .{ .path = "/nofollow", .body = "<p>should not be fetched</p>" },
+    .{ .path = "/noindex", .body = "<meta name=\"robots\" content=\"noindex\"><p>hidden</p><a href=\"/visible\">v</a>" },
+    .{ .path = "/visible", .body = "<p>visible</p>" },
+};
+
+test "links are followed on the same site, to the depth limit, each page once" {
+    var srv: TestServer = undefined;
+    try srv.start(&site_routes);
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [96]u8 = undefined;
+    const seed = srv.url(&b, "/");
+
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    try crawlWith(&srv, &tmp, seed, 2, 100, &got, &ctl);
+    // Depth 2 from "/": a and b.html (1), deep1 (2); not deep2. No cycles, no
+    // binaries, no nofollow, no other site, no mail links.
+    try testing.expectEqual(@as(usize, 4), got.ids.items.len);
+    try testing.expect(hasId(&got, "/a") and hasId(&got, "/b.html") and hasId(&got, "/deep1"));
+    try testing.expectEqual(@as(usize, 1), srv.count("/a")); // linked twice, fetched once
+    try testing.expectEqual(@as(usize, 1), srv.count("/")); // linked back to, fetched once
+    try testing.expectEqual(@as(usize, 0), srv.count("/deep2"));
+    try testing.expectEqual(@as(usize, 0), srv.count("/pic.png"));
+    try testing.expectEqual(@as(usize, 0), srv.count("/nofollow"));
+    try testing.expectEqual(@as(usize, 1), srv.count("/robots.txt"));
+}
+
+test "depth 0 fetches only the seeds; the page budget stops a run" {
+    var srv: TestServer = undefined;
+    try srv.start(&site_routes);
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [96]u8 = undefined;
+    const seed = srv.url(&b, "/");
+
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    try crawlWith(&srv, &tmp, seed, 0, 100, &got, &ctl);
+    try testing.expectEqual(@as(usize, 1), got.ids.items.len);
+
+    var got2: Collect = .{};
+    defer got2.deinit();
+    var ctl2: api.Control = .{};
+    try crawlWith(&srv, &tmp, seed, 10, 3, &got2, &ctl2);
+    try testing.expectEqual(@as(usize, 3), got2.ids.items.len); // "/", then two of its links
+}
+
+test "noindex pages are not stored but their links are followed" {
+    var srv: TestServer = undefined;
+    try srv.start(&site_routes);
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [96]u8 = undefined;
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    try crawlWith(&srv, &tmp, srv.url(&b, "/noindex"), 3, 100, &got, &ctl);
+    try testing.expect(!hasId(&got, "/noindex"));
+    try testing.expect(hasId(&got, "/visible"));
+}
+
+test "robots.txt applies to followed links too" {
+    var routes = site_routes;
+    routes[0] = .{ .path = "/robots.txt", .content_type = "text/plain", .body = "User-agent: *\nDisallow: /deep\n" };
+    var srv: TestServer = undefined;
+    try srv.start(&routes);
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [96]u8 = undefined;
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    try crawlWith(&srv, &tmp, srv.url(&b, "/"), 5, 100, &got, &ctl);
+    try testing.expectEqual(@as(usize, 0), srv.count("/deep1"));
+    try testing.expect(hasId(&got, "/a"));
+}
+
+test "sitemaps and sitemap indexes list pages, only for their own site" {
+    var srv: TestServer = undefined;
+    var index_buf: [400]u8 = undefined;
+    var map_buf: [600]u8 = undefined;
+    try srv.open();
+    const index = try std.fmt.bufPrint(&index_buf, "<?xml version=\"1.0\"?><sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><sitemap><loc>http://127.0.0.1:{d}/map1.xml</loc></sitemap><sitemap><loc>/map2.xml.gz</loc></sitemap></sitemapindex>", .{srv.port});
+    const map = try std.fmt.bufPrint(&map_buf, "<?xml version=\"1.0\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><url><loc>http://127.0.0.1:{d}/p1</loc></url><url><loc>/p2</loc></url><url><loc>http://elsewhere.invalid/p3</loc></url></urlset>", .{srv.port});
+    try srv.serve(&.{
+        .{ .path = "/robots.txt", .status = 404 },
+        .{ .path = "/index.xml", .content_type = "application/xml", .body = index },
+        .{ .path = "/map1.xml", .content_type = "application/xml", .body = map },
+        .{ .path = "/p1", .body = "<p>one</p><a href=\"/linked\">l</a>" },
+        .{ .path = "/p2", .body = "<p>two</p>" },
+        .{ .path = "/linked", .body = "<p>not wanted: sitemap pages follow no links</p>" },
+        .{ .path = "/bad.xml", .content_type = "application/xml", .body = "<urlset><url><loc>http://x" },
+    });
+    defer srv.stop();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [96]u8 = undefined;
+    var line: [140]u8 = undefined;
+    const seed = try std.fmt.bufPrint(&line, "sitemap {s}\n", .{srv.url(&b, "/index.xml")});
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    try crawlWith(&srv, &tmp, seed, 3, 100, &got, &ctl);
+    try testing.expectEqual(@as(usize, 2), got.ids.items.len);
+    try testing.expect(hasId(&got, "/p1") and hasId(&got, "/p2"));
+    try testing.expectEqual(@as(usize, 0), srv.count("/linked"));
+    // The .gz sitemap is refused without being requested.
+    try testing.expectEqual(@as(usize, 0), srv.count("/map2.xml.gz"));
+    try testing.expect(ctl.rejected.load(.monotonic) >= 1);
+
+    // A malformed sitemap is skipped, not fatal.
+    var got2: Collect = .{};
+    defer got2.deinit();
+    var ctl2: api.Control = .{};
+    const seed2 = try std.fmt.bufPrint(&line, "sitemap {s}\n", .{srv.url(&b, "/bad.xml")});
+    try crawlWith(&srv, &tmp, seed2, 3, 100, &got2, &ctl2);
+    try testing.expectEqual(@as(usize, 0), got2.ids.items.len);
 }

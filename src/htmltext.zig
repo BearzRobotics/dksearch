@@ -185,6 +185,120 @@ fn collapseLines(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
     return out.items;
 }
 
+/// What a page says about itself for crawlers, and where it links.
+pub const Scan = struct {
+    /// `<meta name="robots" content="noindex">` (or "none"): do not index.
+    noindex: bool = false,
+    /// `<meta name="robots" content="nofollow">` (or "none"): follow nothing.
+    nofollow: bool = false,
+    /// `href` of `<a>` and `<area>` elements, entities decoded, in page order.
+    /// Links marked `rel="nofollow"` are left out. Empty if the page is nofollow.
+    links: []const []const u8 = &.{},
+};
+
+/// One pass over `html`: robots meta directives and up to `max_links` links.
+/// Like `toText` it is linear, ignores comments, `<script>` and `<style>`, and
+/// never fails on malformed markup.
+pub fn scan(arena: Allocator, html: []const u8, max_links: usize) Allocator.Error!Scan {
+    var out: Scan = .{};
+    var links: std.ArrayList([]const u8) = .empty;
+    var missing_end: [dropped_tags.len]bool = @splat(false);
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
+        i = lt;
+        if (std.mem.startsWith(u8, html[i..], "<!--")) {
+            const end = std.mem.indexOfPos(u8, html, i + 4, "-->");
+            i = if (end) |e| e + 3 else html.len;
+            continue;
+        }
+        const t = tagAt(html, i) orelse {
+            i += 1;
+            continue;
+        };
+        i = t.end;
+        if (t.closing) continue;
+        if (indexOf(t.name, &dropped_tags)) |k| {
+            // Skip the content of script, style, noscript and head; but "head"
+            // holds the meta tags we want, so only the other three are skipped.
+            if (std.ascii.eqlIgnoreCase(t.name, "head")) continue;
+            if (!t.self_closing and !missing_end[k]) {
+                if (endOf(html, t.end, t.name)) |e| {
+                    i = e;
+                } else missing_end[k] = true;
+            }
+            continue;
+        }
+        const body = html[lt..t.end];
+        if (std.ascii.eqlIgnoreCase(t.name, "meta")) {
+            const name = attr(body, "name") orelse continue;
+            if (!std.ascii.eqlIgnoreCase(name, "robots") and !std.ascii.eqlIgnoreCase(name, "dksearch")) continue;
+            const content = attr(body, "content") orelse continue;
+            if (hasToken(content, "noindex") or hasToken(content, "none")) out.noindex = true;
+            if (hasToken(content, "nofollow") or hasToken(content, "none")) out.nofollow = true;
+        } else if ((std.ascii.eqlIgnoreCase(t.name, "a") or std.ascii.eqlIgnoreCase(t.name, "area")) and links.items.len < max_links) {
+            const href = attr(body, "href") orelse continue;
+            if (attr(body, "rel")) |rel| if (hasToken(rel, "nofollow")) continue;
+            const trimmed = std.mem.trim(u8, href, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            try links.append(arena, try decodeEntities(arena, trimmed));
+        }
+    }
+    if (!out.nofollow) out.links = links.items;
+    return out;
+}
+
+/// The value of attribute `name` inside the text of one tag (`<a href="x">`),
+/// quoted or bare, matched case-insensitively. Null if absent.
+fn attr(tag: []const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 1; // past '<'
+    while (i < tag.len and !std.ascii.isWhitespace(tag[i])) i += 1; // tag name
+    while (i < tag.len) {
+        while (i < tag.len and (std.ascii.isWhitespace(tag[i]) or tag[i] == '/')) i += 1;
+        const ns = i;
+        while (i < tag.len and !std.ascii.isWhitespace(tag[i]) and tag[i] != '=' and tag[i] != '>' and tag[i] != '/') i += 1;
+        const an = tag[ns..i];
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) i += 1;
+        var value: []const u8 = "";
+        if (i < tag.len and tag[i] == '=') {
+            i += 1;
+            while (i < tag.len and std.ascii.isWhitespace(tag[i])) i += 1;
+            if (i < tag.len and (tag[i] == '"' or tag[i] == '\'')) {
+                const q = tag[i];
+                const vs = i + 1;
+                const ve = std.mem.indexOfScalarPos(u8, tag, vs, q) orelse return null;
+                value = tag[vs..ve];
+                i = ve + 1;
+            } else {
+                const vs = i;
+                while (i < tag.len and !std.ascii.isWhitespace(tag[i]) and tag[i] != '>') i += 1;
+                value = tag[vs..i];
+            }
+        }
+        if (an.len > 0 and std.ascii.eqlIgnoreCase(an, name)) return value;
+        if (an.len == 0) i += 1; // never stall on odd bytes
+    }
+    return null;
+}
+
+/// Whether `list` (separated by spaces or commas) has `token`, ignoring case.
+fn hasToken(list: []const u8, token: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, list, " \t\r\n,");
+    while (it.next()) |w| if (std.ascii.eqlIgnoreCase(w, token)) return true;
+    return false;
+}
+
+fn decodeEntities(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, s, '&') == null) return s;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '&') if (try entity(arena, &out, s, &i)) continue;
+        try out.append(arena, s[i]);
+        i += 1;
+    }
+    return out.items;
+}
+
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -258,4 +372,42 @@ test "titleOf finds the first title, decodes it and ignores lookalikes" {
     try testing.expect((try titleOf(a, "<p>none</p>")) == null);
     try testing.expect((try titleOf(a, "<title>   </title>")) == null);
     try testing.expect((try titleOf(a, "<title>never closed")) == null);
+}
+
+test "scan finds links, robots directives and respects nofollow" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const html =
+        \\<html><head><META NAME="Robots" CONTENT="noindex, follow"><script>var s = "<a href='/no'>";</script></head>
+        \\<body><a href="/one">1</a> <A HREF='two?x=1&amp;y=2' class=c>2</A>
+        \\<a href=bare>3</a><a rel="nofollow noopener" href="/skip">4</a><a>5</a><a href="">6</a>
+        \\<!-- <a href="/commented"> --><area href="/map"/></body></html>
+    ;
+    const r = try scan(a, html, 100);
+    try testing.expect(r.noindex);
+    try testing.expect(!r.nofollow);
+    try testing.expectEqual(@as(usize, 4), r.links.len);
+    try testing.expectEqualStrings("/one", r.links[0]);
+    try testing.expectEqualStrings("two?x=1&y=2", r.links[1]);
+    try testing.expectEqualStrings("bare", r.links[2]);
+    try testing.expectEqualStrings("/map", r.links[3]);
+
+    const nf = try scan(a, "<meta name=robots content=nofollow><a href=/x>x</a>", 100);
+    try testing.expect(nf.nofollow and nf.links.len == 0 and !nf.noindex);
+    const none = try scan(a, "<meta name=\"robots\" content=\"none\">", 100);
+    try testing.expect(none.noindex and none.nofollow);
+    const capped = try scan(a, "<a href=1><a href=2><a href=3>", 2);
+    try testing.expectEqual(@as(usize, 2), capped.links.len);
+}
+
+test "scan never fails on junk" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var prng = std.Random.DefaultPrng.init(11);
+    var buf: [300]u8 = undefined;
+    for (0..500) |_| {
+        for (&buf) |*b| b.* = "<>a href=\"'=/ &;!-meta robots\n"[prng.random().uintLessThan(usize, 30)];
+        _ = try scan(arena.allocator(), &buf, 50);
+    }
 }

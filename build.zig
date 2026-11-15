@@ -43,11 +43,12 @@ pub fn build(b: *std.Build) void {
     const want_wikipedia = b.option(bool, "wikipedia", "Build the Wikipedia connector with vendored bzip2 and Expat (default: on, except on Windows)") orelse supported;
     const want_feeds = b.option(bool, "feeds", "Build the RSS/Atom feeds connector with vendored Expat (default: on, except on Windows)") orelse supported;
     if ((want_wikipedia or want_feeds) and !supported) @panic("the Wikipedia and feeds connectors are not supported on Windows yet; pass -Dwikipedia=false -Dfeeds=false");
-    const need_expat = want_wikipedia or want_feeds;
     // The web crawler uses Zig's standard HTTP and TLS client (no C library)
     // and the bundled Mozilla CA file (docs/decisions/0018).
     const want_crawler = b.option(bool, "crawler", "Build the web crawler connector with the bundled CA certificates (default: on, except on Windows)") orelse supported;
     if (want_crawler and !supported) @panic("the crawler connector is not supported on Windows yet; pass -Dcrawler=false");
+    // The crawler reads sitemaps with Expat too.
+    const need_expat = want_wikipedia or want_feeds or want_crawler;
 
     const bz2_c: ?*std.Build.Module = if (want_wikipedia) blk: {
         const tc = b.addTranslateC(.{
