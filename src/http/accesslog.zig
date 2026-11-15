@@ -13,16 +13,12 @@ pub const AccessLog = struct {
     mutex: Io.Mutex = .init,
     /// Null: standard error.
     file: ?Io.File = null,
-    /// Where the next line goes in `file` (the log is appended to).
-    offset: u64 = 0,
 
     /// `destination` is "stderr" or a file path, which is created or appended to.
     pub fn open(io: Io, destination: []const u8) Io.File.OpenError!AccessLog {
         if (std.mem.eql(u8, destination, "stderr")) return .{ .io = io };
-        const f = try Io.Dir.cwd().createFile(io, destination, .{ .truncate = false });
-        errdefer f.close(io);
-        const st = f.stat(io) catch return error.Unexpected;
-        return .{ .io = io, .file = f, .offset = st.size };
+        const f = try Io.Dir.cwd().createFile(io, destination, .{ .truncate = false, .permissions = Io.File.Permissions.fromMode(0o600) });
+        return .{ .io = io, .file = f };
     }
 
     pub fn close(self: *AccessLog) void {
@@ -39,8 +35,11 @@ pub const AccessLog = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.file) |f| {
-            f.writePositionalAll(self.io, line, self.offset) catch return;
-            self.offset += line.len;
+            // Append at the file's current end, looked up each time, so a log
+            // truncated by logrotate (copytruncate) starts over cleanly
+            // instead of leaving a hole.
+            const end = (f.stat(self.io) catch return).size;
+            f.writePositionalAll(self.io, line, end) catch return;
         } else {
             Io.File.stderr().writeStreamingAll(self.io, line) catch {};
         }
@@ -85,4 +84,24 @@ test "writes to a file, appending to what is there" {
     try testing.expect(std.mem.startsWith(u8, text, "old line\n"));
     try testing.expect(std.mem.indexOf(u8, text, "Z GET / 200 1ms 10B\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Z POST /login 303 250ms 0B\n") != null);
+}
+
+test "a truncated log starts over without leaving a hole" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [200]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/t.log", .{tmp.sub_path});
+    var log = try AccessLog.open(testing.io, path);
+    defer log.close();
+    log.record("GET", "/", 200, 1, 1);
+    log.record("GET", "/", 200, 1, 1);
+    const f = try tmp.dir.openFile(testing.io, "t.log", .{ .mode = .read_write });
+    try f.setLength(testing.io, 0); // what copytruncate does
+    f.close(testing.io);
+    log.record("GET", "/x", 404, 2, 3);
+    const text = try tmp.dir.readFileAlloc(testing.io, "t.log", testing.allocator, .limited(4096));
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOfScalar(u8, text, 0) == null);
+    try testing.expect(std.mem.endsWith(u8, text, "Z GET /x 404 2ms 3B\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n"));
 }

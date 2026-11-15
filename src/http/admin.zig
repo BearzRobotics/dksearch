@@ -25,7 +25,10 @@ pub const cookie_name = "dks_session";
 const max_sessions = 16;
 const max_verifications = 2;
 const max_credential_bytes = 1024;
-const max_delay_ms: u64 = 30_000;
+/// Kept below the default write timeout (10 s), so a delayed answer is still delivered.
+const max_delay_ms: u64 = 5_000;
+/// Login attempts that may be waiting out their delay at once; more get 429.
+const max_waiting = 4;
 const failure_memory_ns: i96 = 15 * 60 * std.time.ns_per_s;
 
 pub const Options = struct {
@@ -68,6 +71,7 @@ pub const App = struct {
     failures: u32 = 0,
     last_failure_ns: i96 = 0,
     verifying: std.atomic.Value(u32) = .init(0),
+    waiting: std.atomic.Value(u32) = .init(0),
     /// Tests: replaces the clock and skips real waiting.
     fake_now_ns: ?i96 = null,
     skip_delay: bool = false,
@@ -86,7 +90,9 @@ pub const App = struct {
     }
 
     fn nowNs(self: *App) i96 {
-        return self.fake_now_ns orelse Io.Clock.awake.now(self.io).nanoseconds;
+        // The boot clock keeps counting while the machine is suspended, so
+        // sessions cannot outlive their limits by sleeping through them.
+        return self.fake_now_ns orelse Io.Clock.boot.now(self.io).nanoseconds;
     }
 
     fn handleErased(ptr: *anyopaque, arena: Allocator, req: server.Request) Response {
@@ -199,8 +205,9 @@ pub const App = struct {
             if (h.len > prefix.len and std.ascii.eqlIgnoreCase(h[0..prefix.len], prefix)) {
                 const presented = std.mem.trim(u8, h[prefix.len..], " ");
                 if (loaded.secrets.verifyToken(presented)) return .token;
-                self.noteFailure();
-                self.penalty();
+                // A wrong token is not counted or delayed: tokens have 256
+                // bits, guessing is hopeless, and counting would let anyone
+                // slow down the administrator's password sign-in.
                 return .none;
             }
         }
@@ -278,7 +285,7 @@ pub const App = struct {
     // ------------------------------------------------------- brute-force slowing
 
     /// Wait before answering after `failures` consecutive failures: none for
-    /// the first three, then 250 ms doubling up to 30 s.
+    /// the first three, then 250 ms doubling up to 5 s.
     pub fn delayMs(failures: u32) u64 {
         if (failures <= 3) return 0;
         const shift: u6 = @intCast(@min(failures - 4, 20));
@@ -300,26 +307,48 @@ pub const App = struct {
         self.failures = 0;
     }
 
-    /// Makes the caller wait according to the failure count.
-    fn penalty(self: *App) void {
+    /// Failures that still count: none once 15 quiet minutes have passed.
+    fn effectiveFailures(self: *App) u32 {
+        const now = self.nowNs();
         self.mutex.lockUncancelable(self.io);
-        const f = self.failures;
-        self.mutex.unlock(self.io);
-        const ms = delayMs(f);
-        if (ms > 0 and !self.skip_delay) self.io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
+        defer self.mutex.unlock(self.io);
+        if (now - self.last_failure_ns > failure_memory_ns) self.failures = 0;
+        return self.failures;
+    }
+
+    /// Makes the caller wait according to the recent failure count. Returns
+    /// false, without waiting, if too many attempts are already waiting.
+    fn penalty(self: *App) bool {
+        const ms = delayMs(self.effectiveFailures());
+        if (ms == 0 or self.skip_delay) return true;
+        if (self.waiting.fetchAdd(1, .acq_rel) >= max_waiting) {
+            _ = self.waiting.fetchSub(1, .acq_rel);
+            return false;
+        }
+        defer _ = self.waiting.fetchSub(1, .acq_rel);
+        self.io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
+        return true;
     }
 
     // ------------------------------------------------------------ login/logout
 
     fn postLogin(self: *App, arena: Allocator, req: server.Request) error{OutOfMemory}!Response {
         // The form body is parsed like a query string.
-        const form_target = try std.fmt.allocPrint(arena, "/?{s}", .{req.body});
+        // A trailing line break (from `curl --data-binary @file`) is not part of the form.
+        const form_target = try std.fmt.allocPrint(arena, "/?{s}", .{std.mem.trimEnd(u8, req.body, "\r\n")});
         const t = query.parseTarget(arena, form_target) catch return renderLogin(arena, .bad_request, "The form could not be read.");
         const credential = t.params.get("credential") orelse "";
         if (credential.len == 0 or credential.len > max_credential_bytes) return self.loginFailed(arena);
 
         var loaded = self.loadSecrets() orelse return renderLogin(arena, .service_unavailable, "The credentials file cannot be read. See the server's error output.");
         defer loaded.secrets.deinit(self.gpa);
+
+        // Slow down repeated failures first, without holding a verification slot.
+        if (!self.penalty()) {
+            var r = try renderLogin(arena, .too_many_requests, "Too many failed attempts. Wait a few seconds and try again.");
+            r.headers = handler.headersWith(arena, &.{ handler.no_store, .{ .name = "retry-after", .value = "5" } });
+            return r;
+        }
 
         // Password checks are slow and memory-hungry on purpose: only a couple at once.
         if (self.verifying.fetchAdd(1, .acq_rel) >= max_verifications) {
@@ -330,8 +359,6 @@ pub const App = struct {
         }
         defer _ = self.verifying.fetchSub(1, .acq_rel);
 
-        // Delay first, so a flood of guesses is slowed before any work is done.
-        self.penalty();
         const ok = loaded.secrets.verifyToken(credential) or loaded.secrets.verifyPassword(self.gpa, self.io, credential);
         if (!ok) return self.loginFailed(arena);
 
@@ -852,7 +879,7 @@ test "bearer token: accepted when right, refused and counted when wrong" {
 
     const bad = try f.call(a, .GET, "/api/v1/admin/status", .{ .auth = "Bearer dks_wrong" });
     try testing.expectEqual(http.Status.unauthorized, bad.status);
-    try testing.expectEqual(@as(u32, 1), f.app.failures);
+    try testing.expectEqual(@as(u32, 0), f.app.failures); // wrong tokens are not counted
     const lower = try f.call(a, .GET, "/api/v1/admin/status", .{ .auth = try std.fmt.allocPrint(a, "bearer {s}", .{f.token}) });
     try testing.expectEqual(http.Status.ok, lower.status); // the scheme is case-insensitive
     const basic = try f.call(a, .GET, "/api/v1/admin/status", .{ .auth = "Basic dXNlcjpwdw==" });
@@ -947,6 +974,16 @@ test "a session is dropped after its absolute lifetime even if used" {
     }
     try testing.expect(!alive);
     try testing.expect(minutes >= 8 * 60 - 20); // and not before ~8 hours
+}
+
+test "a trailing newline on the form body is ignored" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = try f.call(arena.allocator(), .POST, "/login", .{ .body = "credential=correct+horse\r\n" });
+    try testing.expectEqual(http.Status.see_other, r.status);
 }
 
 test "the token also signs in through the form when used as the credential" {
@@ -1061,8 +1098,8 @@ test "failed attempts slow down, with a ceiling; concurrent verifications are ca
     try testing.expectEqual(@as(u64, 0), App.delayMs(3));
     try testing.expectEqual(@as(u64, 250), App.delayMs(4));
     try testing.expectEqual(@as(u64, 500), App.delayMs(5));
-    try testing.expectEqual(@as(u64, 30_000), App.delayMs(100));
-    try testing.expectEqual(@as(u64, 30_000), App.delayMs(std.math.maxInt(u32)));
+    try testing.expectEqual(@as(u64, 5_000), App.delayMs(100));
+    try testing.expectEqual(@as(u64, 5_000), App.delayMs(std.math.maxInt(u32)));
 
     var f: Fixture = undefined;
     try f.init();
@@ -1076,6 +1113,25 @@ test "failed attempts slow down, with a ceiling; concurrent verifications are ca
     f.app.fake_now_ns.? += 16 * 60 * std.time.ns_per_s;
     _ = try f.call(a, .POST, "/login", .{ .body = "credential=wrong" });
     try testing.expectEqual(@as(u32, 1), f.app.failures);
+
+    // Stale failures stop delaying anyone after the quiet period.
+    f.app.failures = 12;
+    f.app.last_failure_ns = f.app.fake_now_ns.?;
+    try testing.expectEqual(@as(u32, 12), f.app.effectiveFailures());
+    f.app.fake_now_ns.? += 16 * 60 * std.time.ns_per_s;
+    try testing.expectEqual(@as(u32, 0), f.app.effectiveFailures());
+
+    // Many attempts waiting out a delay: the extra ones are turned away at once.
+    f.app.skip_delay = false;
+    f.app.failures = 8; // a 4 s delay
+    f.app.last_failure_ns = f.app.fake_now_ns.?;
+    f.app.waiting.store(max_waiting, .release);
+    const throttled = try f.call(a, .POST, "/login", .{ .body = "credential=correct+horse" });
+    try testing.expectEqual(http.Status.too_many_requests, throttled.status);
+    try testing.expect(Fixture.header(throttled, "retry-after") != null);
+    f.app.waiting.store(0, .release);
+    f.app.failures = 0;
+    f.app.skip_delay = true;
 
     f.app.verifying.store(max_verifications, .release);
     const busy = try f.call(a, .POST, "/login", .{ .body = "credential=correct+horse" });

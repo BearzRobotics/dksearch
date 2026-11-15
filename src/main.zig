@@ -330,7 +330,7 @@ fn secretsPath(arena: std.mem.Allocator, cfg: dk.config.Config) ![]const u8 {
 
 fn secretsProblem(io: Io, path: []const u8, e: dk.secrets.Error) void {
     switch (e) {
-        error.InsecurePermissions => err(io, "{s} can be read by other users; run `chmod 600 {s}` (or create new credentials, which rewrites it safely)", .{ path, path }),
+        error.InsecurePermissions => err(io, "{s} can be read by other users; run `chmod 600 {s}` (or delete it and create new credentials)", .{ path, path }),
         error.Malformed => err(io, "{s} is not a valid credentials file; fix or delete it and create credentials again", .{path}),
         error.OutOfMemory => err(io, "out of memory", .{}),
         else => err(io, "cannot read {s}: {t}", .{ path, e }),
@@ -347,6 +347,7 @@ fn readPassword(io: Io, gpa: std.mem.Allocator) ?[]u8 {
         if (std.posix.tcgetattr(stdin.handle)) |orig| {
             var raw = orig;
             raw.lflag.ECHO = false;
+            raw.lflag.ISIG = false; // Ctrl-C arrives as a byte, so echo is always restored
             std.posix.tcsetattr(stdin.handle, .FLUSH, raw) catch {};
             restore = orig;
         } else |_| {}
@@ -385,6 +386,12 @@ fn readLine(io: Io, gpa: std.mem.Allocator, prompt: ?[]const u8) ?[]u8 {
         const n = Io.File.stdin().readStreaming(io, &bufs) catch break;
         if (n == 0) break;
         if (byte[0] == '\n') break;
+        if (byte[0] == 0x03) { // Ctrl-C at the prompt (signals are off while reading)
+            std.crypto.secureZero(u8, line.items);
+            line.deinit(gpa);
+            if (prompt != null) Io.File.stderr().writeStreamingAll(io, "\n") catch {};
+            return null;
+        }
         line.append(gpa, byte[0]) catch return null;
     }
     if (prompt != null) Io.File.stderr().writeStreamingAll(io, "\n") catch {};
@@ -428,6 +435,10 @@ fn adminCredentialCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, 
         defer {
             std.crypto.secureZero(u8, password);
             gpa.free(password);
+        }
+        if (!std.unicode.utf8ValidateSlice(password)) {
+            err(io, "the password must be valid UTF-8 (the sign-in form sends UTF-8); nothing was changed", .{});
+            return exit_usage;
         }
         s.setPassword(gpa, io, password) catch |e| {
             err(io, "cannot set the password: {t} (it must be 1 to {d} bytes)", .{ e, dk.secrets.max_password_bytes });

@@ -309,6 +309,12 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
 
     cfg.sources = try readSources(a, src, root, diag);
 
+    if (cfg.server.access_log) |sl| if (cfg.admin.access_log) |al| {
+        if (std.mem.eql(u8, sl, al) and !std.mem.eql(u8, sl, "stderr")) {
+            diag.set(src, "admin.access_log", "must differ from server.access_log (two logs cannot share one file)", .{});
+            return error.InvalidValue;
+        }
+    };
     if (cfg.server.port == cfg.admin.port and std.mem.eql(u8, cfg.server.address, cfg.admin.address)) {
         diag.set(src, "admin", "admin and server must not share the same address and port", .{});
         return error.InvalidValue;
@@ -776,6 +782,8 @@ test "admin and access log settings" {
 
     // These keys exist only on [admin]; bad values are named.
     try testing.expectError(error.UnknownKey, loadFromSlice(testing.allocator, "t.toml", "[server]\ncookie_secure = true", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[server]\naccess_log = \"/x.log\"\n[admin]\naccess_log = \"/x.log\"", &d));
+    try testing.expectEqualStrings("admin.access_log", d.key());
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[admin]\nsession_idle_minutes = 0", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[admin]\nsession_max_hours = 1000", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[server]\naccess_log = \"\"", &d));

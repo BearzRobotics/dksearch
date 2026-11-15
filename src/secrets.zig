@@ -160,7 +160,10 @@ pub fn parse(gpa: Allocator, text: []const u8) Error!Secrets {
 /// file and a rename, so a crash never leaves a half-written file.
 pub fn save(io: Io, dir: Io.Dir, path: []const u8, s: Secrets) Error!void {
     var tmp_name_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp = std.fmt.bufPrint(&tmp_name_buf, "{s}.tmp", .{path}) catch return error.WriteFailed;
+    // A random suffix, so two concurrent writers cannot interleave on one file.
+    var rnd: [4]u8 = undefined;
+    io.random(&rnd);
+    const tmp = std.fmt.bufPrint(&tmp_name_buf, "{s}.{x}.tmp", .{ path, rnd }) catch return error.WriteFailed;
 
     var body: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&body);
