@@ -1,0 +1,128 @@
+<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mediawiki.org/xml/export-0.11/ http://www.mediawiki.org/xml/export-0.11.xsd" version="0.11" xml:lang="en">
+  <siteinfo>
+    <sitename>Examplepedia</sitename>
+    <dbname>examplewiki</dbname>
+    <base>https://en.wikipedia.org/wiki/Main_Page</base>
+    <generator>MediaWiki fixture</generator>
+    <case>first-letter</case>
+    <namespaces>
+      <namespace key="0" case="first-letter" />
+      <namespace key="1" case="first-letter">Talk</namespace>
+    </namespaces>
+  </siteinfo>
+  <page>
+    <title>Quartz Lighthouse</title>
+    <ns>0</ns>
+    <id>101</id>
+    <revision>
+      <id>9001</id>
+      <parentid>9000</parentid>
+      <timestamp>2024-03-05T10:20:30Z</timestamp>
+      <contributor>
+        <username>Example editor</username>
+        <id>7777</id>
+      </contributor>
+      <comment>fixture</comment>
+      <model>wikitext</model>
+      <format>text/x-wiki</format>
+      <text bytes="416" xml:space="preserve">{{Infobox building
+| name = infoboxdata
+}}
+The '''Quartz Lighthouse''' is a [[lighthouse]] on the [[Example Coast|coast]].&lt;ref name="a"&gt;{{cite book|title=refcitation}}&lt;/ref&gt;
+
+== History ==
+It was built in &amp;nbsp;1850 &amp;ndash; the keeper lit the great lamp each dusk.[[File:Quartz.jpg|thumb|A caption]]
+
+{| class="wikitable"
+| tablecell
+|}
+
+[[Category:Lighthouses]]
+
+== References ==
+{{reflist}}
+* referencesection
+</text>
+      <sha1>fixture</sha1>
+    </revision>
+  </page>
+  <page>
+    <title>QL</title>
+    <ns>0</ns>
+    <id>102</id>
+    <redirect title="Quartz Lighthouse" />
+    <revision>
+      <id>9101</id>
+      <parentid>9100</parentid>
+      <timestamp>2024-03-06T00:00:00Z</timestamp>
+      <contributor>
+        <username>Example editor</username>
+        <id>7777</id>
+      </contributor>
+      <comment>fixture</comment>
+      <model>wikitext</model>
+      <format>text/x-wiki</format>
+      <text bytes="31" xml:space="preserve">#REDIRECT [[Quartz Lighthouse]]</text>
+      <sha1>fixture</sha1>
+    </revision>
+  </page>
+  <page>
+    <title>Talk:Quartz Lighthouse</title>
+    <ns>1</ns>
+    <id>103</id>
+    <revision>
+      <id>9201</id>
+      <parentid>9200</parentid>
+      <timestamp>2024-03-07T00:00:00Z</timestamp>
+      <contributor>
+        <username>Example editor</username>
+        <id>7777</id>
+      </contributor>
+      <comment>fixture</comment>
+      <model>wikitext</model>
+      <format>text/x-wiki</format>
+      <text bytes="30" xml:space="preserve">Discussion about talkpageword.</text>
+      <sha1>fixture</sha1>
+    </revision>
+  </page>
+  <page>
+    <title>Rhubarb</title>
+    <ns>0</ns>
+    <id>104</id>
+    <revision>
+      <id>9301</id>
+      <parentid>9300</parentid>
+      <timestamp>2024-03-08T08:09:10Z</timestamp>
+      <contributor>
+        <username>Example editor</username>
+        <id>7777</id>
+      </contributor>
+      <comment>fixture</comment>
+      <model>wikitext</model>
+      <format>text/x-wiki</format>
+      <text bytes="53" xml:space="preserve">'''Rhubarb''' needs deep soil &amp; patience; x &lt; y &gt; z.
+</text>
+      <sha1>fixture</sha1>
+    </revision>
+  </page>
+  <page>
+    <title>Café Société (Paris)</title>
+    <ns>0</ns>
+    <id>105</id>
+    <revision>
+      <id>9401</id>
+      <parentid>9400</parentid>
+      <timestamp>2024-03-09T01:02:03Z</timestamp>
+      <contributor>
+        <username>Example editor</username>
+        <id>7777</id>
+      </contributor>
+      <comment>fixture</comment>
+      <model>wikitext</model>
+      <format>text/x-wiki</format>
+      <text bytes="55" xml:space="preserve">A café in Paris with ünïcode text about [[otters]].
+</text>
+      <sha1>fixture</sha1>
+    </revision>
+  </page>
+</mediawiki>

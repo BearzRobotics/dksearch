@@ -74,4 +74,4 @@ Built 2026-11-14 as `src/connectors/gutenberg.zig` with the CSV reader in `src/c
 
 Answered by the maintainer's acceptance of this record: the small CSV reader (decision 4) and vendoring libbz2 and expat for Wikipedia (decisions 5 and 6) are accepted.
 
-Still open: which Gutenberg and Wikipedia language editions matter first. It affects tokenizer work (today only the `unicode61` tokenizer is used) and is not needed until the connectors are built.
+Answered later (2026-11-14): English first. Still open: other language editions. It affects tokenizer work (today only the `unicode61` tokenizer is used) and is not needed until the connectors are built.

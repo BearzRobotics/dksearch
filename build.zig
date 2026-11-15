@@ -33,6 +33,60 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Optional: the Wikipedia connector and the two C libraries it needs
+    // (bzip2 for the dump's compression, Expat for its XML). Build without
+    // them with `-Dwikipedia=false`: nothing of either is then compiled or
+    // linked (docs/decisions/0007, 0011). Windows is not supported yet.
+    const target_os = target.result.os.tag;
+    const want_wikipedia = b.option(bool, "wikipedia", "Build the Wikipedia connector with vendored bzip2 and Expat (default: on, except on Windows)") orelse (target_os != .windows);
+    if (want_wikipedia and target_os == .windows) @panic("-Dwikipedia=true is not supported on Windows yet");
+    const wiki_c: ?*std.Build.Module = if (want_wikipedia) blk: {
+        const tc = b.addTranslateC(.{
+            .root_source_file = b.path("vendor/wikipedia_c.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        tc.addIncludePath(b.path("vendor/bzip2"));
+        tc.addIncludePath(b.path("vendor/expat"));
+        const m = tc.createModule();
+        m.addCSourceFiles(.{
+            .root = b.path("vendor/bzip2"),
+            .files = &.{ "blocksort.c", "bzlib.c", "compress.c", "crctable.c", "decompress.c", "huffman.c", "randtable.c" },
+            .flags = &.{"-D_FILE_OFFSET_BITS=64"},
+        });
+        // Expat salts its hash tables with system entropy; which source to
+        // use depends on the target. XML_GE=0 (no entity expansion) and no DTD
+        // support are set in vendor/expat/expat_config.h.
+        const little = target.result.cpu.arch.endian() == .little;
+        const entropy_flags: []const []const u8 = if (target_os == .linux)
+            &.{ "-DHAVE_GETRANDOM", "-DXML_DEV_URANDOM" }
+        else
+            &.{"-DHAVE_ARC4RANDOM_BUF"};
+        const entropy_files: []const []const u8 = if (target_os == .linux)
+            &.{ "random_getrandom.c", "random_dev_urandom.c" }
+        else
+            &.{"random_arc4random_buf.c"};
+        const byte_order: []const u8 = if (little) "-DBYTEORDER=1234" else "-DBYTEORDER=4321";
+        const expat_flags = std.mem.concat(b.allocator, []const u8, &.{ &.{ "-DHAVE_EXPAT_CONFIG_H", byte_order }, entropy_flags }) catch @panic("out of memory");
+        m.addCSourceFiles(.{
+            .root = b.path("vendor/expat"),
+            .files = &.{ "xcs.c", "xmlparse.c", "xmlrole.c", "xmltok.c" },
+            .flags = expat_flags,
+        });
+        m.addCSourceFiles(.{
+            .root = b.path("vendor/expat"),
+            .files = entropy_files,
+            .flags = expat_flags,
+        });
+        m.addIncludePath(b.path("vendor/expat"));
+        m.addIncludePath(b.path("vendor/bzip2"));
+        break :blk m;
+    } else null;
+
+    const core_options = b.addOptions();
+    core_options.addOption(bool, "wikipedia", want_wikipedia);
+
     // The core library. It must stay independent of HTTP, the web UI and
     // individual connectors (ai/AGENTS.md section 3).
     const core = b.addModule("dksearch", .{
@@ -42,8 +96,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "toml", .module = toml },
             .{ .name = "sqlite_c", .module = sqlite },
+            .{ .name = "build_options", .module = core_options.createModule() },
         },
     });
+    if (wiki_c) |m| core.addImport("wiki_c", m);
 
     // The HTTP adapter: a separate module that imports the core.
     const http = b.addModule("dksearch_http", .{

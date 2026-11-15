@@ -25,7 +25,7 @@ dksearch check-config FILE
 DESCRIPTION
 dksearch is an independently operated, self-hostable search engine. It maintains its own full-text index and does not use an external search provider.
 
-This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles two: `files`, which indexes plain-text and Markdown files from a local directory, and `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded. A connector for Wikipedia is planned. The administration interface is not implemented; the `[admin]` configuration table is validated but nothing listens on it.
+This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles three: `files`, which indexes plain-text and Markdown files from a local directory; `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded; and `wikipedia`, which indexes the articles of a Wikipedia dump file you have already downloaded. The `wikipedia` connector is built by default and can be left out with `zig build -Dwikipedia=false`. The administration interface is not implemented; the `[admin]` configuration table is validated but nothing listens on it.
 
 CONVENTIONS
 Bold represents literal commands, options, and keywords.
@@ -192,7 +192,7 @@ Each `[[source]]` table has these keys. Any other key is an option of the connec
 
 Key	Type	Default	Description
 name	String	required	Unique name, 1-64 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit. Resume positions are kept per name, and it becomes the `connector` of each document, so renaming a source makes it start afresh and its old documents stay under the old name.
-kind	String	required	Connector type. This version knows `files` and `gutenberg`.
+kind	String	required	Connector type. This version knows `files`, `gutenberg` and `wikipedia` (the last only in builds that include it).
 enabled	Boolean	true	A disabled source stays in the file but is never run.
 retain_text	Boolean	true	Keep each document's text so the index can be rebuilt without reading the source again. Set false for a source whose terms forbid keeping its text; its documents are then skipped by **rebuild**.
 
@@ -231,6 +231,27 @@ Example:
     catalog = "/data/gutenberg/pg_catalog.csv"
     books = "/data/gutenberg/books"
     language = "en"
+
+Kind `wikipedia` indexes the articles of a Wikipedia (MediaWiki) XML dump such as `enwiki-YYYYMMDD-pages-articles-multistream.xml.bz2`. It never uses the network: download the dump yourself, from https://dumps.wikimedia.org/ or a mirror, and read the terms there.
+
+Key	Type	Default	Description
+dump	String	required	Path of the dump: a `.bz2` file (multistream or single stream) or a plain `.xml` file.
+language	String	`en`	Language tag stored on each document.
+url_base	String	`https://LANGUAGE.wikipedia.org/wiki/`	Prefix of article URLs; must start with http:// or https:// and end in `/`.
+dataset_version	String	none	A label for the dump, such as its date, stored on each document.
+max_article_bytes	Integer	8388608	Largest article text accepted, 1-67108864. Larger articles are refused, never truncated.
+
+Only articles are indexed: pages in the main namespace (0) that are not redirects and have text. Other namespaces (talk, user, template, category, file pages) and redirects are skipped. The wikitext is converted to plain text by a deliberately modest converter, so it is good for searching, not a faithful rendering: templates (including infoboxes), tables, references, comments, galleries and math are dropped; links keep their label; bold, italic, list and heading marks are removed; and everything from a "References", "External links", "See also", "Notes", "Further reading" or similar level-2 heading to the end is dropped. The id is derived from the source name and the page id; the revision is the revision id, so a newer dump updates changed articles and skips unchanged ones. Each document records the dataset "Wikipedia", the dump label, the article URL, the revision timestamp as modified date, and rights: the license `CC-BY-SA-4.0` with its URL, an attribution line pointing to the article's page history, and a note about the older GFDL license. Wikipedia's text is free to reuse only under those license conditions, which include attribution and share-alike; the search results show the source so that attribution is possible. Images and other media are not imported.
+
+The position is saved after every bzip2 stream (Wikipedia's multistream dumps hold about 100 pages per stream) or, for a plain XML file, every 100 pages, so an interrupted import of a very large dump resumes close to where it stopped. A single-stream `.bz2` file cannot be entered in the middle and starts over each time, skipping unchanged pages. A truncated or damaged dump fails the job; what was committed before the damage stays.
+
+Example:
+
+    [[source]]
+    name = "wikipedia-en"
+    kind = "wikipedia"
+    dump = "/data/wikipedia/enwiki-20260101-pages-articles-multistream.xml.bz2"
+    dataset_version = "20260101"
 
 Validation, unknown keys, reload behavior, versioning, and migration rules
 The whole file is validated before anything starts, including every source's options. Unknown keys, wrong types and out-of-range values are errors that name the file and the key, for example `dksearch.toml: server.prot: unknown key`; a misspelled setting is never silently ignored. `admin` and `server` may not share the same address and port. There is no reload: configuration is read once at start, so a restart is required to apply changes. There is no configuration versioning yet.
@@ -308,6 +329,8 @@ SQLite is compiled without extension loading, so no native code is loaded at run
 
 The index directory should be writable only by the account running dksearch. There are no secrets in the configuration at present.
 
+The `wikipedia` connector treats the dump as untrusted input: it refuses any XML document type declaration (so entity-expansion attacks cannot work), bounds nesting depth and the size of every field and article, converts the text in time linear in its size, and executes nothing. It reads only the one file named by `dump`. The bundled bzip2 and Expat libraries are vendored, and Expat is built without general entity expansion or DTD support.
+
 The `gutenberg` connector treats the catalog and the book files as untrusted input: it bounds field and file sizes, refuses malformed catalogs and invalid text, derives file names only from validated numeric catalog ids, never follows symbolic links, and executes nothing. Project Gutenberg's license and trademark terms apply to the books you import; read them at https://www.gutenberg.org/policy/license.html before redistributing text or running a public service with it.
 
 The `files` connector treats the directory tree as untrusted input. It never follows symbolic links, skips hidden entries, reads only regular files with the expected extensions, enforces a size limit, rejects invalid text, and executes nothing. It indexes only what its account can read, and the text of every indexed file becomes searchable and is shown in results, so point it only at directories whose contents may be searched by everyone who can reach the server. Result URLs for these files are `file://` URLs, which the HTML page shows as plain text, not links.
@@ -347,7 +370,7 @@ Stability guarantees
 The `/api/v1/` API is intended to be stable within version 1 (see dksearch-api(7)). The command-line syntax, configuration keys and diagnostics text are experimental at version 0.
 
 LIMITATIONS
-Two connectors are bundled (`files` and `gutenberg`); Wikipedia is planned. The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. No administration interface. No TLS. No reload or request log. Only the `unicode61` tokenizer is used, so languages without word separators (such as Chinese or Japanese) are not segmented well. Index size and query time at large scale have not been measured.
+Three connectors are bundled (`files`, `gutenberg` and `wikipedia`). The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. No administration interface. No TLS. No reload or request log. Only the `unicode61` tokenizer is used, so languages without word separators (such as Chinese or Japanese) are not segmented well. Index size and query time at large scale have not been measured.
 
 BUGS
 No issue tracker is published yet. When one exists it will be listed under AVAILABILITY. Include the dksearch version, the configuration file, the full diagnostic output and the request that failed.

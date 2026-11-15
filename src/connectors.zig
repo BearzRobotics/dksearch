@@ -11,17 +11,36 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const config = @import("config.zig");
 const api = @import("connector.zig");
+const build_options = @import("build_options");
 
 pub const files = @import("connectors/files.zig");
 pub const gutenberg = @import("connectors/gutenberg.zig");
+/// Present only in builds with `-Dwikipedia` (the default); see build.zig.
+pub const have_wikipedia = build_options.wikipedia;
+pub const wikipedia = if (have_wikipedia) @import("connectors/wikipedia.zig") else struct {};
 
 /// Every kind this build knows, for help text and error messages.
-pub const kinds = [_][]const u8{ files.kind, gutenberg.kind };
+pub const kinds = if (have_wikipedia)
+    [_][]const u8{ files.kind, gutenberg.kind, wikipedia.kind }
+else
+    [_][]const u8{ files.kind, gutenberg.kind };
+
+/// "files, gutenberg, wikipedia", for messages.
+pub const kinds_text = if (have_wikipedia) "files, gutenberg, wikipedia" else "files, gutenberg";
+
+/// Stands in for a connector that this build leaves out; never created.
+const Absent = struct {
+    pub fn deinit(_: *Absent) void {}
+    pub fn connector(_: *Absent) api.Connector {
+        unreachable;
+    }
+};
 
 /// A connector instance of any bundled kind.
 pub const Instance = union(enum) {
     files: files.FilesConnector,
     gutenberg: gutenberg.GutenbergConnector,
+    wikipedia: if (have_wikipedia) wikipedia.WikipediaConnector else Absent,
 
     pub fn deinit(self: *Instance) void {
         switch (self.*) {
@@ -41,8 +60,9 @@ pub const Instance = union(enum) {
 pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!void {
     if (std.mem.eql(u8, source.kind, files.kind)) return files.validate(source, diag);
     if (std.mem.eql(u8, source.kind, gutenberg.kind)) return gutenberg.validate(source, diag);
+    if (have_wikipedia and std.mem.eql(u8, source.kind, "wikipedia")) return wikipedia.validate(source, diag);
     var kbuf: [128]u8 = undefined;
-    diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].kind", .{source.name}) catch "kind", "unknown connector kind \"{s}\" (this build has: files, gutenberg)", .{source.kind});
+    diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].kind", .{source.name}) catch "kind", "unknown connector kind \"{s}\" (this build has: {s})", .{ source.kind, kinds_text });
     return error.InvalidValue;
 }
 
@@ -57,6 +77,7 @@ pub fn validateAll(sources: []const config.Source, diag: *config.Diagnostic) con
 pub fn create(gpa: Allocator, io: Io, source: config.Source) Allocator.Error!Instance {
     if (std.mem.eql(u8, source.kind, files.kind)) return .{ .files = try files.FilesConnector.init(gpa, io, source) };
     if (std.mem.eql(u8, source.kind, gutenberg.kind)) return .{ .gutenberg = try gutenberg.GutenbergConnector.init(gpa, io, source) };
+    if (have_wikipedia and std.mem.eql(u8, source.kind, "wikipedia")) return .{ .wikipedia = try wikipedia.WikipediaConnector.init(gpa, io, source) };
     unreachable; // `validate` rejects unknown kinds
 }
 

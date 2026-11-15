@@ -34,5 +34,6 @@ test {
     _ = runner;
     _ = connectors;
     _ = maintenance;
+    if (connectors.have_wikipedia) _ = connectors.wikipedia;
     _ = @import("sqlite.zig");
 }
