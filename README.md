@@ -6,11 +6,11 @@ Status: version 0.0.0, pre-release. It works end to end and is tested (over 220 
 
 ## Build
 
-Needs Zig 0.17.1 and nothing else. All dependencies are vendored (SQLite, a TOML parser, and for the Wikipedia connector bzip2 and Expat).
+Needs Zig 0.17.1 and nothing else. All dependencies are vendored (SQLite, a TOML parser, and for the Wikipedia and feeds connectors Expat and, for Wikipedia, bzip2).
 
     zig build -Doptimize=ReleaseSafe     # binary: zig-out/bin/dksearch
     zig build test                       # all tests; they run offline
-    zig build -Dwikipedia=false          # leave out the Wikipedia connector and its C libraries
+    zig build -Dwikipedia=false -Dfeeds=false   # leave out those connectors and the C libraries they need
 
 ## Try it
 
@@ -34,7 +34,7 @@ Sources are optional. With none configured, `serve` still works and serves whate
 
 - **Search**: SQLite FTS5 with title and body weighting, phrase and multi-term queries, snippets, filters and stable paging; optional English stemming (`[index] tokenizer = "porter"`). User text is never interpreted as query syntax. Searches run on a pool of read-only connections, so concurrent queries scale across CPU cores.
 - **Public interface**: a server-rendered HTML page (no JavaScript) and a versioned JSON API, both read-only.
-- **Connectors** (all optional): local `.txt`/`.md` files; Project Gutenberg (catalog CSV plus book files you downloaded); Wikipedia (a `pages-articles` dump, bzip2 or plain XML). Imports resume where they stopped and skip unchanged documents.
+- **Connectors** (all optional, all read local files and never use the network): local `.txt`/`.md` files; Project Gutenberg (catalog CSV plus book files you downloaded); Wikipedia (a `pages-articles` dump, bzip2 or plain XML); RSS and Atom feed files. Imports resume where they stopped and skip unchanged documents.
 - **Operations**: `rebuild` the index from retained content, `check` the stored data (including every text's hash), `backup` it safely while running, `remove` a source, `import --prune` documents that left a source.
 - **Administration**: a separate listener with a dashboard, an import-jobs page, counters, a query-testing page that shows ranking scores, and a JSON API, behind a bearer token or a password (credentials are kept only as hashes). Read-only unless you set `admin.actions = true`, which lets it start and cancel imports.
 - **Privacy**: no telemetry, no request log by default; the optional access log never records queries or client details.

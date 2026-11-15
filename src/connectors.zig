@@ -18,15 +18,25 @@ pub const gutenberg = @import("connectors/gutenberg.zig");
 /// Present only in builds with `-Dwikipedia` (the default); see build.zig.
 pub const have_wikipedia = build_options.wikipedia;
 pub const wikipedia = if (have_wikipedia) @import("connectors/wikipedia.zig") else struct {};
+/// Present only in builds with `-Dfeeds` (the default).
+pub const have_feeds = build_options.feeds;
+pub const feeds = if (have_feeds) @import("connectors/feeds.zig") else struct {};
 
 /// Every kind this build knows, for help text and error messages.
-pub const kinds = if (have_wikipedia)
-    [_][]const u8{ files.kind, gutenberg.kind, wikipedia.kind }
-else
-    [_][]const u8{ files.kind, gutenberg.kind };
+pub const kinds = blk: {
+    var k: []const []const u8 = &.{ files.kind, gutenberg.kind };
+    if (have_wikipedia) k = k ++ &[_][]const u8{wikipedia.kind};
+    if (have_feeds) k = k ++ &[_][]const u8{feeds.kind};
+    break :blk k;
+};
 
 /// "files, gutenberg, wikipedia", for messages.
-pub const kinds_text = if (have_wikipedia) "files, gutenberg, wikipedia" else "files, gutenberg";
+pub const kinds_text = blk: {
+    var t: []const u8 = "files, gutenberg";
+    if (have_wikipedia) t = t ++ ", wikipedia";
+    if (have_feeds) t = t ++ ", feeds";
+    break :blk t;
+};
 
 /// Stands in for a connector that this build leaves out; never created.
 const Absent = struct {
@@ -41,6 +51,7 @@ pub const Instance = union(enum) {
     files: files.FilesConnector,
     gutenberg: gutenberg.GutenbergConnector,
     wikipedia: if (have_wikipedia) wikipedia.WikipediaConnector else Absent,
+    feeds: if (have_feeds) feeds.FeedsConnector else Absent,
 
     pub fn deinit(self: *Instance) void {
         switch (self.*) {
@@ -61,6 +72,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     if (std.mem.eql(u8, source.kind, files.kind)) return files.validate(source, diag);
     if (std.mem.eql(u8, source.kind, gutenberg.kind)) return gutenberg.validate(source, diag);
     if (have_wikipedia and std.mem.eql(u8, source.kind, "wikipedia")) return wikipedia.validate(source, diag);
+    if (have_feeds and std.mem.eql(u8, source.kind, "feeds")) return feeds.validate(source, diag);
     var kbuf: [128]u8 = undefined;
     diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].kind", .{source.name}) catch "kind", "unknown connector kind \"{s}\" (this build has: {s})", .{ source.kind, kinds_text });
     return error.InvalidValue;
@@ -78,6 +90,7 @@ pub fn create(gpa: Allocator, io: Io, source: config.Source) Allocator.Error!Ins
     if (std.mem.eql(u8, source.kind, files.kind)) return .{ .files = try files.FilesConnector.init(gpa, io, source) };
     if (std.mem.eql(u8, source.kind, gutenberg.kind)) return .{ .gutenberg = try gutenberg.GutenbergConnector.init(gpa, io, source) };
     if (have_wikipedia and std.mem.eql(u8, source.kind, "wikipedia")) return .{ .wikipedia = try wikipedia.WikipediaConnector.init(gpa, io, source) };
+    if (have_feeds and std.mem.eql(u8, source.kind, "feeds")) return .{ .feeds = try feeds.FeedsConnector.init(gpa, io, source) };
     unreachable; // `validate` rejects unknown kinds
 }
 

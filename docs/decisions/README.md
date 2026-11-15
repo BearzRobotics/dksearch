@@ -11,7 +11,7 @@ Each record states the context, the options considered, the decision and who mad
 | 5. API protocol, versioning, authentication | decided: versioned JSON; admin token and password | 0004, 0012 |
 | 6. Languages and tokenization | English first; `unicode61` default, optional `porter`; CJK deferred | 0007, 0013 |
 | 7. Installation targets and service integration | decided minimally: Linux and systemd from source | 0015 |
-| 8. Connector packaging and plugin boundary | built-in connectors behind one interface, chosen at compile time (`-Dwikipedia`); no runtime plugins | 0002, 0007, 0011 |
+| 8. Connector packaging and plugin boundary | built-in connectors behind one interface, chosen at compile time (`-Dwikipedia`, `-Dfeeds`); no runtime plugins | 0002, 0007, 0011, 0016 |
 | 9. Index partitioning and multi-collection | open | |
 | 10. Federation trust and synchronization | open | |
 
@@ -32,3 +32,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0013 | Optional English stemming |
 | 0014 | Admin actions |
 | 0015 | Installation targets |
+| 0016 | Feeds connector and the XML build split |

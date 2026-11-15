@@ -8,7 +8,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const c = @import("wiki_c");
+const c = @import("bz2_c");
 
 pub const Error = error{
     /// Not bzip2, damaged, or cut off.

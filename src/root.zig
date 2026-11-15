@@ -39,5 +39,6 @@ test {
     _ = secrets;
     _ = jobs;
     if (connectors.have_wikipedia) _ = connectors.wikipedia;
+    if (connectors.have_feeds) _ = connectors.feeds;
     _ = @import("sqlite.zig");
 }

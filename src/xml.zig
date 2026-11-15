@@ -3,7 +3,7 @@
 //! `Parser(Handler)` calls three methods of `Handler`, each taking the
 //! parser so it can stop it or ask where it is:
 //!
-//!   startElement(h: *Handler, p: *P, name: []const u8) void
+//!   startElement(h: *Handler, p: *P, name: []const u8, attrs: Attrs) void
 //!   endElement(h: *Handler, p: *P, name: []const u8) void
 //!   characters(h: *Handler, p: *P, bytes: []const u8) void
 //!
@@ -15,7 +15,7 @@
 //! chunks.
 
 const std = @import("std");
-const c = @import("wiki_c");
+const c = @import("expat_c");
 
 pub const Error = error{
     /// Not well-formed XML, or a DOCTYPE was present.
@@ -23,6 +23,22 @@ pub const Error = error{
     /// A handler called `stop`.
     Stopped,
     OutOfMemory,
+};
+
+/// The attributes of a start tag.
+pub const Attrs = struct {
+    raw: [*c][*c]const c.XML_Char,
+
+    /// The value of attribute `name`, if present. The slice is valid during
+    /// the handler call only.
+    pub fn get(self: Attrs, name: []const u8) ?[]const u8 {
+        var i: usize = 0;
+        while (self.raw[i] != null) : (i += 2) {
+            const k = std.mem.span(@as([*:0]const u8, @ptrCast(self.raw[i])));
+            if (std.mem.eql(u8, k, name)) return std.mem.span(@as([*:0]const u8, @ptrCast(self.raw[i + 1])));
+        }
+        return null;
+    }
 };
 
 pub fn Parser(comptime Handler: type) type {
@@ -86,9 +102,9 @@ pub fn Parser(comptime Handler: type) type {
             return @ptrCast(@alignCast(ud.?));
         }
 
-        fn onStart(ud: ?*anyopaque, name: [*c]const c.XML_Char, _: [*c][*c]const c.XML_Char) callconv(.c) void {
+        fn onStart(ud: ?*anyopaque, name: [*c]const c.XML_Char, atts: [*c][*c]const c.XML_Char) callconv(.c) void {
             const s = self_(ud);
-            s.handler.startElement(s, std.mem.span(@as([*:0]const u8, @ptrCast(name))));
+            s.handler.startElement(s, std.mem.span(@as([*:0]const u8, @ptrCast(name))), .{ .raw = atts });
         }
 
         fn onEnd(ud: ?*anyopaque, name: [*c]const c.XML_Char) callconv(.c) void {

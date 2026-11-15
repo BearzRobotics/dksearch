@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>The Example Harbour Log</title>
+    <link>https://example.org/log/</link>
+    <description>Invented news from an invented harbour.</description>
+    <language>en-gb</language>
+    <lastBuildDate>Tue, 10 Jun 2003 04:00:00 GMT</lastBuildDate>
+    <item>
+      <title>New &amp; improved lamp</title>
+      <link>https://example.org/log/lamp</link>
+      <guid isPermaLink="true">https://example.org/log/lamp</guid>
+      <pubDate>Tue, 10 Jun 2003 04:00:00 GMT</pubDate>
+      <dc:creator>Alice Example</dc:creator>
+      <category>lighthouses</category>
+      <category>engineering</category>
+      <description><![CDATA[<p>The keeper installed a <b>brilliant</b> lamp.</p><p>Gulls approved.</p>]]></description>
+    </item>
+    <item>
+      <title>Fog horn tests</title>
+      <link>https://example.org/log/fog</link>
+      <guid>fog-2003-06</guid>
+      <pubDate>Wed, 11 Jun 2003 09:30:00 +0200</pubDate>
+      <description>short summary only</description>
+      <content:encoded><![CDATA[<h2>Fog horn</h2><p>Full story about the <i>foghornword</i> trials.</p><script>evil()</script>]]></content:encoded>
+    </item>
+    <item>
+      <title>An entry with no body</title>
+      <link>https://example.org/log/empty</link>
+    </item>
+    <item>
+      <description>an entry with no id or link at all</description>
+    </item>
+  </channel>
+</rss>

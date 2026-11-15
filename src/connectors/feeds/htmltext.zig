@@ -1,0 +1,188 @@
+//! HTML (as found in feed entries) to plain text, for search.
+//!
+//! Tags are dropped, block-level tags (paragraphs, line breaks, list items,
+//! headings, table rows) become line breaks, `<script>` and `<style>` content
+//! is removed with the tags, comments are removed, and the common entities
+//! and numeric character references are decoded. It is not an HTML parser
+//! and never fails on malformed markup: whatever it cannot make sense of is
+//! kept as text. Linear time; only ASCII structure is touched, so UTF-8
+//! input stays valid UTF-8.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const block_tags = [_][]const u8{
+    "p",  "br", "div", "li",    "ul",         "ol",  "h1", "h2",      "h3",      "h4",     "h5",     "h6",
+    "tr", "td", "th",  "table", "blockquote", "pre", "hr", "section", "article", "header", "footer",
+};
+const dropped_tags = [_][]const u8{ "script", "style", "head", "noscript" };
+
+pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < html.len) {
+        const ch = html[i];
+        if (ch == '<') {
+            if (std.mem.startsWith(u8, html[i..], "<!--")) {
+                const end = std.mem.indexOfPos(u8, html, i + 4, "-->");
+                i = if (end) |e| e + 3 else html.len;
+                continue;
+            }
+            if (tagAt(html, i)) |t| {
+                if (!t.closing and !t.self_closing and isOneOf(t.name, &dropped_tags)) {
+                    i = endOf(html, t.end, t.name) orelse t.end;
+                    continue;
+                }
+                if (isOneOf(t.name, &block_tags)) try out.append(arena, '\n');
+                i = t.end;
+                continue;
+            }
+        } else if (ch == '&') {
+            if (try entity(arena, &out, html, &i)) continue;
+        }
+        try out.append(arena, ch);
+        i += 1;
+    }
+    return tidy(arena, out.items);
+}
+
+const Tag = struct { name: []const u8, closing: bool, self_closing: bool, end: usize };
+
+/// A tag starting at `i` (the `<`), if it looks like one.
+fn tagAt(s: []const u8, i: usize) ?Tag {
+    const limit = @min(s.len, i + 2048);
+    const gt = std.mem.indexOfScalarPos(u8, s[0..limit], i + 1, '>') orelse return null;
+    var j = i + 1;
+    const closing = j < gt and s[j] == '/';
+    if (closing) j += 1;
+    const start = j;
+    while (j < gt and std.ascii.isAlphanumeric(s[j])) j += 1;
+    if (j == start) return null; // "a < b" or "<>" is text
+    return .{ .name = s[start..j], .closing = closing, .self_closing = s[gt - 1] == '/', .end = gt + 1 };
+}
+
+fn isOneOf(name: []const u8, list: []const []const u8) bool {
+    for (list) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
+    return false;
+}
+
+/// Index just after `</name>`, searching from `from`.
+fn endOf(s: []const u8, from: usize, name: []const u8) ?usize {
+    var i = from;
+    while (std.mem.indexOfScalarPos(u8, s, i, '<')) |lt| {
+        if (lt + 2 + name.len <= s.len and s[lt + 1] == '/' and std.ascii.eqlIgnoreCase(s[lt + 2 .. lt + 2 + name.len], name)) {
+            const gt = std.mem.indexOfScalarPos(u8, s, lt, '>') orelse return null;
+            return gt + 1;
+        }
+        i = lt + 1;
+    }
+    return null;
+}
+
+fn entity(arena: Allocator, out: *std.ArrayList(u8), s: []const u8, i: *usize) Allocator.Error!bool {
+    const start = i.*;
+    const semi = std.mem.indexOfScalarPos(u8, s[0..@min(s.len, start + 12)], start + 1, ';') orelse return false;
+    const name = s[start + 1 .. semi];
+    const named = [_]struct { []const u8, []const u8 }{
+        .{ "nbsp", " " },          .{ "amp", "&" },          .{ "lt", "<" },           .{ "gt", ">" },
+        .{ "quot", "\"" },         .{ "apos", "'" },         .{ "ndash", "\u{2013}" }, .{ "mdash", "\u{2014}" },
+        .{ "hellip", "\u{2026}" }, .{ "rsquo", "\u{2019}" }, .{ "lsquo", "\u{2018}" }, .{ "rdquo", "\u{201d}" },
+        .{ "ldquo", "\u{201c}" },  .{ "copy", "\u{a9}" },    .{ "times", "\u{d7}" },   .{ "deg", "\u{b0}" },
+    };
+    for (named) |n| if (std.mem.eql(u8, name, n[0])) {
+        try out.appendSlice(arena, n[1]);
+        i.* = semi + 1;
+        return true;
+    };
+    if (name.len >= 2 and name[0] == '#') {
+        const cp = (if (name[1] == 'x' or name[1] == 'X')
+            std.fmt.parseInt(u21, name[2..], 16)
+        else
+            std.fmt.parseInt(u21, name[1..], 10)) catch return false;
+        if (cp == 0 or !std.unicode.utf8ValidCodepoint(cp)) return false;
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp, &buf) catch return false;
+        try out.appendSlice(arena, buf[0..n]);
+        i.* = semi + 1;
+        return true;
+    }
+    return false;
+}
+
+/// Trims lines, collapses runs of spaces and of blank lines.
+fn tidy(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var blank_run: usize = 0;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) {
+            blank_run += 1;
+            continue;
+        }
+        if (out.items.len > 0) try out.appendSlice(arena, if (blank_run > 1) "\n\n" else "\n");
+        blank_run = 0;
+        var prev_space = false;
+        for (line) |c| {
+            const sp = c == ' ' or c == '\t';
+            if (sp and prev_space) continue;
+            try out.append(arena, if (sp) ' ' else c);
+            prev_space = sp;
+        }
+    }
+    return out.items;
+}
+
+// ---------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+fn expectText(html: []const u8, want: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings(want, try toText(arena.allocator(), html));
+}
+
+test "paragraphs and breaks become lines; inline tags vanish" {
+    try expectText("<p>First <b>bold</b> and <a href=\"x\">link</a>.</p><p>Second.</p>", "First bold and link.\nSecond.");
+    try expectText("a<br>b<br/>c", "a\nb\nc");
+    try expectText("<ul><li>one</li><li>two</li></ul>", "one\ntwo");
+    try expectText("<h1>Title</h1>body", "Title\nbody");
+}
+
+test "script, style and comments are removed with their content" {
+    try expectText("a<script>alert('x')</script>b<style>p{}</style>c<!-- hidden -->d", "abcd");
+    try expectText("a<script>never closed", "anever closed"); // the stray tag goes, the text stays
+}
+
+test "entities and character references" {
+    try expectText("5&nbsp;km &amp; &lt;b&gt; &quot;q&quot; &#8212; &#x41; &copy;", "5 km & <b> \"q\" \u{2014} A \u{a9}");
+    try expectText("not &an entity; &#0; &#xD800; &", "not &an entity; &#0; &#xD800; &");
+}
+
+test "malformed markup is kept as text, never an error" {
+    try expectText("a < b and c > d", "a < b and c > d");
+    try expectText("<unclosed text", "<unclosed text");
+    try expectText("<>x<<p>y", "<>x<\ny");
+    try expectText("", "");
+}
+
+test "unicode survives; whitespace is tidied" {
+    try expectText("  <p>Café  \u{4e2d}\u{6587}</p>\n\n\n<p> x </p>", "Café \u{4e2d}\u{6587}\n\nx"); // a blank line stays a paragraph break
+}
+
+test "random tag soup: no crash, valid UTF-8" {
+    var prng = std.Random.DefaultPrng.init(0x4817);
+    const rnd = prng.random();
+    const pieces = [_][]const u8{ "<", ">", "</", "/>", "<p>", "</p>", "<br>", "<script>", "</script>", "<!--", "-->", "&", ";", "&amp;", "&#65;", "&#xZZ;", "caf\xc3\xa9", " ", "\n", "a", "<a href=\"", "\">", "<style>" };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for (0..4000) |_| {
+        _ = arena_state.reset(.retain_capacity);
+        var src: std.ArrayList(u8) = .empty;
+        for (0..rnd.uintLessThan(usize, 50)) |_| src.appendSlice(arena_state.allocator(), pieces[rnd.uintLessThan(usize, pieces.len)]) catch unreachable;
+        const out = try toText(arena_state.allocator(), src.items);
+        try testing.expect(std.unicode.utf8ValidateSlice(out));
+        try testing.expect(out.len <= src.items.len + 4);
+    }
+}

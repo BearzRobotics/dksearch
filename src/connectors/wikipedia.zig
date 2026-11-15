@@ -32,7 +32,7 @@ const api = @import("../connector.zig");
 const doc = @import("../document.zig");
 const files = @import("files.zig");
 const bz2 = @import("wikipedia/bz2.zig");
-const xml = @import("wikipedia/xml.zig");
+const xml = @import("../xml.zig");
 const wikitext = @import("wikipedia/wikitext.zig");
 
 pub const kind = "wikipedia";
@@ -330,7 +330,7 @@ const PageHandler = struct {
         };
     }
 
-    pub fn startElement(self: *PageHandler, p: *P, name: []const u8) void {
+    pub fn startElement(self: *PageHandler, p: *P, name: []const u8, _: xml.Attrs) void {
         if (self.fail != null) return;
         self.depth += 1;
         if (self.depth > max_depth) {

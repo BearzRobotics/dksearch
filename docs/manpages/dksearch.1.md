@@ -29,7 +29,7 @@ dksearch check-config FILE
 DESCRIPTION
 dksearch is an independently operated, self-hostable search engine. It maintains its own full-text index and does not use an external search provider.
 
-This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles three: `files`, which indexes plain-text and Markdown files from a local directory; `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded; and `wikipedia`, which indexes the articles of a Wikipedia dump file you have already downloaded. The `wikipedia` connector is built by default and can be left out with `zig build -Dwikipedia=false`. A separate administration interface (sources, import jobs, counters, a query-testing page that shows ranking scores, and optionally starting and cancelling imports) is served on its own address when the configuration has an `[admin]` table and credentials exist; see **admin-token**, **admin-password** and SECURITY CONSIDERATIONS.
+This version provides the public search interface (a JSON API and a server-rendered HTML page, both read-only), an import command, an index rebuild command, and commands to check and back up the stored data. Documents arrive through *sources* defined in the configuration file. Sources are optional: with none configured, **serve** still works and serves whatever index exists. Each source is one instance of a *connector*; this version bundles four: `files`, which indexes plain-text and Markdown files from a local directory; `gutenberg`, which indexes Project Gutenberg books from a catalog file and a directory of book files you have already downloaded; `wikipedia`, which indexes the articles of a Wikipedia dump file you have already downloaded; and `feeds`, which indexes the entries of RSS and Atom feed files you have already downloaded. The `wikipedia` and `feeds` connectors are built by default and can be left out with `zig build -Dwikipedia=false` and `-Dfeeds=false`. A separate administration interface (sources, import jobs, counters, a query-testing page that shows ranking scores, and optionally starting and cancelling imports) is served on its own address when the configuration has an `[admin]` table and credentials exist; see **admin-token**, **admin-password** and SECURITY CONSIDERATIONS.
 
 CONVENTIONS
 Bold represents literal commands, options, and keywords.
@@ -216,7 +216,7 @@ Each `[[source]]` table has these keys. Any other key is an option of the connec
 
 Key	Type	Default	Description
 name	String	required	Unique name, 1-64 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit. Resume positions are kept per name, and it becomes the `connector` of each document, so renaming a source makes it start afresh and its old documents stay under the old name.
-kind	String	required	Connector type. This version knows `files`, `gutenberg` and `wikipedia` (the last only in builds that include it).
+kind	String	required	Connector type. This version knows `files`, `gutenberg`, `wikipedia` and `feeds` (the last two only in builds that include them).
 enabled	Boolean	true	A disabled source stays in the file but is never run.
 retain_text	Boolean	true	Keep each document's text so the index can be rebuilt without reading the source again. Set false for a source whose terms forbid keeping its text; its documents are then skipped by **rebuild**.
 
@@ -276,6 +276,22 @@ Example:
     kind = "wikipedia"
     dump = "/data/wikipedia/enwiki-20260101-pages-articles-multistream.xml.bz2"
     dataset_version = "20260101"
+
+Kind `feeds` indexes RSS 2.0, RSS 1.0 (RDF) and Atom 1.0 files. It never uses the network: fetch the feeds yourself (a scheduled `curl` into a directory works, see `docs/deploy/README.md`) and point the source at them.
+
+Key	Type	Default	Description
+path	String	required	A feed file, or a directory of feed files (`.xml`, `.rss`, `.atom`, `.rdf`, in subdirectories too; hidden entries and symbolic links are skipped).
+language	String	the feed's own	Language tag for every entry, overriding the language a feed declares.
+max_file_bytes	Integer	16777216	Largest feed file accepted, 1-67108864. Larger files are refused.
+
+Each entry becomes a document. Its text is the full content if the feed has one, else the summary, else the title, converted from HTML to plain text (tags removed, paragraphs kept as lines, scripts and styles dropped, entities decoded). The document id is the entry's `guid` or Atom `id`, or its link; an id that is not URL-like (for example `42`) is prefixed with the feed's link so that different feeds cannot collide. Fetching the same feed into the same file again updates entries whose text changed and skips the rest. Each document records the feed title as its source and attribution, the entry's link, author, categories and dates, and rights `unknown`: a feed does not say what you may do with its entries, so the content is treated as belonging to its publisher. A file that cannot be parsed, or an entry with no id and no link or no text, is counted as skipped, and the run continues.
+
+Example:
+
+    [[source]]
+    name = "news"
+    kind = "feeds"
+    path = "/srv/feeds"
 
 Validation, unknown keys, reload behavior, versioning, and migration rules
 The whole file is validated before anything starts, including every source's options. Unknown keys, wrong types and out-of-range values are errors that name the file and the key, for example `dksearch.toml: server.prot: unknown key`; a misspelled setting is never silently ignored. `admin` and `server` may not share the same address and port. There is no reload: configuration is read once at start, so a restart is required to apply changes. There is no configuration versioning yet.
@@ -355,6 +371,8 @@ SQLite is compiled without extension loading, so no native code is loaded at run
 
 The index directory should be writable only by the account running dksearch. The configuration file holds no secrets; the credential hashes are in the separate secrets file, which should be readable only by the account running dksearch.
 
+The `feeds` connector treats feed files as untrusted input in the same way (no XML entity expansion, document type declarations refused, bounded nesting and field sizes, HTML reduced to text and never interpreted), and reads only the files under `path`. Feed content is third-party text that becomes searchable and is shown in results.
+
 The `wikipedia` connector treats the dump as untrusted input: it refuses any XML document type declaration (so entity-expansion attacks cannot work), bounds nesting depth and the size of every field and article, converts the text in time linear in its size, and executes nothing. It reads only the one file named by `dump`. The bundled bzip2 and Expat libraries are vendored, and Expat is built without general entity expansion or DTD support.
 
 The `gutenberg` connector treats the catalog and the book files as untrusted input: it bounds field and file sizes, refuses malformed catalogs and invalid text, derives file names only from validated numeric catalog ids, never follows symbolic links, and executes nothing. Project Gutenberg's license and trademark terms apply to the books you import; read them at https://www.gutenberg.org/policy/license.html before redistributing text or running a public service with it.
@@ -396,7 +414,7 @@ Stability guarantees
 The `/api/v1/` API is intended to be stable within version 1 (see dksearch-api(7)). The command-line syntax, configuration keys and diagnostics text are experimental at version 0.
 
 LIMITATIONS
-Three connectors are bundled (`files`, `gutenberg` and `wikipedia`). The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. The administration interface cannot run **check**, **rebuild**, **remove** or **backup**, or edit configuration; it can start and cancel imports only when `admin.actions` is true. No TLS. No reload or request log. Only two tokenizers exist: `unicode61` and `porter` (English stemming). Languages without word separators (such as Chinese or Japanese) are not segmented well, and stemming is English only. Index size and query time at large scale (millions of documents) have not been measured.
+Four connectors are bundled (`files`, `gutenberg`, `wikipedia` and `feeds`); none of them fetches anything from the network. The `gutenberg` connector reads only the CSV catalog, not the RDF catalog, and does not unpack archives or read HTML or EPUB books. Documents whose items vanished from a source are removed only with **import --prune**, and only the `files` and `gutenberg` connectors can tell. Backups are manual (no scheduling or retention) and the copies are not encrypted. The administration interface cannot run **check**, **rebuild**, **remove** or **backup**, or edit configuration; it can start and cancel imports only when `admin.actions` is true. No TLS. No reload or request log. Only two tokenizers exist: `unicode61` and `porter` (English stemming). Languages without word separators (such as Chinese or Japanese) are not segmented well, and stemming is English only. Index size and query time at large scale (millions of documents) have not been measured.
 
 BUGS
 No issue tracker is published yet. When one exists it will be listed under AVAILABILITY. Include the dksearch version, the configuration file, the full diagnostic output and the request that failed.

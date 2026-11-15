@@ -33,28 +33,45 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Optional: the Wikipedia connector and the two C libraries it needs
-    // (bzip2 for the dump's compression, Expat for its XML). Build without
-    // them with `-Dwikipedia=false`: nothing of either is then compiled or
-    // linked (docs/decisions/0007, 0011). Windows is not supported yet.
+    // Optional XML-based connectors and the C libraries they need: Wikipedia
+    // (bzip2 for the dump's compression, Expat for its XML) and feeds (Expat).
+    // `-Dwikipedia=false` and `-Dfeeds=false` leave them out; a library that no
+    // enabled connector needs is not compiled or linked at all (docs/decisions/
+    // 0007, 0011, 0016). Windows is not supported yet.
     const target_os = target.result.os.tag;
-    const want_wikipedia = b.option(bool, "wikipedia", "Build the Wikipedia connector with vendored bzip2 and Expat (default: on, except on Windows)") orelse (target_os != .windows);
-    if (want_wikipedia and target_os == .windows) @panic("-Dwikipedia=true is not supported on Windows yet");
-    const wiki_c: ?*std.Build.Module = if (want_wikipedia) blk: {
+    const supported = target_os != .windows;
+    const want_wikipedia = b.option(bool, "wikipedia", "Build the Wikipedia connector with vendored bzip2 and Expat (default: on, except on Windows)") orelse supported;
+    const want_feeds = b.option(bool, "feeds", "Build the RSS/Atom feeds connector with vendored Expat (default: on, except on Windows)") orelse supported;
+    if ((want_wikipedia or want_feeds) and !supported) @panic("the Wikipedia and feeds connectors are not supported on Windows yet; pass -Dwikipedia=false -Dfeeds=false");
+    const need_expat = want_wikipedia or want_feeds;
+
+    const bz2_c: ?*std.Build.Module = if (want_wikipedia) blk: {
         const tc = b.addTranslateC(.{
-            .root_source_file = b.path("vendor/wikipedia_c.h"),
+            .root_source_file = b.path("vendor/bzip2_c.h"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         tc.addIncludePath(b.path("vendor/bzip2"));
-        tc.addIncludePath(b.path("vendor/expat"));
         const m = tc.createModule();
         m.addCSourceFiles(.{
             .root = b.path("vendor/bzip2"),
             .files = &.{ "blocksort.c", "bzlib.c", "compress.c", "crctable.c", "decompress.c", "huffman.c", "randtable.c" },
             .flags = &.{"-D_FILE_OFFSET_BITS=64"},
         });
+        m.addIncludePath(b.path("vendor/bzip2"));
+        break :blk m;
+    } else null;
+
+    const expat_c: ?*std.Build.Module = if (need_expat) blk: {
+        const tc = b.addTranslateC(.{
+            .root_source_file = b.path("vendor/expat_c.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        tc.addIncludePath(b.path("vendor/expat"));
+        const m = tc.createModule();
         // Expat salts its hash tables with system entropy; which source to
         // use depends on the target. XML_GE=0 (no entity expansion) and no DTD
         // support are set in vendor/expat/expat_config.h.
@@ -80,12 +97,13 @@ pub fn build(b: *std.Build) void {
             .flags = expat_flags,
         });
         m.addIncludePath(b.path("vendor/expat"));
-        m.addIncludePath(b.path("vendor/bzip2"));
         break :blk m;
     } else null;
 
     const core_options = b.addOptions();
     core_options.addOption(bool, "wikipedia", want_wikipedia);
+    core_options.addOption(bool, "feeds", want_feeds);
+    core_options.addOption(bool, "xml", need_expat);
 
     // The core library: search, storage and ingestion, plus the bundled
     // connectors behind the one connector interface. The search, storage and
@@ -101,7 +119,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = core_options.createModule() },
         },
     });
-    if (wiki_c) |m| core.addImport("wiki_c", m);
+    if (bz2_c) |m| core.addImport("bz2_c", m);
+    if (expat_c) |m| core.addImport("expat_c", m);
 
     // The HTTP adapter: a separate module that imports the core.
     const http = b.addModule("dksearch_http", .{

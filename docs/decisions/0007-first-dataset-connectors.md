@@ -57,6 +57,8 @@ Built 2026-11-14 as `src/connectors/gutenberg.zig` with the CSV reader in `src/c
 - The resume position is the catalog row count, which assumes the same catalog file; delivery after a replaced catalog repeats documents but never loses them.
 - Fixtures are invented books under invented catalog entries, not copies of real ones, so tests are offline and no text is passed off as a real edition. Real files have not been tried against the full catalog yet; that needs a catalog download from the administrator's side.
 
+Note (2026-11-14): Expat is also used by the feeds connector (ADR 0016); the build options are `-Dwikipedia` and `-Dfeeds`, and a library no enabled connector needs is still not built.
+
 ## Alternatives
 
 - **Gutenberg from the RDF archive instead of CSV:** richer metadata but needs bzip2 and XML before the first connector works.

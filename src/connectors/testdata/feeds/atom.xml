@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="fr">
+  <title>Journal du port</title>
+  <link rel="self" href="https://example.net/feed.atom"/>
+  <link rel="alternate" href="https://example.net/"/>
+  <updated>2003-12-13T18:30:02Z</updated>
+  <author><name>Équipe du port</name></author>
+  <id>urn:uuid:60a76c80-d399-11d9-b93C-0003939e0af6</id>
+  <entry>
+    <title type="html">Le &lt;b&gt;phare&lt;/b&gt; est réparé</title>
+    <link rel="alternate" href="https://example.net/phare"/>
+    <link rel="enclosure" href="https://example.net/phare.mp3"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6a</id>
+    <published>2003-12-12T08:00:00+01:00</published>
+    <updated>2003-12-13T18:30:02Z</updated>
+    <author><name>Bob Auteur</name></author>
+    <category term="phares"/>
+    <summary>résumé court</summary>
+    <content type="html">&lt;p&gt;Le gardien a réparé la lampe.&lt;/p&gt;&lt;p&gt;Les mouettes &amp;amp; les goélands approuvent.&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <title>Entrée xhtml</title>
+    <link href="https://example.net/xhtml"/>
+    <id>tag:example.net,2003:xhtml</id>
+    <updated>2003-12-14T00:00:00Z</updated>
+    <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><p>Premier paragraphe xhtmlword.</p><p>Second paragraphe.</p></div></content>
+  </entry>
+  <entry>
+    <title>Texte brut</title>
+    <id>plain-1</id>
+    <updated>2003-12-15T00:00:00Z</updated>
+    <content type="text">a &lt; b is plain text, not markup</content>
+  </entry>
+</feed>

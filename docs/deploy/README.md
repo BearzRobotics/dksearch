@@ -28,6 +28,18 @@ The unit's `StateDirectory=dksearch` creates `/var/lib/dksearch` owned by the se
 
 The instance name is the source name. Imports work while the server runs, resume after an interruption, and share a lock with the other write commands, so overlapping runs are refused instead of corrupting anything. For a schedule, add a timer for the instance (`OnCalendar=...`, `Unit=dksearch-import@my-notes.service`).
 
+## Feeds
+
+The `feeds` connector reads feed files from disk; it does not fetch them. A simple setup downloads feeds into a directory with a timer and imports after each download:
+
+    # /etc/systemd/system/dksearch-feeds.service  (oneshot, run by a timer)
+    [Service]
+    Type=oneshot
+    User=dksearch
+    ExecStart=/bin/sh -c 'curl -fsS --max-time 60 -o /var/lib/dksearch/feeds/example.xml https://example.org/feed.xml && /usr/local/bin/dksearch import --config /etc/dksearch/dksearch.toml news'
+
+Fetching is your policy to set: pick a polite interval, identify yourself in the `User-Agent` only if you are comfortable doing so, and respect each site's terms. The connector indexes whatever is in the directory, so remove a file to stop indexing a feed (and `dksearch import --prune news` to drop entries whose files are gone).
+
 ## Administration
 
 Create a credential as the service user so the secrets file gets the right owner and mode:
