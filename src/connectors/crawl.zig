@@ -43,6 +43,8 @@ pub const default_max_depth: u32 = 3;
 pub const hard_max_depth: u32 = 10;
 pub const default_max_pages: u32 = 1000;
 pub const hard_max_pages: u32 = 1_000_000;
+pub const default_max_hosts: u32 = 100;
+pub const hard_max_hosts: u32 = 100_000;
 pub const default_timeout_s: u32 = 30;
 pub const max_timeout_s: u32 = 300;
 const max_redirects = 5;
@@ -63,7 +65,7 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "timeout_seconds", "ca_bundle", "language" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language" };
 
 // ------------------------------------------------------------ validation
 
@@ -110,6 +112,18 @@ fn intOption(source: config.Source, name: []const u8, lo: u32, hi: u32, diag: *c
     }
 }
 
+fn boolOption(source: config.Source, name: []const u8, diag: *config.Diagnostic) config.Error!void {
+    var kbuf: [128]u8 = undefined;
+    const v = source.option(name) orelse return;
+    switch (v) {
+        .boolean => {},
+        else => {
+            diag.set("", key(&kbuf, source, name), "expected boolean", .{});
+            return error.WrongType;
+        },
+    }
+}
+
 /// A user agent is one header line of printable ASCII with a product token.
 pub fn validUserAgent(ua: []const u8) bool {
     if (ua.len == 0 or ua.len > max_user_agent) return false;
@@ -139,6 +153,9 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     try intOption(source, "max_page_bytes", 1, hard_max_page_bytes, diag);
     try intOption(source, "max_depth", 0, hard_max_depth, diag);
     try intOption(source, "max_pages", 1, hard_max_pages, diag);
+    try intOption(source, "max_hosts", 1, hard_max_hosts, diag);
+    try boolOption(source, "follow_external", diag);
+    try boolOption(source, "allow_private_addresses", diag);
     try intOption(source, "timeout_seconds", 1, max_timeout_s, diag);
     _ = try needString(source, "ca_bundle", false, diag);
     if (try needString(source, "language", false, diag)) |l| if (!files.validLanguageTag(l)) {
@@ -159,6 +176,9 @@ pub const CrawlConnector = struct {
     max_page_bytes: u32,
     max_depth: u32,
     max_pages: u32,
+    max_hosts: u32,
+    follow_external: bool,
+    allow_private: bool,
     timeout_s: u32,
     ca: cabundle.Choice,
     language: ?[]const u8,
@@ -194,6 +214,9 @@ pub const CrawlConnector = struct {
             .max_page_bytes = @intCast(source.optionInt("max_page_bytes") orelse default_max_page_bytes),
             .max_depth = @intCast(source.optionInt("max_depth") orelse default_max_depth),
             .max_pages = @intCast(source.optionInt("max_pages") orelse default_max_pages),
+            .max_hosts = @intCast(source.optionInt("max_hosts") orelse default_max_hosts),
+            .follow_external = source.optionBool("follow_external") orelse false,
+            .allow_private = source.optionBool("allow_private_addresses") orelse false,
             .timeout_s = @intCast(source.optionInt("timeout_seconds") orelse default_timeout_s),
             .ca = ca,
             .language = language,
@@ -373,6 +396,40 @@ fn originOf(arena: Allocator, u: Url) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "{s}://{s}", .{ scheme, lower });
 }
 
+/// True for hosts that name this machine or a private network: "localhost",
+/// names with no dot or ending in a local-only suffix, IPv4 literals in
+/// loopback, private, link-local, carrier-grade NAT, multicast or reserved
+/// ranges, any IPv6 literal, and numbers that merely look like addresses
+/// (decimal, hex or short forms some resolvers accept). A name that *resolves*
+/// to a private address cannot be told from here.
+fn isPrivateHost(host_in: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    if (host_in.len == 0 or host_in.len > buf.len) return true;
+    const host = std.ascii.lowerString(&buf, host_in);
+    if (host[0] == '[' or std.mem.indexOfScalar(u8, host, ':') != null) return true; // IPv6 literal
+    const trimmed = std.mem.trimEnd(u8, host, ".");
+    if (trimmed.len == 0) return true;
+    const suffixes = [_][]const u8{ ".localhost", ".local", ".internal", ".lan", ".home", ".home.arpa", ".corp", ".intranet", ".localdomain" };
+    if (std.mem.eql(u8, trimmed, "localhost")) return true;
+    for (suffixes) |x| if (std.mem.endsWith(u8, trimmed, x)) return true;
+    if (std.mem.indexOfScalar(u8, trimmed, '.') == null) return true; // a bare name resolves through the local network
+    // Anything made only of digits, dots and hex marks is an address in disguise.
+    var numeric = true;
+    for (trimmed) |c| if (!(std.ascii.isHex(c) or c == '.' or c == 'x')) {
+        numeric = false;
+    };
+    if (!numeric) return false;
+    const quad = std.Io.net.Ip4Address.parse(trimmed, 0) catch return true; // odd forms: refuse
+    const b = quad.bytes;
+    return b[0] == 0 or b[0] == 10 or b[0] == 127 or b[0] >= 224 or
+        (b[0] == 100 and b[1] >= 64 and b[1] <= 127) or
+        (b[0] == 169 and b[1] == 254) or
+        (b[0] == 172 and b[1] >= 16 and b[1] <= 31) or
+        (b[0] == 192 and b[1] == 168) or
+        (b[0] == 192 and b[1] == 0 and b[2] == 0) or
+        (b[0] == 198 and (b[1] == 18 or b[1] == 19));
+}
+
 /// The URL without its fragment, as the page's identity.
 fn withoutFragment(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
     const h = std.mem.indexOfScalar(u8, text, '#') orelse return text;
@@ -451,9 +508,10 @@ const Run = struct {
     }
 
     /// The (cached) robots rules for the origin of `u`.
-    fn hostFor(self: *Run, u: Url) error{ OutOfMemory, Canceled }!*Host {
+    fn hostFor(self: *Run, u: Url) error{ OutOfMemory, Canceled, TooManyHosts }!*Host {
         const origin = try originOf(self.arena, u);
         if (self.hosts.get(origin)) |h| return h;
+        if (self.hosts.count() >= self.conn.max_hosts) return error.TooManyHosts;
         const host = try self.arena.create(Host);
         host.* = .{ .rules = .allow_all };
         try self.hosts.put(self.arena, origin, host);
@@ -513,7 +571,7 @@ const Run = struct {
 
     /// One polite GET of `start`: robots.txt, the host's turn, the request and
     /// same-site redirects. Everything is allocated in `a`.
-    fn get(self: *Run, a: Allocator, start: []const u8, accept: []const u8, max_bytes: usize) error{OutOfMemory}!Fetched {
+    fn get(self: *Run, a: Allocator, start: []const u8, site_host: []const u8, accept: []const u8, max_bytes: usize) error{OutOfMemory}!Fetched {
         var url = try withoutFragment(a, start);
         var hops: u32 = 0;
         self.fetched += 1;
@@ -522,6 +580,7 @@ const Run = struct {
             const host = self.hostFor(u) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return .stopped,
+                error.TooManyHosts => return self.skip(),
             };
             if (!host.rules.allowed(try targetOf(a, u))) return self.skip();
             if (!self.waitTurn(host)) return .stopped;
@@ -549,13 +608,23 @@ const Run = struct {
                 const loc = got.location orelse return self.skip();
                 const next = (try resolveRedirect(a, url, loc)) orelse return self.skip();
                 const there = parseUrl(next) orelse return self.skip();
-                if (hops > max_redirects or !sameSite(u.host, there.host)) return self.skip();
+                if (hops > max_redirects or !self.mayVisit(site_host, there.host)) return self.skip();
                 url = next;
                 continue;
             }
             if (got.status < 200 or got.status >= 300) return self.skip();
             return .{ .page = .{ .url = url, .resp = got } };
         }
+    }
+
+    /// Whether a link or redirect to `host` may be followed from a crawl that
+    /// started on `site`: the same site always; another site only if
+    /// `follow_external` is on, and then never a private or local address
+    /// unless `allow_private_addresses` says so.
+    fn mayVisit(self: *Run, site: []const u8, host: []const u8) bool {
+        if (sameSite(host, site)) return true;
+        if (!self.conn.follow_external) return false;
+        return self.conn.allow_private or !isPrivateHost(host);
     }
 
     fn skip(self: *Run) Fetched {
@@ -607,7 +676,7 @@ const Run = struct {
         var tmp = std.heap.ArenaAllocator.init(self.conn.gpa);
         defer tmp.deinit();
         const t = tmp.allocator();
-        const got = switch (try self.get(t, url, accept_sitemap, max_sitemap_bytes)) {
+        const got = switch (try self.get(t, url, site, accept_sitemap, max_sitemap_bytes)) {
             .stopped => return true,
             .skipped => return false,
             .page => |p| p,
@@ -663,7 +732,7 @@ const Run = struct {
             var page = std.heap.ArenaAllocator.init(gpa);
             defer page.deinit();
             const a = page.allocator();
-            const got = switch (try self.get(a, item.url, accept_pages, self.conn.max_page_bytes)) {
+            const got = switch (try self.get(a, item.url, site, accept_pages, self.conn.max_page_bytes)) {
                 .stopped => return .stopped,
                 .skipped => continue,
                 .page => |p| p,
@@ -682,7 +751,7 @@ const Run = struct {
                 if (queue.items.len - head >= max_queue) break;
                 const target = (try resolveRedirect(a, got.url, link)) orelse continue;
                 const tu = parseUrl(target) orelse continue;
-                if (!sameSite(tu.host, site) or looksBinary(tu.uri.path)) continue;
+                if (!self.mayVisit(site, tu.host) or looksBinary(tu.uri.path)) continue;
                 const keep = (try self.firstVisit(target)) orelse continue;
                 try queue.append(gpa, .{ .url = keep, .depth = item.depth + 1 });
             }
@@ -943,8 +1012,12 @@ const TestServer = struct {
 
     /// Listens, so the port is known before the routes are (bodies may name it).
     fn open(s: *TestServer) !void {
+        return s.openAt("127.0.0.1");
+    }
+
+    fn openAt(s: *TestServer, ip: []const u8) !void {
         s.* = .{
-            .listener = try (try net.IpAddress.parseIp4("127.0.0.1", 0)).listen(testing.io, .{ .reuse_address = true }),
+            .listener = try (try net.IpAddress.parseIp4(ip, 0)).listen(testing.io, .{ .reuse_address = true }),
             .port = 0,
             .routes = &.{},
             .future = undefined,
@@ -968,7 +1041,11 @@ const TestServer = struct {
     }
 
     fn url(s: *TestServer, buf: []u8, path: []const u8) []const u8 {
-        return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}{s}", .{ s.port, path }) catch unreachable;
+        return s.urlAt(buf, "127.0.0.1", path);
+    }
+
+    fn urlAt(s: *TestServer, buf: []u8, ip: []const u8, path: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, "http://{s}:{d}{s}", .{ ip, s.port, path }) catch unreachable;
     }
 
     fn count(s: *TestServer, path: []const u8) usize {
@@ -1435,4 +1512,135 @@ test "sitemaps and sitemap indexes list pages, only for their own site" {
     const seed2 = try std.fmt.bufPrint(&line, "sitemap {s}\n", .{srv.url(&b, "/bad.xml")});
     try crawlWith(&srv, &tmp, seed2, 3, 100, &got2, &ctl2);
     try testing.expectEqual(@as(usize, 0), got2.ids.items.len);
+}
+
+test "private and local hosts are recognised" {
+    for ([_][]const u8{ "localhost", "LOCALHOST.", "printer.local", "nas", "router.lan", "10.1.2.3", "127.0.0.1", "192.168.0.9", "172.16.5.5", "172.31.255.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1", "[::1]", "[fe80::1]", "2130706433", "0x7f.0.0.1", "127.1", "1.2.3", "service.internal", "a.localhost" }) |h| {
+        errdefer std.debug.print("should be private: {s}\n", .{h});
+        try testing.expect(isPrivateHost(h));
+    }
+    for ([_][]const u8{ "example.org", "www.example.co.uk", "8.8.8.8", "172.32.0.1", "172.15.0.1", "100.63.0.1", "93.184.216.34", "xn--bcher-kva.example", "a.b.c.d.example" }) |h| {
+        errdefer std.debug.print("should be public: {s}\n", .{h});
+        try testing.expect(!isPrivateHost(h));
+    }
+}
+
+test "links to other sites are followed only when asked, and never to private addresses by default" {
+    var other: TestServer = undefined;
+    other.openAt("127.0.0.2") catch return error.SkipZigTest;
+    try other.serve(&.{
+        .{ .path = "/robots.txt", .status = 404 },
+        .{ .path = "/x", .body = "<p>on the other site</p>" },
+    });
+    defer other.stop();
+
+    var origin: TestServer = undefined;
+    try origin.open();
+    var link_buf: [128]u8 = undefined;
+    var page_buf: [400]u8 = undefined;
+    const link = other.urlAt(&link_buf, "127.0.0.2", "/x");
+    const page = try std.fmt.bufPrint(&page_buf, "<p>start</p><a href=\"{s}\">elsewhere</a><a href=\"/mine\">mine</a>", .{link});
+    try origin.serve(&.{
+        .{ .path = "/robots.txt", .status = 404 },
+        .{ .path = "/", .body = page },
+        .{ .path = "/mine", .body = "<p>same site</p>" },
+    });
+    defer origin.stop();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [96]u8 = undefined;
+    const seed = origin.url(&b, "/");
+
+    // Default: the other site is left alone.
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    try crawlWith(&origin, &tmp, seed, 3, 100, &got, &ctl);
+    try testing.expect(hasId(&got, "/mine") and !hasId(&got, "/x"));
+    try testing.expectEqual(@as(usize, 0), other.count("/x"));
+
+    // follow_external alone still refuses a private (here loopback) address.
+    {
+        var conn = try testConnector(&tmp, seed, "t/1");
+        defer conn.deinit();
+        conn.follow_external = true;
+        var g: Collect = .{};
+        defer g.deinit();
+        var c: api.Control = .{};
+        _ = try conn.connector().run(g.sink(), &c, null);
+        try testing.expect(!hasId(&g, "/x"));
+        try testing.expectEqual(@as(usize, 0), other.count("/x"));
+    }
+
+    // With both options it goes there, after asking that site's robots.txt.
+    {
+        var conn = try testConnector(&tmp, seed, "t/1");
+        defer conn.deinit();
+        conn.follow_external = true;
+        conn.allow_private = true;
+        var g: Collect = .{};
+        defer g.deinit();
+        var c: api.Control = .{};
+        _ = try conn.connector().run(g.sink(), &c, null);
+        try testing.expect(hasId(&g, "/x") and hasId(&g, "/mine"));
+        try testing.expectEqual(@as(usize, 1), other.count("/robots.txt"));
+    }
+
+    // max_hosts bounds how many sites one run talks to.
+    {
+        var conn = try testConnector(&tmp, seed, "t/1");
+        defer conn.deinit();
+        conn.follow_external = true;
+        conn.allow_private = true;
+        conn.max_hosts = 1;
+        var g: Collect = .{};
+        defer g.deinit();
+        var c: api.Control = .{};
+        _ = try conn.connector().run(g.sink(), &c, null);
+        try testing.expect(hasId(&g, "/mine") and !hasId(&g, "/x"));
+    }
+}
+
+test "a redirect to another site needs follow_external too" {
+    var other: TestServer = undefined;
+    other.openAt("127.0.0.2") catch return error.SkipZigTest;
+    try other.serve(&.{
+        .{ .path = "/robots.txt", .status = 404 },
+        .{ .path = "/landing", .body = "<p>landed</p>" },
+    });
+    defer other.stop();
+    var origin: TestServer = undefined;
+    try origin.open();
+    var loc_buf: [128]u8 = undefined;
+    try origin.serve(&.{
+        .{ .path = "/robots.txt", .status = 404 },
+        .{ .path = "/go", .status = 301, .location = other.urlAt(&loc_buf, "127.0.0.2", "/landing"), .body = "" },
+    });
+    defer origin.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [96]u8 = undefined;
+    const seed = origin.url(&b, "/go");
+    {
+        var conn = try testConnector(&tmp, seed, "t/1");
+        defer conn.deinit();
+        var g: Collect = .{};
+        defer g.deinit();
+        var c: api.Control = .{};
+        _ = try conn.connector().run(g.sink(), &c, null);
+        try testing.expectEqual(@as(usize, 0), g.ids.items.len);
+    }
+    {
+        var conn = try testConnector(&tmp, seed, "t/1");
+        defer conn.deinit();
+        conn.follow_external = true;
+        conn.allow_private = true;
+        var g: Collect = .{};
+        defer g.deinit();
+        var c: api.Control = .{};
+        _ = try conn.connector().run(g.sink(), &c, null);
+        try testing.expectEqual(@as(usize, 1), g.ids.items.len);
+        try testing.expect(hasId(&g, "/landing"));
+    }
 }

@@ -46,3 +46,4 @@ tokenizer = "unicode61"
 #delay_ms = 1000
 #max_depth = 3                                               # links to follow from each URL (same site only)
 #max_pages = 1000                                            # most pages per run
+#follow_external = false                                     # true: also follow links to other sites (see the manual)
