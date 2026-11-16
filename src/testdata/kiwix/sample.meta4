@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metalink xmlns="urn:ietf:params:xml:ns:metalink">
+  <generator>MirrorBrain/2.19.0</generator>
+  <origin dynamic="true">https://lb.download.kiwix.org/zim/wikipedia/wikipedia_en_ray-charles_mini_2026-10.zim.meta4</origin>
+  <published>2026-11-16T09:30:51Z</published>
+  <publisher>
+    <name>Kiwix project</name>
+    <url>https://kiwix.org</url>
+  </publisher>
+
+  <file name="wikipedia_en_ray-charles_mini_2026-10.zim">
+    <size>26229009</size>
+
+    <!-- <mtime>1793631680</mtime> -->
+
+    <!-- internal id: 12454 -->
+    <hash type="md5">11652dc0f7d9a9d7e457e5bfcc9bc60f</hash>
+    <hash type="sha-1">a505b3415273ebd46c494f902627db724a97b129</hash>
+    <hash type="sha-256">ad37a9355a356b12cc4f2e339fcd15940dd93099de0c2851b6a25cc5b9c33c31</hash>
+    <pieces length="4194304" type="sha-1">
+      <hash>83db03c9b08b756f6a7c3b91ef79d5f2d0fc0a5c</hash>
+      <hash>cb256e2f4202be917537493de36db7fa6593b685</hash>
+      <hash>b1124b0ab79f0f58cda9f33b9385781e2faae0dd</hash>
+      <hash>254cbf8ea74707af7d2d4cd04331f081dcedebd9</hash>
+      <hash>85a3ed16baea2bc61d9136d9e3956c5eb40ea579</hash>
+      <hash>1dfc3478baa0110e7e9089f02fbbba3f15bd942d</hash>
+      <hash>b2083ba30b420551a34077a5c8b13356a277ed81</hash>
+    </pieces>
+
+
+    <!-- Found 11 mirrors: 0 in the same network prefix, 0 in the same autonomous system,
+         3 handling this country, 0 in the same region, 3 elsewhere -->
+
+    <!-- Mirrors in the same network (unknown): -->
+
+    <!-- Mirrors in the same AS (unknown): -->
+
+    <!-- Mirrors which handle this country (US): -->
+    <url location="us" priority="1">https://wi.mirror.driftle.ss/kiwix/zim/wikipedia/wikipedia_en_ray-charles_mini_2026-10.zim</url>
+    <url location="us" priority="2">https://dumps.wikimedia.org/kiwix/zim/wikipedia/wikipedia_en_ray-charles_mini_2026-10.zim</url>
+    <url location="us" priority="3">https://ftpmirror.your.org/pub/kiwix/zim/wikipedia/wikipedia_en_ray-charles_mini_2026-10.zim</url>
+
+    <!-- Mirrors in the same continent (NA): -->
+
+    <!-- Mirrors in the rest of the world: -->
+    <url location="nl" priority="4">https://ftp.nluug.nl/pub/kiwix/zim/wikipedia/wikipedia_en_ray-charles_mini_2026-10.zim</url>
+    <url location="fr" priority="5">https://mirror.download.kiwix.org/zim/wikipedia/wikipedia_en_ray-charles_mini_2026-10.zim</url>
+    <url location="dk" priority="6">https://mirrors.dotsrc.org/kiwix/zim/wikipedia/wikipedia_en_ray-charles_mini_2026-10.zim</url>
+  </file>
+</metalink>

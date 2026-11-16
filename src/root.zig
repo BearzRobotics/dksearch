@@ -17,6 +17,7 @@ pub const originals = @import("originals.zig");
 pub const avmeta = @import("avmeta.zig");
 pub const render = @import("render.zig");
 pub const ziparchive = @import("ziparchive.zig");
+pub const kiwix = @import("kiwix.zig");
 pub const optioninfo = @import("optioninfo.zig");
 pub const settinginfo = @import("settinginfo.zig");
 pub const officetext = @import("officetext.zig");
@@ -57,6 +58,7 @@ test {
     _ = avmeta;
     _ = render;
     _ = ziparchive;
+    _ = kiwix;
     _ = optioninfo;
     _ = settinginfo;
     _ = officetext;
