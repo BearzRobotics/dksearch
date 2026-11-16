@@ -31,6 +31,10 @@ pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
                 i = if (end) |e| e + 3 else html.len;
                 continue;
             }
+            if (declarationEnd(html, i)) |e| {
+                i = e;
+                continue;
+            }
             if (tagAt(html, i)) |t| {
                 if (!t.closing and !t.self_closing) {
                     if (indexOf(t.name, &dropped_tags)) |k| {
@@ -56,6 +60,16 @@ pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
         i += 1;
     }
     return tidy(arena, out.items);
+}
+
+/// The index just after a markup declaration or processing instruction that starts at `i`
+/// (`<!DOCTYPE html>`, `<?xml version="1.0"?>`), or null if there is none. They hold no text.
+fn declarationEnd(s: []const u8, i: usize) ?usize {
+    if (i + 1 >= s.len) return null;
+    if (s[i + 1] != '!' and s[i + 1] != '?') return null;
+    const limit = @min(s.len, i + 4096);
+    const gt = std.mem.indexOfScalarPos(u8, s[0..limit], i + 2, '>') orelse return null;
+    return gt + 1;
 }
 
 const Tag = struct { name: []const u8, closing: bool, self_closing: bool, end: usize };
@@ -211,6 +225,10 @@ pub fn scan(arena: Allocator, html: []const u8, max_links: usize) Allocator.Erro
             i = if (end) |e| e + 3 else html.len;
             continue;
         }
+        if (declarationEnd(html, i)) |e| {
+            i = e;
+            continue;
+        }
         const t = tagAt(html, i) orelse {
             i += 1;
             continue;
@@ -319,6 +337,14 @@ test "paragraphs and breaks become lines; inline tags vanish" {
 test "script, style and comments are removed with their content" {
     try expectText("a<script>alert('x')</script>b<style>p{}</style>c<!-- hidden -->d", "abcd");
     try expectText("a<script>never closed", "anever closed"); // the stray tag goes, the text stays
+}
+
+test "a doctype and processing instructions are markup, not text" {
+    try expectText("<!DOCTYPE html>\n<html><body><p>hi</p></body></html>", "hi");
+    try expectText("<!doctype HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\"><p>x</p>", "x");
+    try expectText("<?xml version=\"1.0\" encoding=\"UTF-8\"?><p>x</p>", "x");
+    try expectText("a <! b", "a <! b"); // never closed: stays text
+    try expectText("1 <3 you", "1 <3 you");
 }
 
 test "entities and character references" {
