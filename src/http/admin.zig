@@ -63,6 +63,9 @@ pub const Options = struct {
     /// Regular-expression filtering for the query-testing page and API (with
     /// the larger administration limits), if available.
     regex: ?*dk.regexsearch.Service = null,
+    /// The Kiwix library's catalogue (tests point this at a local server).
+    kiwix_catalog_url: []const u8 = dk.kiwix.catalog_base,
+    kiwix_options: dk.kiwix.Options = .{},
 };
 
 const Session = struct {
@@ -125,7 +128,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -133,7 +136,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -147,6 +150,8 @@ pub const App = struct {
             .{ "/actions/settings", .action_settings },
             .{ "/maintenance", .maintenance },
             .{ "/actions/maintenance", .action_maintenance },
+            .{ "/zim", .zim_page },
+            .{ "/actions/zim", .action_zim },
             .{ "/api/v1/admin/maintenance", .api_maintenance },
             .{ "/login", .login },
             .{ "/logout", .logout },
@@ -197,7 +202,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -220,6 +225,8 @@ pub const App = struct {
             .jobs => self.pageJobs(arena, csrf),
             .maintenance => self.pageMaintenance(arena, csrf),
             .action_maintenance => self.startOperation(arena, req, auth, false),
+            .zim_page => self.pageZim(arena, csrf, t.params),
+            .action_zim => self.startZimDownload(arena, req, auth),
             .api_maintenance => self.startOperation(arena, req, auth, true),
             .api_status => self.apiStatus(arena),
             .api_sources => if (req.method == .POST) self.editSources(arena, req, auth, true) else self.apiSources(arena),
@@ -1032,6 +1039,147 @@ pub const App = struct {
         return handler.htmlResponse(arena, .ok, aw.written());
     }
 
+    // ----------------------------------------------------- Kiwix library
+
+    /// A Metalink address must be on kiwix.org (or, in tests, whatever `kiwix_options` allows).
+    fn kiwixUrlOk(self: *App, url: []const u8) bool {
+        if (self.opts.kiwix_options.allow_http) return std.mem.startsWith(u8, url, "http://127.0.0.1:");
+        const prefix = "https://";
+        if (!std.mem.startsWith(u8, url, prefix)) return false;
+        const rest = url[prefix.len..];
+        const host_end = std.mem.indexOfAny(u8, rest, "/?#@:") orelse rest.len;
+        if (host_end >= rest.len or rest[host_end] != '/') return false;
+        const host = rest[0..host_end];
+        return std.mem.eql(u8, host, "kiwix.org") or std.mem.endsWith(u8, host, ".kiwix.org");
+    }
+
+    fn pageZim(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "ZIM files", csrf, "zim") catch return error.OutOfMemory;
+        self.writeZim(arena, w, csrf, params) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
+    }
+
+    fn writeZim(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, params: query.Params) !void {
+        const zim_dir = if (self.opts.jobs) |m| m.opts.zim_dir else null;
+        try w.writeAll("<p class=\"muted\">Search the <a href=\"https://library.kiwix.org\">Kiwix library</a> of offline copies of Wikipedia, Wiktionary, Stack Exchange sites, books and more, and download a file to index. This page contacts <code>library.kiwix.org</code> only when you search here; nothing is downloaded without your confirmation.</p>");
+        const dir = zim_dir orelse {
+            try w.writeAll("<section class=\"card\"><h2>Not set up</h2><p class=\"muted\">Downloads need a folder to put the files in: add <code>zim_dir = \"/path/to/zim\"</code> to the <code>[admin]</code> table of the configuration (a folder you control and that has room for the files; the interface writes nowhere else) and enable <code>actions</code>, then restart.</p></section>");
+            return;
+        };
+
+        // The confirmation for one file.
+        if (params.get("file")) |file| {
+            const meta4 = params.get("meta4") orelse "";
+            const size = std.fmt.parseInt(u64, params.get("size") orelse "0", 10) catch 0;
+            if (!dk.kiwix.validFileName(file) or !self.kiwixUrlOk(meta4)) {
+                try w.writeAll("<p class=\"error\">That file cannot be downloaded from here.</p>");
+                return;
+            }
+            try w.writeAll("<section class=\"card\"><h2>Download this file?</h2><dl class=\"facts\"><div><dt>File</dt><dd><code>");
+            try html.writeEscaped(w, file);
+            try w.writeAll("</code></dd></div><div><dt>Size</dt><dd>");
+            try writeBytes(w, size);
+            try w.writeAll("</dd></div><div><dt>Saved to</dt><dd><code>");
+            try html.writeEscaped(w, dir);
+            try w.writeAll("</code></dd></div></dl><p class=\"muted\">Check that the folder has room for it. The file is fetched from the library&rsquo;s mirrors over HTTPS, checked against the checksum the library publishes, and only then given its name; an interrupted download continues where it stopped. Only one task runs at a time, and imports can run meanwhile elsewhere.</p>");
+            if (csrf) |token| {
+                try w.writeAll("<form action=\"/actions/zim\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+                try html.writeEscaped(w, token);
+                try w.writeAll("\"><input type=\"hidden\" name=\"file\" value=\"");
+                try html.writeEscaped(w, file);
+                try w.writeAll("\"><input type=\"hidden\" name=\"meta4\" value=\"");
+                try html.writeEscaped(w, meta4);
+                try w.print("\"><input type=\"hidden\" name=\"size\" value=\"{d}\"><button type=\"submit\" class=\"btn\">Download</button> <a href=\"/zim\">Cancel</a></form>", .{size});
+            }
+            try w.writeAll("</section>");
+            return;
+        }
+
+        const q = params.get("q") orelse "";
+        const lang = params.get("lang") orelse "eng";
+        const start = std.fmt.parseInt(u32, params.get("start") orelse "0", 10) catch 0;
+        try w.writeAll("<form class=\"inline\" action=\"/zim\" method=\"get\"><input type=\"search\" name=\"q\" maxlength=\"100\" aria-label=\"Search the library\" placeholder=\"wikipedia, chemistry, ...\" value=\"");
+        try html.writeEscaped(w, q);
+        try w.writeAll("\"> <input type=\"text\" name=\"lang\" maxlength=\"3\" size=\"4\" aria-label=\"Language (three letters)\" value=\"");
+        try html.writeEscaped(w, lang);
+        try w.writeAll("\"> <button type=\"submit\" class=\"btn\">Search</button></form>");
+        if (q.len == 0 and params.get("go") == null) {
+            try w.writeAll("<p class=\"muted\">Type what you are looking for (for example <code>wikipedia</code>, <code>mini</code> for short versions, <code>nopic</code> for text only) and a language code such as <code>eng</code>; leave the language empty for all.</p>");
+            return;
+        }
+        var url_aw: Io.Writer.Allocating = .init(arena);
+        const uw = &url_aw.writer;
+        try uw.print("{s}?count=25&start={d}", .{ self.opts.kiwix_catalog_url, start });
+        if (lang.len > 0) {
+            try uw.writeAll("&lang=");
+            try query.writeEncoded(uw, lang);
+        }
+        if (q.len > 0) {
+            try uw.writeAll("&q=");
+            try query.writeEncoded(uw, q);
+        }
+        const bytes = dk.kiwix.fetchText(self.gpa, self.io, arena, url_aw.written(), 4 * 1024 * 1024, self.opts.kiwix_options) catch {
+            try w.writeAll("<p class=\"error\">The library could not be reached or gave an answer that cannot be read. Try again in a moment.</p>");
+            return;
+        };
+        const cat = dk.kiwix.parseCatalog(arena, bytes) catch {
+            try w.writeAll("<p class=\"error\">The library&rsquo;s answer could not be read.</p>");
+            return;
+        };
+        try w.print("<p class=\"muted\">{d} matching files; showing {d}&ndash;{d}.</p>", .{ cat.total, @min(start + 1, cat.total), start + cat.entries.len });
+        try w.writeAll("<table><thead><tr><th>Title</th><th>Language</th><th>Kind</th><th>Articles</th><th>Size</th><th>Made</th><th></th></tr></thead><tbody>");
+        for (cat.entries) |e| {
+            const file = e.fileName() orelse continue;
+            try w.writeAll("<tr><td><strong>");
+            try html.writeEscaped(w, e.title);
+            try w.writeAll("</strong><br><span class=\"muted\">");
+            try html.writeEscaped(w, e.summary);
+            try w.writeAll("</span></td><td>");
+            try html.writeEscaped(w, e.language);
+            try w.writeAll("</td><td>");
+            try html.writeEscaped(w, e.flavour);
+            try w.print("</td><td>{d}</td><td>", .{e.article_count});
+            try writeBytes(w, e.size);
+            try w.writeAll("</td><td>");
+            try html.writeEscaped(w, e.issued[0..@min(10, e.issued.len)]);
+            try w.writeAll("</td><td><a href=\"/zim?file=");
+            try query.writeEncoded(w, file);
+            try w.writeAll("&amp;meta4=");
+            try query.writeEncoded(w, e.meta4_url);
+            try w.print("&amp;size={d}\">Download&hellip;</a></td></tr>", .{e.size});
+        }
+        try w.writeAll("</tbody></table>");
+        if (start + cat.entries.len < cat.total) {
+            try w.print("<p><a href=\"/zim?q=", .{});
+            try query.writeEncoded(w, q);
+            try w.writeAll("&amp;lang=");
+            try query.writeEncoded(w, lang);
+            try w.print("&amp;go=1&amp;start={d}\">More results</a></p>", .{start + cat.entries.len});
+        }
+    }
+
+    fn startZimDownload(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const file = params.get("file") orelse "";
+        const meta4 = params.get("meta4") orelse "";
+        const size = std.fmt.parseInt(u64, params.get("size") orelse "0", 10) catch 0;
+        if (!self.kiwixUrlOk(meta4)) return actionFailure(arena, false, .{ .status = .bad_request, .code = "bad_address", .message = "downloads only come from the Kiwix library (kiwix.org)" });
+        self.opts.jobs.?.startDownload(.{ .meta4_url = meta4, .file_name = file, .size = size }) catch |e| return actionFailure(arena, false, switch (e) {
+            error.NotConfigured => .{ .status = .conflict, .code = "not_configured", .message = "downloads need a folder: set [admin] zim_dir" },
+            error.BadArgument => .{ .status = .bad_request, .code = "bad_argument", .message = "that file name or address cannot be used" },
+            error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "another operation is already running" },
+            error.OutOfMemory => return error.OutOfMemory,
+            else => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start the download" },
+        });
+        return redirect(arena, "/", null);
+    }
+
     fn pageJobs(self: *App, arena: Allocator, csrf: ?[]const u8) error{OutOfMemory}!Response {
         const snap = self.snapshot(arena, 50);
         var aw: Io.Writer.Allocating = .init(arena);
@@ -1096,6 +1244,7 @@ const nav_items = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "jobs", "/jobs", "Jobs" },
     .{ "settings", "/settings", "Settings" },
     .{ "maintenance", "/maintenance", "Maintenance" },
+    .{ "zim", "/zim", "ZIM files" },
     .{ "search", "/search", "Search test" },
 };
 
@@ -1277,8 +1426,9 @@ fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const 
             .check => try w.writeAll("Checking the stored data"),
             .backup => try w.writeAll("Backing up"),
             .remove => try w.writeAll("Removing "),
+            .download => try w.writeAll("Downloading "),
         }
-        if (c.op == .import or c.op == .remove) {
+        if (c.op == .import or c.op == .remove or c.op == .download) {
             try w.writeAll("<strong>");
             try html.writeEscaped(w, c.source);
             try w.writeAll("</strong>");
@@ -1791,6 +1941,7 @@ fn opTitle(op: dk.jobs.Op) []const u8 {
         .check => "Check of the stored data",
         .backup => "Backup",
         .remove => "Removal",
+        .download => "Download",
     };
 }
 
@@ -2494,6 +2645,43 @@ test "maintenance: check, backup, confirmed removal, and the page" {
     // Without a session (token only) the page explains how to proceed.
     const tok = try f.call(a, .GET, "/maintenance", .{ .auth = auth });
     try testing.expect(std.mem.indexOf(u8, tok.body, "Sign in with the password") != null);
+}
+
+test "ZIM files: the page explains when no folder is set, confirms before downloading, and only takes kiwix.org addresses" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+
+    const off = try f.call(a, .GET, "/zim", .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.ok, off.status);
+    try testing.expect(std.mem.indexOf(u8, off.body, "zim_dir") != null);
+
+    f.manager.opts.zim_dir = "/nonexistent-dksearch-zim-dir";
+    const ok_url = "https%3A%2F%2Fdownload.kiwix.org%2Fzim%2Fwikipedia%2Fa_2026-01.zim.meta4";
+    const confirm = try f.call(a, .GET, try std.fmt.allocPrint(a, "/zim?file=a_2026-01.zim&meta4={s}&size=1048576", .{ok_url}), .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, confirm.body, "Download this file?") != null);
+    try testing.expect(std.mem.indexOf(u8, confirm.body, "1.0 MiB") != null or std.mem.indexOf(u8, confirm.body, "MiB") != null);
+    try testing.expect(std.mem.indexOf(u8, confirm.body, "/nonexistent-dksearch-zim-dir") != null);
+    const csrf = csrfOf(confirm.body);
+
+    const evil = try f.call(a, .GET, "/zim?file=a.zim&meta4=https%3A%2F%2Fevil.example%2Fa.zim.meta4&size=1", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, evil.body, "cannot be downloaded") != null);
+    const lookalike = try f.call(a, .GET, "/zim?file=a.zim&meta4=https%3A%2F%2Fkiwix.org.evil.example%2Fa.zim.meta4&size=1", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, lookalike.body, "cannot be downloaded") != null);
+    const userinfo = try f.call(a, .GET, "/zim?file=a.zim&meta4=https%3A%2F%2Fkiwix.org%40evil.example%2Fa.zim.meta4&size=1", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, userinfo.body, "cannot be downloaded") != null);
+
+    const bad_csrf = try f.call(a, .POST, "/actions/zim", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf=wrong&file=a_2026-01.zim&meta4={s}", .{ok_url}) });
+    try testing.expectEqual(http.Status.forbidden, bad_csrf.status);
+    const refused = try f.call(a, .POST, "/actions/zim", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&file=a_2026-01.zim&meta4=https%3A%2F%2Fevil.example%2Fa.zim.meta4", .{csrf}) });
+    try testing.expectEqual(http.Status.bad_request, refused.status);
+    const bad_name = try f.call(a, .POST, "/actions/zim", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&file=..%2Fa.zim&meta4={s}", .{ csrf, ok_url }) });
+    try testing.expectEqual(http.Status.bad_request, bad_name.status);
 }
 
 test "sources can be added, edited, disabled and deleted from the interface, and apply at once" {

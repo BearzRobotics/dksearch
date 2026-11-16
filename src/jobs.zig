@@ -23,6 +23,7 @@ const pipeline = @import("pipeline.zig");
 const runner = @import("runner.zig");
 const maintenance = @import("maintenance.zig");
 const sourcestore = @import("sourcestore.zig");
+const kiwix = @import("kiwix.zig");
 
 /// The runner wants a clock without a context argument; one process runs one
 /// manager, so the clock's `Io` is kept here.
@@ -47,6 +48,10 @@ pub const Options = struct {
     /// Where backups made from the interface go (a new subdirectory per
     /// backup). Null turns the backup operation off.
     backup_dir: ?[]const u8 = null,
+    /// Where ZIM files downloaded from the Kiwix library go. Null turns downloads off.
+    zim_dir: ?[]const u8 = null,
+    /// How downloads behave (tests allow plain http to a local server).
+    kiwix_options: kiwix.Options = .{},
     /// Tests only: skip syncing, which is very slow on some disks.
     sync_off: bool = false,
 };
@@ -60,6 +65,15 @@ pub const Op = enum {
     backup,
     /// Delete every document of a source.
     remove,
+    /// Download a ZIM file from the Kiwix library into `zim_dir`.
+    download,
+};
+
+/// What a download needs, copied by the manager.
+pub const Download = struct {
+    meta4_url: []const u8,
+    file_name: []const u8,
+    size: u64 = 0,
 };
 
 pub const StartError = error{
@@ -170,6 +184,18 @@ pub const Manager = struct {
     /// Starts `op` in the background and returns at once. `arg` is the source
     /// name for `.import` and `.remove`, and unused otherwise.
     pub fn startOp(self: *Manager, op: Op, arg: ?[]const u8) StartError!void {
+        return self.begin(op, arg, null);
+    }
+
+    /// Starts downloading a ZIM file in the background. It does not touch the data files, so it takes
+    /// no writer lock, but only one background task runs at a time.
+    pub fn startDownload(self: *Manager, d: Download) StartError!void {
+        if (self.opts.zim_dir == null) return error.NotConfigured;
+        if (!kiwix.validFileName(d.file_name) or d.meta4_url.len == 0 or d.meta4_url.len > 2048) return error.BadArgument;
+        return self.begin(.download, d.file_name, d);
+    }
+
+    fn begin(self: *Manager, op: Op, arg: ?[]const u8, dl: ?Download) StartError!void {
         var source: config.Source = .{ .name = "", .kind = "" };
         switch (op) {
             .import => {
@@ -186,6 +212,7 @@ pub const Manager = struct {
             },
             .backup => if (self.opts.backup_dir == null) return error.NotConfigured,
             .check => {},
+            .download => source.name = arg orelse return error.BadArgument,
         }
 
         self.mutex.lockUncancelable(self.io);
@@ -194,13 +221,18 @@ pub const Manager = struct {
 
         // The lock is taken here, so a conflict is reported to the caller,
         // and handed to the task, which releases it when the run ends.
-        var dir = Io.Dir.cwd().openDir(self.io, self.opts.data_dir, .{}) catch return error.DataDirUnavailable;
-        defer dir.close(self.io);
-        const lock = maintenance.WriterLock.acquire(self.io, dir, "write.lock") catch |e| return switch (e) {
-            error.Busy => error.LockHeld,
-            error.Io => error.DataDirUnavailable,
-        };
-        errdefer lock.release(self.io);
+        var lock: ?maintenance.WriterLock = null;
+        if (op != .download) {
+            var dir = Io.Dir.cwd().openDir(self.io, self.opts.data_dir, .{}) catch return error.DataDirUnavailable;
+            defer dir.close(self.io);
+            lock = maintenance.WriterLock.acquire(self.io, dir, "write.lock") catch |e| return switch (e) {
+                error.Busy => error.LockHeld,
+                error.Io => error.DataDirUnavailable,
+            };
+        }
+        errdefer if (lock) |l| l.release(self.io);
+        const owned_dl: ?*OwnedDownload = if (dl) |d| try OwnedDownload.create(self.gpa, d) else null;
+        errdefer if (owned_dl) |o| o.destroy(self.gpa);
 
         const control = self.gpa.create(connector.Control) catch return error.OutOfMemory;
         errdefer self.gpa.destroy(control);
@@ -209,7 +241,7 @@ pub const Manager = struct {
         errdefer self.gpa.free(owned_name);
 
         self.running = .{ .op = op, .source = owned_name, .started_at = now(), .control = control };
-        self.group.concurrent(self.io, task, .{ self, op, source, control, lock }) catch {
+        self.group.concurrent(self.io, task, .{ self, op, source, control, lock, owned_dl }) catch {
             self.running = null;
             return error.NoConcurrency;
         };
@@ -324,7 +356,60 @@ pub const Manager = struct {
         if (r.failure) |f| out.failure = self.gpa.dupe(u8, f) catch null; // `f` lives in the arena
     }
 
-    fn task(self: *Manager, op: Op, source: config.Source, control: *connector.Control, lock: maintenance.WriterLock) Io.Cancelable!void {
+    const OwnedDownload = struct {
+        meta4_url: []u8,
+        file_name: []u8,
+        size: u64,
+
+        fn create(gpa: Allocator, d: Download) error{OutOfMemory}!*OwnedDownload {
+            const o = try gpa.create(OwnedDownload);
+            errdefer gpa.destroy(o);
+            const u = try gpa.dupe(u8, d.meta4_url);
+            errdefer gpa.free(u);
+            o.* = .{ .meta4_url = u, .file_name = try gpa.dupe(u8, d.file_name), .size = d.size };
+            return o;
+        }
+
+        fn destroy(o: *OwnedDownload, gpa: Allocator) void {
+            gpa.free(o.meta4_url);
+            gpa.free(o.file_name);
+            gpa.destroy(o);
+        }
+    };
+
+    fn runDownload(self: *Manager, d: *OwnedDownload, control: *connector.Control, out: *Outcome) void {
+        const dir = self.opts.zim_dir orelse return self.fail(out, "no ZIM folder is configured ([admin] zim_dir)");
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const path = kiwix.download(self.gpa, self.io, arena_state.allocator(), .{
+            .meta4_url = d.meta4_url,
+            .dest_dir = dir,
+            .file_name = d.file_name,
+            .size = d.size,
+        }, control, self.opts.kiwix_options) catch |e| {
+            switch (e) {
+                error.Cancelled => {
+                    out.state = .cancelled;
+                    self.summaryPrint(out, "Stopped. The part already fetched stays as {s}.part and the next download of the same file continues from it.", .{d.file_name});
+                },
+                error.Stalled => self.fail(out, "nothing arrived for a minute, so the download stopped; starting it again continues where it left off"),
+                error.Exists => self.fail(out, "that file is already in the ZIM folder"),
+                error.Checksum => self.fail(out, "the downloaded file does not match the checksum the library published, so it was discarded"),
+                error.Refused => self.fail(out, "the library or its mirror refused the request"),
+                error.Tls => self.fail(out, "the secure connection failed (certificate or handshake)"),
+                error.Io => self.fail(out, "cannot write in the ZIM folder (does it exist, is there room, may the server write there?)"),
+                error.BadCatalog, error.BadName => self.fail(out, "the library's answer for this file cannot be trusted (no checksum, or the name or size differs)"),
+                error.NotAvailable => self.fail(out, "this build has no network support (-Dcrawler)"),
+                error.OutOfMemory => self.fail(out, "out of memory"),
+                else => self.fail(out, "the download failed (network problem); starting it again continues where it left off"),
+            }
+            return;
+        };
+        out.state = .completed;
+        self.summaryPrint(out, "Saved and verified: {s}. Add it as a source of kind zim (Sources, then Add a source) to search it.", .{path});
+    }
+
+    fn task(self: *Manager, op: Op, source: config.Source, control: *connector.Control, lock: ?maintenance.WriterLock, dl: ?*OwnedDownload) Io.Cancelable!void {
         // Each runner sets the state on every path; `failed` is the safe default.
         var outcome: Outcome = .{ .state = .failed };
         switch (op) {
@@ -332,8 +417,10 @@ pub const Manager = struct {
             .check => runCheck(self, control, &outcome),
             .backup => runBackup(self, control, &outcome),
             .remove => runRemove(self, source.name, control, &outcome),
+            .download => runDownload(self, dl.?, control, &outcome),
         }
-        lock.release(self.io);
+        if (dl) |d| d.destroy(self.gpa);
+        if (lock) |l| l.release(self.io);
         self.record(op, source.name, outcome);
     }
 

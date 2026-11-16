@@ -753,6 +753,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
                 },
                 .sources = cfg.sources,
                 .backup_dir = cfg.admin_options.backup_dir,
+                .zim_dir = cfg.admin_options.zim_dir,
             });
             job_manager_ready = true;
         }
