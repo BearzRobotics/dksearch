@@ -542,6 +542,14 @@ fn adminCredentialCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, 
     return exit_ok;
 }
 
+fn logLine(io: Io, text: []const u8) void {
+    err(io, "{s}", .{text});
+}
+
+fn schedulerTask(gpa: std.mem.Allocator, io: Io, manager: *dk.jobs.Manager, state_path: [:0]const u8) Io.Cancelable!void {
+    dk.scheduler.run(gpa, io, manager, state_path, &stop_control.stop, logLine);
+}
+
 fn adminServeTask(
     gpa: std.mem.Allocator,
     io: Io,
@@ -828,6 +836,9 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .max_body_bytes = 4096,
             .shutdown_grace_ms = cfg.admin.shutdown_grace_ms,
         };
+        if (job_manager_ready) {
+            group.concurrent(io, schedulerTask, .{ gpa, io, &job_manager, paths.state }) catch err(io, "scheduled imports are off (no concurrency available)", .{});
+        }
         group.concurrent(io, adminServeTask, .{ gpa, io, &admin_listener.?, &admin_app, if (admin_log) |*l| l else null, admin_limits, &admin_stats }) catch {
             err(io, "cannot start the administration server (no concurrency available)", .{});
             admin_listener.?.deinit(io);

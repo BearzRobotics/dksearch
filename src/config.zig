@@ -158,6 +158,26 @@ pub const Option = struct {
 /// configuration with none is complete and valid (docs/decisions/0007).
 /// `name`, `kind`, `enabled` and `retain_text` are common to all; every other
 /// key is a connector-specific option, validated by that connector.
+/// A schedule as seconds: `hourly`, `daily`, `weekly`, or a number with `m`, `h` or `d` (`30m`, `6h`, `2d`),
+/// between 10 minutes and a year. Null if it is not one of those.
+pub fn parseInterval(text: []const u8) ?u32 {
+    const t = std.mem.trim(u8, text, " \t");
+    if (std.mem.eql(u8, t, "hourly")) return 3600;
+    if (std.mem.eql(u8, t, "daily")) return 86400;
+    if (std.mem.eql(u8, t, "weekly")) return 7 * 86400;
+    if (t.len < 2) return null;
+    const unit: u32 = switch (t[t.len - 1]) {
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
+        else => return null,
+    };
+    const n = std.fmt.parseInt(u32, t[0 .. t.len - 1], 10) catch return null;
+    const secs = std.math.mul(u32, n, unit) catch return null;
+    if (secs < 600 or secs > 365 * 86400) return null;
+    return secs;
+}
+
 pub const Source = struct {
     /// Unique, 1-64 characters of [a-z0-9_-], starting with a letter or digit.
     /// Jobs and resume points are keyed by it, so renaming a source starts it afresh.
@@ -175,6 +195,10 @@ pub const Source = struct {
     /// How much this source's results count in the ranking, in percent: 100 changes nothing, 150 ranks
     /// them half as high again, 50 halves them.
     boost: u32 = 100,
+    /// How often the server imports this source by itself (`schedule = "daily"`, `"6h"`, `"30m"`): the
+    /// text as written, and in seconds (0: never, import by hand or with a timer).
+    schedule: ?[]const u8 = null,
+    schedule_seconds: u32 = 0,
     options: []const Option = &.{},
 
     pub fn option(self: Source, key: []const u8) ?OptionValue {
@@ -433,7 +457,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     return cfg;
 }
 
-const source_common_keys = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights", "boost" };
+const source_common_keys = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights", "boost", "schedule" };
 
 pub fn validSourceName(name: []const u8) bool {
     if (name.len == 0 or name.len > 64) return false;
@@ -484,6 +508,13 @@ fn readSources(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnost
         if (try optBool(src, where, t, "enabled", diag)) |b| s.enabled = b;
         if (try optBool(src, where, t, "retain_text", diag)) |b| s.retain_text = b;
         if (try intIn(src, where, t, "boost", 1, 1000, diag)) |n| s.boost = @intCast(n);
+        if (try str(src, where, t, "schedule", diag)) |sv| {
+            s.schedule_seconds = parseInterval(sv) orelse {
+                diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}].schedule", .{i}) catch "source.schedule", "must be hourly, daily, weekly, or a number with m, h or d (30m, 6h, 2d; at least 10 minutes), got \"{s}\"", .{sv});
+                return error.InvalidValue;
+            };
+            s.schedule = try a.dupe(u8, sv);
+        }
         if (try str(src, where, t, "rights", diag)) |rv| {
             s.rights = std.meta.stringToEnum(document.Redistribution, rv) orelse {
                 diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}].rights", .{i}) catch "source.rights", "must be \"unknown\", \"allowed\", \"restricted\" or \"forbidden\", got \"{s}\"", .{rv});
@@ -856,6 +887,15 @@ test "ranking settings and a source's boost are read and checked" {
     try testing.expectEqual(@as(u32, 90), c.search.recency_half_life_days);
     try testing.expectEqual(@as(u32, 150), c.sources[0].boost);
     try testing.expectEqual(@as(u32, 100), c.sources[1].boost);
+    try testing.expectEqual(@as(u32, 0), c.sources[1].schedule_seconds);
+    var d2: Diagnostic = .{};
+    var sc = try loadFromSlice(testing.allocator, "t.toml", "[[source]]\nname = \"a\"\nkind = \"files\"\nschedule = \"6h\"", &d2);
+    defer sc.deinit();
+    try testing.expectEqual(@as(u32, 21600), sc.sources[0].schedule_seconds);
+    try testing.expectEqualStrings("6h", sc.sources[0].schedule.?);
+    try testing.expect(sc.sources[0].option("schedule") == null);
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[[source]]\nname = \"a\"\nkind = \"files\"\nschedule = \"often\"", &d2));
+    try testing.expectEqualStrings("source[0].schedule", d2.key());
     try testing.expect(c.sources[0].option("boost") == null);
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[[source]]\nname = \"a\"\nkind = \"files\"\nboost = 0", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[search]\ntitle_weight = 0", &d));

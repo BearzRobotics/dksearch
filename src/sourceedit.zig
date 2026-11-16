@@ -27,6 +27,8 @@ pub const Spec = struct {
     rights: ?[]const u8 = null,
     /// Ranking boost in percent (100 = none).
     boost: u32 = 100,
+    /// How often to import by itself ("daily", "6h", ...); empty or null: never.
+    schedule: ?[]const u8 = null,
     /// The connector's options as TOML, one `key = value` per line.
     options: []const u8 = "",
 };
@@ -66,7 +68,7 @@ pub const Problem = struct {
     }
 };
 
-const reserved = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights", "boost" };
+const reserved = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights", "boost", "schedule" };
 
 /// Applies `edit` to the configuration text and returns the new text (caller
 /// frees it). The result has been validated as a whole configuration.
@@ -131,6 +133,7 @@ pub fn apply(gpa: Allocator, text: []const u8, edit: Edit, problem: *Problem) Er
             try t.entries.put(a, try doc.dupe("kind"), .{ .string = try doc.dupe(spec.kind) });
             if (!spec.enabled) try t.entries.put(a, try doc.dupe("enabled"), .{ .boolean = false });
             if (!spec.retain_text) try t.entries.put(a, try doc.dupe("retain_text"), .{ .boolean = false });
+            if (spec.schedule) |sc| if (sc.len > 0) try t.entries.put(a, try doc.dupe("schedule"), .{ .string = try doc.dupe(sc) });
             if (spec.boost != 100) try t.entries.put(a, try doc.dupe("boost"), .{ .integer = @intCast(spec.boost) });
             if (spec.rights) |r| if (r.len > 0) try t.entries.put(a, try doc.dupe("rights"), .{ .string = try doc.dupe(r) });
 
@@ -321,6 +324,7 @@ test "add, update, toggle and delete a source; other comments survive" {
         .options = "path = \"/srv/feeds\"\nmax_file_bytes = 1000000\n",
         .rights = "restricted",
         .boost = 150,
+        .schedule = "daily",
     } } }, &p);
     defer testing.allocator.free(added);
     try testing.expect(std.mem.indexOf(u8, added, "# my search") != null);
@@ -328,6 +332,7 @@ test "add, update, toggle and delete a source; other comments survive" {
     try testing.expect(std.mem.indexOf(u8, added, "name = \"feeds1\"") != null);
     try testing.expect(std.mem.indexOf(u8, added, "rights = \"restricted\"") != null);
     try testing.expect(std.mem.indexOf(u8, added, "boost = 150") != null);
+    try testing.expect(std.mem.indexOf(u8, added, "schedule = \"daily\"") != null);
     try testing.expect(std.mem.indexOf(u8, added, "max_file_bytes = 1000000") != null);
 
     const updated = try apply(testing.allocator, added, .{ .save = .{ .original = "feeds1", .spec = .{

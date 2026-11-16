@@ -26,7 +26,7 @@ The unit's `StateDirectory=dksearch` creates `/var/lib/dksearch` owned by the se
     sudo systemctl start dksearch-import@my-notes
     journalctl -u dksearch-import@my-notes
 
-The instance name is the source name. Imports work while the server runs, resume after an interruption, and share a lock with the other write commands, so overlapping runs are refused instead of corrupting anything. For a schedule, add a timer for the instance (`OnCalendar=...`, `Unit=dksearch-import@my-notes.service`).
+The instance name is the source name. Imports work while the server runs, resume after an interruption, and share a lock with the other write commands, so overlapping runs are refused instead of corrupting anything. For a schedule inside the server, give the source `schedule = "daily"` (with `admin.actions = true`). Or, for a schedule outside it, add a timer for the instance (`OnCalendar=...`, `Unit=dksearch-import@my-notes.service`).
 
 ## Feeds
 
