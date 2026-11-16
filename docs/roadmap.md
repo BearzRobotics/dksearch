@@ -15,7 +15,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 ## Then
 
-- **Chunks, pages and RAG retrieval:** a section and page model, ingest of Docling and MinerU output (structure, page numbers), a retrieval API (top chunks, neighbours, parent document, attribution). dksearch is the retrieval backend, not the whole RAG system; an optional "ask" endpoint that calls a local LLM may come later as an add-on, never in the core.
+- **Chunks, pages and RAG retrieval (version 1 done):** `GET /api/v1/retrieve` returns the best passages (section-aware chunks with heading path, byte span, neighbours, source attribution) for a query, chunking the candidates' stored text per request (ADR 0030). Still to do: page numbers (need page breaks in the text: Docling's page-break option, or PDF pages), a persistent chunk index and dense or hybrid retrieval with embeddings, ingest of MinerU output, parent-section expansion. dksearch stays the retrieval backend; an answer endpoint remains an optional add-on.
 - **Ranking controls:** configurable field weights, recency and per-source boosts, sort modes, an explain output, stop words and synonyms.
 - **Semantic and hybrid search:** embeddings from a configurable provider (local Ollama first), opt-in, with lexical search staying the default; reranking.
 - **Collections and access control:** collections, scoped and federated search, API keys with per-collection scopes.
