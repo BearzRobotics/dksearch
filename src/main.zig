@@ -658,6 +658,16 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         const base = src.optionString("path") orelse continue;
         origin_roots.append(gpa, .{ .connector = src.name, .base = base }) catch break;
     }
+    // ZIM files are shown from the file itself unless a source says `serve_articles = false`.
+    var zim_archives: std.ArrayList(dk.zimserve.Archive) = .empty;
+    defer zim_archives.deinit(gpa);
+    for (cfg.sources) |src| {
+        if (!std.mem.eql(u8, src.kind, "zim") or !src.enabled) continue;
+        if (!(src.optionBool("serve_articles") orelse true)) continue;
+        const zpath = src.optionString("path") orelse continue;
+        zim_archives.append(gpa, .{ .connector = src.name, .path = zpath }) catch break;
+    }
+    var zim_service: ?dk.zimserve.Service = if (zim_archives.items.len > 0) .{ .io = io, .gpa = gpa, .archives = zim_archives.items } else null;
     var originals_service: ?dk.originals.Service = if (origin_roots.items.len > 0) .{ .io = io, .roots = origin_roots.items } else null;
     if (originals_service != null) err(io, "note: original files are served for {d} source(s) (serve_originals = true)", .{origin_roots.items.len});
 
@@ -785,7 +795,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
 
     installSignalHandlers(onServeSignal);
     var result: u8 = exit_ok;
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

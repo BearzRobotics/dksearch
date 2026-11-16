@@ -48,7 +48,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, api_search, api_health, style, document, other };
+const Route = enum { help_search, help_regex, home, search_page, api_search, api_health, style, document, zim, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -59,6 +59,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/api/v1/health")) return .api_health;
     if (std.mem.eql(u8, path, "/assets/style.css")) return .style;
     if (std.mem.startsWith(u8, path, "/doc/")) return .document;
+    if (std.mem.startsWith(u8, path, "/zim/")) return .zim;
     return .other;
 }
 
@@ -81,6 +82,8 @@ pub const Services = struct {
     content: ?dk.storage.ContentStore = null,
     /// Original files of the sources that allow them to be opened (`serve_originals`).
     originals: ?*const dk.originals.Service = null,
+    /// ZIM files whose articles can be shown from the file itself.
+    zims: ?*const dk.zimserve.Service = null,
     /// The configured sources, for the Source drop-down (follows edits made in the admin panel).
     sources: ?*dk.sourcestore.Store = null,
 };
@@ -148,6 +151,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Service
         .api_search => try apiSearch(arena, searcher, regex, t.params),
         .search_page => try pageSearch(arena, searcher, regex, try sourceNames(arena, services), t.params),
         .document => try documentPage(arena, searcher, services, t.path, t.params),
+        .zim => try zimPage(arena, services, t.path),
         .other => unreachable,
     };
 }
@@ -346,6 +350,57 @@ pub fn apiError(arena: Allocator, status: http.Status, code: []const u8, message
     return jsonResponse(arena, status, .{ .@"error" = .{ .code = code, .message = message } });
 }
 
+// ------------------------------------------------------------ ZIM articles
+
+/// `zim://name/encoded/path` split into the source name and the (still encoded) path.
+fn zimAddress(url: []const u8) ?struct { name: []const u8, path: []const u8 } {
+    const prefix = "zim://";
+    if (!std.mem.startsWith(u8, url, prefix)) return null;
+    const rest = url[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    if (slash == 0 or slash + 1 >= rest.len) return null;
+    return .{ .name = rest[0..slash], .path = rest[slash + 1 ..] };
+}
+
+fn validSourceName(s: []const u8) bool {
+    if (s.len == 0 or s.len > 64) return false;
+    for (s) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_' or c == '-')) return false;
+    return true;
+}
+
+/// An article, picture or page from a ZIM file: `/zim/<source>/<path>`.
+fn zimPage(arena: Allocator, services: Services, path: []const u8) error{OutOfMemory}!Response {
+    const svc = services.zims orelse return htmlError(arena, .not_found, "Not found", "Articles are not served here.");
+    const rest = path["/zim/".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return htmlError(arena, .not_found, "Not found", "No such article.");
+    const name = rest[0..slash];
+    if (!validSourceName(name)) return htmlError(arena, .not_found, "Not found", "No such article.");
+    const decoded = (try dk.zimserve.decodePath(arena, rest[slash + 1 ..])) orelse return htmlError(arena, .not_found, "Not found", "No such article.");
+    const got = svc.fetch(arena, name, decoded) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.NotServed, error.NotFound, error.Unsupported => htmlError(arena, .not_found, "Not found", "No such article in that file."),
+        error.TooLarge => htmlError(arena, .payload_too_large, "Too large", "That entry is too large to be shown here."),
+        error.Io => htmlError(arena, .internal_server_error, "Error", "The ZIM file could not be read."),
+    };
+
+    if (dk.zimserve.isHtml(got.mime)) {
+        const ctx: dk.zimserve.LinkContext = .{ .connector = name, .entry_path = got.path };
+        const body = dk.htmlsafe.sanitizeAlloc(arena, got.bytes, .{ .rewrite = dk.zimserve.rewriteLink, .ctx = @constCast(&ctx), .max_output_bytes = 4 * 1024 * 1024 }) catch return error.OutOfMemory;
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        html.writeArticle(&aw.writer, got.title, name, body) catch return error.OutOfMemory;
+        return htmlResponse(arena, .ok, aw.written());
+    }
+    // Pictures and plain text are sent as they are, under a policy that lets them do nothing else.
+    const is_svg = std.mem.startsWith(u8, got.mime, "image/svg");
+    const headers = try arena.alloc(Header, 4);
+    headers[0] = .{ .name = "x-content-type-options", .value = "nosniff" };
+    headers[1] = .{ .name = "referrer-policy", .value = "no-referrer" };
+    headers[2] = .{ .name = "content-security-policy", .value = if (is_svg) "default-src 'none'; style-src 'unsafe-inline'; sandbox" else "default-src 'none'; img-src 'self'" };
+    headers[3] = asset_cache;
+    const ct: []const u8 = if (std.mem.startsWith(u8, got.mime, "text/plain")) "text/plain; charset=utf-8" else got.mime;
+    return .{ .status = .ok, .content_type = ct, .body = got.bytes, .headers = headers };
+}
+
 // ------------------------------------------------------------ document viewer
 
 /// Longest stored text shown on the viewer page, in bytes.
@@ -365,6 +420,13 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     const hit = info orelse return htmlError(arena, .not_found, "Not found", "No such document.");
     const can_open = if (services.originals) |o| (if (hit.url) |u| o.serves(hit.connector, u) else false) else false;
     if (want_file) return if (can_open) originalFile(arena, services.originals.?, hit) else htmlError(arena, .not_found, "Not found", "The original file of this document is not available here.");
+    // A ZIM article can be read from the file itself.
+    var open_link: ?html.OpenLink = null;
+    if (can_open) {
+        open_link = .{ .href = try std.fmt.allocPrint(arena, "/doc/{s}/file", .{hex}), .label = "Open the original file" };
+    } else if (services.zims) |z| if (hit.url) |u| if (zimAddress(u)) |za| if (z.has(za.name)) {
+        open_link = .{ .href = try std.fmt.allocPrint(arena, "/zim/{s}/{s}", .{ za.name, za.path }), .label = "Read the article" };
+    };
 
     var text: ?[]const u8 = null;
     var cut = false;
@@ -390,7 +452,7 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
         };
     };
     var aw: std.Io.Writer.Allocating = .init(arena);
-    html.writeDocument(&aw.writer, hit, text, cut, can_open, rendered, is_markdown) catch return error.OutOfMemory;
+    html.writeDocument(&aw.writer, hit, text, cut, open_link, rendered, is_markdown) catch return error.OutOfMemory;
     return htmlResponse(arena, .ok, aw.written());
 }
 
@@ -790,6 +852,52 @@ test "the document viewer shows what is known and the stored text, escaped; unkn
         errdefer std.debug.print("target: {s}\n", .{t});
         try testing.expectEqual(http.Status.not_found, nf.status);
     }
+}
+
+test "ZIM articles are served from the file: sanitized, links and images through us, redirects followed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "sample.zim", .data = dk.zim_sample });
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const abs = try tmp.dir.realPathFileAlloc(testing.io, "sample.zim", a);
+    const archives = [_]dk.zimserve.Archive{.{ .connector = "sea", .path = abs }};
+    const svc: dk.zimserve.Service = .{ .io = testing.io, .gpa = testing.allocator, .archives = &archives };
+    const services: Services = .{ .zims = &svc };
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    const get = struct {
+        fn at(arena: Allocator, f: *FakeSearch, sv: Services, path: []const u8) Response {
+            return handleServices(arena, f.searcher(), sv, .GET, path);
+        }
+    }.at;
+
+    const page = get(a, &fake, services, "/zim/sea/Lighthouse");
+    try testing.expectEqual(http.Status.ok, page.status);
+    try testing.expect(std.mem.startsWith(u8, page.content_type, "text/html"));
+    for ([_][]const u8{ "<h1>Lighthouse</h1>", "A lighthouse is a tower", "polished the lens" }) |n| {
+        errdefer std.debug.print("missing {s}\n{s}\n", .{ n, page.body });
+        try testing.expect(std.mem.indexOf(u8, page.body, n) != null);
+    }
+    // The article's own script and style never reach the page.
+    try testing.expect(std.mem.indexOf(u8, page.body, "var x=") == null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "p{}") == null);
+    // A redirect shows its target; a picture and plain text are sent as they are.
+    try testing.expect(std.mem.indexOf(u8, get(a, &fake, services, "/zim/sea/Light").body, "A lighthouse is a tower") != null);
+    const logo = get(a, &fake, services, "/zim/sea/logo.png");
+    try testing.expectEqualStrings("image/png", logo.content_type);
+    try testing.expect(std.mem.startsWith(u8, logo.body, "\x89PNG"));
+    const notes = get(a, &fake, services, "/zim/sea/notes.txt");
+    try testing.expectEqualStrings("text/plain; charset=utf-8", notes.content_type);
+    try testing.expect(std.mem.indexOf(u8, notes.body, "Spring tides") != null);
+    // Percent-encoded paths work; unknown names and paths are 404, never an error page of ours.
+    try testing.expectEqual(http.Status.ok, get(a, &fake, services, "/zim/sea/%4Cighthouse").status);
+    for ([_][]const u8{ "/zim/sea/Nope", "/zim/other/Lighthouse", "/zim/sea/", "/zim/sea", "/zim/Sea/Lighthouse", "/zim/sea/%zz", "/zim/sea/M/Title", "/zim/../Lighthouse" }) |p| {
+        errdefer std.debug.print("path: {s}\n", .{p});
+        try testing.expectEqual(http.Status.not_found, get(a, &fake, services, p).status);
+    }
+    // Not configured: nothing is served.
+    try testing.expectEqual(http.Status.not_found, get(a, &fake, .{}, "/zim/sea/Lighthouse").status);
 }
 
 test "original files are served only for sources that allow it, from inside their folder" {

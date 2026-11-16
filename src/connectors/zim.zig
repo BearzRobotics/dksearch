@@ -46,10 +46,10 @@ pub const default_max_cluster_bytes: u32 = 128 * 1024 * 1024;
 pub const hard_max_cluster_bytes: u32 = 1 << 30;
 const checkpoint_every_clusters = 8;
 const header_len = 80;
-const max_entry_read = 1100;
+pub const max_entry_read = 1100;
 const max_url_len = 1000;
 const zim_magic: u32 = 0x044D495A;
-const allowed_options = [_][]const u8{ "path", "language", "url_base", "max_article_bytes", "max_cluster_bytes" };
+const allowed_options = [_][]const u8{ "path", "language", "url_base", "max_article_bytes", "max_cluster_bytes", "serve_articles" };
 
 fn key(buf: []u8, source: config.Source, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "source[{s}].{s}", .{ source.name, name }) catch name;
@@ -87,6 +87,13 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
         },
         else => {
             diag.set("", key(&kbuf, source, "language"), "expected string", .{});
+            return error.WrongType;
+        },
+    };
+    if (source.option("serve_articles")) |v| switch (v) {
+        .boolean => {},
+        else => {
+            diag.set("", key(&kbuf, source, "serve_articles"), "expected true or false", .{});
             return error.WrongType;
         },
     };
@@ -284,7 +291,9 @@ pub const ZimConnector = struct {
         }
         if (title == null) title = entry.url;
 
-        const url: ?[]const u8 = if (self.url_base) |base| try urlFor(a, base, entry.url) else null;
+        // With a url_base the article lives on a Kiwix server; without one it gets a `zim://` address, which
+        // the viewer turns into a page served from the file itself (see zimserve.zig).
+        const url: ?[]const u8 = if (self.url_base) |base| try urlFor(a, base, entry.url) else try virtualUrl(a, self.name, entry.url);
         const d: doc.Document = .{
             .connector = self.name,
             .source_id = entry.url,
@@ -328,6 +337,12 @@ fn urlFor(a: Allocator, base: []const u8, path: []const u8) Allocator.Error![]co
     return out.items;
 }
 
+/// `zim://source-name/percent-encoded/path`.
+fn virtualUrl(a: Allocator, name: []const u8, path: []const u8) Allocator.Error![]const u8 {
+    const encoded = try urlFor(a, "", path);
+    return std.fmt.allocPrint(a, "zim://{s}/{s}", .{ name, encoded });
+}
+
 const Item = struct { cluster: u32, blob: u32, entry: u32 };
 
 fn itemLess(_: void, x: Item, y: Item) bool {
@@ -341,7 +356,9 @@ const Metadata = struct {
     title: ?[]const u8 = null,
 };
 
-const Entry = struct {
+pub const Entry = struct {
+    /// For a redirect: the index of the entry it points to.
+    redirect: u32 = 0,
     mime: u16,
     namespace: u8,
     /// False for redirects, link targets and deleted entries.
@@ -360,6 +377,7 @@ fn parseEntry(buf: []const u8) ?Entry {
     var e: Entry = .{ .mime = mime, .namespace = ns, .content = false, .cluster = 0, .blob = 0, .url = "", .title = "" };
     var url_at: usize = 0;
     if (mime == 0xFFFF) {
+        e.redirect = std.mem.readInt(u32, buf[8..12], .little);
         url_at = 12; // redirect: index at 8
     } else if (mime == 0xFFFE or mime == 0xFFFD) {
         url_at = 8; // link target or deleted
@@ -381,7 +399,7 @@ fn parseEntry(buf: []const u8) ?Entry {
     return e;
 }
 
-const Blobs = struct {
+pub const Blobs = struct {
     data: []const u8,
     /// Offsets of blob i are offs[i]..offs[i+1], `count` blobs.
     offsets: []const u64,
@@ -392,7 +410,7 @@ const Blobs = struct {
     }
 };
 
-const Zim = struct {
+pub const Zim = struct {
     file: Io.File,
     io: Io,
     size: u64,
@@ -403,9 +421,9 @@ const Zim = struct {
     checksum_pos: u64,
     mimes: [][]const u8,
 
-    const OpenError = error{ OutOfMemory, NotZim, Unsupported, Damaged, Io };
+    pub const OpenError = error{ OutOfMemory, NotZim, Unsupported, Damaged, Io };
 
-    fn open(a: Allocator, io: Io, file: Io.File) OpenError!Zim {
+    pub fn open(a: Allocator, io: Io, file: Io.File) OpenError!Zim {
         const size = file.length(io) catch return error.Io;
         if (size < header_len) return error.NotZim;
         var h: [header_len]u8 = undefined;
@@ -447,7 +465,7 @@ const Zim = struct {
         return z;
     }
 
-    fn mimeOf(self: *const Zim, idx: u16) []const u8 {
+    pub fn mimeOf(self: *const Zim, idx: u16) []const u8 {
         return if (idx < self.mimes.len) self.mimes[idx] else "";
     }
 
@@ -460,10 +478,39 @@ const Zim = struct {
     }
 
     /// Entry `i`; the strings point into `buf`.
-    fn readEntry(self: *const Zim, i: u32, buf: *[max_entry_read]u8) ?Entry {
+    pub fn readEntry(self: *const Zim, i: u32, buf: *[max_entry_read]u8) ?Entry {
         const off = self.entryOffset(i) orelse return null;
         const n = preadAll(self.file, self.io, buf, off) catch return null;
         return parseEntry(buf[0..n]);
+    }
+
+    /// The index of the entry `url` in namespace `ns` (the directory is sorted by namespace, then
+    /// by URL, bytewise), or null.
+    pub fn find(self: *const Zim, ns: u8, url: []const u8) ?u32 {
+        var lo: u32 = 0;
+        var hi: u32 = self.entry_count;
+        var buf: [max_entry_read]u8 = undefined;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const e = self.readEntry(mid, &buf) orelse return null;
+            const order: std.math.Order = if (ns != e.namespace) std.math.order(ns, e.namespace) else std.mem.order(u8, url, e.url);
+            switch (order) {
+                .eq => return mid,
+                .lt => hi = mid,
+                .gt => lo = mid + 1,
+            }
+        }
+        return null;
+    }
+
+    /// The bytes of a content entry, allocated from `a` (the decompressed cluster is held in `a` too).
+    pub fn readContent(self: *const Zim, a: Allocator, gpa: Allocator, e: Entry, max_bytes: u32) LoadError![]const u8 {
+        if (!e.content) return error.Damaged;
+        var zstd_buf: ?[]u8 = null;
+        defer if (zstd_buf) |b| gpa.free(b);
+        const blobs = try self.loadCluster(a, gpa, &zstd_buf, e.cluster, max_bytes);
+        if (e.blob >= blobs.count) return error.Damaged;
+        return blobs.get(e.blob);
     }
 
     const ScanError = error{ OutOfMemory, Cancelled, Io };
@@ -507,10 +554,10 @@ const Zim = struct {
         return keep.dupe(u8, v);
     }
 
-    const LoadError = error{ OutOfMemory, Damaged, Unsupported, TooBig, Io };
+    pub const LoadError = error{ OutOfMemory, Damaged, Unsupported, TooBig, Io };
 
     /// Reads and decompresses cluster `c` into `a`.
-    fn loadCluster(self: *const Zim, a: Allocator, gpa: Allocator, zstd_buf: *?[]u8, c: u32, max_bytes: u32) LoadError!Blobs {
+    pub fn loadCluster(self: *const Zim, a: Allocator, gpa: Allocator, zstd_buf: *?[]u8, c: u32, max_bytes: u32) LoadError!Blobs {
         if (c >= self.cluster_count) return error.Damaged;
         var pb: [16]u8 = undefined;
         const have = preadAll(self.file, self.io, pb[0..8], self.cluster_ptr_pos + 8 * @as(u64, c)) catch return error.Io;
@@ -603,7 +650,8 @@ fn preadAll(file: Io.File, io: Io, buf: []u8, pos: u64) !usize {
 
 const testing = std.testing;
 const nettest = @import("nettest.zig");
-const sample = @embedFile("testdata/zim/sample.zim");
+/// A tiny ZIM file of invented content (about 3 KB), for tests here and in the HTTP layer.
+pub const sample = @embedFile("testdata/zim/sample.zim");
 
 fn zimSource(path: []const u8, extra: []const config.Option) !ZimConnector {
     var opts: std.ArrayList(config.Option) = .empty;
@@ -704,18 +752,23 @@ test "the library name from the metadata is recorded as the dataset" {
     defer conn.deinit();
     const Spy = struct {
         saw_dataset: bool = false,
-        saw_url: bool = false,
+        saw_virtual_url: bool = false,
+        saw_other_url: bool = false,
         fn submit(ptr: *anyopaque, d: doc.Document) api.Sink.Error!void {
             const s: *@This() = @ptrCast(@alignCast(ptr));
             if (d.source_dataset != null and std.mem.eql(u8, d.source_dataset.?, "Sample Sea Library")) s.saw_dataset = true;
-            if (d.canonical_url != null) s.saw_url = true;
+            if (d.canonical_url) |u| {
+                if (std.mem.startsWith(u8, u, "zim://kiwix/")) s.saw_virtual_url = true else s.saw_other_url = true;
+            }
         }
     };
     var spy: Spy = .{};
     var ctl: api.Control = .{};
     _ = try conn.connector().run(.{ .ptr = &spy, .vtable = &.{ .submit = Spy.submit } }, &ctl, null);
     try testing.expect(spy.saw_dataset);
-    try testing.expect(!spy.saw_url); // no url_base configured: no links
+    // No url_base configured: each article gets a zim:// address that the viewer serves from the file.
+    try testing.expect(spy.saw_virtual_url);
+    try testing.expect(!spy.saw_other_url);
 }
 
 test "urlFor encodes unsafe bytes and keeps slashes" {

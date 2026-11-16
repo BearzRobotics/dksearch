@@ -327,7 +327,8 @@ Kind `zim` indexes the articles of a ZIM file, the offline-content format of the
 Key	Type	Default	Description
 path	String	required	The `.zim` file (format version 5 or 6).
 language	String	none	Language tag stored on each document.
-url_base	String	none	Where the articles can be read, starting with http:// or https:// and ending in "/", for example the address of a kiwix-serve (`http://localhost:8080/content/wikipedia_en_all_maxi/`). Each result then links to that address plus the article's path. Without it results have no link.
+url_base	String	none	Where the articles can be read, starting with http:// or https:// and ending in "/", for example the address of a kiwix-serve (`http://localhost:8080/content/wikipedia_en_all_maxi/`). Each result then links to that address plus the article's path. Without it each article gets an address of the form `zim://SOURCE/PATH`, and the search server shows the article itself from the ZIM file (see `serve_articles`).
+serve_articles	Boolean	true	Show this file's articles, pictures and plain-text pages from the file itself at `/zim/SOURCE/PATH`, so results open in the browser. Article HTML is made safe first (no scripts, styles, frames or forms), links inside the file and its pictures keep working through the same address, links to other sites stay, and stylesheets and scripts of the file are never served. Set false to stop serving the file. The setting is read when the server starts.
 max_article_bytes	Integer	4194304	Largest article text indexed, 1-67108864; larger ones are skipped.
 max_cluster_bytes	Integer	134217728	Largest decompressed cluster accepted, 1-1073741824.
 

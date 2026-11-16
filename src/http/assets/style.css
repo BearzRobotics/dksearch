@@ -224,3 +224,5 @@ dl.meta dd { margin: 0; overflow-wrap: anywhere; }
 .rendered blockquote { margin-left: 0; padding-left: 1rem; border-left: 3px solid var(--border); color: var(--muted); }
 .rendered table { border-collapse: collapse; display: block; overflow: auto; }
 .rendered th, .rendered td { border: 1px solid var(--border); padding: 0.25rem 0.6rem; }
+.article img { max-width: 100%; height: auto; }
+.article a { overflow-wrap: anywhere; }

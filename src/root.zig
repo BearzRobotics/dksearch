@@ -16,6 +16,9 @@ pub const docmeta = @import("docmeta.zig");
 pub const originals = @import("originals.zig");
 pub const avmeta = @import("avmeta.zig");
 pub const render = @import("render.zig");
+pub const zimserve = @import("zimserve.zig");
+/// A tiny ZIM file for tests of the HTTP layer.
+pub const zim_sample = @import("connectors/zim.zig").sample;
 pub const htmlsafe = @import("htmlsafe.zig");
 pub const exif = @import("exif.zig");
 pub const sourcestore = @import("sourcestore.zig");
@@ -49,6 +52,7 @@ test {
     _ = originals;
     _ = avmeta;
     _ = render;
+    _ = zimserve;
     _ = htmlsafe;
     _ = exif;
     _ = sourcestore;

@@ -240,6 +240,17 @@ fn writeInterpretation(w: *Writer, f: Form, page: dk.search.Page, offset: u32) W
 fn writeHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
     try w.writeAll("<li>");
     const label = h.title orelse h.url orelse "(untitled)";
+    if (h.url) |u| if (std.mem.startsWith(u8, u, "zim://")) {
+        // An article of a ZIM file: it opens from the file (see handler.zimPage).
+        try w.writeAll("<a class=\"title\" href=\"/zim/");
+        try writeEscaped(w, u["zim://".len..]);
+        try w.writeAll("\">");
+        try writeEscaped(w, label);
+        try w.writeAll("</a><div class=\"url\">");
+        try writeEscaped(w, u);
+        try w.writeAll("</div>");
+        return finishHit(w, h);
+    };
     if (h.url) |u| if (isLinkable(u)) {
         try w.writeAll("<a class=\"title\" href=\"");
         try writeEscaped(w, u);
@@ -323,7 +334,23 @@ fn writeDate(w: *Writer, secs: i64) Writer.Error!void {
 }
 
 /// The viewer page for one document: what is known about it and its stored text.
-pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, can_open_original: bool, rendered: ?[]const u8, is_markdown: bool) Writer.Error!void {
+pub const OpenLink = struct { href: []const u8, label: []const u8 };
+
+/// A page from a ZIM file. `body` was made safe by the sanitizer.
+pub fn writeArticle(w: *Writer, title: []const u8, source: []const u8, body: []const u8) Writer.Error!void {
+    try writeHead(w, title);
+    try w.writeAll("<body><main class=\"docpage\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n<h2 class=\"doctitle\">");
+    try writeEscaped(w, title);
+    try w.writeAll("</h2>\n<p class=\"muted small\">From the ZIM source <a href=\"/search?q=*&amp;connector=");
+    try query.writeEncoded(w, source);
+    try w.writeAll("\">");
+    try writeEscaped(w, source);
+    try w.writeAll("</a></p>\n<div class=\"doctext rendered article\">");
+    try w.writeAll(body);
+    try w.writeAll("</div>\n<p><a href=\"/\">&larr; New search</a></p></main></body></html>\n");
+}
+
+pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, open_link: ?OpenLink, rendered: ?[]const u8, is_markdown: bool) Writer.Error!void {
     try writeHead(w, h.title orelse h.url orelse "Document");
     try w.writeAll("<body><main class=\"docpage\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n<h2 class=\"doctitle\">");
     try writeEscaped(w, h.title orelse h.url orelse "(untitled)");
@@ -357,10 +384,12 @@ pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool,
         }
     }
     try w.writeAll("</dl>\n");
-    if (can_open_original) {
-        try w.writeAll("<p><a class=\"button\" href=\"/doc/");
-        try writeIdHex(w, h.id);
-        try w.writeAll("/file\">Open the original file</a></p>\n");
+    if (open_link) |l| {
+        try w.writeAll("<p><a class=\"button\" href=\"");
+        try writeEscaped(w, l.href);
+        try w.writeAll("\">");
+        try writeEscaped(w, l.label);
+        try w.writeAll("</a></p>\n");
     }
     if (rendered) |html_body| {
         // `html_body` was made safe by the sanitizer.
