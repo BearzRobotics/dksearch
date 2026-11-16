@@ -624,8 +624,10 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         p.setFuzzyMode(fuzzy_mode);
         p.setSimpleSyntax(!cfg.search.advanced_syntax);
         p.setWeights(cfg.search.title_weight, cfg.search.body_weight);
+        p.setRecency(cfg.search.recency_boost, cfg.search.recency_half_life_days);
     }
     index.setWeights(cfg.search.title_weight, cfg.search.body_weight);
+    index.setRecency(cfg.search.recency_boost, cfg.search.recency_half_life_days);
     index.setFuzzyMode(fuzzy_mode);
     index.setSimpleSyntax(!cfg.search.advanced_syntax);
     const searcher = if (pool) |*p| p.searcher() else index.searcher();

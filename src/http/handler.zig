@@ -88,6 +88,14 @@ pub const Services = struct {
     sources: ?*dk.sourcestore.Store = null,
 };
 
+/// How much each source counts in the ranking (only those that differ from 100).
+fn sourceBoosts(arena: Allocator, services: Services) error{OutOfMemory}![]const dk.search.SourceBoost {
+    const store = services.sources orelse return &.{};
+    var out: std.ArrayList(dk.search.SourceBoost) = .empty;
+    for (store.snapshot()) |src| if (src.enabled and src.boost != 100) try out.append(arena, .{ .source = try arena.dupe(u8, src.name), .percent = src.boost });
+    return out.items;
+}
+
 /// The enabled sources, sorted by kind and then name, for the Source drop-down.
 fn sourceChoices(arena: Allocator, services: Services) error{OutOfMemory}![]const html.SourceChoice {
     const store = services.sources orelse return &.{};
@@ -150,8 +158,8 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Service
             html.writeHelpRegex(&aw.writer, if (regex) |svc| svc.limits else null) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
-        .api_search => try apiSearch(arena, searcher, regex, t.params),
-        .search_page => try pageSearch(arena, searcher, regex, try sourceChoices(arena, services), t.params),
+        .api_search => try apiSearch(arena, searcher, regex, try sourceBoosts(arena, services), t.params),
+        .search_page => try pageSearch(arena, searcher, regex, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
         .document => try documentPage(arena, searcher, services, t.path, t.params),
         .zim => try zimPage(arena, services, t.path),
         .other => unreachable,
@@ -282,6 +290,9 @@ const ApiHit = struct {
     size: ?u64,
     /// Unix time in seconds, when the source gave one.
     modified_at: ?i64,
+    /// With `explain=1`: the parts of the score (text match in the title and in the body, the source's
+    /// boost, the recency factor).
+    explain: ?dk.search.Explain = null,
 };
 const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false };
 
@@ -304,12 +315,14 @@ pub fn regexSearch(arena: Allocator, searcher: dk.search.Searcher, service: ?*dk
     return .{ .ok = r };
 }
 
-fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, params: query.Params) error{OutOfMemory}!Response {
+fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
     const parsed = switch (try parseQuery(arena, params, false)) {
         .ok => |p| p,
         .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
-    const q = parsed.q;
+    var q = parsed.q;
+    q.boosts = boosts;
+    if (params.get("explain")) |v| q.explain = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
     if (parsed.re) |req| {
         const r = switch (try regexSearch(arena, searcher, regex, q, req)) {
             .ok => |r| r,
@@ -346,6 +359,7 @@ fn apiHit(arena: Allocator, h: dk.search.Hit) error{OutOfMemory}!ApiHit {
         .author = h.author,
         .size = h.size,
         .modified_at = h.modified_at,
+        .explain = h.explain,
     };
 }
 
@@ -506,12 +520,13 @@ fn originalFile(arena: Allocator, svc: *const dk.originals.Service, hit: dk.sear
 
 // ------------------------------------------------------------ HTML pages
 
-fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, sources: []const html.SourceChoice, params: query.Params) error{OutOfMemory}!Response {
+fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
     const parsed = switch (try parseQuery(arena, params, true)) {
         .ok => |p| p,
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
     var q = parsed.q;
+    q.boosts = boosts;
     const chosen_connector: []const u8 = q.connector orelse "";
     // "All sources of this kind" (`connector=kind:zim`): every source of the kind, as alternatives.
     if (q.connector) |c| if (std.mem.startsWith(u8, c, "kind:")) {

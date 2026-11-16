@@ -6,7 +6,7 @@ NAME
 dksearch-api - HTTP interface of dksearch: JSON API version 1 and the HTML search page
 
 SYNOPSIS
-GET /api/v1/search?q=TEXT[&language=L][&content_type=T][&connector=C][&filter=F]...[&sort=ORDER][&limit=N][&offset=N][&regex=PATTERN[&regex_flags=i][&regex_dialect=perl|ere]]
+GET /api/v1/search?q=TEXT[&language=L][&content_type=T][&connector=C][&filter=F]...[&sort=ORDER][&explain=1][&limit=N][&offset=N][&regex=PATTERN[&regex_flags=i][&regex_dialect=perl|ere]]
 
 GET /api/v1/health
 
@@ -41,6 +41,9 @@ sort
 
 language, content_type, connector
 : Optional exact-match filters on the document's language tag, media type and source connector. At most 64 bytes, no control characters. An empty value means no filter.
+
+explain
+: Optional. `1` adds the parts of each hit's score (`explain` object), to see why a result ranks where it does.
 
 limit
 : Optional page size. Default 10, maximum 100.
@@ -77,7 +80,7 @@ Response: 200 with `application/json`:
       "fuzzy": false
     }
 
-`interpreted` is how the query was read, as text like `linux OR bsd NOT android`, when it used the query language or typo tolerance, and null for plain words. `fuzzy` is true when the results include words one typo away from those typed. `id` is the 32-hex-digit stable document id. `url`, `title`, `snippet`, `language`, `content_type`, `kind`, `domain`, `author`, `size` and `modified_at` may be null (a source need not know them; documents indexed before these were recorded have none until they are imported again or the index is rebuilt). `view_url` is the document's page on this server, with its details and stored text. `kind` is page, text, markdown, pdf, image, video, audio, data or other; `domain` is the host of the address; `size` is in bytes; `modified_at` is Unix time in seconds. `score` is higher for better matches and is comparable only within one response. Hits are ordered by score, ties by id, so paging an unchanged index is stable. `has_more` says whether another page follows. `snippet` brackets matched text with the control characters U+0002 and U+0003 (JSON `\u0002`, `\u0003`); a client must escape the text for its output format first and only then replace the markers with its own markup. Snippets come from untrusted documents and may themselves contain such characters.
+`interpreted` is how the query was read, as text like `linux OR bsd NOT android`, when it used the query language or typo tolerance, and null for plain words. `fuzzy` is true when the results include words one typo away from those typed. `id` is the 32-hex-digit stable document id. `url`, `title`, `snippet`, `language`, `content_type`, `kind`, `domain`, `author`, `size` and `modified_at` may be null (a source need not know them; documents indexed before these were recorded have none until they are imported again or the index is rebuilt). `view_url` is the document's page on this server, with its details and stored text. `kind` is page, text, markdown, pdf, image, video, audio, data or other; `domain` is the host of the address; `size` is in bytes; `modified_at` is Unix time in seconds. `score` is higher for better matches and is comparable only within one response. It is the weighted text match (title and text, `[search] title_weight` and `body_weight`) times the source's `boost` and, if `[search] recency_boost` is set, a factor for how new the document is. With `explain=1` every hit also has an `explain` object: `text` (the weighted text match), `source` (the boost factor) and `recency` (the age factor), with `score` = `text * source * recency`, plus `title` and `body`, how well the title and the text match on their own (unweighted; they do not add up to `text`, because the search engine weighs word counts before it saturates them). Without `explain` the member is null. Hits are ordered by score, ties by id, so paging an unchanged index is stable. `has_more` says whether another page follows. `snippet` brackets matched text with the control characters U+0002 and U+0003 (JSON `\u0002`, `\u0003`); a client must escape the text for its output format first and only then replace the markers with its own markup. Snippets come from untrusted documents and may themselves contain such characters.
 
 GET /api/v1/health
 Returns 200 and `{"status":"ok"}`. It reports that the process is serving requests and nothing about the index.

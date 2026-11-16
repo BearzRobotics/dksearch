@@ -115,6 +115,10 @@ pub const SqliteIndex = struct {
     /// (`[search] title_weight`, `body_weight`).
     title_weight: u32 = 10,
     body_weight: u32 = 1,
+    /// Newer documents rank higher by up to this many percent (0 = off); the boost halves for every
+    /// `recency_days` of age (`[search] recency_boost`, `recency_half_life_days`).
+    recency_percent: u32 = 0,
+    recency_days: u32 = 365,
     /// A time limit for each search, if set (`setQueryTimeout`).
     timeout: ?struct { io: Io, ms: u32 } = null,
     /// True if the `docs` table has the metadata columns filters use (an index
@@ -158,6 +162,11 @@ pub const SqliteIndex = struct {
     pub fn setWeights(self: *SqliteIndex, title: u32, body: u32) void {
         self.title_weight = title;
         self.body_weight = body;
+    }
+
+    pub fn setRecency(self: *SqliteIndex, percent: u32, half_life_days: u32) void {
+        self.recency_percent = percent;
+        self.recency_days = @max(half_life_days, 1);
     }
 
     pub fn setQueryTimeout(self: *SqliteIndex, io: Io, ms: u32) void {
@@ -804,17 +813,44 @@ pub const SqliteIndex = struct {
         if (filters.len > 0 and !self.has_meta) return error.InvalidQuery; // an index from before filters: `rebuild` upgrades it
         const columns = if (self.has_meta) "d.language, d.content_type, d.modified_at, d.size, d.author, d.kind, d.domain" else "d.language, d.content_type, NULL, NULL, NULL, NULL, NULL";
         const text_mode = match.len > 0;
-        const bm = try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0)", .{ self.title_weight, self.body_weight });
+        // The score: the weighted text match, times the source's boost and a recency factor. bm25 is
+        // negative (smaller is better), so a factor above 1 helps.
+        var factors: std.ArrayList(u8) = .empty;
+        var src_expr: []const u8 = "1.0";
+        if (q.boosts.len > 0) {
+            var cs: std.ArrayList(u8) = .empty;
+            try cs.appendSlice(arena, "(CASE d.connector");
+            for (q.boosts) |b| {
+                try cs.appendSlice(arena, " WHEN '");
+                for (b.source) |ch| {
+                    if (ch == '\'') try cs.append(arena, '\'');
+                    try cs.append(arena, ch);
+                }
+                try cs.print(arena, "' THEN {d}.{d:0>2}", .{ b.percent / 100, b.percent % 100 });
+            }
+            try cs.appendSlice(arena, " ELSE 1.0 END)");
+            src_expr = cs.items;
+        }
+        var rec_expr: []const u8 = "1.0";
+        if (self.recency_percent > 0 and self.has_meta) {
+            rec_expr = try std.fmt.allocPrint(arena, "(1.0 + {d}.{d:0>2} / (1.0 + MAX(0, CAST(strftime('%s','now') AS INTEGER) - COALESCE(d.modified_at, d.published_at, d.indexed_at, 0)) / 86400.0 / {d}.0))", .{ self.recency_percent / 100, self.recency_percent % 100, self.recency_days });
+        }
+        try factors.print(arena, "{s} * {s}", .{ src_expr, rec_expr });
+        const bm = try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0) * {s}", .{ self.title_weight, self.body_weight, factors.items });
+        const explain_cols = if (q.explain and text_mode)
+            try std.fmt.allocPrint(arena, ", -bm25(fts, {d}.0, {d}.0), -bm25(fts, 1.0, 0.0), -bm25(fts, 0.0, 1.0), {s}, {s}", .{ self.title_weight, self.body_weight, src_expr, rec_expr })
+        else
+            "";
         var sql: std.ArrayList(u8) = .empty;
         var binds: std.ArrayList(Bind) = .empty;
         if (text_mode) {
             try sql.print(arena,
                 \\SELECT d.id, d.connector, d.url, d.title,
                 \\       snippet(fts, 1, ?1, ?2, '…', 16),
-                \\       -{s}, {s}
+                \\       -({s}), {s}{s}
                 \\FROM fts JOIN docs d ON d.rowid = fts.rowid
                 \\WHERE fts MATCH ?3
-            , .{ bm, columns });
+            , .{ bm, columns, explain_cols });
         } else {
             try sql.print(arena, "SELECT d.id, d.connector, d.url, d.title, NULL, 0.0, {s} FROM docs d WHERE 1", .{columns});
         }
@@ -862,7 +898,9 @@ pub const SqliteIndex = struct {
                 more = true;
                 break;
             }
-            try hits.append(arena, try hitFromRow(arena, st));
+            var hit = try hitFromRow(arena, st);
+            if (q.explain and text_mode) hit.explain = .{ .text = st.colFloat(13), .title = st.colFloat(14), .body = st.colFloat(15), .source = st.colFloat(16), .recency = st.colFloat(17) };
+            try hits.append(arena, hit);
         }
         return .{ .hits = hits.items, .has_more = more, .interpreted = interpreted, .fuzzy = fuzzy };
     }
@@ -938,6 +976,10 @@ pub const SearchPool = struct {
 
     pub fn setWeights(self: *SearchPool, title: u32, body: u32) void {
         for (self.slots) |*sl| sl.index.setWeights(title, body);
+    }
+
+    pub fn setRecency(self: *SearchPool, percent: u32, half_life_days: u32) void {
+        for (self.slots) |*sl| sl.index.setRecency(percent, half_life_days);
     }
 
     /// See `SqliteIndex.setQueryTimeout`; call before searching.
@@ -1282,6 +1324,44 @@ test "the title and body weights decide which counts more" {
     try testing.expectEqual(body_id, flipped.hits[0].id);
     idx.setWeights(1000, 1);
     try testing.expectEqual(title_id, (try searchAll(a, &idx, "truth")).hits[0].id);
+}
+
+test "a source's boost, the recency boost and the explanation of a score" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const day: i64 = 86400;
+    const now: i64 = Io.Clock.real.now(testing.io).toSeconds();
+    try putDoc(&idx, .{ .connector = "a", .source_id = "1", .title = "Anchor", .text = "anchor anchor", .modified_at = now - 3000 * day });
+    try putDoc(&idx, .{ .connector = "b", .source_id = "2", .title = "Anchor", .text = "anchor anchor", .modified_at = now - 3000 * day });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two identical documents tie; a boost on source b puts it first, a cut puts it last.
+    const boosted = try idx.searcher().search(a, .{ .text = "anchor", .boosts = &.{.{ .source = "b", .percent = 200 }} });
+    try testing.expectEqualStrings("b", boosted.hits[0].connector);
+    try testing.expect(boosted.hits[0].score > boosted.hits[1].score * 1.9);
+    const cut = try idx.searcher().search(a, .{ .text = "anchor", .boosts = &.{.{ .source = "b", .percent = 50 }} });
+    try testing.expectEqualStrings("a", cut.hits[0].connector);
+
+    // A newer document of the same text ranks above an old one once recency counts.
+    try putDoc(&idx, .{ .connector = "c", .source_id = "3", .title = "Anchor", .text = "anchor anchor", .modified_at = now - day });
+    idx.setRecency(100, 365);
+    const fresh = try idx.searcher().search(a, .{ .text = "anchor" });
+    try testing.expectEqualStrings("c", fresh.hits[0].connector);
+    try testing.expect(fresh.hits[0].score > fresh.hits[2].score * 1.5);
+
+    // The explanation: the factors multiply back to the score.
+    const ex = try idx.searcher().search(a, .{ .text = "anchor", .explain = true, .boosts = &.{.{ .source = "c", .percent = 150 }} });
+    const h = ex.hits[0];
+    try testing.expectEqualStrings("c", h.connector);
+    const e = h.explain.?;
+    try testing.expectApproxEqRel(1.5, e.source, 1e-9);
+    try testing.expect(e.recency > 1.9 and e.recency <= 2.0);
+    try testing.expectApproxEqRel(h.score, e.text * e.source * e.recency, 1e-9);
+    try testing.expect(e.title > 0 and e.body > 0);
+    // Without asking, nothing is added.
+    try testing.expect((try idx.searcher().search(a, .{ .text = "anchor" })).hits[0].explain == null);
 }
 
 test "re-adding an id replaces the old text; remove deletes" {

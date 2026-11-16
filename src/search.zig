@@ -112,6 +112,24 @@ pub const Query = struct {
     /// Page size; 0 means `default_limit`. Larger than `max_limit` is an error.
     limit: u32 = 0,
     offset: u32 = 0,
+    /// How much each source counts, in percent (sources not named count 100). Set by the server from the
+    /// sources' `boost` settings.
+    boosts: []const SourceBoost = &.{},
+    /// Fill `Hit.explain` with the parts of each score.
+    explain: bool = false,
+};
+
+pub const SourceBoost = struct { source: []const u8, percent: u32 };
+
+/// The parts of a score: `score` = `text` x `source` x `recency`. `text` is the weighted text match; `title` and
+/// `body` are how well the title and the text match on their own (not weighted, and not additive: the search
+/// engine weighs the word counts before it saturates them, so the two do not add up to `text`).
+pub const Explain = struct {
+    text: f64,
+    title: f64,
+    body: f64,
+    source: f64,
+    recency: f64,
 };
 
 pub const Hit = struct {
@@ -135,6 +153,7 @@ pub const Hit = struct {
     /// Filled by `Searcher.info`, not by `search`.
     published_at: ?i64 = null,
     indexed_at: ?i64 = null,
+    explain: ?Explain = null,
 };
 
 pub const Page = struct {

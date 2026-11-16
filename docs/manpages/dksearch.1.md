@@ -236,6 +236,8 @@ admin.zim_dir	String	none	A folder you control where the administration interfac
 admin.cookie_secure	Boolean	false	Add `Secure` to the session cookie. Set it when a reverse proxy serves the interface over HTTPS.
 search.fuzzy	String	auto	Typo tolerance without anyone asking for it: `auto` repeats a search that finds fewer than three results with every word of four or more letters also matching words one typo away (and tells the person, with a link to search exactly as typed); `always` does that for every search; `off` leaves it to `word~` in the query. See SEARCH SYNTAX.
 search.query_syntax	String	advanced	`advanced`: the query language (AND, OR, NOT, parentheses, `-word`, `prefix*`, `word~`, `"a b"~5`). `simple`: every word is plain text and only quotes make a phrase, as in earlier versions.
+search.recency_boost	Integer	0	Newer documents rank up to this many percent higher, 0-1000 (0 = off). A document's date is when it was modified or published, otherwise when it was indexed. The boost shrinks smoothly with age: it halves for every `search.recency_half_life_days`.
+search.recency_half_life_days	Integer	365	Age in days at which the newer-first boost has halved, 1-36500.
 search.query_timeout_ms	Integer	5000	Longest a search may run, 0-60000 milliseconds (0 = no limit, which is not recommended). Very common words over a very large index take seconds to rank, because every matching document is scored; a search that runs past this is stopped and answers HTTP 503 `search_timeout` ("try more specific words") instead of tying up a connection until the connection's own deadline (`server.write_timeout_ms`) cuts it off. Keep it below that deadline.
 search.regex	Boolean	true	Offer the regular-expression filter on the public search page and API, and on the administration query-testing page. It needs `content.db` (it reads the stored texts), so it is off until something has been imported; restart after the first import. See the notes below.
 search.regex_max_pattern	Integer	200	Longest regular expression, in bytes, 1-2000.
@@ -258,6 +260,7 @@ kind	String	required	Connector type. This version knows `files`, `gutenberg`, `z
 enabled	Boolean	true	A disabled source stays in the file but is never run.
 retain_text	Boolean	true	Keep each document's text so the index can be rebuilt without reading the source again. Set false for a source whose terms forbid keeping its text; its documents are then skipped by **rebuild**.
 rights	String	connector default	Override the redistribution flag (`unknown`, `allowed`, `restricted`, `forbidden`) of every document from this source. Defaults are conservative guesses, not legal advice; the decision is yours. Only documents that are added or changed afterwards pick it up; unchanged ones keep the flag they were stored with.
+boost	Integer	100	How much this source's results count in the ranking, in percent, 1-1000. 100 changes nothing; 150 ranks its results half as high again, 50 halves them. It multiplies the relevance score, so it reorders results by relevance (and the relevance part of other orders) but does not add or hide anything. Settable from the source's page in the administration interface.
 
 Kind `files` indexes `.txt` and `.md` files (and `.pdf` files with `pdf_text`; extensions are case-insensitive) under a directory, including subdirectories:
 

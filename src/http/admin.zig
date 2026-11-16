@@ -412,6 +412,7 @@ pub const App = struct {
             .enabled = if (params.get("form") != null) checked(params.get("enabled")) else (if (params.get("enabled")) |v| checked(v) else true),
             .retain_text = if (params.get("form") != null) checked(params.get("retain_text")) else (if (params.get("retain_text")) |v| checked(v) else true),
             .rights = if (params.get("rights")) |r| (if (r.len > 0) r else null) else null,
+            .boost = if (params.get("boost")) |b| (std.fmt.parseInt(u32, std.mem.trim(u8, b, " "), 10) catch 100) else 100,
             // The form posts one field per option (`opt_KEY`) and a box for any other settings; the
             // API (and older forms) send the settings as one text.
             .options = if (params.get("fields") != null)
@@ -583,6 +584,7 @@ pub const App = struct {
                 .enabled = found.enabled,
                 .retain_text = found.retain_text,
                 .rights = if (found.rights) |r| @tagName(r) else null,
+                .boost = found.boost,
                 .options = try dk.sourceedit.optionsText(arena, found),
             };
             original = found.name;
@@ -1926,6 +1928,7 @@ fn writeSourceForm(arena: Allocator, w: *Io.Writer, csrf: []const u8, spec: dk.s
         try w.print("<option value=\"{s}\"{s}>{s}</option>", .{ r, if (sel) " selected" else "", if (r.len == 0) "the connector&rsquo;s default" else r });
     }
     try w.writeAll("</select><small>What may be done with the content. This is your decision, not legal advice.</small></label>");
+    try w.print("<label>Ranking boost (%) <input type=\"number\" name=\"boost\" min=\"1\" max=\"1000\" value=\"{d}\"><small>100 changes nothing. 150 ranks this source&rsquo;s results half as high again in search; 50 halves them. Useful to put curated sources ahead of large, noisy ones.</small></label>", .{spec.boost});
     try writeOptionFields(arena, w, spec);
     try w.writeAll("<p><button type=\"submit\" class=\"btn\">Save</button> <a class=\"btn secondary\" href=\"/sources\">Cancel</a></p></form>\n");
     if (kindInfo(spec.kind)) |info| {

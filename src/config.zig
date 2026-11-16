@@ -172,6 +172,9 @@ pub const Source = struct {
     /// When set, overrides the redistribution flag every document from this
     /// source gets from its connector. Null keeps the connector's own choice.
     rights: ?document.Redistribution = null,
+    /// How much this source's results count in the ranking, in percent: 100 changes nothing, 150 ranks
+    /// them half as high again, 50 halves them.
+    boost: u32 = 100,
     options: []const Option = &.{},
 
     pub fn option(self: Source, key: []const u8) ?OptionValue {
@@ -213,6 +216,10 @@ pub const SearchSettings = struct {
     /// How much a match in the title counts against one in the body when ranking.
     title_weight: u32 = 10,
     body_weight: u32 = 1,
+    /// Newer documents rank higher by up to this many percent (0 = off), the boost halving for every
+    /// `recency_half_life_days` of age.
+    recency_boost: u32 = 0,
+    recency_half_life_days: u32 = 365,
     /// "advanced": the query language (OR, NOT, grouping, prefix*, word~, "a b"~5, +, -);
     /// "simple": every word is plain text, as in earlier versions.
     advanced_syntax: bool = true,
@@ -265,7 +272,7 @@ const server_keys = [_][]const u8{
 const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions", "backup_dir", "zim_dir" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
-const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
+const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
 const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source" };
 
 /// Parses and validates configuration text. `source_name` is only used in
@@ -388,6 +395,8 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
         }
         if (try intIn(src, "search", t, "title_weight", 1, 1000, diag)) |n| cfg.search.title_weight = @intCast(n);
         if (try intIn(src, "search", t, "body_weight", 1, 1000, diag)) |n| cfg.search.body_weight = @intCast(n);
+        if (try intIn(src, "search", t, "recency_boost", 0, 1000, diag)) |n| cfg.search.recency_boost = @intCast(n);
+        if (try intIn(src, "search", t, "recency_half_life_days", 1, 36500, diag)) |n| cfg.search.recency_half_life_days = @intCast(n);
         if (try intIn(src, "search", t, "query_timeout_ms", 0, 60_000, diag)) |n| cfg.search.query_timeout_ms = @intCast(n);
         if (try optBool(src, "search", t, "regex", diag)) |b| cfg.search.regex = b;
         if (try intIn(src, "search", t, "regex_max_pattern", 1, 2000, diag)) |n| cfg.search.regex_max_pattern = @intCast(n);
@@ -412,7 +421,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     return cfg;
 }
 
-const source_common_keys = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights" };
+const source_common_keys = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights", "boost" };
 
 pub fn validSourceName(name: []const u8) bool {
     if (name.len == 0 or name.len > 64) return false;
@@ -462,6 +471,7 @@ fn readSources(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnost
         var s: Source = .{ .name = try a.dupe(u8, name), .kind = try a.dupe(u8, kind) };
         if (try optBool(src, where, t, "enabled", diag)) |b| s.enabled = b;
         if (try optBool(src, where, t, "retain_text", diag)) |b| s.retain_text = b;
+        if (try intIn(src, where, t, "boost", 1, 1000, diag)) |n| s.boost = @intCast(n);
         if (try str(src, where, t, "rights", diag)) |rv| {
             s.rights = std.meta.stringToEnum(document.Redistribution, rv) orelse {
                 diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}].rights", .{i}) catch "source.rights", "must be \"unknown\", \"allowed\", \"restricted\" or \"forbidden\", got \"{s}\"", .{rv});
@@ -822,6 +832,21 @@ test "sources: common keys, defaults and connector options" {
     try testing.expectEqual(@as(?document.Redistribution, .forbidden), b.rights);
     try testing.expectEqual(@as(?document.Redistribution, null), a.rights);
     try testing.expectEqual(@as(usize, 0), b.options.len);
+}
+
+test "ranking settings and a source's boost are read and checked" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "[search]\ntitle_weight = 5\nbody_weight = 2\nrecency_boost = 30\nrecency_half_life_days = 90\n[[source]]\nname = \"a\"\nkind = \"files\"\nboost = 150\n[[source]]\nname = \"b\"\nkind = \"files\"", &d);
+    defer c.deinit();
+    try testing.expectEqual(@as(u32, 5), c.search.title_weight);
+    try testing.expectEqual(@as(u32, 2), c.search.body_weight);
+    try testing.expectEqual(@as(u32, 30), c.search.recency_boost);
+    try testing.expectEqual(@as(u32, 90), c.search.recency_half_life_days);
+    try testing.expectEqual(@as(u32, 150), c.sources[0].boost);
+    try testing.expectEqual(@as(u32, 100), c.sources[1].boost);
+    try testing.expect(c.sources[0].option("boost") == null);
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[[source]]\nname = \"a\"\nkind = \"files\"\nboost = 0", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[search]\ntitle_weight = 0", &d));
 }
 
 test "search table: regex settings are read and checked" {
