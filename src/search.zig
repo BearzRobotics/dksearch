@@ -156,6 +156,10 @@ pub const Hit = struct {
     explain: ?Explain = null,
 };
 
+/// A passage found in the chunk index: the document, the position of the chunk among that document's chunks (as
+/// `retrieve.chunk` numbers them with `index_chunk_chars` and `index_chunk_overlap`) and a score.
+pub const ChunkHit = struct { id: doc.Id, index: u32, score: f64 };
+
 pub const Page = struct {
     hits: []const Hit,
     /// True if at least one more hit follows this page.
@@ -191,7 +195,16 @@ pub const Searcher = struct {
         search: *const fn (ptr: *anyopaque, arena: Allocator, q: Query) Error!Page,
         /// What the index knows about one document (null if it is not there). Optional.
         info: ?*const fn (ptr: *anyopaque, arena: Allocator, id: doc.Id) Error!?Hit = null,
+        /// The best passages of large documents, from the chunk index (see `ChunkHit`). Optional.
+        search_chunks: ?*const fn (ptr: *anyopaque, arena: Allocator, q: Query, limit: u32) Error![]const ChunkHit = null,
     };
+
+    /// Passages of large documents that match `q` (its words, conditions and source choice), best first. Empty
+    /// when the index has no chunk index or nothing matches.
+    pub fn searchChunks(self: Searcher, arena: Allocator, q: Query, limit: u32) Error![]const ChunkHit {
+        const f = self.vtable.search_chunks orelse return &.{};
+        return f(self.ptr, arena, q, limit);
+    }
 
     /// What the index records about document `id`, or null if it has none (or cannot say).
     pub fn info(self: Searcher, arena: Allocator, id: doc.Id) Error!?Hit {

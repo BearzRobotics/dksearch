@@ -582,6 +582,7 @@ fn applySources(arena: Allocator, q: *dk.search.Query, sources: []const html.Sou
 
 const max_retrieve_text_bytes = 8 * 1024 * 1024; // of one document read for chunking
 const max_retrieve_total_bytes = 64 * 1024 * 1024; // of all candidates together
+const max_chunk_candidates = 60; // passages taken from the chunk index
 
 const RetrievedChunk = struct {
     doc_id: []const u8,
@@ -597,8 +598,12 @@ const RetrievedChunk = struct {
     /// Byte span in the document's stored text.
     start: usize,
     end: usize,
-    /// Page, when the text has page breaks.
+    /// Page: from the text's own page breaks (`page_source` "text"), or, for text without them, placed by matching
+    /// against the PDF of the same work (`page_source` "pdf"); null when neither is possible.
     page: ?u32,
+    page_source: ?[]const u8,
+    /// Entry names in the passage (bold terms that open paragraphs, as in encyclopedias converted to Markdown).
+    entries: []const []const u8,
     score: f64,
     text: []const u8,
     before: []const []const u8,
@@ -653,18 +658,42 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
     q.sort = .relevance;
     const page = searcher.search(arena, q) catch |e| return searchFailure(arena, e, true);
 
+    // Passages of very large documents (books) come from the chunk index, so a document whose relevant section is a
+    // small part of it is found anyway; a document found only that way is added to the candidates.
+    const chunk_hits = searcher.searchChunks(arena, q, max_chunk_candidates) catch &.{};
+    var combined: std.ArrayList(dk.search.Hit) = .empty;
+    try combined.appendSlice(arena, page.hits);
+    var extra: u32 = 0;
+    for (chunk_hits) |ch| {
+        var known = false;
+        for (combined.items) |h| if (std.mem.eql(u8, &h.id, &ch.id)) {
+            known = true;
+            break;
+        };
+        if (known or extra >= 20) continue;
+        const info = searcher.info(arena, ch.id) catch null;
+        if (info) |h| {
+            try combined.append(arena, h);
+            extra += 1;
+        }
+    }
+
     // The same work in several formats (book.md, book.pdf, book.epub in one folder) is one candidate: the
     // format that keeps the most structure wins.
     var kept: std.ArrayList(dk.search.Hit) = .empty;
     var duplicates: u32 = 0;
-    for (page.hits) |h| {
+    // The PDF copy of a work whose other copy was kept: its page breaks give the kept copy page numbers.
+    var twins: std.ArrayList(dk.search.Hit) = .empty;
+    for (combined.items) |h| {
         if (dedupe) if (h.url) |u| {
             const stem = dk.retrieve.stemOf(u);
             var merged = false;
             for (kept.items) |*have| {
                 const ku = have.url orelse continue;
                 if (std.mem.eql(u8, have.connector, h.connector) and std.mem.eql(u8, dk.retrieve.stemOf(ku), stem)) {
+                    const loser = if (dk.retrieve.formatRank(u) < dk.retrieve.formatRank(ku)) have.* else h;
                     if (dk.retrieve.formatRank(u) < dk.retrieve.formatRank(ku)) have.* = h;
+                    if (std.ascii.endsWithIgnoreCase(loser.url orelse "", ".pdf")) try twins.append(arena, loser);
                     merged = true;
                     duplicates += 1;
                     break;
@@ -676,7 +705,7 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
     }
 
     // Chunk the candidates' stored texts.
-    const Doc = struct { hit: dk.search.Hit, chunks: []const dk.retrieve.Chunk };
+    const Doc = struct { hit: dk.search.Hit, chunks: []const dk.retrieve.Chunk, from_index: bool };
     var docs: std.ArrayList(Doc) = .empty;
     var all_text: std.ArrayList([]const u8) = .empty;
     var all_head: std.ArrayList([]const u8) = .empty;
@@ -699,15 +728,26 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
             text = text[0..end];
         }
         total += text.len;
-        const cs = dk.retrieve.chunk(arena, text, .{ .chunk_chars = chunk_chars, .overlap = overlap }) catch return error.OutOfMemory;
+        // A document with passages in the chunk index is chunked as the index was (so the numbers agree) and only
+        // those passages compete; any other is chunked as asked and all its passages compete.
+        var wanted: std.ArrayList(u32) = .empty;
+        for (chunk_hits) |ch| if (std.mem.eql(u8, &ch.id, &h.id)) try wanted.append(arena, ch.index);
+        const from_index = wanted.items.len > 0;
+        const cs = dk.retrieve.chunk(arena, text, if (from_index) dk.retrieve.index_chunk_options else .{ .chunk_chars = chunk_chars, .overlap = overlap }) catch return error.OutOfMemory;
         const di: u32 = @intCast(docs.items.len);
-        try docs.append(arena, .{ .hit = h, .chunks = cs });
+        try docs.append(arena, .{ .hit = h, .chunks = cs, .from_index = from_index });
         for (cs) |c| {
+            if (from_index and std.mem.indexOfScalar(u32, wanted.items, c.index) == null) continue;
             try all_text.append(arena, c.text);
             try all_head.append(arena, try std.mem.join(arena, " / ", c.heading));
             try owner.append(arena, .{ .doc = di, .chunk = c.index });
         }
     }
+    var page_indexes: std.ArrayList(?dk.retrieve.PageIndex) = .empty;
+    var page_built: std.ArrayList(bool) = .empty;
+    try page_indexes.resize(arena, twins.items.len);
+    try page_built.appendNTimes(arena, false, twins.items.len);
+    @memset(page_indexes.items, null);
     const ranked = try dk.retrieve.rank(arena, terms, all_text.items, all_head.items);
     const n_out = @min(ranked.len, k);
     const out = try arena.alloc(RetrievedChunk, n_out);
@@ -722,6 +762,29 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
         const after = try arena.alloc([]const u8, hi - (ow.chunk + 1));
         for (after, ow.chunk + 1..) |*b, i| b.* = d.chunks[i].text;
         const hex = std.fmt.bytesToHex(d.hit.id, .lower);
+        var page_no: ?u32 = c.page;
+        var page_source: ?[]const u8 = if (c.page != null) "text" else null;
+        if (page_no == null) if (d.hit.url) |du| {
+            // No page breaks here: look for the same work as a PDF among the duplicates set aside.
+            for (twins.items, 0..) |tw, ti| {
+                const tu = tw.url orelse continue;
+                if (!std.mem.eql(u8, tw.connector, d.hit.connector) or !std.mem.eql(u8, dk.retrieve.stemOf(tu), dk.retrieve.stemOf(du))) continue;
+                if (page_indexes.items.len <= ti) try page_indexes.resize(arena, twins.items.len);
+                if (!page_built.items[ti]) {
+                    page_built.items[ti] = true;
+                    if (store.get(arena, tw.id)) |t| {
+                        page_indexes.items[ti] = dk.retrieve.PageIndex.build(arena, t) catch null;
+                    } else |_| {}
+                }
+                if (page_indexes.items[ti]) |*pi| {
+                    if (try pi.pageOf(arena, c.text)) |pg| {
+                        page_no = pg;
+                        page_source = "pdf";
+                    }
+                }
+                break;
+            }
+        };
         const can_open = if (services.originals) |svc| (if (d.hit.url) |u| svc.serves(d.hit.connector, u) else false) else false;
         const images = try arena.alloc(RetrievedImage, c.images.len);
         for (c.images, images) |n, *im| im.* = .{ .n = n, .url = if (can_open) try std.fmt.allocPrint(arena, "/doc/{s}/image/{d}", .{ hex, n }) else null };
@@ -736,7 +799,9 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
             .of = @intCast(d.chunks.len),
             .start = c.start,
             .end = c.end,
-            .page = c.page,
+            .page = page_no,
+            .page_source = page_source,
+            .entries = c.entries,
             .score = r.score,
             .text = c.text,
             .before = before,
@@ -1387,6 +1452,36 @@ test "original files are served only for sources that allow it, from inside thei
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, other, "/file")).status);
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, outside, "/file")).status);
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, pdf, "/file/x")).status);
+}
+
+test "retrieval: a Markdown work without page breaks gets pages from its PDF twin; entry names are listed" {
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    const id_m: dk.document.Id = .{ 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const id_p: dk.document.Id = .{ 0x22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try mem.store().put(id_m, "# Myths\n\n**URD:** The first page tells of rivers and mountains in the old north country.\n\n**MUNINN:** On the second page Odin sends Huginn and Muninn out over the whole world every morning.\n\n**FENRIR:** The third page is about wolves, moons and the end of all things at Ragnarok.");
+    try mem.store().put(id_p, "The first page tells of rivers and mountains in the old north country.\n\n\x0c\n\nOn the second page Odin sends Huginn and Muninn out over the whole world every morning.\n\n\x0c\n\nThe third page is about wolves, moons and the end of all things at Ragnarok.");
+    const hits = [_]dk.search.Hit{
+        .{ .id = id_p, .connector = "books", .url = "file:///b/myths.pdf", .title = "Myths", .snippet = null, .score = 2 },
+        .{ .id = id_m, .connector = "books", .url = "file:///b/myths.md", .title = "Myths", .snippet = null, .score = 1 },
+    };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
+    const r = handleServices(ar.allocator(), fake.searcher(), .{ .content = mem.store() }, .GET, "/api/v1/retrieve?q=Odin+Huginn+Muninn+morning&chunk_chars=200&overlap=0");
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, r.body, .{});
+    defer parsed.deinit();
+    const first = parsed.value.object.get("chunks").?.array.items[0].object;
+    try testing.expectEqualStrings("/doc/11", first.get("view_url").?.string[0..7]); // the Markdown copy was kept
+    try testing.expectEqual(@as(i64, 2), first.get("page").?.integer);
+    try testing.expectEqualStrings("pdf", first.get("page_source").?.string);
+    const entries = first.get("entries").?.array.items;
+    try testing.expect(entries.len >= 1);
+    var has_muninn = false;
+    for (entries) |e| if (std.mem.eql(u8, e.string, "MUNINN")) {
+        has_muninn = true;
+    };
+    try testing.expect(has_muninn);
 }
 
 test "pictures embedded in a Markdown original are served from it, and shown in the viewer" {

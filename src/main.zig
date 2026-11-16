@@ -375,12 +375,13 @@ fn prepareDataDir(io: Io, data_dir: []const u8) bool {
     return true;
 }
 
-fn openIndex(io: Io, path: [:0]const u8, tokenizer: dk.config.Tokenizer, retokenize: bool) ?dk.index_sqlite.SqliteIndex {
+fn openIndex(io: Io, path: [:0]const u8, cfg: *const dk.config.Config, retokenize: bool) ?dk.index_sqlite.SqliteIndex {
+    const tokenizer = cfg.tokenizer;
     const tk: dk.index_sqlite.Tokenizer = switch (tokenizer) {
         .unicode61 => .unicode61,
         .porter => .porter,
     };
-    return dk.index_sqlite.SqliteIndex.open(path, .{ .tokenizer = tk, .retokenize = retokenize }) catch |e| {
+    return dk.index_sqlite.SqliteIndex.open(path, .{ .tokenizer = tk, .retokenize = retokenize, .chunk_min_bytes = cfg.search.chunk_index_min_kb * 1024 }) catch |e| {
         switch (e) {
             error.TokenizerMismatch => err(io, "{s} was built with a different tokenizer than index.tokenizer = \"{s}\" asks for; run `dksearch rebuild` to recreate it", .{ path, @tagName(tokenizer) }),
             error.SchemaMismatch => err(io, "{s} was written by an incompatible version; delete it and run `dksearch rebuild`", .{path}),
@@ -604,7 +605,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         err(io, "out of memory", .{});
         return exit_io;
     };
-    var index = openIndex(io, paths.index, cfg.tokenizer, false) orelse return exit_io;
+    var index = openIndex(io, paths.index, &cfg, false) orelse return exit_io;
     defer index.close();
 
     // An older state.db is brought up to date now (a quick, idempotent step), because the
@@ -803,6 +804,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
                 .sources = cfg.sources,
                 .backup_dir = cfg.admin_options.backup_dir,
                 .zim_dir = cfg.admin_options.zim_dir,
+                .chunk_min_bytes = cfg.search.chunk_index_min_kb * 1024,
             });
             job_manager_ready = true;
         }
@@ -892,7 +894,7 @@ fn rebuildCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     defer state.close();
     var content = openContent(io, gpa, paths.content) orelse return exit_io;
     defer content.close();
-    var index = openIndex(io, paths.index, cfg.tokenizer, true) orelse return exit_io;
+    var index = openIndex(io, paths.index, &cfg, true) orelse return exit_io;
     defer index.close();
 
     const stats = dk.rebuild.rebuild(gpa, index.indexer(), content.store(), state.documents()) catch |e| {
@@ -1031,7 +1033,7 @@ fn evalCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, judgments_p
         err(io, "{s} does not exist: import something first (or run `dksearch rebuild`)", .{paths.index});
         return exit_io;
     };
-    var index = openIndex(io, paths.index, cfg.tokenizer, false) orelse return exit_io;
+    var index = openIndex(io, paths.index, &cfg, false) orelse return exit_io;
     defer index.close();
     const report = dk.evaluate.evaluate(a, index.searcher(), judgments, k) catch |e| switch (e) {
         error.InvalidK => return usageError(io, "-k must be from 1 to 100"),
@@ -1116,7 +1118,7 @@ fn removeCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, source: []
     defer state.close();
     var content = openContent(io, gpa, paths.content) orelse return exit_io;
     defer content.close();
-    var index = openIndex(io, paths.index, cfg.tokenizer, false) orelse return exit_io;
+    var index = openIndex(io, paths.index, &cfg, false) orelse return exit_io;
     defer index.close();
 
     const n = state.documents().countOf(source) catch |e| {
@@ -1178,7 +1180,7 @@ fn importCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, one: ?[]co
     defer state.close();
     var content = openContent(io, gpa, paths.content) orelse return exit_io;
     defer content.close();
-    var index = openIndex(io, paths.index, cfg.tokenizer, false) orelse return exit_io;
+    var index = openIndex(io, paths.index, &cfg, false) orelse return exit_io;
     defer index.close();
     if (state.recovered_jobs > 0) err(io, "note: {d} earlier import(s) did not finish; they resume from their last checkpoint", .{state.recovered_jobs});
 

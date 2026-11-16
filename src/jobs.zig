@@ -52,6 +52,8 @@ pub const Options = struct {
     zim_dir: ?[]const u8 = null,
     /// How downloads behave (tests allow plain http to a local server).
     kiwix_options: kiwix.Options = .{},
+    /// Documents of at least this many bytes also get their passages indexed (see `index_sqlite.OpenOptions`).
+    chunk_min_bytes: u32 = 64 * 1024,
     /// Tests only: skip syncing, which is very slow on some disks.
     sync_off: bool = false,
 };
@@ -326,6 +328,7 @@ pub const Manager = struct {
         var index = index_sqlite.SqliteIndex.open(self.opts.index_path, .{
             .tokenizer = self.opts.tokenizer,
             .sync = if (self.opts.sync_off) .off else .normal,
+            .chunk_min_bytes = self.opts.chunk_min_bytes,
         }) catch |e| {
             self.fail(out, if (e == error.TokenizerMismatch)
                 "the index was built with a different tokenizer; run `dksearch rebuild`"
@@ -542,6 +545,7 @@ pub const Manager = struct {
         var index = index_sqlite.SqliteIndex.open(self.opts.index_path, .{
             .tokenizer = self.opts.tokenizer,
             .sync = if (self.opts.sync_off) .off else .normal,
+            .chunk_min_bytes = self.opts.chunk_min_bytes,
         }) catch return self.fail(out, "cannot open index.db (if the tokenizer changed, run `dksearch rebuild`)");
         defer index.close();
         var pipe = pipeline.Pipeline.init(content.store(), state.documents(), index.indexer(), .{ .now = now });

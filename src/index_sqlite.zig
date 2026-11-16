@@ -29,6 +29,7 @@ const search = @import("search.zig");
 const image_mod = @import("image.zig");
 const queryparse = @import("queryparse.zig");
 const lexicon_mod = @import("lexicon.zig");
+const retrieve = @import("retrieve.zig");
 const docmeta = @import("docmeta.zig");
 const derive = docmeta.derive;
 
@@ -90,6 +91,9 @@ pub const OpenOptions = struct {
     /// recreated with this one. Only `rebuild` sets this: the index is
     /// derived data, and it is refilled right after.
     retokenize: bool = false,
+    /// Documents with at least this many bytes of text also get their passages indexed, for retrieval inside large
+    /// documents (`search.chunk_index_min_kb`). 0 turns it off.
+    chunk_min_bytes: u32 = 64 * 1024,
 };
 
 pub const OpenError = idx_api.Error || error{
@@ -125,6 +129,8 @@ pub const SqliteIndex = struct {
     /// What is left of the search's time limit for its second attempt (the typo-tolerant repeat), so that
     /// the two together never exceed the limit.
     retry_budget_ms: ?u32 = null,
+    /// See `OpenOptions.chunk_min_bytes`.
+    chunk_min_bytes: u32 = 0,
     /// A time limit for each search, if set (`setQueryTimeout`).
     timeout: ?struct { io: Io, ms: u32 } = null,
     /// True if the `docs` table has the metadata columns filters use (an index
@@ -145,6 +151,7 @@ pub const SqliteIndex = struct {
         registerFunctions(self.db);
         try self.initSchema(options);
         self.has_meta = self.detectMeta();
+        self.chunk_min_bytes = options.chunk_min_bytes;
         return self;
     }
 
@@ -238,7 +245,7 @@ pub const SqliteIndex = struct {
             if (options.tokenizer) |want| {
                 if (have != want) {
                     if (!options.retokenize) return error.TokenizerMismatch;
-                    try self.exec("DROP TABLE fts; DROP TABLE docs; DROP TABLE IF EXISTS doc_meta;");
+                    try self.exec("DROP TABLE fts; DROP TABLE docs; DROP TABLE IF EXISTS doc_meta; DROP TABLE IF EXISTS chunks_fts; DROP TABLE IF EXISTS chunk_map;");
                 }
             } else tokenizer = have; // keep what the index has
         }
@@ -259,6 +266,20 @@ pub const SqliteIndex = struct {
             \\CREATE INDEX IF NOT EXISTS docs_connector ON docs(connector);
         );
         try self.exec(create);
+        // The passages of large documents: a contentless full-text index (the text is read back from the stored
+        // document and re-chunked) and the map from its rows to documents. Created if missing; derived data like
+        // the rest, refilled by `rebuild`.
+        const create_chunks = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(heading, body, content = '', contentless_delete = 1, tokenize = '{s}');", .{tokenizer.sql()}, 0);
+        defer std.heap.page_allocator.free(create_chunks);
+        try self.exec(create_chunks);
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS chunk_map(
+            \\  rowid INTEGER PRIMARY KEY,
+            \\  doc   INTEGER NOT NULL,
+            \\  idx   INTEGER NOT NULL
+            \\);
+            \\CREATE INDEX IF NOT EXISTS chunk_map_doc ON chunk_map(doc);
+        );
         try self.migrateMeta();
         // Perceptual hashes of pictures, for search by image. Created if missing
         // (older indexes get it on their next write); it never changes the schema version.
@@ -327,7 +348,7 @@ pub const SqliteIndex = struct {
     }
 
     pub fn searcher(self: *SqliteIndex) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = searchImpl, .info = infoImpl } };
+        return .{ .ptr = self, .vtable = &.{ .search = searchImpl, .info = infoImpl, .search_chunks = searchChunksImpl } };
     }
 
     pub fn imageSearcher(self: *SqliteIndex) search.ImageSearcher {
@@ -483,6 +504,7 @@ pub const SqliteIndex = struct {
             _ = try st.step();
             stored += 1;
         }
+        try self.indexChunks(rowid, d.text);
         // A picture's perceptual hash (extra "phash", 16 hex digits), replacing
         // any earlier one; a document without it has none.
         {
@@ -504,10 +526,62 @@ pub const SqliteIndex = struct {
         try self.commit();
     }
 
+    /// Replaces the passage index of document `rowid`: its old passages go, and a large text gets new ones.
+    fn indexChunks(self: *SqliteIndex, rowid: i64, text: ?[]const u8) idx_api.Error!void {
+        try self.dropChunks(rowid);
+        const t = text orelse return;
+        if (self.chunk_min_bytes == 0 or t.len < self.chunk_min_bytes) return;
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const cs = retrieve.chunk(arena, t, retrieve.index_chunk_options) catch return error.OutOfMemory;
+        const max_chunks = 20000;
+        for (cs[0..@min(cs.len, max_chunks)]) |ch| {
+            const map = try Stmt.prepare(self.db, "INSERT INTO chunk_map(doc, idx) VALUES(?1, ?2) RETURNING rowid");
+            defer map.deinit();
+            try map.int(1, rowid);
+            try map.int(2, ch.index);
+            if (!try map.step()) return error.Io;
+            const row = map.colInt(0);
+            const st = try Stmt.prepare(self.db, "INSERT INTO chunks_fts(rowid, heading, body) VALUES(?1, ?2, ?3)");
+            defer st.deinit();
+            try st.int(1, row);
+            const heading = std.mem.join(arena, " / ", ch.heading) catch return error.OutOfMemory;
+            try st.text(2, heading);
+            try st.text(3, ch.text);
+            _ = try st.step();
+        }
+    }
+
+    fn dropChunks(self: *SqliteIndex, rowid: i64) idx_api.Error!void {
+        {
+            const st = try Stmt.prepare(self.db, "DELETE FROM chunks_fts WHERE rowid IN (SELECT rowid FROM chunk_map WHERE doc = ?1)");
+            defer st.deinit();
+            try st.int(1, rowid);
+            _ = try st.step();
+        }
+        const st = try Stmt.prepare(self.db, "DELETE FROM chunk_map WHERE doc = ?1");
+        defer st.deinit();
+        try st.int(1, rowid);
+        _ = try st.step();
+    }
+
     fn remove(ptr: *anyopaque, id: doc.Id) idx_api.Error!void {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
         try self.begin();
         errdefer self.rollback();
+        {
+            const st = try Stmt.prepare(self.db, "DELETE FROM chunks_fts WHERE rowid IN (SELECT rowid FROM chunk_map WHERE doc = (SELECT rowid FROM docs WHERE id = ?1))");
+            defer st.deinit();
+            try st.blob(1, &id);
+            _ = try st.step();
+        }
+        {
+            const st = try Stmt.prepare(self.db, "DELETE FROM chunk_map WHERE doc = (SELECT rowid FROM docs WHERE id = ?1)");
+            defer st.deinit();
+            try st.blob(1, &id);
+            _ = try st.step();
+        }
         {
             const st = try Stmt.prepare(self.db, "DELETE FROM fts WHERE rowid = (SELECT rowid FROM docs WHERE id = ?1)");
             defer st.deinit();
@@ -539,7 +613,7 @@ pub const SqliteIndex = struct {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
         try self.begin();
         errdefer self.rollback();
-        try self.exec("DELETE FROM fts; DELETE FROM docs; DELETE FROM image_hash; DELETE FROM doc_meta;");
+        try self.exec("DELETE FROM fts; DELETE FROM docs; DELETE FROM image_hash; DELETE FROM doc_meta; DELETE FROM chunks_fts; DELETE FROM chunk_map;");
         try self.commit();
     }
 
@@ -599,6 +673,74 @@ pub const SqliteIndex = struct {
             .kind = try dupeOpt(arena, st.colText(11)),
             .domain = try dupeOpt(arena, st.colText(12)),
         };
+    }
+
+    /// The best passages of large documents for `q`: the chunk index searched with the query's words and conditions
+    /// (the same document filters and source choice as a search). No typo tolerance; empty if there is no chunk
+    /// index or nothing matches.
+    pub fn searchChunksImpl(ptr: *anyopaque, arena: Allocator, q: search.Query, limit: u32) search.Error![]const search.ChunkHit {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
+        if (limit == 0 or limit > 500) return error.InvalidQuery;
+        if (!self.has_meta) return &.{};
+        const now: i64 = if (self.timeout) |t| @intCast(@divTrunc(Io.Timestamp.now(t.io, .real).nanoseconds, std.time.ns_per_s)) else 0;
+        if (q.filters.len + q.filter_strings.len > max_filters) return error.InvalidQuery;
+        const base_filters = blk: {
+            if (q.filter_strings.len == 0) break :blk q.filters;
+            const out = try arena.alloc(search.Filter, q.filters.len + q.filter_strings.len);
+            @memcpy(out[0..q.filters.len], q.filters);
+            for (q.filter_strings, out[q.filters.len..]) |text, *dst| {
+                dst.* = (try queryparse.parseFilterString(arena, text, now)) orelse return error.InvalidQuery;
+            }
+            break :blk out;
+        };
+        const parsed = self.parseQuery(arena, q.text, false, now) catch |e| switch (e) {
+            error.EmptyQuery => return &.{},
+            else => return e,
+        };
+        if (parsed.fts.len == 0) return &.{};
+        const filters = try mergeFilters(arena, base_filters, parsed.filters);
+
+        var sql: std.ArrayList(u8) = .empty;
+        var binds: std.ArrayList(Bind) = .empty;
+        try sql.appendSlice(arena,
+            \\SELECT d.id, m.idx, -bm25(chunks_fts, 2.0, 1.0)
+            \\FROM chunks_fts JOIN chunk_map m ON m.rowid = chunks_fts.rowid JOIN docs d ON d.rowid = m.doc
+            \\WHERE chunks_fts MATCH ?3
+            \\  AND (?4 IS NULL OR d.language = ?4)
+            \\  AND (?5 IS NULL OR d.content_type = ?5)
+            \\  AND (?6 IS NULL OR d.connector = ?6)
+        );
+        try filterSql(arena, filters, &sql, &binds);
+        try sql.appendSlice(arena, " ORDER BY bm25(chunks_fts, 2.0, 1.0), d.id, m.idx LIMIT ?7");
+        const st = Stmt.prepare(self.db, try arena.dupeSentinel(u8, sql.items, 0)) catch return &.{}; // no chunk index here
+        defer st.deinit();
+        st.text(3, parsed.fts) catch |e| return searchError(e);
+        st.text(4, q.language) catch |e| return searchError(e);
+        st.text(5, q.content_type) catch |e| return searchError(e);
+        st.text(6, q.connector) catch |e| return searchError(e);
+        st.int(7, limit) catch |e| return searchError(e);
+        for (binds.items, 0..) |b, i| {
+            const n: c_int = @intCast(9 + i);
+            (switch (b) {
+                .text => |t| st.text(n, t),
+                .int => |v| st.int(n, v),
+            }) catch |e| return searchError(e);
+        }
+        var guard: Deadline = undefined;
+        if (self.timeout) |t| {
+            guard = .{ .io = t.io, .deadline_ns = Io.Timestamp.now(t.io, .awake).nanoseconds + @as(i96, t.ms) * std.time.ns_per_ms };
+            c.sqlite3_progress_handler(self.db, 2000, progressCallback, &guard);
+        } else guard = .{ .io = undefined, .deadline_ns = 0 };
+        defer if (self.timeout != null) c.sqlite3_progress_handler(self.db, 0, null, null);
+        var out: std.ArrayList(search.ChunkHit) = .empty;
+        while (st.step() catch |e| return if (guard.fired) error.Timeout else searchError(e)) {
+            const idb = c.sqlite3_column_blob(st.s, 0) orelse return error.Io;
+            if (c.sqlite3_column_bytes(st.s, 0) != @sizeOf(doc.Id)) return error.Io;
+            var id: doc.Id = undefined;
+            @memcpy(&id, @as([*]const u8, @ptrCast(idb))[0..@sizeOf(doc.Id)]);
+            try out.append(arena, .{ .id = id, .index = @intCast(st.colInt(1)), .score = st.colFloat(2) });
+        }
+        return out.items;
     }
 
     pub fn searchImpl(ptr: *anyopaque, arena: Allocator, q: search.Query) search.Error!search.Page {
@@ -1017,7 +1159,7 @@ pub const SearchPool = struct {
     }
 
     pub fn searcher(self: *SearchPool) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = poolSearch, .info = poolInfo } };
+        return .{ .ptr = self, .vtable = &.{ .search = poolSearch, .info = poolInfo, .search_chunks = poolSearchChunks } };
     }
 
     pub fn imageSearcher(self: *SearchPool) search.ImageSearcher {
@@ -1045,6 +1187,19 @@ pub const SearchPool = struct {
             if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
                 defer slot.busy.store(false, .release);
                 return SqliteIndex.infoImpl(&slot.index, arena, id);
+            }
+        }
+        unreachable;
+    }
+
+    fn poolSearchChunks(ptr: *anyopaque, arena: Allocator, q: search.Query, limit: u32) search.Error![]const search.ChunkHit {
+        const self: *SearchPool = @ptrCast(@alignCast(ptr));
+        self.idle.waitUncancelable(self.io);
+        defer self.idle.post(self.io);
+        for (self.slots) |*slot| {
+            if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                defer slot.busy.store(false, .release);
+                return SqliteIndex.searchChunksImpl(&slot.index, arena, q, limit);
             }
         }
         unreachable;
@@ -1337,6 +1492,46 @@ test "title matches outrank body matches; ties break by id" {
     try testing.expectEqual(body_id, page.hits[1].id);
     try testing.expect(page.hits[0].score > page.hits[1].score);
     try testing.expect(!page.has_more);
+}
+
+test "passages of large documents are indexed, found with their conditions, replaced on update and removed" {
+    var idx = try SqliteIndex.open(":memory:", .{ .chunk_min_bytes = 2000 });
+    defer idx.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A long text with one distinctive word in one section; and a short document that is not chunk-indexed.
+    var big: std.ArrayList(u8) = .empty;
+    for (0..30) |i| try big.print(a, "## Section {d}\n\nOrdinary filler about harvests and rain in section {d}, nothing special at all.\n\n", .{ i, i });
+    try big.appendSlice(a, "## Zebra\n\nThe quagga is a rare word found only here.\n\n");
+    for (30..40) |i| try big.print(a, "## Section {d}\n\nMore ordinary filler about harvests and rain in section {d}.\n\n", .{ i, i });
+    const d: doc.Document = .{ .connector = "books", .source_id = "big", .title = "Big", .text = big.items, .content_type = "text/markdown" };
+    try idx.indexer().add(d.id(), d);
+    const small: doc.Document = .{ .connector = "notes", .source_id = "small", .title = "Small", .text = "A quagga mention in a short note." };
+    try idx.indexer().add(small.id(), small);
+
+    const hits = try idx.searcher().searchChunks(a, .{ .text = "quagga" }, 10);
+    try testing.expectEqual(@as(usize, 1), hits.len); // only the large document has passages
+    try testing.expectEqualSlices(u8, &d.id(), &hits[0].id);
+    // The index of the chunk is the one `retrieve.chunk` gives the same text.
+    const cs = try retrieve.chunk(a, big.items, retrieve.index_chunk_options);
+    try testing.expect(std.mem.indexOf(u8, cs[hits[0].index].text, "quagga") != null);
+    // The search's conditions apply.
+    try testing.expectEqual(@as(usize, 0), (try idx.searcher().searchChunks(a, .{ .text = "quagga", .connector = "notes" }, 10)).len);
+    try testing.expectEqual(@as(usize, 1), (try idx.searcher().searchChunks(a, .{ .text = "quagga", .connector = "books" }, 10)).len);
+    try testing.expectEqual(@as(usize, 0), (try idx.searcher().searchChunks(a, .{ .text = "unicorn" }, 10)).len);
+    // Updating replaces the passages; removing deletes them.
+    const d2: doc.Document = .{ .connector = "books", .source_id = "big", .title = "Big", .text = try std.mem.concat(a, u8, &.{ big.items, "\n\n## Last\n\nA unicorn appears at the very end.\n\n" }), .content_type = "text/markdown" };
+    try idx.indexer().add(d2.id(), d2);
+    try testing.expectEqual(@as(usize, 1), (try idx.searcher().searchChunks(a, .{ .text = "unicorn" }, 10)).len);
+    try testing.expectEqual(@as(usize, 1), (try idx.searcher().searchChunks(a, .{ .text = "quagga" }, 10)).len); // not doubled
+    try idx.indexer().remove(d2.id());
+    try testing.expectEqual(@as(usize, 0), (try idx.searcher().searchChunks(a, .{ .text = "quagga" }, 10)).len);
+    // Off: nothing is indexed.
+    var off = try SqliteIndex.open(":memory:", .{ .chunk_min_bytes = 0 });
+    defer off.close();
+    try off.indexer().add(d.id(), d);
+    try testing.expectEqual(@as(usize, 0), (try off.searcher().searchChunks(a, .{ .text = "quagga" }, 10)).len);
 }
 
 test "the title and body weights decide which counts more" {

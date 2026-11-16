@@ -19,6 +19,9 @@ pub const Options = struct {
     overlap: u32 = 150,
 };
 
+/// The chunking the chunk index is built with: the chunks it names are re-made with these when a passage is read.
+pub const index_chunk_options: Options = .{ .chunk_chars = 1200, .overlap = 150 };
+
 pub const min_chunk_chars = 200;
 pub const max_chunk_chars = 8000;
 
@@ -36,7 +39,19 @@ pub const Chunk = struct {
     text: []const u8,
     /// Pictures that sit in this chunk's span, as numbers for `nthInlineImage` (from `dkimg:N` references).
     images: []const u32 = &.{},
+    /// Entry names in the chunk: bold terms that open a paragraph (`**MUNINN:**`), at most eight. Encyclopedias
+    /// converted to Markdown often have these and no headings, so this says what a passage is about.
+    entries: []const []const u8 = &.{},
 };
+
+/// The bold term a paragraph opens with, without its colon or full stop, or null.
+fn leadingLabel(text: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, text, "**")) return null;
+    const close = std.mem.indexOfPos(u8, text, 2, "**") orelse return null;
+    if (close > 102 or std.mem.indexOfScalar(u8, text[2..close], '\n') != null) return null;
+    const label = std.mem.trim(u8, text[2..close], " \t:.;,");
+    return if (label.len == 0) null else label;
+}
 
 const Block = struct {
     start: usize,
@@ -47,6 +62,8 @@ const Block = struct {
     text: []const u8 = "",
     /// Pictures of the original file placed in this block (`dkimg:N` references).
     images: []const u32 = &.{},
+    /// A block that opens with a bold term (`**MUNINN:** ...`, how encyclopedias converted to Markdown mark entries).
+    label: ?[]const u8 = null,
     page: ?u32 = null,
     /// The heading path in force for this block (shared slices).
     path: []const []const u8 = &.{},
@@ -237,6 +254,7 @@ fn blocks(arena: Allocator, text: []const u8) Allocator.Error![]Block {
             var refs: std.ArrayList(u32) = .empty;
             b.text = try withoutFormFeeds(arena, try takeImageRefs(arena, try withoutInlineImages(arena, trimmed), &refs));
             b.images = refs.items;
+            b.label = leadingLabel(b.text);
         }
         b.page = if (saw_pages) page else null;
         const path = try arena.alloc([]const u8, stack.items.len);
@@ -295,7 +313,7 @@ fn splitLong(arena: Allocator, text: []const u8, max: usize, out: *std.ArrayList
     if (rest.len > 0) try out.append(arena, rest);
 }
 
-const Piece = struct { start: usize, end: usize, text: []const u8, page: ?u32, path: []const []const u8, heading: bool, images: []const u32 = &.{} };
+const Piece = struct { start: usize, end: usize, text: []const u8, page: ?u32, path: []const []const u8, heading: bool, images: []const u32 = &.{}, label: ?[]const u8 = null };
 
 /// Chunks `text`. Everything is allocated from `arena`.
 pub fn chunk(arena: Allocator, text: []const u8, options: Options) Allocator.Error![]const Chunk {
@@ -310,7 +328,7 @@ pub fn chunk(arena: Allocator, text: []const u8, options: Options) Allocator.Err
         .text => {
             if (b.text.len == 0 and b.images.len == 0) continue;
             if (b.text.len <= max) {
-                try pieces.append(arena, .{ .start = b.start, .end = b.end, .text = b.text, .page = b.page, .path = b.path, .heading = false, .images = b.images });
+                try pieces.append(arena, .{ .start = b.start, .end = b.end, .text = b.text, .page = b.page, .path = b.path, .heading = false, .images = b.images, .label = b.label });
             } else {
                 var parts: std.ArrayList([]const u8) = .empty;
                 try splitLong(arena, b.text, max, &parts);
@@ -319,7 +337,7 @@ pub fn chunk(arena: Allocator, text: []const u8, options: Options) Allocator.Err
                     // so fall back to the whole block's span.
                     const at = std.mem.indexOf(u8, text[b.start..b.end], p[0..@min(p.len, 40)]);
                     const s = if (at) |a| b.start + a else b.start;
-                    try pieces.append(arena, .{ .start = s, .end = @min(s + p.len, b.end), .text = p, .page = b.page, .path = b.path, .heading = false, .images = if (part_no == 0) b.images else &.{} });
+                    try pieces.append(arena, .{ .start = s, .end = @min(s + p.len, b.end), .text = p, .page = b.page, .path = b.path, .heading = false, .images = if (part_no == 0) b.images else &.{}, .label = if (part_no == 0) b.label else null });
                 }
             }
         },
@@ -345,8 +363,10 @@ pub fn chunk(arena: Allocator, text: []const u8, options: Options) Allocator.Err
         var buf: std.ArrayList(u8) = .empty;
         var first_text: ?usize = null;
         var imgs: std.ArrayList(u32) = .empty;
+        var entries: std.ArrayList([]const u8) = .empty;
         for (pieces.items[i..j], i..) |p, k| {
             try imgs.appendSlice(arena, p.images);
+            if (p.label) |l| if (entries.items.len < 8) try entries.append(arena, l);
             if (p.text.len == 0) continue;
             if (buf.items.len > 0) try buf.appendSlice(arena, "\n\n");
             try buf.appendSlice(arena, p.text);
@@ -361,6 +381,7 @@ pub fn chunk(arena: Allocator, text: []const u8, options: Options) Allocator.Err
             .page = pieces.items[i].page,
             .text = buf.items,
             .images = imgs.items,
+            .entries = entries.items,
         });
         if (j >= pieces.items.len) break;
         // The next chunk starts with whole pieces from the end of this one, within the overlap budget, but
@@ -375,6 +396,114 @@ pub fn chunk(arena: Allocator, text: []const u8, options: Options) Allocator.Err
     }
     return chunks.items;
 }
+
+// ------------------------------------------------------------------ pages from a twin
+
+/// Page numbers for a text that has none (Markdown made from a PDF), taken from the PDF's own text where page breaks
+/// (form feeds) survive: every run of four words of the PDF is remembered with its page, and a passage is placed on the
+/// page most of its four-word runs are found on. Formatting differences (line breaks, bold marks, hyphenation) do not
+/// matter, only the words; the result is a good guess, not a proof.
+pub const PageIndex = struct {
+    map: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    pages: u32 = 0,
+
+    const shingle = 4;
+
+    fn isWordByte(b: u8) bool {
+        return std.ascii.isAlphanumeric(b) or b >= 0x80;
+    }
+
+    /// Calls `f(ctx, hash, page)` for the hash of each run of four words of `text`; page counts form feeds from 1.
+    fn scan(text: []const u8, ctx: anytype, comptime f: fn (@TypeOf(ctx), u64, u32) void) u32 {
+        var ring: [shingle]u64 = @splat(0);
+        var count: usize = 0;
+        var page: u32 = 1;
+        var i: usize = 0;
+        while (i < text.len) {
+            const b = text[i];
+            if (b == 0x0c) {
+                page += 1;
+                i += 1;
+                continue;
+            }
+            if (!isWordByte(b)) {
+                i += 1;
+                continue;
+            }
+            var h = std.hash.Wyhash.init(0);
+            while (i < text.len and isWordByte(text[i])) : (i += 1) {
+                const lc = std.ascii.toLower(text[i]);
+                h.update(&.{lc});
+            }
+            ring[count % shingle] = h.final();
+            count += 1;
+            if (count >= shingle) {
+                var run = std.hash.Wyhash.init(1);
+                for (0..shingle) |k| run.update(std.mem.asBytes(&ring[(count - shingle + k) % shingle]));
+                f(ctx, run.final(), page);
+            }
+        }
+        return page;
+    }
+
+    const Builder = struct {
+        arena: Allocator,
+        map: *std.AutoHashMapUnmanaged(u64, u32),
+        failed: bool = false,
+    };
+
+    fn add(b: *Builder, hash: u64, page: u32) void {
+        const gop = b.map.getOrPut(b.arena, hash) catch {
+            b.failed = true;
+            return;
+        };
+        if (!gop.found_existing) gop.value_ptr.* = page; // a repeated phrase keeps its first page
+    }
+
+    /// Null when the text has no page breaks (nothing to place a passage on) or is too large to index.
+    pub fn build(arena: Allocator, pdf_text: []const u8) Allocator.Error!?PageIndex {
+        if (std.mem.indexOfScalar(u8, pdf_text, 0x0c) == null or pdf_text.len > 32 * 1024 * 1024) return null;
+        var out: PageIndex = .{};
+        var b: Builder = .{ .arena = arena, .map = &out.map };
+        out.pages = scan(pdf_text, &b, add);
+        if (b.failed) return error.OutOfMemory;
+        return out;
+    }
+
+    const Voter = struct { idx: *const PageIndex, votes: std.AutoHashMapUnmanaged(u32, u32) = .empty, arena: Allocator, failed: bool = false };
+
+    fn vote(v: *Voter, hash: u64, _: u32) void {
+        const page = v.idx.map.get(hash) orelse return;
+        const gop = v.votes.getOrPut(v.arena, page) catch {
+            v.failed = true;
+            return;
+        };
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+
+    /// The page most of `passage`'s word runs are on, or null if too few are found (a passage of fewer than ten
+    /// words, or text that is not in the PDF).
+    pub fn pageOf(self: *const PageIndex, arena: Allocator, passage: []const u8) Allocator.Error!?u32 {
+        var v: Voter = .{ .idx = self, .arena = arena };
+        _ = scan(passage, &v, vote);
+        if (v.failed) return error.OutOfMemory;
+        var best: ?u32 = null;
+        var best_votes: u32 = 0;
+        var total: u32 = 0;
+        var it = v.votes.iterator();
+        while (it.next()) |e| {
+            total += e.value_ptr.*;
+            if (e.value_ptr.* > best_votes or (e.value_ptr.* == best_votes and best != null and e.key_ptr.* < best.?)) {
+                best = e.key_ptr.*;
+                best_votes = e.value_ptr.*;
+            }
+        }
+        // At least three runs agree, and they are a good part of those found.
+        if (best_votes < 3 or best_votes * 2 < total) return null;
+        return best;
+    }
+};
 
 // ------------------------------------------------------------------ ranking
 
@@ -577,6 +706,36 @@ test "inline pictures become numbered references, can be fetched by number, and 
         }
     }
     try testing.expect(found0 and found1);
+}
+
+test "bold terms that open paragraphs are entry names" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cs = try chunk(a, "# Book\n\n**MUNINN (\"Memory\"):** One of Odin's two ravens.\n\n**MUNDILFARI:** Father of the moon.\n\nPlain paragraph.", .{ .chunk_chars = 400, .overlap = 0 });
+    try testing.expectEqual(@as(usize, 1), cs.len);
+    try testing.expectEqual(@as(usize, 2), cs[0].entries.len);
+    try testing.expectEqualStrings("MUNINN (\"Memory\")", cs[0].entries[0]);
+    try testing.expectEqualStrings("MUNDILFARI", cs[0].entries[1]);
+    try testing.expectEqual(@as(?[]const u8, null), leadingLabel("no bold here"));
+    try testing.expectEqual(@as(?[]const u8, null), leadingLabel("**unterminated"));
+}
+
+test "a passage without page breaks is placed on the page of its twin with them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pdf = "The first page tells of rivers and mountains in the old north country.\n\n\x0c\n\nOn the second page Odin sends Huginn and Muninn out over the whole world every morning.\n\n\x0c\n\nThe third page is about wolves, moons and the end of all things at Ragnarok.";
+    const idx = (try PageIndex.build(a, pdf)).?;
+    try testing.expectEqual(@as(u32, 3), idx.pages);
+    // The Markdown version: other line breaks, bold marks, different case.
+    try testing.expectEqual(@as(?u32, 2), try idx.pageOf(a, "**On the second page** Odin sends\nHuginn and MUNINN out over the whole world every morning."));
+    try testing.expectEqual(@as(?u32, 3), try idx.pageOf(a, "The third page is about wolves, moons and the end of all things at Ragnarok"));
+    // Too short, or not in the PDF at all.
+    try testing.expectEqual(@as(?u32, null), try idx.pageOf(a, "second page"));
+    try testing.expectEqual(@as(?u32, null), try idx.pageOf(a, "a completely different sentence that appears nowhere in the book at all"));
+    // A twin without page breaks gives nothing to go by.
+    try testing.expect((try PageIndex.build(a, "no form feeds here")) == null);
 }
 
 test "a question becomes its meaningful words joined by OR; query-language queries are left alone" {
