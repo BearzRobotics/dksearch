@@ -33,6 +33,8 @@ const files = [_]Option{
     .{ .key = "path", .label = "Folder", .type = .path, .required = true, .placeholder = "/home/me/notes", .help = "The folder to index, including its subfolders." },
     .{ .key = "pdf_text", .label = "Also index PDFs", .type = .flag, .help = "Needs the pdftotext program (Ubuntu: sudo apt install poppler-utils). Reads the text layer only; scans are skipped." },
     .{ .key = "pdf_workers", .label = "PDF workers", .type = .number, .min = 1, .max = 32, .default = "4", .help = "How many pdftotext programs run at once. Raise it for a big library." },
+    .{ .key = "max_pdf_bytes", .label = "Largest PDF (bytes)", .type = .number, .min = 1, .max = 8589934592, .default = "536870912", .help = "PDFs larger than this are skipped. The file is read by pdftotext, not held in memory here." },
+    .{ .key = "pdf_timeout_seconds", .label = "Time for one PDF (seconds)", .type = .number, .min = 1, .max = 3600, .default = "120", .help = "How long pdftotext may take on one file. Huge books need more." },
     .{ .key = "office", .label = "Also index Word, OpenDocument and EPUB files", .type = .flag, .help = "docx, odt and epub, by their text and their own title and author. No outside program needed." },
     .{ .key = "html", .label = "Also index HTML files", .type = .flag, .help = "html and htm files as web pages (UTF-8 only)." },
     .{ .key = "media", .label = "Also index audio and video", .type = .flag, .help = "By their tags, with subtitle and lyrics files next to them. Needs the ffprobe program (Ubuntu: sudo apt install ffmpeg)." },

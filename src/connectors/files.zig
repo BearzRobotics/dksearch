@@ -33,7 +33,7 @@ pub const kind = "files";
 pub const default_max_file_bytes: u32 = 4 * 1024 * 1024;
 pub const hard_max_file_bytes: u32 = 64 * 1024 * 1024;
 const checkpoint_every = 100;
-const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text", "pdf_workers", "media", "office", "html" };
+const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text", "pdf_workers", "max_pdf_bytes", "pdf_timeout_seconds", "media", "office", "html" };
 
 /// Checks a source's options without touching the filesystem.
 pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!void {
@@ -85,6 +85,21 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
             },
         };
     }
+    inline for (.{ .{ "max_pdf_bytes", 1, max_pdf_file_bytes }, .{ "pdf_timeout_seconds", 1, 3600 } }) |opt| {
+        if (source.option(opt[0])) |v| {
+            const key = std.fmt.bufPrint(&kbuf, "source[{s}]." ++ opt[0], .{source.name}) catch opt[0];
+            switch (v) {
+                .integer => |n| if (n < opt[1] or n > opt[2]) {
+                    diag.set("", key, "must be between {d} and {d}, got {d}", .{ @as(i64, opt[1]), @as(i64, opt[2]), n });
+                    return error.InvalidValue;
+                },
+                else => {
+                    diag.set("", key, "expected integer", .{});
+                    return error.WrongType;
+                },
+            }
+        }
+    }
     if (source.option("pdf_workers")) |v| {
         const key = std.fmt.bufPrint(&kbuf, "source[{s}].pdf_workers", .{source.name}) catch "pdf_workers";
         switch (v) {
@@ -132,6 +147,9 @@ pub const FilesConnector = struct {
     pdf_text: bool,
     /// How many `pdftotext` programs run at once (`pdf_workers`).
     pdf_workers: u32,
+    /// Largest PDF file accepted, and the time `pdftotext` is given for one (`max_pdf_bytes`, `pdf_timeout_seconds`).
+    max_pdf_bytes: u64,
+    pdf_timeout_s: u32,
     /// Text that was extracted ahead of time by the workers, by path (consumed in order).
     pdf_cache: std.StringHashMapUnmanaged(PdfResult) = .empty,
     /// Index audio and video through `ffprobe` and their subtitle or lyrics files (`media = true`).
@@ -162,6 +180,8 @@ pub const FilesConnector = struct {
             .pdf_text = source.optionBool("pdf_text") orelse false,
             .media = source.optionBool("media") orelse false,
             .pdf_workers = @intCast(source.optionInt("pdf_workers") orelse default_pdf_workers),
+            .max_pdf_bytes = @intCast(source.optionInt("max_pdf_bytes") orelse @as(i64, @intCast(default_max_pdf_bytes))),
+            .pdf_timeout_s = @intCast(source.optionInt("pdf_timeout_seconds") orelse default_pdf_timeout_seconds),
             .office = source.optionBool("office") orelse false,
             .html = source.optionBool("html") orelse false,
         };
@@ -324,7 +344,7 @@ pub const FilesConnector = struct {
             if (!hasExtension(rel, ".pdf") or self.pdf_cache.contains(rel)) continue;
             if (resume_from) |r| if (!std.mem.lessThan(u8, r, rel)) continue;
             const abs = std.fmt.allocPrint(arena, "{s}/{s}", .{ base_abs, rel }) catch return;
-            jobs[n] = .{ .io = io, .abs_path = abs, .max_out = self.max_file_bytes };
+            jobs[n] = .{ .io = io, .abs_path = abs, .max_out = self.max_file_bytes, .timeout_s = self.pdf_timeout_s };
             rels[n] = rel;
             n += 1;
         }
@@ -395,6 +415,11 @@ pub const FilesConnector = struct {
 
 const pdf_timeout_seconds = 60;
 pub const max_pdf_workers = 32;
+/// Largest PDF accepted by default, and the most that can be asked for. `pdftotext` reads the file
+/// itself, so this is not memory held here; it bounds how much work one file can cost.
+pub const default_max_pdf_bytes: u64 = 512 * 1024 * 1024;
+pub const max_pdf_file_bytes: i64 = 8 * 1024 * 1024 * 1024;
+pub const default_pdf_timeout_seconds: u32 = 120;
 pub const default_pdf_workers = 4;
 /// Largest `docx`, `odt` or `epub` file opened (only its text parts are read, one at a time).
 const hard_max_office_bytes: u64 = 512 * 1024 * 1024;
@@ -592,6 +617,7 @@ const PdfJob = struct {
     io: Io,
     abs_path: []const u8,
     max_out: u32,
+    timeout_s: u32,
     result: ?PdfResult = null,
 };
 
@@ -603,7 +629,7 @@ fn runPdfJob(job: *PdfJob) void {
         .argv = &.{ "pdftotext", "-enc", "UTF-8", "-layout", "-q", job.abs_path, "-" },
         .stdout_limit = .limited(job.max_out + 1),
         .stderr_limit = .limited(64 * 1024),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(pdf_timeout_seconds), .clock = .awake } },
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(job.timeout_s), .clock = .awake } },
     }) catch return;
     pa.free(r.stderr);
     if (!r.term.success() or r.stdout.len > job.max_out) {
@@ -622,7 +648,7 @@ fn pdftotextWorks(gpa: Allocator, io: Io) bool {
 }
 
 fn readPdfImpl(self: *FilesConnector, arena: Allocator, io: Io, st: Io.File.Stat, base_abs: []const u8, rel: []const u8) FilesConnector.Read {
-    if (st.size > hard_max_file_bytes) return .refused;
+    if (st.size > self.max_pdf_bytes) return .refused;
     if (st.size == 0) return .skip;
     // Output prepared ahead of time by the workers, or run the program now.
     var stdout: []const u8 = undefined;
@@ -638,7 +664,7 @@ fn readPdfImpl(self: *FilesConnector, arena: Allocator, io: Io, st: Io.File.Stat
             .argv = &.{ "pdftotext", "-enc", "UTF-8", "-layout", "-q", path, "-" },
             .stdout_limit = .limited(self.max_file_bytes + 1),
             .stderr_limit = .limited(64 * 1024),
-            .timeout = .{ .duration = .{ .raw = .fromSeconds(pdf_timeout_seconds), .clock = .awake } },
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(self.pdf_timeout_s), .clock = .awake } },
         }) catch |e| switch (e) {
             error.OutOfMemory => return .out_of_memory,
             else => return .refused, // too much text, a timeout, or the program could not run
@@ -1358,6 +1384,16 @@ test "pdf_text with several workers finds every PDF, refuses the broken one, and
         try testing.expectEqual(@as(usize, 1), try e.hits("lighthouse10"));
         try testing.expectEqual(@as(u32, 0), fc.pdf_cache.count()); // nothing is left over
     }
+}
+
+test "max_pdf_bytes and pdf_timeout_seconds are numbers in range" {
+    var d: config.Diagnostic = .{};
+    const base = config.Option{ .key = "path", .value = .{ .string = "/x" } };
+    try validate(src(&.{ base, .{ .key = "max_pdf_bytes", .value = .{ .integer = 1_000_000_000 } }, .{ .key = "pdf_timeout_seconds", .value = .{ .integer = 600 } } }), &d);
+    try testing.expectError(error.InvalidValue, validate(src(&.{ base, .{ .key = "max_pdf_bytes", .value = .{ .integer = 0 } } }), &d));
+    try testing.expectError(error.InvalidValue, validate(src(&.{ base, .{ .key = "max_pdf_bytes", .value = .{ .integer = 9_000_000_000 } } }), &d));
+    try testing.expectError(error.InvalidValue, validate(src(&.{ base, .{ .key = "pdf_timeout_seconds", .value = .{ .integer = 7200 } } }), &d));
+    try testing.expectError(error.WrongType, validate(src(&.{ base, .{ .key = "max_pdf_bytes", .value = .{ .string = "big" } } }), &d));
 }
 
 test "pdf_workers is a number from 1 to 32" {
