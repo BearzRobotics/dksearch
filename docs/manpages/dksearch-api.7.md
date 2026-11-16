@@ -178,7 +178,10 @@ GET /api/v1/admin/sources
 : Returns `sources`: one entry per configured source (`name`, `kind`, `enabled`, `configured: true`, `documents`, `last_job`) and one per name that has documents but is no longer configured (`configured: false`).
 
 GET /api/v1/admin/jobs
-: Returns `jobs`: the 50 most recent import jobs, newest first (`id`, `source`, `kind`, `state`, `started_at`, `finished_at` as Unix seconds or null, `submitted`, `rejected`, `skip_reasons` (an object with the counts `robots`, `network`, `certificate`, `http_status`, `wrong_type`, `too_large`, `encoding`, `no_text`, `redirect` and `limit`; they add up to at most `rejected`, because only some connectors say why they skipped something), `error_message`). A job shown as `running` may belong to an import that was killed; it is marked interrupted the next time a command opens the data.
+: Returns `jobs`: the 50 most recent import jobs, newest first (`id`, `source`, `kind`, `state`, `started_at`, `finished_at` as Unix seconds or null, `submitted`, `rejected`, `skip_reasons` (an object with the counts `robots`, `network`, `certificate`, `http_status`, `wrong_type`, `too_large`, `encoding`, `no_text`, `redirect`, `limit` and `unreadable`; they add up to at most `rejected`, because only some connectors say why they skipped something), `error_message`). A job shown as `running` may belong to an import that was killed; it is marked interrupted the next time a command opens the data.
+
+GET /api/v1/admin/jobs/skipped?job=ID
+: Returns `job` and `skipped`: examples of what that job skipped, each with a `reason` (as in `skip_reasons`) and `what` (the address or path), at most twenty per reason and a hundred in all. The counts in `jobs` are complete; this is only a sample, so you can see what is being left out. Sources whose connector does not name what it skips have none. 400 if `job` is not a number.
 
 GET /api/v1/admin/search
 : Runs a search like the public API (`q`, optional `language` and `connector`, at most 20 results) and returns `hits` with their ranking `score`, plus `tokenizer`, `title_weight` and `body_weight`, so ranking can be inspected. Same errors as the public search (`empty_query`, `invalid_query`). The HTML page `/search` is the same thing for people.

@@ -599,6 +599,15 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     var index = openIndex(io, paths.index, cfg.tokenizer, false) orelse return exit_io;
     defer index.close();
 
+    // An older state.db is brought up to date now (a quick, idempotent step), because the
+    // administration pages read it without writing.
+    if (Io.Dir.cwd().access(io, paths.state, .{})) |_| {
+        if (openState(io, gpa, paths.state)) |st| {
+            var s = st;
+            s.close();
+        } else return exit_io;
+    } else |_| {}
+
     // Searches run on several read-only connections so that concurrent
     // requests are answered in parallel (one connection would serialise
     // them). If they cannot be opened, the single connection is used.

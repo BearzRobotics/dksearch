@@ -492,11 +492,21 @@ const Run = struct {
     /// Pages stored since the work was last committed.
     unsaved: u32 = 0,
     network_failures: u64 = 0,
+    /// The address being fetched, named in the examples of what was skipped (a copy, because the address
+    /// itself lives in a short-lived arena).
+    current_buf: [api.Control.max_sample_bytes]u8 = undefined,
+    current_len: usize = 0,
+
+    fn setCurrent(self: *Run, url: []const u8) void {
+        const n = @min(url.len, self.current_buf.len);
+        @memcpy(self.current_buf[0..n], url[0..n]);
+        self.current_len = n;
+    }
 
     const Result = enum { stored, skipped, stopped };
 
     fn reject(self: *Run, why: api.Reason) Result {
-        self.control.reject(why);
+        self.control.rejectAt(why, self.current_buf[0..self.current_len]);
         return .skipped;
     }
 
@@ -591,6 +601,7 @@ const Run = struct {
         var url = try withoutFragment(a, start);
         var hops: u32 = 0;
         self.fetched += 1;
+        self.setCurrent(url);
         while (true) {
             const u = parseUrl(url) orelse return self.skip(.limit);
             const host = self.hostFor(u, listed and hops == 0) catch |e| switch (e) {
@@ -646,7 +657,7 @@ const Run = struct {
     }
 
     fn skip(self: *Run, why: api.Reason) Fetched {
-        self.control.reject(why);
+        self.control.rejectAt(why, self.current_buf[0..self.current_len]);
         return .skipped;
     }
 

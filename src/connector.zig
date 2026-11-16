@@ -70,9 +70,15 @@ pub const Reason = enum {
     redirect,
     /// A limit of the run (pages, sites) was reached, or the URL is unusable.
     limit,
+    /// A local file that could not be read or understood: unreadable, damaged, not valid text, over the
+    /// file size cap, or an unsupported variant of a format.
+    unreadable,
 };
 
 pub const reason_count = std.enums.values(Reason).len;
+
+/// An example of a refused item.
+pub const Sample = struct { reason: []const u8, what: []const u8 };
 
 /// A count per `Reason`.
 pub const ReasonCounts = [reason_count]u64;
@@ -115,6 +121,49 @@ pub const Control = struct {
     /// See `setProgress`.
     progress_done: std.atomic.Value(u64) = .init(0),
     progress_total: std.atomic.Value(u64) = .init(0),
+    /// A few examples of what was refused and why (`rejectAt`), so that the person running the import can see
+    /// what is being skipped. Guarded by a spin lock: the critical sections are a few bytes long.
+    sample_lock: std.atomic.Value(bool) = .init(false),
+    sample_count: usize = 0,
+    sample_reason: [max_samples]Reason = undefined,
+    sample_len: [max_samples]u8 = undefined,
+    sample_text: [max_samples][max_sample_bytes]u8 = undefined,
+    sample_per_reason: [reason_count]u8 = @splat(0),
+
+    pub const max_samples = 100;
+    pub const max_sample_bytes = 200;
+    const max_samples_per_reason = 20;
+
+    /// Like `reject`, and remembers `what` (an address or path) as an example, up to a few per reason.
+    pub fn rejectAt(self: *Control, why: Reason, what: []const u8) void {
+        self.reject(why);
+        while (self.sample_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        defer self.sample_lock.store(false, .release);
+        const r = @backingInt(why);
+        if (self.sample_count >= max_samples or self.sample_per_reason[r] >= max_samples_per_reason) return;
+        const n = @min(what.len, max_sample_bytes);
+        @memcpy(self.sample_text[self.sample_count][0..n], what[0..n]);
+        self.sample_len[self.sample_count] = @intCast(n);
+        self.sample_reason[self.sample_count] = why;
+        self.sample_per_reason[r] += 1;
+        self.sample_count += 1;
+    }
+
+    /// The samples recorded from number `from` on, written to `out` (reason name and text, allocated from `arena`).
+    pub fn samplesFrom(self: *Control, arena: std.mem.Allocator, from: usize) std.mem.Allocator.Error![]const Sample {
+        while (self.sample_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        defer self.sample_lock.store(false, .release);
+        if (from >= self.sample_count) return &.{};
+        const out = try arena.alloc(Sample, self.sample_count - from);
+        for (out, from..) |*o, i| o.* = .{ .reason = @tagName(self.sample_reason[i]), .what = try arena.dupe(u8, self.sample_text[i][0..self.sample_len[i]]) };
+        return out;
+    }
+
+    pub fn sampleTotal(self: *Control) usize {
+        while (self.sample_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        defer self.sample_lock.store(false, .release);
+        return self.sample_count;
+    }
 
     /// Counts one refused item, with its reason.
     pub fn reject(self: *Control, why: Reason) void {

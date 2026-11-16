@@ -71,6 +71,8 @@ const JobSink = struct {
     /// Counters as of the last successful commit.
     committed_submitted: u64 = 0,
     committed_rejected: u64 = 0,
+    /// How many of the control's skip examples are already stored.
+    samples_saved: usize = 0,
     /// Latest position the connector reported; borrowed copy in `arena`.
     last_checkpoint: ?[]const u8 = null,
     arena: Allocator,
@@ -107,6 +109,17 @@ const JobSink = struct {
         var rb: [reasons_text_max]u8 = undefined;
         self.state.saveCheckpoint(self.job, position, self.submitted, self.totalRejected(), reasonsText(&rb, self.control.reasonCounts())) catch return error.Stopped;
         if (position) |p| self.last_checkpoint = self.arena.dupe(u8, p) catch return error.OutOfMemory;
+        self.saveSamples();
+    }
+
+    /// Stores the skip examples collected since the last call. Examples are a convenience: failing to store
+    /// them never stops a run.
+    fn saveSamples(self: *JobSink) void {
+        const total = self.control.sampleTotal();
+        if (total <= self.samples_saved) return;
+        const fresh = self.control.samplesFrom(self.arena, self.samples_saved) catch return;
+        self.state.addSkips(self.job, fresh) catch return;
+        self.samples_saved = total;
     }
 
     fn totalRejected(self: *const JobSink) u64 {
@@ -195,6 +208,7 @@ pub fn runImport(
     var rb: [reasons_text_max]u8 = undefined;
     const reasons = control.reasonCounts();
     state.saveCheckpoint(job, checkpoint, js.submitted, js.totalRejected(), reasonsText(&rb, reasons)) catch return error.StateUnavailable;
+    js.saveSamples();
     state.finishJob(job, final, now(), failure) catch return error.StateUnavailable;
 
     return .{
@@ -316,6 +330,8 @@ const ScriptedConnector = struct {
     fail_at: ?usize = null,
     fail_with: connector_mod.RunError = error.SourceFailed,
     seen_resume: ?usize = null,
+    /// Items it refuses itself, before the others.
+    skips: []const []const u8 = &.{},
     buf: [20]u8 = undefined,
 
     fn info(_: *anyopaque) connector_mod.Info {
@@ -325,6 +341,7 @@ const ScriptedConnector = struct {
     fn run(ptr: *anyopaque, sink: connector_mod.Sink, control: *connector_mod.Control, resume_from: ?[]const u8) connector_mod.RunError!connector_mod.Outcome {
         const self: *ScriptedConnector = @ptrCast(@alignCast(ptr));
         var i: usize = 0;
+        for (self.skips) |s| control.rejectAt(.no_text, s);
         if (resume_from) |r| {
             i = std.fmt.parseInt(usize, r, 10) catch return error.InvalidSource;
             self.seen_resume = i;
@@ -423,6 +440,24 @@ test "rejected documents are counted and do not stop the run" {
     try testing.expectEqual(state_sqlite.JobState.completed, r.state);
     try testing.expectEqual(@as(u64, 2), r.submitted);
     try testing.expectEqual(@as(u64, 1), r.rejected);
+}
+
+test "examples of what a connector refused are kept with the job, a few per reason" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var many: [30][]const u8 = undefined;
+    for (&many, 0..) |*m, i| m.* = if (i % 2 == 0) "https://example.org/a" else "https://example.org/b";
+    var c: ScriptedConnector = .{ .items = &.{ "a", "b" }, .skips = &many };
+    var ctl: connector_mod.Control = .{};
+    const r = try rig.run(&c, &ctl);
+    try testing.expectEqual(@as(u64, 30), r.rejected); // all counted
+    const skips = try rig.state.skipsOf(rig.arena.allocator(), r.job_id);
+    try testing.expectEqual(@as(usize, 20), skips.len); // twenty per reason are kept
+    try testing.expectEqualStrings("no_text", skips[0].reason);
+    try testing.expectEqualStrings("https://example.org/a", skips[0].what);
+    // Another job has none.
+    try testing.expectEqual(@as(usize, 0), (try rig.state.skipsOf(rig.arena.allocator(), r.job_id + 1)).len);
 }
 
 test "cancel then resume continues where it stopped" {

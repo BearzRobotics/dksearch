@@ -268,8 +268,8 @@ pub const FilesConnector = struct {
             }
             switch (self.readOne(file_arena, io, dir, base_abs, rel)) {
                 .skip => {},
-                .no_text => control.reject(.no_text),
-                .refused => _ = control.rejected.fetchAdd(1, .monotonic),
+                .no_text => control.rejectAt(.no_text, rel),
+                .refused => control.rejectAt(.unreadable, rel),
                 .document => |d| {
                     sink.submit(d) catch |e| switch (e) {
                         error.Rejected => {}, // the pipeline counts and reports it

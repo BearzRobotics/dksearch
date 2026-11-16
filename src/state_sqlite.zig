@@ -17,6 +17,7 @@ const c = sqlite.c;
 const Stmt = sqlite.Stmt;
 const doc = @import("document.zig");
 const storage = @import("storage.zig");
+const connector_mod = @import("connector.zig");
 
 const migrations = [_][:0]const u8{
     \\CREATE TABLE documents(
@@ -44,6 +45,14 @@ const migrations = [_][:0]const u8{
     ,
     // 2: why items were refused, as "reason=count, ..." text (see connector.formatReasons).
     \\ALTER TABLE jobs ADD COLUMN reasons TEXT;
+    ,
+    // 3: examples of what a run skipped (a few per reason), shown by the interface.
+    \\CREATE TABLE job_skips(
+    \\  job    INTEGER NOT NULL,
+    \\  reason TEXT NOT NULL,
+    \\  what   TEXT NOT NULL
+    \\);
+    \\CREATE INDEX job_skips_job ON job_skips(job);
 };
 
 pub const OpenError = sqlite.MigrateError;
@@ -297,6 +306,32 @@ pub const SqliteStateStore = struct {
         try st.int(4, @intCast(rejected));
         try st.text(5, reasons);
         _ = try st.step();
+    }
+
+    /// Records examples of skipped items for `job`.
+    pub fn addSkips(self: *SqliteStateStore, job: i64, samples: []const connector_mod.Sample) sqlite.Error!void {
+        for (samples) |s| {
+            const st = try Stmt.prepare(self.db, "INSERT INTO job_skips(job, reason, what) VALUES (?1, ?2, ?3)");
+            defer st.deinit();
+            try st.int(1, job);
+            try st.text(2, s.reason);
+            try st.text(3, s.what);
+            _ = try st.step();
+        }
+    }
+
+    /// The recorded examples of what `job` skipped, strings allocated from `arena`.
+    pub fn skipsOf(self: *SqliteStateStore, arena: Allocator, job: i64) storage.Error![]const connector_mod.Sample {
+        const st = Stmt.prepare(self.db, "SELECT reason, what FROM job_skips WHERE job = ?1 ORDER BY rowid") catch return error.Io;
+        defer st.deinit();
+        st.int(1, job) catch return error.Io;
+        var out: std.ArrayList(connector_mod.Sample) = .empty;
+        while (st.step() catch return error.Io) {
+            const reason = arena.dupe(u8, st.colText(0) orelse "") catch return error.OutOfMemory;
+            const what = arena.dupe(u8, st.colText(1) orelse "") catch return error.OutOfMemory;
+            out.append(arena, .{ .reason = reason, .what = what }) catch return error.OutOfMemory;
+        }
+        return out.items;
     }
 
     /// Ends a run. `final` must not be `running`.

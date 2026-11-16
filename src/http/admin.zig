@@ -131,7 +131,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -139,12 +139,14 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
             .{ "/", .dashboard },
             .{ "/jobs", .jobs },
+            .{ "/jobs/skipped", .jobs_skipped },
+            .{ "/api/v1/admin/jobs/skipped", .api_jobs_skipped },
             .{ "/sources", .sources_page },
             .{ "/sources/new", .sources_new },
             .{ "/sources/edit", .source_edit },
@@ -226,6 +228,8 @@ pub const App = struct {
         return switch (route) {
             .dashboard => self.pageDashboard(arena, csrf),
             .jobs => self.pageJobs(arena, csrf),
+            .jobs_skipped => self.pageSkipped(arena, csrf, t.params),
+            .api_jobs_skipped => self.apiSkipped(arena, t.params),
             .maintenance => self.pageMaintenance(arena, csrf),
             .action_maintenance => self.startOperation(arena, req, auth, false),
             .zim_page => self.pageZim(arena, csrf, t.params),
@@ -919,6 +923,7 @@ pub const App = struct {
         no_text: u64,
         redirect: u64,
         limit: u64,
+        unreadable: u64,
     };
 
     fn jsonReasons(c: dk.connector.ReasonCounts) JsonReasons {
@@ -1185,6 +1190,41 @@ pub const App = struct {
         return redirect(arena, "/", null);
     }
 
+    /// Examples of what one job skipped (a few per reason), from state.db.
+    fn skipsFor(self: *App, arena: Allocator, params: query.Params) error{ OutOfMemory, BadJob, Unavailable }!struct { job: i64, skips: []const dk.connector.Sample } {
+        const job = std.fmt.parseInt(i64, params.get("job") orelse "", 10) catch return error.BadJob;
+        var state = dk.state_sqlite.SqliteStateStore.inspect(self.gpa, self.opts.state_path) catch return error.Unavailable;
+        defer state.close();
+        const skips = state.skipsOf(arena, job) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Unavailable,
+        };
+        return .{ .job = job, .skips = skips };
+    }
+
+    fn pageSkipped(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
+        const got = self.skipsFor(arena, params) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.BadJob => handler.htmlError(arena, .bad_request, "Bad request", "job must be a job number."),
+            error.Unavailable => handler.htmlError(arena, .service_unavailable, "Unavailable", "The job records cannot be read now."),
+        };
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "Skipped items", csrf, "jobs") catch return error.OutOfMemory;
+        writeSkipped(w, got.job, got.skips) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
+    }
+
+    fn apiSkipped(self: *App, arena: Allocator, params: query.Params) error{OutOfMemory}!Response {
+        const got = self.skipsFor(arena, params) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.BadJob => handler.apiError(arena, .bad_request, "invalid_parameter", "job: must be a job number"),
+            error.Unavailable => handler.apiError(arena, .service_unavailable, "unavailable", "the job records cannot be read now"),
+        };
+        return handler.jsonResponse(arena, .ok, .{ .job = got.job, .skipped = got.skips });
+    }
+
     fn pageJobs(self: *App, arena: Allocator, csrf: ?[]const u8) error{OutOfMemory}!Response {
         const snap = self.snapshot(arena, 50);
         var aw: Io.Writer.Allocating = .init(arena);
@@ -1396,7 +1436,8 @@ fn writeJobCells(w: *Io.Writer, j: dk.state_sqlite.Job) Io.Writer.Error!void {
     try writeBadge(w, j.state);
     try w.writeAll("</td><td>");
     try writeTime(w, j.started_at);
-    try w.print("</td><td class=\"num\">{d}</td><td class=\"num\">{d}", .{ j.submitted, j.rejected });
+    try w.print("</td><td class=\"num\">{d}</td><td class=\"num\">", .{j.submitted});
+    if (j.rejected > 0) try w.print("<a href=\"/jobs/skipped?job={d}\">{d}</a>", .{ j.id, j.rejected }) else try w.writeAll("0");
     if (j.reasons) |t| {
         // Our own "reason=count" text, never connector- or site-supplied.
         try w.print(" <span class=\"muted\">({s})</span>", .{t});
@@ -1993,6 +2034,20 @@ fn writeMaintenance(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapsh
     try w.writeAll("<section class=\"card\"><h2>Rebuild and restore</h2><p class=\"muted\">These stay on the command line: <code>dksearch rebuild</code> recreates the index (stop <code>serve</code> first), and <code>dksearch restore DIR</code> recreates the stored data from a backup. Both replace files the running server is using.</p></section>\n");
 }
 
+fn writeSkipped(w: *Io.Writer, job: i64, skips: []const dk.connector.Sample) Io.Writer.Error!void {
+    try w.print("<p>Examples of what job {d} skipped: up to twenty for each reason, taken as the run went. The counts on the Jobs page are complete; this list is only a sample, so you can see <em>what</em> is being left out. <a href=\"/jobs\">Back to the jobs</a></p>", .{job});
+    if (skips.len == 0) return w.writeAll("<p class=\"muted\">No examples were recorded (the connector does not name what it skips, or nothing was skipped).</p>\n");
+    try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Why</th><th>Address or path</th></tr></thead><tbody>\n");
+    for (skips) |s| {
+        try w.writeAll("<tr><td>");
+        try html.writeEscaped(w, s.reason);
+        try w.writeAll("</td><td><code>");
+        try html.writeEscaped(w, s.what);
+        try w.writeAll("</code></td></tr>\n");
+    }
+    try w.writeAll("</tbody></table></div>\n");
+}
+
 fn writeJobs(w: *Io.Writer, jobs: []const dk.state_sqlite.Job) Io.Writer.Error!void {
     if (jobs.len == 0) return w.writeAll("<p>No imports have run yet.</p>\n");
     try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Job</th><th>Source</th><th>Kind</th><th>State</th><th>Started</th><th class=\"num\">Submitted</th><th class=\"num\">Skipped</th><th>Note</th></tr></thead><tbody>\n");
@@ -2230,6 +2285,13 @@ test "api: sources and jobs" {
     try testing.expect(std.mem.indexOf(u8, jobs.body, "\"started_at\":1709634030") != null);
     // Why items were skipped: every reason is present, with its count.
     try testing.expect(std.mem.indexOf(u8, jobs.body, "\"skip_reasons\":{\"robots\":2,\"network\":0,\"certificate\":0,\"http_status\":1,") != null);
+    const sk = try f.call(a, .GET, "/api/v1/admin/jobs/skipped?job=1", .{ .auth = auth });
+    try testing.expectEqual(http.Status.ok, sk.status);
+    try testing.expect(std.mem.indexOf(u8, sk.body, "\"skipped\":[]") != null);
+    try testing.expectEqual(http.Status.bad_request, (try f.call(a, .GET, "/api/v1/admin/jobs/skipped?job=x", .{ .auth = auth })).status);
+    const skp = try f.call(a, .GET, "/jobs/skipped?job=1", .{ .cookie = try f.signIn(a) });
+    try testing.expectEqual(http.Status.ok, skp.status);
+    try testing.expect(std.mem.indexOf(u8, skp.body, "No examples were recorded") != null);
     const page = try f.call(a, .GET, "/jobs", .{ .auth = auth });
     try testing.expect(std.mem.indexOf(u8, page.body, "(robots=2, http_status=1)") != null);
 }
