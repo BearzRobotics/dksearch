@@ -125,11 +125,11 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regex
 pub const ParamError = struct { name: []const u8, message: []const u8 };
 
 const Parsed = union(enum) {
-    ok: struct { q: dk.search.Query, re: ?dk.regexsearch.Request },
+    ok: struct { q: dk.search.Query, re: ?dk.regexsearch.Request, typed: []const u8 },
     bad: ParamError,
 };
 
-fn parseQuery(params: query.Params, html_mode: bool) Parsed {
+fn parseQuery(arena: Allocator, params: query.Params, html_mode: bool) error{OutOfMemory}!Parsed {
     var q: dk.search.Query = .{ .text = params.get("q") orelse "" };
     inline for (.{ "language", "content_type", "connector" }) |name| {
         if (params.get(name)) |v| if (v.len > 0) {
@@ -157,10 +157,39 @@ fn parseQuery(params: query.Params, html_mode: bool) Parsed {
         .ok => |r| r,
         .bad => |b| return .{ .bad = b },
     };
-    return .{ .ok = .{ .q = q, .re = re } };
+    // A pattern written in the search box: re:/…/i
+    const tok = dk.regexsearch.extractToken(arena, q.text) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnterminatedPattern => .{ .bad = .{ .name = "q", .message = "a pattern written re:/… needs a closing slash, like re:/colou?r/" } },
+        error.BadFlag => .{ .bad = .{ .name = "q", .message = "after the closing slash only the flag i (ignore case) is allowed" } },
+        error.TooManyPatterns => .{ .bad = .{ .name = "q", .message = "only one re:/…/ pattern per search" } },
+    };
+    if (tok.request) |r| {
+        if (re != null) return .{ .bad = .{ .name = "regex", .message = "use either the regex parameter or re:/…/ in the query, not both" } };
+        q.text = tok.text;
+        return .{ .ok = .{ .q = q, .re = r, .typed = params.get("q") orelse "" } };
+    }
+    return .{ .ok = .{ .q = q, .re = re, .typed = q.text } };
 }
 
 pub const RegexParams = union(enum) { none, ok: dk.regexsearch.Request, bad: ParamError };
+
+/// Applies a `re:/…/` written in the query text: the text loses the token and
+/// the regex request is taken from it. Used where the query and the regex
+/// parameters are parsed separately.
+pub fn applyToken(arena: Allocator, q: dk.search.Query, rx: RegexParams) error{OutOfMemory}!struct { q: dk.search.Query, rx: RegexParams } {
+    const tok = dk.regexsearch.extractToken(arena, q.text) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnterminatedPattern => .{ .q = q, .rx = .{ .bad = .{ .name = "q", .message = "a pattern written re:/… needs a closing slash, like re:/colou?r/" } } },
+        error.BadFlag => .{ .q = q, .rx = .{ .bad = .{ .name = "q", .message = "after the closing slash only the flag i (ignore case) is allowed" } } },
+        error.TooManyPatterns => .{ .q = q, .rx = .{ .bad = .{ .name = "q", .message = "only one re:/…/ pattern per search" } } },
+    };
+    const r = tok.request orelse return .{ .q = q, .rx = rx };
+    if (rx != .none) return .{ .q = q, .rx = .{ .bad = .{ .name = "regex", .message = "use either the regex parameter or re:/…/ in the query, not both" } } };
+    var out = q;
+    out.text = tok.text;
+    return .{ .q = out, .rx = .{ .ok = r } };
+}
 
 /// Regular-expression filter parameters: `regex` is the pattern, `regex_flags`
 /// may contain `i` (ignore case), `regex_dialect` is `perl` (default) or `ere`.
@@ -219,7 +248,7 @@ pub fn regexSearch(arena: Allocator, searcher: dk.search.Searcher, service: ?*dk
 }
 
 fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, params: query.Params) error{OutOfMemory}!Response {
-    const parsed = switch (parseQuery(params, false)) {
+    const parsed = switch (try parseQuery(arena, params, false)) {
         .ok => |p| p,
         .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
@@ -288,15 +317,19 @@ pub fn apiError(arena: Allocator, status: http.Status, code: []const u8, message
 // ------------------------------------------------------------ HTML pages
 
 fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, params: query.Params) error{OutOfMemory}!Response {
-    const parsed = switch (parseQuery(params, true)) {
+    const parsed = switch (try parseQuery(arena, params, true)) {
         .ok => |p| p,
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
     const q = parsed.q;
-    var form: html.Form = .{ .q = q.text, .language = q.language orelse "", .connector = q.connector orelse "", .regex_enabled = regex != null, .exact_only = q.fuzzy == .off };
+    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .connector = q.connector orelse "", .regex_enabled = regex != null, .exact_only = q.fuzzy == .off };
     if (parsed.re) |req| {
-        form.regex = req.pattern;
-        form.regex_ignore_case = req.ignore_case;
+        // A pattern typed in the box is already part of `q` and travels with it; only one given
+        // as a parameter has to be carried separately (the pager and the exact-spelling link).
+        if (std.mem.eql(u8, parsed.typed, q.text)) {
+            form.regex = req.pattern;
+            form.regex_ignore_case = req.ignore_case;
+        }
         const result = try regexSearch(arena, searcher, regex, q, req);
         var aw: std.Io.Writer.Allocating = .init(arena);
         switch (result) {
@@ -629,6 +662,33 @@ test "API regex filter keeps matching documents and says how much was checked" {
     try testing.expect(std.mem.indexOf(u8, r2.body, "\"title\":\"A\"") != null and std.mem.indexOf(u8, r2.body, "\"title\":\"B\"") != null);
 }
 
+test "re:/pattern/ in the query text works like the regex parameters" {
+    var f: RegexFixture = undefined;
+    try f.init(.{});
+    defer f.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const typed = f.get(&ar, true, "/api/v1/search?q=order%20re:/%5Cd%7B3%7D-%5Cd%2B/");
+    const param = f.get(&ar, true, "/api/v1/search?q=order&regex=%5Cd%7B3%7D-%5Cd%2B");
+    try testing.expectEqual(http.Status.ok, typed.status);
+    try testing.expectEqualStrings(param.body, typed.body);
+    // Negated: the documents that do not match.
+    const neg = f.get(&ar, true, "/api/v1/search?q=order%20-re:/%5Cd%7B3%7D-%5Cd%2B/");
+    try testing.expectEqual(http.Status.ok, neg.status);
+    try testing.expect(!std.mem.eql(u8, neg.body, typed.body));
+    // Mistakes get a message, and so does using both forms.
+    for ([_][]const u8{ "/api/v1/search?q=order%20re:/abc", "/api/v1/search?q=order%20re:/a/g", "/api/v1/search?q=order%20re:/a/%20re:/b/", "/api/v1/search?q=order%20re:/a/&regex=b" }) |t| {
+        const r = f.get(&ar, true, t);
+        errdefer std.debug.print("target: {s}\n", .{t});
+        try testing.expectEqual(http.Status.bad_request, r.status);
+    }
+    // Without the regex service it is refused as before, and the page keeps the typed text.
+    const off = f.get(&ar, false, "/api/v1/search?q=order%20re:/a/");
+    try testing.expectEqual(http.Status.bad_request, off.status);
+    const page = f.get(&ar, true, "/search?q=order%20re:/%5Cd%2B/");
+    try testing.expect(std.mem.indexOf(u8, page.body, "value=\"order re:/\\d+/\"") != null);
+}
+
 test "API regex errors are JSON with stable codes" {
     var f: RegexFixture = undefined;
     try f.init(.{});
@@ -681,12 +741,17 @@ test "the HTML page offers the regex field only when enabled, escapes it and kee
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const home_off = f.get(&ar, false, "/");
+    // The regex is part of the query language: no separate box, and the side panel
+    // explains it only when the server has it.
     try testing.expect(std.mem.indexOf(u8, home_off.body, "name=\"regex\"") == null);
+    try testing.expect(std.mem.indexOf(u8, home_off.body, "re:/") == null);
     const home_on = f.get(&ar, true, "/");
-    try testing.expect(std.mem.indexOf(u8, home_on.body, "name=\"regex\"") != null);
+    try testing.expect(std.mem.indexOf(u8, home_on.body, "name=\"regex\"") == null);
+    try testing.expect(std.mem.indexOf(u8, home_on.body, "re:/") != null);
+    try testing.expect(std.mem.indexOf(u8, home_on.body, "class=\"side\"") != null);
 
-    const r = f.get(&ar, true, "/search?q=order&regex=%3Cb%3E%5Cd%2B");
-    // Nothing matches "<b>\d+", the pattern is shown escaped and never as markup.
+    // A pattern typed in the box is shown escaped (never as markup) and kept in the box.
+    const r = f.get(&ar, true, "/search?q=order%20re:/%3Cb%3E%5Cd%2B/");
     try testing.expect(std.mem.indexOf(u8, r.body, "<b>\\d+") == null);
     try testing.expect(std.mem.indexOf(u8, r.body, "&lt;b&gt;\\d+") != null);
 

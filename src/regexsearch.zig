@@ -71,7 +71,77 @@ pub const Request = struct {
     pattern: []const u8,
     ignore_case: bool = false,
     dialect: Dialect = .perl,
+    /// Keep the documents that do NOT contain a match (`-re:/draft/`).
+    negate: bool = false,
 };
+
+pub const TokenError = error{
+    /// `re:/` with no closing slash.
+    UnterminatedPattern,
+    /// A letter after the closing slash other than `i`.
+    BadFlag,
+    /// More than one `re:/…/` in a query.
+    TooManyPatterns,
+    OutOfMemory,
+};
+
+pub const Extracted = struct {
+    /// The query text without the regex token.
+    text: []const u8,
+    request: ?Request = null,
+};
+
+fn startsWithToken(text: []const u8, i: usize) ?struct { negate: bool, len: usize } {
+    var j = i;
+    var negate = false;
+    if (j < text.len and text[j] == '-') {
+        negate = true;
+        j += 1;
+    }
+    inline for (.{ "regex:/", "re:/" }) |name| {
+        if (text.len - j >= name.len and std.ascii.eqlIgnoreCase(text[j .. j + name.len], name)) return .{ .negate = negate, .len = j + name.len - i };
+    }
+    return null;
+}
+
+/// Finds a `re:/pattern/i` (or `regex:/…/`, with `-` in front to negate) in a
+/// query written in the search box and takes it out. The token must start a
+/// word, outside quotes. Inside the pattern a backslash escapes the next
+/// character, so `\/` is a literal slash; the pattern ends at the first
+/// unescaped slash, so write `[\/]` rather than `[/]`.
+pub fn extractToken(arena: Allocator, text: []const u8) TokenError!Extracted {
+    var out: std.ArrayList(u8) = .empty;
+    var found: ?Request = null;
+    var in_quote = false;
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = text[i];
+        if (ch == '"') in_quote = !in_quote;
+        const at_word_start = i == 0 or std.ascii.isWhitespace(text[i - 1]) or text[i - 1] == '(';
+        if (!in_quote and at_word_start) if (startsWithToken(text, i)) |tok| {
+            var j = i + tok.len;
+            const pat_start = j;
+            while (j < text.len and text[j] != '/') : (j += 1) {
+                if (text[j] == '\\' and j + 1 < text.len) j += 1;
+            }
+            if (j >= text.len) return error.UnterminatedPattern;
+            const pattern = text[pat_start..j];
+            j += 1;
+            var ignore_case = false;
+            while (j < text.len and std.ascii.isAlphabetic(text[j])) : (j += 1) {
+                if (text[j] != 'i') return error.BadFlag;
+                ignore_case = true;
+            }
+            if (found != null) return error.TooManyPatterns;
+            found = .{ .pattern = pattern, .ignore_case = ignore_case, .negate = tok.negate };
+            i = j;
+            continue;
+        };
+        try out.append(arena, ch);
+        i += 1;
+    }
+    return .{ .text = if (found == null) text else out.items, .request = found };
+}
 
 pub const Error = error{
     /// The word part of the query has no searchable terms.
@@ -220,6 +290,15 @@ pub const Service = struct {
                         continue;
                     },
                 };
+                if (req.negate) {
+                    // Keep the documents the pattern does not match; there is nothing to highlight.
+                    if (found != null) continue;
+                    matches_seen += 1;
+                    if (matches_seen <= q.offset) continue;
+                    try hits.append(arena, h);
+                    if (hits.items.len > want) break :scan;
+                    continue;
+                }
                 const m = found orelse continue;
                 matches_seen += 1;
                 if (matches_seen <= q.offset) continue;
@@ -496,4 +575,32 @@ test "random patterns and texts never crash and stay within bounds" {
         var diag: PatternDiag = .{};
         _ = svc.run(arena.allocator(), f.index.searcher(), .{ .text = "a" }, .{ .pattern = pat[0 .. rnd.uintLessThan(usize, pat.len) + 1] }, &diag) catch {};
     }
+}
+
+test "re:/pattern/ tokens are taken out of the query text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = std.testing;
+    var x = try extractToken(a, "invoice re:/INV-\\d{6}/i ext:pdf");
+    try t.expectEqualStrings("invoice  ext:pdf", x.text);
+    try t.expectEqualStrings("INV-\\d{6}", x.request.?.pattern);
+    try t.expect(x.request.?.ignore_case and !x.request.?.negate);
+
+    x = try extractToken(a, "order -re:/draft/ (a OR b)");
+    try t.expect(x.request.?.negate);
+    try t.expectEqualStrings("order  (a OR b)", x.text);
+
+    x = try extractToken(a, "a REGEX:/x\\/y/");
+    try t.expectEqualStrings("x\\/y", x.request.?.pattern); // an escaped slash stays in the pattern
+
+    // Not a token: inside quotes, in the middle of a word, or without the slash.
+    for ([_][]const u8{ "\"say re:/x/\"", "more:/x/", "re:x", "plain words" }) |plain_text| {
+        x = try extractToken(a, plain_text);
+        try t.expect(x.request == null);
+        try t.expectEqualStrings(plain_text, x.text);
+    }
+    try t.expectError(error.UnterminatedPattern, extractToken(a, "a re:/abc"));
+    try t.expectError(error.BadFlag, extractToken(a, "a re:/abc/g"));
+    try t.expectError(error.TooManyPatterns, extractToken(a, "re:/a/ re:/b/"));
 }

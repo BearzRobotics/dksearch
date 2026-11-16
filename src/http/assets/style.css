@@ -24,6 +24,20 @@ body {
   font: 16px/1.5 system-ui, sans-serif;
 }
 main { max-width: 44rem; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
+/* Search pages: the tips panel is left of the results on wide screens and below them on narrow ones. */
+.layout { display: flex; flex-direction: column; }
+.side { max-width: 44rem; margin: 0 auto; padding: 0 1rem 3rem; color: var(--muted); font-size: 0.9rem; width: 100%; }
+.side h2 { font-size: 1rem; margin: 0 0 0.4rem; color: var(--fg); }
+.side h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; margin: 1rem 0 0.3rem; }
+.side dl { margin: 0; }
+.side dt { margin-top: 0.4rem; }
+.side dd { margin: 0 0 0 0.6rem; }
+.side .small { margin: 0.8rem 0 0; }
+@media (min-width: 62rem) {
+  .layout { display: grid; grid-template-columns: 16rem minmax(0, 44rem); gap: 1rem; justify-content: center; align-items: start; }
+  .layout > main { grid-column: 2; grid-row: 1; margin: 0; }
+  .layout > .side { grid-column: 1; grid-row: 1; margin: 0; padding: 3.6rem 0 2rem 1rem; position: sticky; top: 0; max-height: 100vh; overflow-y: auto; }
+}
 .brand { font-size: 1.5rem; margin: 0 0 1rem; }
 .brand a { color: inherit; text-decoration: none; }
 .home main { padding-top: 18vh; text-align: center; }
@@ -180,3 +194,4 @@ pre { background: var(--card); border: 1px solid var(--border); border-radius: 0
   .stat-n { font-size: 1.3rem; }
   .card { padding: 0.8rem; }
 }
+@media (min-width: 62rem) { .home .layout > .side { padding-top: calc(18vh + 2rem); } }

@@ -69,7 +69,7 @@ GET /api/v1/health
 Returns 200 and `{"status":"ok"}`. It reports that the process is serving requests and nothing about the index.
 
 GET /search and GET /
-HTML pages. `/` is the search form. `/search` takes `q`, `language`, `connector`, `offset`, `fuzzy` and, when the server offers it, `regex` and `regex_flags` (the search form has a Regex field under Filters); the page size is fixed at 10 and any `limit` is ignored. Result URLs are links only if they begin with `http://` or `https://`; otherwise they are shown as text. An empty `q` shows the form again.
+HTML pages. `/` is the search form. `/search` takes `q`, `language`, `connector`, `offset`, `fuzzy` and, when the server offers it, `regex` and `regex_flags` (on the page a pattern is written in the search box as `re:/pattern/` or `re:/pattern/i`, with a minus in front to keep only documents that do not match; the same form works in the `q` parameter of the API and cannot be combined with `regex`); the page size is fixed at 10 and any `limit` is ignored. Result URLs are links only if they begin with `http://` or `https://`; otherwise they are shown as text. An empty `q` shows the form again.
 
 GET /assets/style.css
 The stylesheet, cacheable for one hour. All other responses are `Cache-Control: no-store`.

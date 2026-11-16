@@ -252,11 +252,12 @@ pub const App = struct {
 
     fn apiSearchTest(self: *App, arena: Allocator, params: query.Params) error{OutOfMemory}!Response {
         const searcher = self.opts.searcher orelse return handler.apiError(arena, .not_found, "not_found", "searching is not available here");
-        switch (handler.parseRegexParams(params)) {
+        const applied = try handler.applyToken(arena, testQuery(params), handler.parseRegexParams(params));
+        switch (applied.rx) {
             .none => {},
             .bad => |b| return handler.apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
             .ok => |req| {
-                const r = switch (try handler.regexSearch(arena, searcher, self.opts.regex, testQuery(params), req)) {
+                const r = switch (try handler.regexSearch(arena, searcher, self.opts.regex, applied.q, req)) {
                     .ok => |r| r,
                     .failed => |n| return handler.apiError(arena, n.status, n.code, n.message),
                 };
@@ -266,7 +267,7 @@ pub const App = struct {
                 return handler.jsonResponse(arena, .ok, .{ .tokenizer = self.opts.tokenizer, .hits = rhits, .has_more = r.page.has_more, .regex = .{ .examined = r.examined, .truncated = r.truncated } });
             },
         }
-        const page = searcher.search(arena, testQuery(params)) catch |e| return switch (e) {
+        const page = searcher.search(arena, applied.q) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.EmptyQuery => handler.apiError(arena, .bad_request, "empty_query", "the query has no searchable terms"),
             error.InvalidQuery => handler.apiError(arena, .bad_request, "invalid_query", "the query is out of range"),
@@ -1070,11 +1071,14 @@ fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.sear
         try w.writeAll("> ignore case</label></details>");
     }
     try w.writeAll("</form>\n");
-    try w.print("<p class=\"muted\">Runs the same search as the public page and shows the ranking score of each result (higher is better; a match in the title counts ten times a match in the text; tokenizer: {s}). Terms are ANDed, text in double quotes is a phrase, and no query syntax is interpreted.</p>\n", .{app.opts.tokenizer});
-    if (q.text.len == 0) return;
+    try w.print("<p class=\"muted\">Runs the same search as the public page and shows the ranking score of each result (higher is better; a match in the title counts ten times a match in the text; tokenizer: {s}). The search syntax works here as on the public page: quotes, OR, NOT, filters such as <code>ext:pdf</code>, and <code>re:/pattern/</code> for a regular expression.</p>\n", .{app.opts.tokenizer});
+    const applied = try handler.applyToken(arena, q, rx);
+    const q_run = applied.q;
+    const rx_run = applied.rx;
+    if (q_run.text.len == 0 and rx_run != .ok) return;
     var examined: ?struct { n: u32, truncated: bool } = null;
     const page = blk: {
-        switch (rx) {
+        switch (rx_run) {
             .none => {},
             .bad => |b| {
                 try w.writeAll("<p class=\"error\" role=\"alert\">");
@@ -1082,7 +1086,7 @@ fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.sear
                 try w.writeAll("</p>\n");
                 return;
             },
-            .ok => |req| switch (try handler.regexSearch(arena, searcher, app.opts.regex, q, req)) {
+            .ok => |req| switch (try handler.regexSearch(arena, searcher, app.opts.regex, q_run, req)) {
                 .ok => |r| {
                     examined = .{ .n = r.examined, .truncated = r.truncated };
                     break :blk r.page;
@@ -1095,7 +1099,7 @@ fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.sear
                 },
             },
         }
-        break :blk searcher.search(arena, q) catch |e| {
+        break :blk searcher.search(arena, q_run) catch |e| {
             try w.writeAll("<p class=\"error\" role=\"alert\">");
             try html.writeEscaped(w, switch (e) {
                 error.EmptyQuery => "The query has no searchable terms.",

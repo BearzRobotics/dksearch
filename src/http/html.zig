@@ -83,25 +83,44 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
         "<input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Search\" autofocus value=\"");
     try writeEscaped(w, f.q);
     try w.writeAll("\"><button type=\"submit\">Search</button>");
-    const open = if (f.language.len > 0 or f.connector.len > 0 or f.regex.len > 0) " open" else "";
+    const open = if (f.language.len > 0 or f.connector.len > 0) " open" else "";
     try w.print("<details{s}><summary><span>Filters</span><a class=\"tips\" href=\"/help/search\">Search tips</a></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
     try writeEscaped(w, f.language);
     try w.writeAll("\"></label><label>Source <input name=\"connector\" maxlength=\"64\" value=\"");
     try writeEscaped(w, f.connector);
     try w.writeAll("\"></label>");
-    if (f.regex_enabled) {
-        try w.writeAll("<label>Regex <a href=\"/help/regex\">how does this work?</a> <input name=\"regex\" maxlength=\"200\" spellcheck=\"false\" placeholder=\"e.g. \\d{3}-\\d{4}\" value=\"");
-        try writeEscaped(w, f.regex);
-        try w.writeAll("\"></label><label class=\"check\"><input type=\"checkbox\" name=\"regex_flags\" value=\"i\"");
-        if (f.regex_ignore_case) try w.writeAll(" checked");
-        try w.writeAll("> ignore case</label><small>The words above choose the documents; the regex then keeps those whose text matches it.</small>");
-    }
     try w.writeAll("</details></form>\n");
     if (f.regex_notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
         try writeEscaped(w, n);
         try w.writeAll("</p>\n");
     }
+}
+
+/// The left panel: the search syntax at a glance, with links to the full guides.
+fn writeSidePanel(w: *Writer, regex_enabled: bool) Writer.Error!void {
+    try w.writeAll("<aside class=\"side\" aria-label=\"Search tips\"><h2>Search tips</h2>");
+    try w.writeAll("<h3>Words</h3><dl><dt><code>\"exact phrase\"</code></dt><dd>words together, in order</dd>" ++
+        "<dt><code>a OR b</code></dt><dd>either word</dd>" ++
+        "<dt><code>a -b</code></dt><dd>a, but not b</dd>" ++
+        "<dt><code>comp*</code></dt><dd>words starting with comp</dd>" ++
+        "<dt><code>word~</code></dt><dd>allow one typo</dd>" ++
+        "<dt><code>title:word</code></dt><dd>only in the title</dd></dl>");
+    try w.writeAll("<h3>Filters</h3><dl><dt><code>ext:pdf</code></dt><dd>file extension</dd>" ++
+        "<dt><code>type:image</code></dt><dd>page, text, pdf, image, video, audio&hellip;</dd>" ++
+        "<dt><code>site:example.org</code></dt><dd>one website</dd>" ++
+        "<dt><code>size:&gt;1mb</code></dt><dd>bigger or smaller</dd>" ++
+        "<dt><code>modified:7d</code></dt><dd>changed in the last 7 days</dd>" ++
+        "<dt><code>modified:&gt;2026-01-01</code></dt><dd>changed after a date</dd>" ++
+        "<dt><code>lang:en</code></dt><dd>language</dd>" ++
+        "<dt><code>source:name</code></dt><dd>one source</dd>" ++
+        "<dt><code>-ext:pdf</code></dt><dd>a minus leaves them out</dd></dl>");
+    if (regex_enabled) try w.writeAll("<h3>Regular expressions</h3><dl><dt><code>re:/\\d{3}-\\d{4}/</code></dt><dd>keep results whose text matches the pattern</dd>" ++
+        "<dt><code>re:/colou?r/i</code></dt><dd>the <code>i</code> ignores case</dd>" ++
+        "<dt><code>-re:/draft/</code></dt><dd>leave out those that match</dd></dl><p class=\"small\">Use it together with at least one word.</p>");
+    try w.writeAll("<p class=\"small\"><a href=\"/help/search\">Full guide</a>");
+    if (regex_enabled) try w.writeAll(" &middot; <a href=\"/help/regex\">Regex guide</a>");
+    try w.writeAll("</p></aside>\n");
 }
 
 pub fn writeHome(w: *Writer, notice: ?[]const u8) Writer.Error!void {
@@ -111,19 +130,21 @@ pub fn writeHome(w: *Writer, notice: ?[]const u8) Writer.Error!void {
 /// The home page; `regex_enabled` adds the regex filter to the form.
 pub fn writeHomeWith(w: *Writer, notice: ?[]const u8, regex_enabled: bool) Writer.Error!void {
     try writeHead(w, "dksearch");
-    try w.writeAll("<body class=\"home\"><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
+    try w.writeAll("<body class=\"home\"><div class=\"layout\"><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
     try writeForm(w, .{ .regex_enabled = regex_enabled });
     if (notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
         try writeEscaped(w, n);
         try w.writeAll("</p>");
     }
-    try w.writeAll("</main></body></html>\n");
+    try w.writeAll("</main>");
+    try writeSidePanel(w, regex_enabled);
+    try w.writeAll("</div></body></html>\n");
 }
 
 pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page_size: u32) Writer.Error!void {
     try writeHead(w, if (f.q.len > 0) f.q else "dksearch");
-    try w.writeAll("<body><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
+    try w.writeAll("<body><div class=\"layout\"><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
     try writeForm(w, f);
     try writeInterpretation(w, f, page, offset);
 
@@ -146,7 +167,9 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
         if (page.has_more) try writePagerLink(w, f, offset + page_size, "Next &rarr;");
         try w.writeAll("</span></nav>\n");
     }
-    try w.writeAll("</main></body></html>\n");
+    try w.writeAll("</main>");
+    try writeSidePanel(w, f.regex_enabled);
+    try w.writeAll("</div></body></html>\n");
 }
 
 /// How the query was read, and whether similar spellings were included.
@@ -289,6 +312,7 @@ pub fn writeHelpRegex(w: *Writer, limits: ?dk.regexsearch.Limits) Writer.Error!v
     try writeHead(w, "Regular expressions - dksearch");
     try w.writeAll("<body><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1><h2>Regular expressions</h2>\n");
     try w.writeAll("<p>A regular expression (&ldquo;regex&rdquo;) describes a pattern of text, such as &ldquo;three digits, a dash, four digits&rdquo;. Use one when words cannot say what you are looking for: part numbers, dates, phone numbers, spellings like <code>colou?r</code>.</p>\n");
+    try w.writeAll("<h3>How to write one</h3><p>Type it in the search box between slashes after <code>re:</code>, together with your words and any filters: <code>invoice ext:pdf re:/INV-\\d{6}/</code>. Put <code>i</code> after the closing slash to ignore case (<code>re:/colou?r/i</code>). A minus in front, <code>-re:/draft/</code>, keeps only the documents that do <em>not</em> match. To match a slash, write <code>\\/</code>. One pattern per search.</p>\n");
     try w.writeAll("<h3>How a regex search works</h3><ol><li><strong>Your words choose the documents.</strong> Type at least one word in the search box. dksearch finds the documents that contain your words, best matches first, using its index. This is what keeps it fast.</li><li><strong>Then the regex checks their text.</strong> Each of those documents is read and tested against your pattern. Only the ones that contain a match are kept, and the match is highlighted in the result.</li><li><strong>It stops at a limit.</strong> To keep the server responsive it checks a limited number of documents; if it stopped early, the results may be incomplete, so make the words more specific.</li></ol>\n");
     if (limits) |l| try w.print("<p class=\"muted\">On this server: patterns up to {d} characters, up to {d} documents checked, about {d} ms in total, and at most {d} regex searches at once.</p>\n", .{ l.max_pattern_bytes, l.max_candidates, l.budget_ms, l.concurrency });
     try w.writeAll("<h3>The pattern language</h3><div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Write</th><th>Matches</th></tr></thead><tbody>");
@@ -318,7 +342,7 @@ pub fn writeHelpRegex(w: *Writer, limits: ?dk.regexsearch.Limits) Writer.Error!v
         .{ "\\b[A-Z]{2,}\\b", "an ALL-CAPS word of two or more letters" },
     };
     for (ex) |r| try w.print("<tr><td><code>{s}</code></td><td>{s}</td></tr>", .{ r[0], r[1] });
-    try w.writeAll("</tbody></table></div>\n<h3>Limits to know about</h3><ul><li>The pattern is matched on bytes, not characters, so <code>.</code> matches one byte of a character like &eacute; and Unicode classes such as <code>\\p{L}</code> are not available.</li><li>A pattern that takes too long on the documents it is tried on is refused with an explanation: make it simpler, for example avoid nesting <code>(a+)+</code>.</li><li>Typing a regex does not turn off the search syntax: the words in the search box can still use quotes, OR, NOT and so on (see <a href=\"/help/search\">search tips</a>).</li></ul><p><a href=\"/\">&larr; Back to search</a></p></main></body></html>\n");
+    try w.writeAll("</tbody></table></div>\n<h3>Limits to know about</h3><ul><li>The pattern is matched on bytes, not characters, so <code>.</code> matches one byte of a character like &eacute; and Unicode classes such as <code>\\p{L}</code> are not available.</li><li>A pattern that takes too long on the documents it is tried on is refused with an explanation: make it simpler, for example avoid nesting <code>(a+)+</code>.</li><li>The pattern is part of the query, so the words and filters next to it can still use quotes, OR, NOT and so on (see <a href=\"/help/search\">search tips</a>).</li></ul><p><a href=\"/\">&larr; Back to search</a></p></main></body></html>\n");
 }
 
 pub fn writeError(w: *Writer, status_text: []const u8, message: []const u8) Writer.Error!void {
