@@ -42,6 +42,14 @@ pub const Error = error{
     Invalid,
 };
 
+/// One setting of a table other than the sources (`[search]`, `[server]`, `[admin]`): set to a
+/// value, or (`value` null) removed so that its default applies again.
+pub const Setting = struct {
+    table: []const u8,
+    key: []const u8,
+    value: ?union(enum) { string: []const u8, integer: i64, boolean: bool } = null,
+};
+
 /// Why an edit was refused, in words for the person who asked.
 pub const Problem = struct {
     buf: [400]u8 = undefined,
@@ -155,6 +163,58 @@ pub fn apply(gpa: Allocator, text: []const u8, edit: Edit, problem: *Problem) Er
     errdefer gpa.free(out);
     try validate(gpa, out, problem);
     return out;
+}
+
+/// Applies changes to settings (outside the `[[source]]` tables) and returns the new configuration
+/// text, validated as a whole like `apply`. Comments elsewhere in the file are kept.
+pub fn applySettings(gpa: Allocator, text: []const u8, changes: []const Setting, problem: *Problem) Error![]u8 {
+    var tdiag: toml.Diagnostic = .{};
+    var doc = toml.Document.parse(gpa, text, .{}, &tdiag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return problem.set("the configuration file has a syntax error (line {d}: {s}) and cannot be edited here; fix it by hand first", .{ tdiag.line, tdiag.message }),
+    };
+    defer doc.deinit();
+    for (changes) |c| {
+        if (c.value) |v| {
+            const value: toml.Value = switch (v) {
+                .string => |sv| .{ .string = try doc.dupe(sv) },
+                .integer => |n| .{ .integer = n },
+                .boolean => |b| .{ .boolean = b },
+            };
+            doc.set(&.{ c.table, c.key }, value) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.NotATable => return problem.set("`{s}` in this file is not a table; edit it by hand", .{c.table}),
+            };
+        } else if (doc.root.getTable(c.table)) |t| {
+            _ = t.remove(c.key);
+            if (t.count() == 0) _ = doc.root.remove(c.table);
+        }
+    }
+    const out = doc.toOwnedString(gpa) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return problem.set("the new configuration could not be written", .{}),
+    };
+    errdefer gpa.free(out);
+    try validate(gpa, out, problem);
+    return out;
+}
+
+/// The current value of `table.key` in the configuration text, as text (a string without quotes, a
+/// number, "true" or "false"), or null if it is not set.
+pub fn settingText(arena: Allocator, text: []const u8, table: []const u8, key: []const u8) Allocator.Error!?[]const u8 {
+    var doc = toml.Document.parse(arena, text, .{}, null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer doc.deinit();
+    const t = doc.root.getTable(table) orelse return null;
+    const v = t.get(key) orelse return null;
+    return switch (v) {
+        .string => |sv| try arena.dupe(u8, sv),
+        .integer => |n| try std.fmt.allocPrint(arena, "{d}", .{n}),
+        .boolean => |b| if (b) "true" else "false",
+        else => null,
+    };
 }
 
 fn indexOf(array: *const toml.Array, name: []const u8) ?usize {
@@ -368,4 +428,50 @@ test "writeFile replaces atomically and keeps a backup" {
         return;
     };
     return error.TestUnexpectedResult; // the temporary file must be gone
+}
+
+test "settings are set, changed and removed; the rest of the file survives; bad values are refused" {
+    var problem: Problem = .{};
+    const original =
+        \\# my config
+        \\[storage]
+        \\data_dir = "/var/lib/dksearch"
+        \\
+        \\[search]
+        \\fuzzy = "off"
+        \\
+        \\[[source]]
+        \\name = "notes"
+        \\kind = "files"
+        \\path = "/home/me/notes"
+        \\
+    ;
+    const out = try applySettings(testing.allocator, original, &.{
+        .{ .table = "search", .key = "fuzzy", .value = .{ .string = "auto" } },
+        .{ .table = "search", .key = "query_timeout_ms", .value = .{ .integer = 8000 } },
+        .{ .table = "admin", .key = "cookie_secure", .value = .{ .boolean = true } },
+    }, &problem);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "# my config") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "fuzzy = \"auto\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "query_timeout_ms = 8000") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "cookie_secure = true") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "name = \"notes\"") != null);
+    // Removing the last setting of a table removes the table.
+    const back = try applySettings(testing.allocator, out, &.{
+        .{ .table = "admin", .key = "cookie_secure" },
+        .{ .table = "search", .key = "query_timeout_ms" },
+    }, &problem);
+    defer testing.allocator.free(back);
+    try testing.expect(std.mem.indexOf(u8, back, "[admin]") == null);
+    try testing.expect(std.mem.indexOf(u8, back, "query_timeout_ms") == null);
+    try testing.expect(std.mem.indexOf(u8, back, "fuzzy") != null);
+    // What the configuration would not accept is refused, with the setting named, and nothing is returned.
+    try testing.expectError(error.Invalid, applySettings(testing.allocator, original, &.{.{ .table = "search", .key = "fuzzy", .value = .{ .string = "sometimes" } }}, &problem));
+    try testing.expect(std.mem.indexOf(u8, problem.message(), "fuzzy") != null);
+    try testing.expectError(error.Invalid, applySettings(testing.allocator, original, &.{.{ .table = "search", .key = "query_timeout_ms", .value = .{ .integer = 999999 } }}, &problem));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("off", (try settingText(arena.allocator(), original, "search", "fuzzy")).?);
+    try testing.expect((try settingText(arena.allocator(), original, "search", "nothing")) == null);
 }

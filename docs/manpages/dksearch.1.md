@@ -247,6 +247,8 @@ storage.data_dir	String	data	Directory for the index and other state. Must not b
 source	Array of tables	none	Optional. Each `[[source]]` defines one connector instance; see Sources below.
 
 Sources
+The administration interface has a Settings page for the `[search]`, `[server]` and `[admin]` settings that are safe to change from it (typo tolerance, query syntax, time limit, regex limits, addresses and limits of the public server, session lengths, backup folder). A save is checked as a whole before it is written, keeps the old file as `.bak`, and applies after a restart. Sources have a labelled field for every option on their own pages.
+
 Each `[[source]]` table has these keys. Any other key is an option of the connector named by `kind` and is validated by it, so a misspelled option is an error.
 
 Key	Type	Default	Description

@@ -125,7 +125,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/maintenance", "/actions/maintenance", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -133,7 +133,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, sources_page, sources_new, source_edit, action_sources, maintenance, action_maintenance, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -143,6 +143,8 @@ pub const App = struct {
             .{ "/sources/new", .sources_new },
             .{ "/sources/edit", .source_edit },
             .{ "/actions/sources", .action_sources },
+            .{ "/settings", .settings_page },
+            .{ "/actions/settings", .action_settings },
             .{ "/maintenance", .maintenance },
             .{ "/actions/maintenance", .action_maintenance },
             .{ "/api/v1/admin/maintenance", .api_maintenance },
@@ -195,7 +197,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .api_maintenance or route == .action_sources;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -225,6 +227,8 @@ pub const App = struct {
             .sources_new => self.pageSourcesNew(arena, csrf),
             .source_edit => self.pageSourceEdit(arena, csrf, t.params),
             .action_sources => self.editSources(arena, req, auth, false),
+            .settings_page => self.pageSettings(arena, csrf, t.params),
+            .action_settings => self.saveSettings(arena, req, auth),
             .api_jobs => self.apiJobs(arena),
             .api_imports => if (req.method == .POST) self.startImport(arena, req, auth, true) else self.apiImports(arena),
             .action_import => self.startImport(arena, req, auth, false),
@@ -477,6 +481,56 @@ pub const App = struct {
 
     /// True when sources can be edited here: actions are on, a configuration
     /// file is known and the list is replaceable.
+    // ------------------------------------------------------------ settings
+
+    fn readConfigText(self: *App, arena: Allocator) ?[]const u8 {
+        const path = self.opts.config_path orelse return null;
+        return Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(16 * 1024 * 1024)) catch null;
+    }
+
+    fn pageSettings(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
+        return self.renderSettings(arena, csrf, params.get("done"), null, null, .ok);
+    }
+
+    /// The Settings page: every setting with its current value, editable when actions are on.
+    /// `posted` (after a refused save) shows what was typed instead of what is in the file.
+    fn renderSettings(self: *App, arena: Allocator, csrf: ?[]const u8, done: ?[]const u8, problem: ?[]const u8, posted: ?query.Params, status: http.Status) error{OutOfMemory}!Response {
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "Settings", csrf, "settings") catch return error.OutOfMemory;
+        const text = self.readConfigText(arena);
+        const editable = self.canEditSources() and text != null;
+        writeSettings(arena, w, csrf orelse "", text, editable, self.opts.config_path != null, done, problem, posted) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, status, aw.written());
+    }
+
+    fn saveSettings(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const path = self.opts.config_path orelse return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "the server was started without --config, so there is no configuration file to edit" });
+        if (!self.canEditSources()) return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "editing settings is not available here" });
+        self.edit_mutex.lockUncancelable(self.io);
+        defer self.edit_mutex.unlock(self.io);
+        const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_unreadable", .message = "cannot read the configuration file" }),
+        };
+        var problem: dk.sourceedit.Problem = .{};
+        const changes = try dk.settinginfo.changes(arena, params);
+        const new_text = dk.sourceedit.applySettings(arena, text, changes, &problem) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => return self.renderSettings(arena, try csrfCopy(arena, auth), null, try arena.dupe(u8, problem.message()), params, .bad_request),
+        };
+        dk.sourceedit.writeFile(self.io, arena, path, new_text) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Io => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_not_writable", .message = "the configuration file could not be written (check its permissions); nothing was changed" }),
+        };
+        return redirect(arena, "/settings?done=saved", null);
+    }
+
     fn canEditSources(self: *App) bool {
         return self.opts.jobs != null and self.opts.config_path != null and self.opts.store != null;
     }
@@ -1040,6 +1094,7 @@ const nav_items = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "dashboard", "/", "Dashboard" },
     .{ "sources", "/sources", "Sources" },
     .{ "jobs", "/jobs", "Jobs" },
+    .{ "settings", "/settings", "Settings" },
     .{ "maintenance", "/maintenance", "Maintenance" },
     .{ "search", "/search", "Search test" },
 };
@@ -1599,6 +1654,90 @@ fn writeOptionFields(arena: Allocator, w: *Io.Writer, spec: dk.sourceedit.Spec) 
     try w.writeAll("><summary>Other settings</summary><label>Anything else, one <code>key = value</code> per line <textarea name=\"options\" rows=\"3\" spellcheck=\"false\" maxlength=\"16384\">");
     try html.writeEscaped(w, split.rest);
     try w.writeAll("</textarea><small>For a setting this form does not list. Saving checks everything and tells you what is wrong.</small></label></details>");
+}
+
+/// The Settings page body.
+fn writeSettings(arena: Allocator, w: *Io.Writer, csrf: []const u8, text: ?[]const u8, editable: bool, has_file: bool, done: ?[]const u8, problem: ?[]const u8, posted: ?query.Params) !void {
+    if (done != null) try w.writeAll("<p class=\"notice ok\" role=\"status\">Saved. The server reads its settings when it starts: restart it for the changes to take effect. The previous file is kept as <code>.bak</code>.</p>\n");
+    if (problem) |p| {
+        try w.writeAll("<p class=\"notice err\" role=\"alert\">");
+        try html.writeEscaped(w, p);
+        try w.writeAll("</p>\n");
+    }
+    if (!has_file) {
+        try w.writeAll("<p class=\"notice\">The server was started without <code>--config</code>, so there is no configuration file to show or edit.</p>");
+        return;
+    }
+    if (!editable) try w.writeAll("<p class=\"notice\">Read only. Turn on <code>[admin] actions = true</code> to change settings from here.</p>\n");
+    try w.writeAll("<p class=\"muted\">Empty fields use their default. Settings are read when the server starts, so a saved change applies after a restart. Everything is checked before it is saved.</p>\n");
+    try w.writeAll("<form class=\"stack\" action=\"/actions/settings\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+    try html.writeEscaped(w, csrf);
+    try w.writeAll("\">");
+    for (dk.settinginfo.groups) |g| {
+        try w.writeAll("<fieldset class=\"options\"><legend>");
+        try html.writeEscaped(w, g.title);
+        try w.writeAll("</legend><p class=\"muted small\">");
+        try html.writeEscaped(w, g.note);
+        try w.writeAll("</p>");
+        for (g.fields) |f| {
+            const name = try std.fmt.allocPrint(arena, "s_{s}_{s}", .{ f.table, f.key });
+            // What to show: what was just typed, else what the file says.
+            const typed: ?[]const u8 = if (posted) |pp| pp.get(name) else null;
+            const in_file: ?[]const u8 = if (text) |t| try dk.sourceedit.settingText(arena, t, f.table, f.key) else null;
+            const dis: []const u8 = if (editable) "" else " disabled";
+            switch (f.type) {
+                .flag => {
+                    const on = if (posted != null) typed != null else if (in_file) |v| std.mem.eql(u8, v, "true") else std.mem.eql(u8, f.default, "true");
+                    try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"{s}\" value=\"1\"{s}{s}> ", .{ name, if (on) " checked" else "", dis });
+                    try html.writeEscaped(w, f.label);
+                    try w.writeAll("<small>");
+                    try html.writeEscaped(w, f.help);
+                    try w.writeAll("</small></label>");
+                },
+                .choice => {
+                    const current = typed orelse in_file orelse f.default;
+                    try w.writeAll("<label>");
+                    try html.writeEscaped(w, f.label);
+                    try w.print(" <select name=\"{s}\"{s}>", .{ name, dis });
+                    for (f.choices) |c| {
+                        try w.print("<option value=\"{s}\"{s}>{s}</option>", .{ c, if (std.mem.eql(u8, c, current)) " selected" else "", c });
+                    }
+                    try w.writeAll("</select><small>");
+                    try html.writeEscaped(w, f.help);
+                    try w.writeAll("</small></label>");
+                },
+                .number, .text => {
+                    try w.writeAll("<label>");
+                    try html.writeEscaped(w, f.label);
+                    try w.print(" <input name=\"{s}\" type=\"{s}\"{s}", .{ name, if (f.type == .number) "number" else "text", dis });
+                    if (f.type == .number) try w.print(" min=\"{d}\" max=\"{d}\"", .{ f.min, f.max }) else try w.writeAll(" spellcheck=\"false\" autocomplete=\"off\"");
+                    try w.writeAll(" maxlength=\"1000\"");
+                    const hint = if (f.placeholder.len > 0) f.placeholder else f.default;
+                    if (hint.len > 0) {
+                        try w.writeAll(" placeholder=\"");
+                        try html.writeEscaped(w, hint);
+                        try w.writeByte('"');
+                    }
+                    if (typed orelse in_file) |v| {
+                        try w.writeAll(" value=\"");
+                        try html.writeEscaped(w, v);
+                        try w.writeByte('"');
+                    }
+                    try w.writeAll("><small>");
+                    try html.writeEscaped(w, f.help);
+                    if (f.default.len > 0) {
+                        try w.writeAll(" Default: ");
+                        try html.writeEscaped(w, f.default);
+                        try w.writeAll(".");
+                    }
+                    try w.writeAll("</small></label>");
+                },
+            }
+        }
+        try w.writeAll("</fieldset>");
+    }
+    if (editable) try w.writeAll("<p><button type=\"submit\" class=\"btn\">Save settings</button></p>");
+    try w.writeAll("</form>\n<p class=\"muted\">Other settings (where the data lives, access to the credentials file, more server limits) are changed in the file by hand; see <code>man dksearch</code>.</p>\n");
 }
 
 fn writeSourceForm(arena: Allocator, w: *Io.Writer, csrf: []const u8, spec: dk.sourceedit.Spec, original: ?[]const u8, problem: ?[]const u8) !void {
@@ -2462,6 +2601,81 @@ test "sources can be added, edited, disabled and deleted from the interface, and
     const none = try f.call(a, .POST, "/api/v1/admin/sources", .{ .auth = auth, .body = "op=delete&name=notes" });
     try testing.expectEqual(http.Status.conflict, none.status);
     try testing.expect(std.mem.indexOf(u8, none.body, "no_config_file") != null);
+    f.manager.opts.store = null;
+}
+
+test "settings: shown with their values, saved through the same checks, refused with the reason" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const original =
+        \\# my config
+        \\[search]
+        \\fuzzy = "off"
+        \\
+        \\[[source]]
+        \\name = "notes"
+        \\kind = "files"
+        \\path = "/home/me/notes"
+        \\
+    ;
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "cfg.toml", .data = original });
+    var pb: [200]u8 = undefined;
+    const cfg_path = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}/cfg.toml", .{f.tmp.sub_path});
+    var d: dk.config.Diagnostic = .{};
+    var cfg0 = try dk.config.loadFromSlice(testing.allocator, cfg_path, original, &d);
+    defer cfg0.deinit();
+    var store = dk.sourcestore.Store.init(testing.allocator, testing.io, cfg0.sources);
+    defer store.deinit();
+    f.app.opts.store = &store;
+    f.app.opts.config_path = cfg_path;
+    f.manager.opts.store = &store;
+
+    const cookie = try f.signIn(a);
+    const page = try f.call(a, .GET, "/settings", .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.ok, page.status);
+    try testing.expect(std.mem.indexOf(u8, page.body, "name=\"s_search_fuzzy\"") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "<option value=\"off\" selected>off</option>") != null); // from the file
+    try testing.expect(std.mem.indexOf(u8, page.body, "Save settings") != null);
+    const csrf = csrfOf(page.body);
+
+    // A good save: the file changes, comments and sources stay, the old file is kept.
+    const good = try std.fmt.allocPrint(a, "csrf={s}&s_search_fuzzy=always&s_search_query_syntax=advanced&s_search_query_timeout_ms=9000&s_search_regex=1&s_server_port=&s_admin_cookie_secure=1", .{csrf});
+    const saved = try f.call(a, .POST, "/actions/settings", .{ .cookie = cookie, .body = good });
+    try testing.expectEqual(http.Status.see_other, saved.status);
+    try testing.expectEqualStrings("/settings?done=saved", Fixture.header(saved, "location").?);
+    const file = try f.tmp.dir.readFileAlloc(testing.io, "cfg.toml", a, .limited(10_000));
+    try testing.expect(std.mem.indexOf(u8, file, "# my config") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "fuzzy = \"always\"") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "query_timeout_ms = 9000") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "cookie_secure = true") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "query_syntax") == null); // the default is not written
+    try testing.expect(std.mem.indexOf(u8, file, "name = \"notes\"") != null);
+    const bak = try f.tmp.dir.readFileAlloc(testing.io, "cfg.toml.bak", a, .limited(10_000));
+    try testing.expectEqualStrings(original, bak);
+    const again = try f.call(a, .GET, "/settings?done=saved", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, again.body, "restart it") != null);
+    try testing.expect(std.mem.indexOf(u8, again.body, "value=\"9000\"") != null);
+
+    // A refused save says why, keeps what was typed, and leaves the file alone.
+    const before = try f.tmp.dir.readFileAlloc(testing.io, "cfg.toml", a, .limited(10_000));
+    const bad = try std.fmt.allocPrint(a, "csrf={s}&s_search_fuzzy=sometimes&s_search_query_timeout_ms=999999", .{csrf});
+    const refused = try f.call(a, .POST, "/actions/settings", .{ .cookie = cookie, .body = bad });
+    try testing.expectEqual(http.Status.bad_request, refused.status);
+    try testing.expect(std.mem.indexOf(u8, refused.body, "fuzzy") != null);
+    try testing.expect(std.mem.indexOf(u8, refused.body, "value=\"999999\"") != null);
+    try testing.expectEqualStrings(before, try f.tmp.dir.readFileAlloc(testing.io, "cfg.toml", a, .limited(10_000)));
+    const wrong = try f.call(a, .POST, "/actions/settings", .{ .cookie = cookie, .body = "csrf=nope&s_search_fuzzy=off" });
+    try testing.expectEqual(http.Status.forbidden, wrong.status);
+
+    // Without a configuration file there is nothing to show.
+    f.app.opts.config_path = null;
+    const none = try f.call(a, .GET, "/settings", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, none.body, "without <code>--config</code>") != null);
     f.manager.opts.store = null;
 }
 

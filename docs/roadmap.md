@@ -11,7 +11,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 - **Search results in the API (done):** file kind, size, dates, domain and the rest of what the index knows in the JSON, `filter` parameters and sort modes.
 - **Office and ebook text (mostly done):** `docx`, `odt` and `epub` extraction on `xml-zig` (zip plus XML) and an HTML option for the files connector are built (`office = true`, `html = true`); the switch of the Wikipedia connector from Expat to `xml-zig` is still to do.
 - **Parallel external extraction:** several `pdftotext` processes at once, for libraries of tens of thousands of PDFs (a 28,000-PDF library is the test case).
-- **Admin panel, feature complete (in progress):** every source option as a labelled field with help and validation (done); server settings, runs and schedules, a list of skipped items with the reason.
+- **Admin panel, feature complete (in progress):** every source option as a labelled field with help and validation (done); a Settings page for the search, server and admin settings (done); runs and schedules, a list of skipped items with the reason.
 
 ## Then
 
