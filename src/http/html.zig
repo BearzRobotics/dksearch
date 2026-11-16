@@ -84,7 +84,7 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
     try writeEscaped(w, f.q);
     try w.writeAll("\"><button type=\"submit\">Search</button>");
     const open = if (f.language.len > 0 or f.connector.len > 0 or f.regex.len > 0) " open" else "";
-    try w.print("<details{s}><summary>Filters</summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
+    try w.print("<details{s}><summary><span>Filters</span><a class=\"tips\" href=\"/help/search\">Search tips</a></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
     try writeEscaped(w, f.language);
     try w.writeAll("\"></label><label>Source <input name=\"connector\" maxlength=\"64\" value=\"");
     try writeEscaped(w, f.connector);
@@ -96,7 +96,7 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
         if (f.regex_ignore_case) try w.writeAll(" checked");
         try w.writeAll("> ignore case</label><small>The words above choose the documents; the regex then keeps those whose text matches it.</small>");
     }
-    try w.writeAll("</details></form>\n<p class=\"tips\"><a href=\"/help/search\">Search tips</a></p>\n");
+    try w.writeAll("</details></form>\n");
     if (f.regex_notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
         try writeEscaped(w, n);
@@ -258,6 +258,26 @@ pub fn writeHelpSearch(w: *Writer, regex_enabled: bool) Writer.Error!void {
     };
     for (rows) |r| try w.print("<tr><td><code>{s}</code></td><td>{s}</td></tr>", .{ r[0], r[1] });
     try w.writeAll("</tbody></table></div>\n");
+    try w.writeAll("<h3>Filters: narrow by what kind of document it is</h3><p>Write them in the search box next to your words. Put a minus in front to leave matching documents out. A search made only of filters (<code>ext:pdf</code>) lists the matches, newest first.</p>\n");
+    try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>You type</th><th>It means</th></tr></thead><tbody>");
+    const filter_rows = [_][2][]const u8{
+        .{ "ext:pdf", "files with that extension (also <code>-ext:pdf</code> to leave them out)" },
+        .{ "type:image", "a kind of document: page, text, markdown, pdf, image, video, audio, data, other" },
+        .{ "mime:text/*", "a media type, exactly (<code>mime:application/pdf</code>) or a whole family (<code>mime:image/*</code>)" },
+        .{ "source:notes", "documents from the source with that name" },
+        .{ "lang:en", "documents in that language (<code>en</code> also finds <code>en-US</code>)" },
+        .{ "site:example.org", "from that website, including its subdomains (<code>domain:</code> and <code>host:</code> work too)" },
+        .{ "path:/docs/", "whose address starts with that path" },
+        .{ "author:\"Jo Smith\"", "the author contains that text (quote values that have spaces)" },
+        .{ "tag:linux", "documents carrying that tag; <code>meta.camera:acme</code> tests any other field a source provides" },
+        .{ "size:&gt;1mb", "bigger than one megabyte; also <code>&lt;10k</code>, <code>&gt;=1gb</code> or <code>10k..2mb</code> (units b, k, m, g)" },
+        .{ "modified:&gt;2026-01-01", "changed after that day; also <code>2026</code>, <code>2026-03</code>, <code>2026-03-15</code> or a range <code>2025-06..2025-12</code>" },
+        .{ "modified:7d", "changed in the last 7 days (<code>d</code> days, <code>w</code> weeks, <code>m</code> months, <code>y</code> years)" },
+        .{ "created:2025", "published in that year (what the source says); <code>indexed:</code> is when it was added here" },
+        .{ "title:kernel", "the word must be in the title; <code>body:kernel</code> in the text; <code>title:(linux OR bsd)</code> works for a group" },
+    };
+    for (filter_rows) |r| try w.print("<tr><td><code>{s}</code></td><td>{s}</td></tr>", .{ r[0], r[1] });
+    try w.writeAll("</tbody></table></div>\n<p>Several filters must all hold, except that the same filter written twice means either (<code>ext:pdf ext:md</code> finds PDFs and Markdown). A filter that does not make sense (<code>size:big</code>) is searched as ordinary text. Documents indexed before filters existed have no type, size or dates until they are imported again or the index is rebuilt.</p>\n");
     try w.writeAll("<h3>You do not have to spell everything right</h3><p>If a search finds fewer than three results, dksearch automatically tries again with words that are one typo away (a letter missing, extra, wrong or swapped) and tells you it did, with a link to search exactly as typed. Short words (three letters or fewer) are never guessed at. To force it for one word, write <code>word~</code>.</p>\n");
     try w.writeAll("<h3>Good to know</h3><ul><li><code>AND</code>, <code>OR</code> and <code>NOT</code> only count as operators in capital letters; <code>and</code> or <code>or</code> in lower case are ordinary words. To search for the word itself, put it in quotes: <code>\"OR\"</code>.</li><li>A search with only excluded words (<code>-android</code>) has nothing to look for: add a word you do want.</li><li>When your query used these features, the results page shows how it was read (&ldquo;Searching for: &hellip;&rdquo;).</li>");
     if (regex_enabled) try w.writeAll("<li>For patterns that words cannot express (codes, dates, phone numbers), see <a href=\"/help/regex\">regular expressions</a>.</li>");

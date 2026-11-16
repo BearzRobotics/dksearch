@@ -28,6 +28,13 @@ const idx_api = @import("indexer.zig");
 const search = @import("search.zig");
 const image_mod = @import("image.zig");
 const queryparse = @import("queryparse.zig");
+const docmeta = @import("docmeta.zig");
+const derive = docmeta.derive;
+
+/// Most tags and custom fields kept per document.
+const max_meta_fields = 32;
+/// Most conditions in one search.
+const max_filters = 16;
 
 /// Bumped when the table layout changes. Stored in `PRAGMA user_version`.
 pub const schema_version = 1;
@@ -109,6 +116,9 @@ pub const SqliteIndex = struct {
     fuzzy_mode: FuzzyMode = .off,
     /// A time limit for each search, if set (`setQueryTimeout`).
     timeout: ?struct { io: Io, ms: u32 } = null,
+    /// True if the `docs` table has the metadata columns filters use (an index
+    /// made before they existed gets them on its next writable open).
+    has_meta: bool = false,
 
     /// Opens (creating if needed) the index at `path`; ":memory:" gives a
     /// throwaway index.
@@ -123,6 +133,7 @@ pub const SqliteIndex = struct {
         errdefer self.close();
         registerFunctions(self.db);
         try self.initSchema(options);
+        self.has_meta = self.detectMeta();
         return self;
     }
 
@@ -155,6 +166,7 @@ pub const SqliteIndex = struct {
         errdefer self.close();
         try self.exec("PRAGMA query_only = 1;");
         registerFunctions(db);
+        self.has_meta = self.detectMeta();
         return self;
     }
 
@@ -201,7 +213,7 @@ pub const SqliteIndex = struct {
             if (options.tokenizer) |want| {
                 if (have != want) {
                     if (!options.retokenize) return error.TokenizerMismatch;
-                    try self.exec("DROP TABLE fts; DROP TABLE docs;");
+                    try self.exec("DROP TABLE fts; DROP TABLE docs; DROP TABLE IF EXISTS doc_meta;");
                 }
             } else tokenizer = have; // keep what the index has
         }
@@ -222,6 +234,7 @@ pub const SqliteIndex = struct {
             \\CREATE INDEX IF NOT EXISTS docs_connector ON docs(connector);
         );
         try self.exec(create);
+        try self.migrateMeta();
         // Perceptual hashes of pictures, for search by image. Created if missing
         // (older indexes get it on their next write); it never changes the schema version.
         try self.exec(
@@ -231,6 +244,48 @@ pub const SqliteIndex = struct {
             \\) WITHOUT ROWID;
         );
         if (v == 0) try self.exec("PRAGMA user_version = 1");
+    }
+
+    fn detectMeta(self: SqliteIndex) bool {
+        return self.hasColumn("domain");
+    }
+
+    fn hasColumn(self: SqliteIndex, name: []const u8) bool {
+        const st = Stmt.prepare(self.db, "SELECT 1 FROM pragma_table_info('docs') WHERE name = ?1") catch return false;
+        defer st.deinit();
+        st.text(1, name) catch return false;
+        return st.step() catch false;
+    }
+
+    /// Adds what filters need to an index made without it: columns for the
+    /// dates, size, author, kind, extension, host and path, and a table of
+    /// tags and custom fields. Existing documents keep empty values until they
+    /// are indexed again (`rebuild`, or the next import that changes them).
+    fn migrateMeta(self: SqliteIndex) OpenError!void {
+        const columns = [_][]const u8{
+            "modified_at INTEGER", "indexed_at INTEGER", "author TEXT", "size INTEGER",
+            "ext TEXT",            "domain TEXT",        "path TEXT",   "kind TEXT",
+        };
+        for (columns) |col| {
+            const name = col[0..std.mem.indexOfScalar(u8, col, ' ').?];
+            if (self.hasColumn(name)) continue;
+            var buf: [96]u8 = undefined;
+            const sql = std.fmt.bufPrint(&buf, "ALTER TABLE docs ADD COLUMN {s}\x00", .{col}) catch unreachable;
+            try self.exec(sql[0 .. sql.len - 1 :0]);
+        }
+        try self.exec(
+            \\CREATE INDEX IF NOT EXISTS docs_domain ON docs(domain);
+            \\CREATE INDEX IF NOT EXISTS docs_ext ON docs(ext);
+            \\CREATE INDEX IF NOT EXISTS docs_kind ON docs(kind);
+            \\CREATE INDEX IF NOT EXISTS docs_modified ON docs(modified_at);
+            \\CREATE TABLE IF NOT EXISTS doc_meta(
+            \\  doc   INTEGER NOT NULL,
+            \\  key   TEXT NOT NULL,
+            \\  value TEXT NOT NULL
+            \\);
+            \\CREATE INDEX IF NOT EXISTS doc_meta_doc ON doc_meta(doc);
+            \\CREATE INDEX IF NOT EXISTS doc_meta_kv ON doc_meta(key, value);
+        );
     }
 
     /// The tokenizer the existing `fts` table was created with, if any.
@@ -336,12 +391,15 @@ pub const SqliteIndex = struct {
 
         const rowid = blk: {
             const st = try Stmt.prepare(self.db,
-                \\INSERT INTO docs(id, connector, url, title, language, content_type, published_at)
-                \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                \\INSERT INTO docs(id, connector, url, title, language, content_type, published_at,
+                \\                 modified_at, indexed_at, author, size, ext, domain, path, kind)
+                \\VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                 \\ON CONFLICT(id) DO UPDATE SET
                 \\  connector = excluded.connector, url = excluded.url, title = excluded.title,
                 \\  language = excluded.language, content_type = excluded.content_type,
-                \\  published_at = excluded.published_at
+                \\  published_at = excluded.published_at, modified_at = excluded.modified_at,
+                \\  indexed_at = excluded.indexed_at, author = excluded.author, size = excluded.size,
+                \\  ext = excluded.ext, domain = excluded.domain, path = excluded.path, kind = excluded.kind
                 \\RETURNING rowid
             );
             defer st.deinit();
@@ -352,6 +410,15 @@ pub const SqliteIndex = struct {
             try st.text(5, d.language);
             try st.text(6, d.content_type);
             try st.int(7, d.published_at);
+            const derived = derive(d);
+            try st.int(8, d.modified_at);
+            try st.int(9, d.acquired_at);
+            try st.text(10, d.author);
+            try st.int(11, derived.size);
+            try st.text(12, derived.ext());
+            try st.text(13, derived.host());
+            try st.text(14, derived.path);
+            try st.text(15, derived.kind);
             if (!try st.step()) return error.Io;
             break :blk st.colInt(0);
         };
@@ -371,6 +438,25 @@ pub const SqliteIndex = struct {
             // their summary.
             try st.text(3, d.text orelse d.summary orelse "");
             _ = try st.step();
+        }
+        // Tags and custom fields (every extra but the picture hash), replacing any earlier ones.
+        {
+            const st = try Stmt.prepare(self.db, "DELETE FROM doc_meta WHERE doc = ?1");
+            defer st.deinit();
+            try st.int(1, rowid);
+            _ = try st.step();
+        }
+        var stored: usize = 0;
+        for (d.extra) |e| {
+            if (std.mem.eql(u8, e.key, "phash")) continue;
+            if (stored >= max_meta_fields or e.key.len == 0 or e.key.len > 32 or e.value.len == 0 or e.value.len > 256) continue;
+            const st = try Stmt.prepare(self.db, "INSERT INTO doc_meta(doc, key, value) VALUES(?1, lower(?2), ?3)");
+            defer st.deinit();
+            try st.int(1, rowid);
+            try st.text(2, e.key);
+            try st.text(3, e.value);
+            _ = try st.step();
+            stored += 1;
         }
         // A picture's perceptual hash (extra "phash", 16 hex digits), replacing
         // any earlier one; a document without it has none.
@@ -404,6 +490,12 @@ pub const SqliteIndex = struct {
             _ = try st.step();
         }
         {
+            const st = try Stmt.prepare(self.db, "DELETE FROM doc_meta WHERE doc = (SELECT rowid FROM docs WHERE id = ?1)");
+            defer st.deinit();
+            try st.blob(1, &id);
+            _ = try st.step();
+        }
+        {
             const st = try Stmt.prepare(self.db, "DELETE FROM docs WHERE id = ?1");
             defer st.deinit();
             try st.blob(1, &id);
@@ -422,7 +514,7 @@ pub const SqliteIndex = struct {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
         try self.begin();
         errdefer self.rollback();
-        try self.exec("DELETE FROM fts; DELETE FROM docs; DELETE FROM image_hash;");
+        try self.exec("DELETE FROM fts; DELETE FROM docs; DELETE FROM image_hash; DELETE FROM doc_meta;");
         try self.commit();
     }
 
@@ -449,7 +541,13 @@ pub const SqliteIndex = struct {
         if (limit > search.max_limit) return error.InvalidQuery;
         if (@as(u64, q.offset) + limit > search.max_window) return error.InvalidQuery;
 
-        if (self.simple_syntax) return self.runMatch(arena, q, limit, try buildMatchSimple(arena, q.text), null, false);
+        const now: i64 = if (self.timeout) |t| @intCast(@divTrunc(Io.Timestamp.now(t.io, .real).nanoseconds, std.time.ns_per_s)) else 0;
+        if (q.filters.len > max_filters) return error.InvalidQuery;
+
+        if (self.simple_syntax) {
+            const m = try buildMatchSimple(arena, q.text);
+            return self.runMatch(arena, q, q.filters, limit, m, null, false);
+        }
 
         // Typo tolerance: forced on or off by the search, or by the server's mode;
         // in `auto` an exact search that finds nothing is repeated with it.
@@ -462,12 +560,17 @@ pub const SqliteIndex = struct {
                 .auto => null,
             },
         };
-        const first = try parseQuery(arena, q.text, forced orelse false);
-        const page = try self.runMatch(arena, q, limit, first.fts, interpretedOf(first), first.fuzzy_applied);
-        if (forced == null and page.hits.len < auto_fuzzy_below and q.offset == 0) {
-            if (parseQuery(arena, q.text, true)) |second| {
+        const first = parseQuery(arena, q.text, forced orelse false, now) catch |e| {
+            // Conditions given as parameters can stand alone, without words to find.
+            if (e == error.EmptyQuery and q.filters.len > 0) return self.runMatch(arena, q, q.filters, limit, "", null, false);
+            return e;
+        };
+        const all = try mergeFilters(arena, q.filters, first.filters);
+        const page = try self.runMatch(arena, q, all, limit, first.fts, interpretedOf(first), first.fuzzy_applied);
+        if (forced == null and page.hits.len < auto_fuzzy_below and q.offset == 0 and first.fts.len > 0) {
+            if (parseQuery(arena, q.text, true, now)) |second| {
                 if (second.fuzzy_applied) {
-                    const again = try self.runMatch(arena, q, limit, second.fts, interpretedOf(second), true);
+                    const again = try self.runMatch(arena, q, all, limit, second.fts, interpretedOf(second), true);
                     if (again.hits.len > page.hits.len) return again;
                 }
             } else |_| {}
@@ -475,8 +578,17 @@ pub const SqliteIndex = struct {
         return page;
     }
 
-    fn parseQuery(arena: Allocator, text: []const u8, fuzzy_words: bool) search.Error!queryparse.Parsed {
-        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words }) catch |e| switch (e) {
+    fn mergeFilters(arena: Allocator, a: []const search.Filter, b: []const search.Filter) search.Error![]const search.Filter {
+        if (b.len == 0) return a;
+        if (a.len + b.len > max_filters) return error.InvalidQuery;
+        const out = try arena.alloc(search.Filter, a.len + b.len);
+        @memcpy(out[0..a.len], a);
+        @memcpy(out[a.len..], b);
+        return out;
+    }
+
+    fn parseQuery(arena: Allocator, text: []const u8, fuzzy_words: bool, now: i64) search.Error!queryparse.Parsed {
+        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now }) catch |e| switch (e) {
             error.EmptyQuery => error.EmptyQuery,
             error.InvalidQuery => error.InvalidQuery,
             error.OutOfMemory => error.OutOfMemory,
@@ -487,29 +599,176 @@ pub const SqliteIndex = struct {
         return if (p.advanced or p.fuzzy_applied) p.shown else null;
     }
 
-    fn runMatch(self: *SqliteIndex, arena: Allocator, q: search.Query, limit: u32, match: []const u8, interpreted: ?[]const u8, fuzzy: bool) search.Error!search.Page {
-        const st = Stmt.prepare(self.db,
-            \\SELECT d.id, d.connector, d.url, d.title,
-            \\       snippet(fts, 1, ?1, ?2, '…', 16),
-            \\       -bm25(fts, 10.0, 1.0)
-            \\FROM fts JOIN docs d ON d.rowid = fts.rowid
-            \\WHERE fts MATCH ?3
-            \\  AND (?4 IS NULL OR d.language = ?4)
+    const Bind = union(enum) { text: []const u8, int: i64 };
+
+    /// Escapes `%`, `_` and `\` for a LIKE pattern written with ESCAPE '\'.
+    fn likeEscape(arena: Allocator, text: []const u8, before: []const u8, after: []const u8) Allocator.Error![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(arena, before);
+        for (text) |b| {
+            if (b == '%' or b == '_' or b == '\\') try out.append(arena, '\\');
+            try out.append(arena, b);
+        }
+        try out.appendSlice(arena, after);
+        return out.items;
+    }
+
+    /// Appends ` AND <condition>` for each filter to `sql`, with the values to
+    /// bind (numbered from 9 up) in `binds`. Values never become SQL text.
+    fn filterSql(arena: Allocator, filters: []const search.Filter, sql: *std.ArrayList(u8), binds: *std.ArrayList(Bind)) search.Error!void {
+        const P = struct {
+            arena: Allocator,
+            binds: *std.ArrayList(Bind),
+            fn add(self: @This(), b: Bind) Allocator.Error![]const u8 {
+                try self.binds.append(self.arena, b);
+                return std.fmt.allocPrint(self.arena, "?{d}", .{8 + self.binds.items.len});
+            }
+        };
+        const pb: P = .{ .arena = arena, .binds = binds };
+        // Positive conditions on the same text field are alternatives (`ext:pdf ext:md`
+        // means either); everything else must all hold.
+        var any_of: std.ArrayList(u8) = .empty;
+        for (filters, 0..) |f, i| {
+            if (f.negate or !isAlternative(f.field)) continue;
+            var first = true;
+            for (filters[0..i]) |g| if (!g.negate and g.field == f.field) {
+                first = false;
+            };
+            if (!first) continue;
+            var same: usize = 0;
+            for (filters) |g| if (!g.negate and g.field == f.field) {
+                same += 1;
+            };
+            if (same < 2) continue;
+            var parts: std.ArrayList(u8) = .empty;
+            for (filters) |g| if (!g.negate and g.field == f.field) {
+                var one: std.ArrayList(u8) = .empty;
+                try filterClause(arena, g, pb, &one);
+                if (parts.items.len > 0) try parts.appendSlice(arena, " OR ");
+                try parts.print(arena, "COALESCE(({s}), 0)", .{one.items});
+            };
+            try any_of.print(arena, " AND ({s})", .{parts.items});
+        }
+        try sql.appendSlice(arena, any_of.items);
+        for (filters, 0..) |f, fi| {
+            if (!f.negate and isAlternative(f.field)) {
+                var same: usize = 0;
+                for (filters) |g| if (!g.negate and g.field == f.field) {
+                    same += 1;
+                };
+                if (same >= 2) continue; // already written as a group
+            }
+            _ = fi;
+            var cl: std.ArrayList(u8) = .empty;
+            try filterClause(arena, f, pb, &cl);
+            if (cl.items.len == 0) continue;
+            // A document without the property does not satisfy the condition, and does satisfy its negation.
+            try sql.print(arena, " AND {s}COALESCE(({s}), 0)", .{ if (f.negate) "NOT " else "", cl.items });
+        }
+    }
+
+    fn isAlternative(field: search.FilterField) bool {
+        return switch (field) {
+            .source, .language, .mime, .kind, .ext, .domain, .path, .author, .tag => true,
+            else => false,
+        };
+    }
+
+    fn filterClause(arena: Allocator, f: search.Filter, pb: anytype, cl: *std.ArrayList(u8)) search.Error!void {
+        {
+            switch (f.field) {
+                .source => try cl.print(arena, "d.connector = {s}", .{try pb.add(.{ .text = f.text })}),
+                .language => {
+                    const n = try pb.add(.{ .text = f.text });
+                    // "en" also matches "en-US", ignoring case.
+                    try cl.print(arena, "lower(substr(d.language, 1, length({s}))) = lower({s}) AND (length(d.language) = length({s}) OR substr(d.language, length({s}) + 1, 1) = '-')", .{ n, n, n, n });
+                },
+                .mime => {
+                    if (std.mem.endsWith(u8, f.text, "/*")) {
+                        try cl.print(arena, "lower(d.content_type) LIKE {s} ESCAPE '\\'", .{try pb.add(.{ .text = try likeEscape(arena, f.text[0 .. f.text.len - 1], "", "%") })});
+                    } else {
+                        const exact = try pb.add(.{ .text = f.text });
+                        const with_params = try pb.add(.{ .text = try likeEscape(arena, f.text, "", ";%") });
+                        try cl.print(arena, "(lower(d.content_type) = {s} OR lower(d.content_type) LIKE {s} ESCAPE '\\')", .{ exact, with_params });
+                    }
+                },
+                .kind => try cl.print(arena, "d.kind = {s}", .{try pb.add(.{ .text = f.text })}),
+                .ext => try cl.print(arena, "d.ext = {s}", .{try pb.add(.{ .text = f.text })}),
+                .domain => {
+                    const exact = try pb.add(.{ .text = f.text });
+                    const sub = try pb.add(.{ .text = try likeEscape(arena, f.text, "%.", "") });
+                    try cl.print(arena, "(d.domain = {s} OR d.domain LIKE {s} ESCAPE '\\')", .{ exact, sub });
+                },
+                .path => try cl.print(arena, "d.path LIKE {s} ESCAPE '\\'", .{try pb.add(.{ .text = try likeEscape(arena, f.text, "", "%") })}),
+                .author => try cl.print(arena, "d.author LIKE {s} ESCAPE '\\'", .{try pb.add(.{ .text = try likeEscape(arena, f.text, "%", "%") })}),
+                .size, .modified, .created, .indexed => {
+                    const col = switch (f.field) {
+                        .size => "d.size",
+                        .modified => "d.modified_at",
+                        .created => "d.published_at",
+                        else => "d.indexed_at",
+                    };
+                    if (f.min) |v| try cl.print(arena, "{s} >= {s}", .{ col, try pb.add(.{ .int = v }) });
+                    if (f.max) |v| try cl.print(arena, "{s}{s} <= {s}", .{ if (f.min != null) " AND " else "", col, try pb.add(.{ .int = v }) });
+                },
+                .tag => try cl.print(arena, "EXISTS (SELECT 1 FROM doc_meta m WHERE m.doc = d.rowid AND m.key = 'tag' AND m.value = {s} COLLATE NOCASE)", .{try pb.add(.{ .text = f.text })}),
+                .meta => {
+                    const k = try pb.add(.{ .text = f.key });
+                    const v = try pb.add(.{ .text = try likeEscape(arena, f.text, "%", "%") });
+                    try cl.print(arena, "EXISTS (SELECT 1 FROM doc_meta m WHERE m.doc = d.rowid AND m.key = {s} AND m.value LIKE {s} ESCAPE '\\')", .{ k, v });
+                },
+            }
+        }
+    }
+
+    fn runMatch(self: *SqliteIndex, arena: Allocator, q: search.Query, filters: []const search.Filter, limit: u32, match: []const u8, interpreted: ?[]const u8, fuzzy: bool) search.Error!search.Page {
+        if (filters.len > 0 and !self.has_meta) return error.InvalidQuery; // an index from before filters: `rebuild` upgrades it
+        const columns = if (self.has_meta) "d.language, d.content_type, d.modified_at, d.size, d.author, d.kind, d.domain" else "d.language, d.content_type, NULL, NULL, NULL, NULL, NULL";
+        const text_mode = match.len > 0;
+        var sql: std.ArrayList(u8) = .empty;
+        var binds: std.ArrayList(Bind) = .empty;
+        if (text_mode) {
+            try sql.print(arena,
+                \\SELECT d.id, d.connector, d.url, d.title,
+                \\       snippet(fts, 1, ?1, ?2, '…', 16),
+                \\       -bm25(fts, 10.0, 1.0), {s}
+                \\FROM fts JOIN docs d ON d.rowid = fts.rowid
+                \\WHERE fts MATCH ?3
+            , .{columns});
+        } else {
+            try sql.print(arena, "SELECT d.id, d.connector, d.url, d.title, NULL, 0.0, {s} FROM docs d WHERE 1", .{columns});
+        }
+        try sql.appendSlice(arena,
+            \\ AND (?4 IS NULL OR d.language = ?4)
             \\  AND (?5 IS NULL OR d.content_type = ?5)
             \\  AND (?6 IS NULL OR d.connector = ?6)
-            \\ORDER BY bm25(fts, 10.0, 1.0), d.id
-            \\LIMIT ?7 OFFSET ?8
-        ) catch |e| return searchError(e);
+        );
+        try filterSql(arena, filters, &sql, &binds);
+        // Without words to rank by, the most recently changed come first.
+        try sql.appendSlice(arena, if (text_mode)
+            " ORDER BY bm25(fts, 10.0, 1.0), d.id LIMIT ?7 OFFSET ?8"
+        else
+            " ORDER BY COALESCE(d.modified_at, d.published_at, d.indexed_at, 0) DESC, d.id LIMIT ?7 OFFSET ?8");
+        const st = Stmt.prepare(self.db, try arena.dupeSentinel(u8, sql.items, 0)) catch |e| return searchError(e);
         defer st.deinit();
-        st.text(1, search.match_start) catch |e| return searchError(e);
-        st.text(2, search.match_end) catch |e| return searchError(e);
-        st.text(3, match) catch |e| return searchError(e);
+        if (text_mode) {
+            st.text(1, search.match_start) catch |e| return searchError(e);
+            st.text(2, search.match_end) catch |e| return searchError(e);
+            st.text(3, match) catch |e| return searchError(e);
+        }
         st.text(4, q.language) catch |e| return searchError(e);
         st.text(5, q.content_type) catch |e| return searchError(e);
         st.text(6, q.connector) catch |e| return searchError(e);
         // One extra row tells us whether another page follows.
         st.int(7, @as(i64, limit) + 1) catch |e| return searchError(e);
         st.int(8, q.offset) catch |e| return searchError(e);
+        for (binds.items, 0..) |b, i| {
+            const n: c_int = @intCast(9 + i);
+            (switch (b) {
+                .text => |t| st.text(n, t),
+                .int => |v| st.int(n, v),
+            }) catch |e| return searchError(e);
+        }
 
         var guard: Deadline = undefined;
         if (self.timeout) |t| {
@@ -536,6 +795,13 @@ pub const SqliteIndex = struct {
                 .title = try dupeOpt(arena, st.colText(3)),
                 .snippet = try dupeOpt(arena, st.colText(4)),
                 .score = st.colFloat(5),
+                .language = try dupeOpt(arena, st.colText(6)),
+                .content_type = try dupeOpt(arena, st.colText(7)),
+                .modified_at = colOptInt(st, 8),
+                .size = if (colOptInt(st, 9)) |v| @intCast(@max(v, 0)) else null,
+                .author = try dupeOpt(arena, st.colText(10)),
+                .kind = try dupeOpt(arena, st.colText(11)),
+                .domain = try dupeOpt(arena, st.colText(12)),
             });
         }
         return .{ .hits = hits.items, .has_more = more, .interpreted = interpreted, .fuzzy = fuzzy };
@@ -547,6 +813,11 @@ pub const SqliteIndex = struct {
 /// serialises the use of one connection). WAL mode lets any number of readers
 /// run alongside the single writer. A search takes any idle connection; if
 /// all are busy it waits on a semaphore (no spinning) until one is free.
+fn colOptInt(st: Stmt, i: c_int) ?i64 {
+    if (c.sqlite3_column_type(st.s, i) == c.SQLITE_NULL) return null;
+    return st.colInt(i);
+}
+
 /// The deadline of one search, watched from SQLite's progress callback.
 const Deadline = struct {
     io: Io,
@@ -1026,10 +1297,12 @@ test "hostile query text never errors or escapes into FTS syntax" {
             try testing.expect(e == error.EmptyQuery or e == error.InvalidQuery);
         }
     }
-    // The documents are still there and column syntax did not leak: "title:Title"
-    // is searched as literal words, so it does not match via the title column.
+    // The documents are still there. "title:Title" is the column restriction of the
+    // query language (it finds the title), but other column names are plain words.
     try testing.expectEqual(@as(u64, 1), try idx.count());
-    try testing.expectEqual(@as(usize, 0), (try s.search(arena.allocator(), .{ .text = "title:Title" })).hits.len);
+    try testing.expectEqual(@as(usize, 1), (try s.search(arena.allocator(), .{ .text = "title:Title" })).hits.len);
+    try testing.expectEqual(@as(usize, 0), (try s.search(arena.allocator(), .{ .text = "title:body" })).hits.len);
+    try testing.expectEqual(@as(usize, 0), (try s.search(arena.allocator(), .{ .text = "nosuch:Title" })).hits.len);
 }
 
 test "limit and window bounds" {
@@ -1203,4 +1476,142 @@ test "pool: same answers as one connection, also from many threads at once" {
     const mp = try std.fmt.bufPrintSentinel(&missing, ".zig-cache/tmp/{s}/nope.db", .{tmp.sub_path}, 0);
     try testing.expectError(error.Io, SearchPool.open(testing.allocator, testing.io, mp, 2));
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "nope.db", .{}));
+}
+
+fn putDoc(idx: *SqliteIndex, d: doc.Document) !void {
+    try idx.indexer().add(d.id(), d);
+}
+
+fn titles(arena: Allocator, idx: *SqliteIndex, text: []const u8, filters: []const search.Filter) ![]const u8 {
+    const page = try idx.searcher().search(arena, .{ .text = text, .filters = filters });
+    var out: std.ArrayList(u8) = .empty;
+    for (page.hits) |h| {
+        if (out.items.len > 0) try out.append(arena, ',');
+        try out.appendSlice(arena, h.title orelse "?");
+    }
+    // The titles sorted, so the check does not depend on tie order.
+    const items = try arena.dupe(u8, out.items);
+    var parts: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, items, ',');
+    while (it.next()) |p| try parts.append(arena, p);
+    std.mem.sort([]const u8, parts.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return std.mem.join(arena, ",", parts.items);
+}
+
+test "filters narrow results by file type, host, size, dates, author, tags and fields" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const day = 86400;
+    try putDoc(&idx, .{ .connector = "web", .source_id = "1", .title = "A", .text = "kernel notes", .canonical_url = "https://docs.example.org/guide/a.html", .content_type = "text/html", .language = "en-US", .author = "Jo Smith", .modified_at = 100 * day, .acquired_at = 200 * day, .extra = &.{ .{ .key = "tag", .value = "Linux" }, .{ .key = "camera", .value = "ACME 100" } } });
+    try putDoc(&idx, .{ .connector = "web", .source_id = "2", .title = "B", .text = "kernel manual with a lot more words in it than the others have", .canonical_url = "https://example.org/files/b.pdf", .content_type = "application/pdf", .language = "de", .modified_at = 300 * day, .acquired_at = 200 * day });
+    try putDoc(&idx, .{ .connector = "disk", .source_id = "3", .title = "C", .text = "kernel readme", .canonical_url = "file:///home/x/c.md", .content_type = "text/markdown", .acquired_at = 400 * day, .extra = &.{.{ .key = "tag", .value = "bsd" }} });
+
+    const F = search.Filter;
+    try testing.expectEqualStrings("A,B,C", try titles(a, &idx, "kernel", &.{}));
+    try testing.expectEqualStrings("B", try titles(a, &idx, "kernel", &.{.{ .field = .ext, .text = "pdf" }}));
+    try testing.expectEqualStrings("A,C", try titles(a, &idx, "kernel", &.{.{ .field = .ext, .text = "pdf", .negate = true }}));
+    try testing.expectEqualStrings("C", try titles(a, &idx, "kernel", &.{.{ .field = .kind, .text = "markdown" }}));
+    try testing.expectEqualStrings("A,B", try titles(a, &idx, "kernel", &.{.{ .field = .domain, .text = "example.org" }})); // subdomains count
+    try testing.expectEqualStrings("A", try titles(a, &idx, "kernel", &.{.{ .field = .domain, .text = "docs.example.org" }}));
+    try testing.expectEqualStrings("", try titles(a, &idx, "kernel", &.{.{ .field = .domain, .text = "ample.org" }})); // not a suffix of letters
+    try testing.expectEqualStrings("A", try titles(a, &idx, "kernel", &.{.{ .field = .language, .text = "en" }})); // en matches en-US
+    try testing.expectEqualStrings("B", try titles(a, &idx, "kernel", &.{.{ .field = .language, .text = "DE" }}));
+    try testing.expectEqualStrings("C", try titles(a, &idx, "kernel", &.{.{ .field = .source, .text = "disk" }}));
+    try testing.expectEqualStrings("A", try titles(a, &idx, "kernel", &.{.{ .field = .mime, .text = "text/html" }}));
+    try testing.expectEqualStrings("A,C", try titles(a, &idx, "kernel", &.{.{ .field = .mime, .text = "text/*" }}));
+    try testing.expectEqualStrings("B", try titles(a, &idx, "kernel", &.{.{ .field = .size, .min = 30 }}));
+    try testing.expectEqualStrings("A", try titles(a, &idx, "kernel", &.{.{ .field = .author, .text = "smith" }}));
+    try testing.expectEqualStrings("A,B", try titles(a, &idx, "kernel", &.{.{ .field = .modified, .min = 0 }})); // C has no date
+    try testing.expectEqualStrings("B", try titles(a, &idx, "kernel", &.{.{ .field = .modified, .min = 200 * day }}));
+    try testing.expectEqualStrings("A,B", try titles(a, &idx, "kernel", &.{.{ .field = .indexed, .max = 300 * day }}));
+    try testing.expectEqualStrings("C", try titles(a, &idx, "kernel", &.{.{ .field = .indexed, .min = 300 * day }}));
+    try testing.expectEqualStrings("C", try titles(a, &idx, "kernel", &.{.{ .field = .modified, .min = 0, .negate = true }})); // no date satisfies the negation
+    try testing.expectEqualStrings("A", try titles(a, &idx, "kernel", &.{.{ .field = .tag, .text = "linux" }}));
+    try testing.expectEqualStrings("A", try titles(a, &idx, "kernel", &.{.{ .field = .meta, .key = "camera", .text = "acme" }}));
+    try testing.expectEqualStrings("A,B", try titles(a, &idx, "kernel", &.{.{ .field = .tag, .text = "bsd", .negate = true }}));
+    try testing.expectEqualStrings("B", try titles(a, &idx, "kernel", &.{ .{ .field = .domain, .text = "example.org" }, .{ .field = .language, .text = "en", .negate = true } })); // all must hold
+    try testing.expectEqualStrings("A", try titles(a, &idx, "kernel", &.{.{ .field = .path, .text = "/guide/" }}));
+
+    // Special characters in values are text, not SQL or wildcards.
+    try testing.expectEqualStrings("", try titles(a, &idx, "kernel", &.{.{ .field = .author, .text = "%" }}));
+    try testing.expectEqualStrings("", try titles(a, &idx, "kernel", &.{.{ .field = .ext, .text = "pdf' OR '1'='1" }}));
+    _ = F;
+
+    // Hits carry what is known about the document.
+    const page = try idx.searcher().search(a, .{ .text = "manual" });
+    try testing.expectEqual(@as(usize, 1), page.hits.len);
+    try testing.expectEqualStrings("pdf", page.hits[0].kind.?);
+    try testing.expectEqualStrings("example.org", page.hits[0].domain.?);
+    try testing.expectEqual(@as(?i64, 300 * day), page.hits[0].modified_at);
+    try testing.expect(page.hits[0].size.? > 30);
+}
+
+test "the query text itself can carry filters and column restrictions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    try putDoc(&idx, .{ .connector = "web", .source_id = "1", .title = "Window manager", .text = "tiling is nice", .canonical_url = "https://a.org/x.html", .content_type = "text/html" });
+    try putDoc(&idx, .{ .connector = "web", .source_id = "2", .title = "Notes", .text = "a window manager is a program", .canonical_url = "https://a.org/y.pdf", .content_type = "application/pdf" });
+
+    try testing.expectEqualStrings("Notes,Window manager", try titles(a, &idx, "window manager", &.{}));
+    try testing.expectEqualStrings("Window manager", try titles(a, &idx, "title:window", &.{}));
+    try testing.expectEqualStrings("Notes", try titles(a, &idx, "body:program", &.{}));
+    try testing.expectEqualStrings("Notes", try titles(a, &idx, "window ext:pdf", &.{}));
+    try testing.expectEqualStrings("Window manager", try titles(a, &idx, "window -ext:pdf", &.{}));
+    try testing.expectEqualStrings("Notes,Window manager", try titles(a, &idx, "site:a.org type:pdf OR type:page", &.{}));
+}
+
+test "a search made only of filters lists matches, newest first; an old index refuses filters" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    try putDoc(&idx, .{ .connector = "d", .source_id = "1", .title = "Old", .text = "t", .canonical_url = "file:///a.pdf", .modified_at = 10 });
+    try putDoc(&idx, .{ .connector = "d", .source_id = "2", .title = "New", .text = "t", .canonical_url = "file:///b.pdf", .modified_at = 20 });
+    try putDoc(&idx, .{ .connector = "d", .source_id = "3", .title = "Other", .text = "t", .canonical_url = "file:///c.txt", .modified_at = 30 });
+    const page = try idx.searcher().search(a, .{ .text = "ext:pdf" });
+    try testing.expectEqual(@as(usize, 2), page.hits.len);
+    try testing.expectEqualStrings("New", page.hits[0].title.?);
+    try testing.expectEqualStrings("Old", page.hits[1].title.?);
+    // Parameters alone, with no text at all.
+    const by_param = try idx.searcher().search(a, .{ .text = "", .filters = &.{.{ .field = .ext, .text = "txt" }} });
+    try testing.expectEqual(@as(usize, 1), by_param.hits.len);
+    try testing.expectError(error.EmptyQuery, idx.searcher().search(a, .{ .text = "-ext:pdf" }));
+
+    idx.has_meta = false; // as an index from before filters
+    try testing.expectError(error.InvalidQuery, idx.searcher().search(a, .{ .text = "t ext:pdf" }));
+    const plain = try idx.searcher().search(a, .{ .text = "t" });
+    try testing.expect(plain.hits.len == 3);
+}
+
+test "the metadata columns are added to an older index, and removal clears tags" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    // An index as it was before filters.
+    try idx.exec("DROP TABLE doc_meta; DROP INDEX docs_domain; DROP INDEX docs_ext; DROP INDEX docs_kind; DROP INDEX docs_modified; ALTER TABLE docs DROP COLUMN modified_at; ALTER TABLE docs DROP COLUMN indexed_at; ALTER TABLE docs DROP COLUMN author; ALTER TABLE docs DROP COLUMN size; ALTER TABLE docs DROP COLUMN ext; ALTER TABLE docs DROP COLUMN domain; ALTER TABLE docs DROP COLUMN path; ALTER TABLE docs DROP COLUMN kind;");
+    try testing.expect(!idx.detectMeta());
+    try idx.migrateMeta();
+    try testing.expect(idx.detectMeta());
+    idx.has_meta = true;
+    const d: doc.Document = .{ .connector = "c", .source_id = "1", .title = "T", .text = "hello", .extra = &.{.{ .key = "tag", .value = "x" }} };
+    try putDoc(&idx, d);
+    try testing.expectEqualStrings("T", try titles(a, &idx, "hello", &.{.{ .field = .tag, .text = "x" }}));
+    try idx.indexer().remove(d.id());
+    const st = try Stmt.prepare(idx.db, "SELECT count(*) FROM doc_meta");
+    defer st.deinit();
+    _ = try st.step();
+    try testing.expectEqual(@as(i64, 0), st.colInt(0));
 }

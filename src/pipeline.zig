@@ -115,6 +115,8 @@ pub const Pipeline = struct {
 
         const id = d.id();
         const hash = d.contentHash();
+        // The index records when a document was added; the same moment goes in the record below.
+        if (d.acquired_at == null) d.acquired_at = self.options.now();
 
         const existing = self.docs.find(id) catch |e| return self.fail(e);
         if (existing) |old| {
@@ -133,7 +135,7 @@ pub const Pipeline = struct {
         self.docs.upsert(.{
             .id = id,
             .content_hash = hash,
-            .acquired_at = d.acquired_at orelse self.options.now(),
+            .acquired_at = d.acquired_at,
             .meta = meta,
         }) catch |e| return self.fail(e);
 

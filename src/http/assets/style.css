@@ -48,6 +48,8 @@ form.search button {
   cursor: pointer;
 }
 form.search details { flex-basis: 100%; text-align: left; color: var(--muted); }
+form.search details > summary { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; list-style-position: inside; }
+form.search details > summary a.tips { font-weight: 400; font-size: 0.9em; }
 form.search details label { display: inline-block; margin: 0.5rem 1rem 0 0; }
 form.search details input {
   font: inherit;

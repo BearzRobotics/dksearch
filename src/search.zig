@@ -32,7 +32,55 @@ pub const Fuzzy = enum {
     off,
 };
 
+/// Which property of a document a `Filter` tests.
+pub const FilterField = enum {
+    /// The connector (source) name.
+    source,
+    language,
+    /// The media type: exact (`text/html`) or a family (`image/*`).
+    mime,
+    /// A group of file types: page, text, markdown, pdf, image, video, audio, data, other.
+    kind,
+    /// File extension without the dot, lower case.
+    ext,
+    /// Host of the document's URL; also matches its subdomains.
+    domain,
+    /// A prefix of the URL's path.
+    path,
+    /// Contains the text, ignoring case.
+    author,
+    /// Size of the text in bytes.
+    size,
+    /// When the document was last modified, as the source says (Unix seconds).
+    modified,
+    /// When it was created or published, as the source says.
+    created,
+    /// When it was added to the index.
+    indexed,
+    /// A tag attached to the document.
+    tag,
+    /// A custom field (`key`) containing the text.
+    meta,
+};
+
+/// One condition a result must satisfy (or, negated, must not). A search has
+/// a list of them and all must hold.
+pub const Filter = struct {
+    field: FilterField,
+    negate: bool = false,
+    /// The field name for `meta` filters.
+    key: []const u8 = "",
+    /// The value of the text fields.
+    text: []const u8 = "",
+    /// Inclusive limits of the numeric fields; null = open.
+    min: ?i64 = null,
+    max: ?i64 = null,
+};
+
 pub const Query = struct {
+    /// Conditions on the documents, all of which must hold. Filters written in
+    /// the query text itself (`ext:pdf`) are added to these.
+    filters: []const Filter = &.{},
     fuzzy: Fuzzy = .default,
     /// What the user typed: words (ANDed), "phrases", and the query language of
     /// `queryparse.zig` (OR, NOT, parentheses, prefix*, word~, "a b"~5, +, -).
@@ -57,6 +105,14 @@ pub const Hit = struct {
     snippet: ?[]const u8,
     /// Higher is better. Only comparable within one result set.
     score: f64,
+    // What is known about the document, for display and for refining a search.
+    language: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+    modified_at: ?i64 = null,
+    size: ?u64 = null,
+    author: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    domain: ?[]const u8 = null,
 };
 
 pub const Page = struct {

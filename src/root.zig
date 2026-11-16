@@ -12,6 +12,7 @@ pub const search = @import("search.zig");
 pub const evaluate = @import("evaluate.zig");
 pub const image = @import("image.zig");
 pub const queryparse = @import("queryparse.zig");
+pub const docmeta = @import("docmeta.zig");
 pub const exif = @import("exif.zig");
 pub const sourcestore = @import("sourcestore.zig");
 pub const sourceedit = @import("sourceedit.zig");
@@ -40,6 +41,7 @@ test {
     _ = evaluate;
     _ = image;
     _ = queryparse;
+    _ = docmeta;
     _ = exif;
     _ = sourcestore;
     _ = sourceedit;

@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const search = @import("search.zig");
 
 pub const max_query_bytes = 1024;
 pub const max_terms = 32;
@@ -50,6 +51,9 @@ pub const Error = error{
 };
 
 pub const Options = struct {
+    /// "Now" in Unix seconds, for relative dates such as `modified:7d`. Zero
+    /// means unknown: relative dates are then not understood.
+    now: i64 = 0,
     /// Treat every plain word as if it had been written `word~`: it also matches
     /// words one typo away. Applies to words only (not phrases, prefixes or
     /// words that are not plain letters and digits).
@@ -57,6 +61,9 @@ pub const Options = struct {
 };
 
 pub const Parsed = struct {
+    /// Conditions written in the query (`ext:pdf`, `size:>1mb`), to be applied
+    /// to the documents. A query of filters alone has an empty `fts`.
+    filters: []const search.Filter = &.{},
     /// True if `fuzzy_words` changed at least one word (so a repeat search
     /// with it can differ from the plain one).
     fuzzy_applied: bool = false,
@@ -70,16 +77,22 @@ pub const Parsed = struct {
 
 const Kind = enum { word, prefix, fuzzy, phrase, near };
 
+/// Which full-text column a term is restricted to (`title:kernel`).
+const Column = enum { title, body };
+
 const Term = struct {
     text: []const u8,
     kind: Kind,
     /// Distance for `near`.
     n: u32 = 0,
+    column: ?Column = null,
 };
+
+const Group = struct { node: *Or, column: ?Column = null };
 
 const Unit = union(enum) {
     term: Term,
-    group: *Or,
+    group: Group,
 };
 
 const And = struct {
@@ -94,10 +107,17 @@ const Or = struct {
 const Lexer = struct {
     text: []const u8,
     i: usize = 0,
+    /// A word that came glued to a column (`title:word`), handed out next.
+    queued: ?[]const u8 = null,
+    key_buf: [48]u8 = undefined,
 
     const Token = union(enum) {
         word: struct { text: []const u8, prefix: bool, fuzzy: bool },
         phrase: struct { text: []const u8, near: ?u32 },
+        /// `key:value`, with a key from `filter_keys`.
+        filter: struct { key: []const u8, value: []const u8 },
+        /// `title:` or `body:` (the restricted term follows).
+        column: Column,
         lparen,
         rparen,
         op_and,
@@ -118,6 +138,10 @@ const Lexer = struct {
     }
 
     fn next(self: *Lexer) Token {
+        if (self.queued) |w| {
+            self.queued = null;
+            return finishWord(w);
+        }
         while (self.i < self.text.len and isSpace(self.text[self.i])) self.i += 1;
         if (self.i >= self.text.len) return .end;
         const ch = self.text[self.i];
@@ -162,10 +186,34 @@ const Lexer = struct {
         var end = start;
         while (end < self.text.len and !isSpace(self.text[end]) and self.text[end] != '"' and self.text[end] != '(' and self.text[end] != ')') end += 1;
         self.i = end;
-        var w = self.text[start..end];
+        const w = self.text[start..end];
         if (std.mem.eql(u8, w, "AND")) return .op_and;
         if (std.mem.eql(u8, w, "OR")) return .op_or;
         if (std.mem.eql(u8, w, "NOT")) return .op_not;
+        // `key:value`: a filter, or a column restriction (`title:`/`body:`).
+        if (std.mem.indexOfScalar(u8, w, ':')) |colon| if (colon > 0 and colon < self.key_buf.len) {
+            const key = std.ascii.lowerString(self.key_buf[0..colon], w[0..colon]);
+            var value = w[colon + 1 ..];
+            if (columnOf(key)) |col| {
+                if (value.len > 0) self.queued = value;
+                return .{ .column = col };
+            }
+            if (isFilterKey(key)) {
+                if (value.len == 0 and self.i < self.text.len and self.text[self.i] == '"') {
+                    const open = self.i + 1;
+                    const close = std.mem.indexOfScalarPos(u8, self.text, open, '"');
+                    value = self.text[open .. close orelse self.text.len];
+                    self.i = if (close) |c2| c2 + 1 else self.text.len;
+                }
+                if (value.len > 0) return .{ .filter = .{ .key = key, .value = value } };
+            }
+        };
+        return finishWord(w);
+    }
+
+    /// A plain word with its `*` or `~` suffix taken off.
+    fn finishWord(word: []const u8) Token {
+        var w = word;
         var prefix = false;
         var fuzzy = false;
         // `word~` or `word~1` (any digits are accepted; one edit is what it means).
@@ -188,6 +236,204 @@ const Lexer = struct {
     }
 };
 
+fn columnOf(key: []const u8) ?Column {
+    if (std.mem.eql(u8, key, "title")) return .title;
+    if (std.mem.eql(u8, key, "body") or std.mem.eql(u8, key, "text")) return .body;
+    return null;
+}
+
+const filter_names = [_]struct { []const u8, search.FilterField }{
+    .{ "source", .source },
+    .{ "src", .source },
+    .{ "connector", .source },
+    .{ "lang", .language },
+    .{ "language", .language },
+    .{ "mime", .mime },
+    .{ "type", .kind },
+    .{ "kind", .kind },
+    .{ "ext", .ext },
+    .{ "extension", .ext },
+    .{ "domain", .domain },
+    .{ "site", .domain },
+    .{ "host", .domain },
+    .{ "path", .path },
+    .{ "dir", .path },
+    .{ "author", .author },
+    .{ "by", .author },
+    .{ "size", .size },
+    .{ "modified", .modified },
+    .{ "updated", .modified },
+    .{ "created", .created },
+    .{ "published", .created },
+    .{ "date", .created },
+    .{ "indexed", .indexed },
+    .{ "added", .indexed },
+    .{ "tag", .tag },
+};
+
+fn isMetaKey(key: []const u8) bool {
+    const prefix = if (std.mem.startsWith(u8, key, "meta.")) "meta." else if (std.mem.startsWith(u8, key, "field.")) "field." else return false;
+    const name = key[prefix.len..];
+    if (name.len == 0 or name.len > 32) return false;
+    for (name) |b| if (!(std.ascii.isAlphanumeric(b) or b == '_' or b == '-' or b == '.')) return false;
+    return true;
+}
+
+fn isFilterKey(key: []const u8) bool {
+    for (filter_names) |f| if (std.mem.eql(u8, key, f[0])) return true;
+    return isMetaKey(key);
+}
+
+const max_filter_text = 200;
+const max_filters = 16;
+
+fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
+    const y = if (month <= 2) year - 1 else year;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp = @mod(month + 9, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// The start and the last second of a date written `2026`, `2026-03` or `2026-03-15`.
+fn datePeriod(text: []const u8) ?struct { start: i64, end: i64 } {
+    var it = std.mem.splitScalar(u8, text, '-');
+    const ys = it.next() orelse return null;
+    if (ys.len != 4) return null;
+    const y = std.fmt.parseInt(i64, ys, 10) catch return null;
+    if (y < 1970 or y > 2200) return null;
+    const ms = it.next();
+    const ds = it.next();
+    if (it.next() != null) return null;
+    if (ms == null) return .{ .start = daysFromCivil(y, 1, 1) * 86400, .end = daysFromCivil(y + 1, 1, 1) * 86400 - 1 };
+    if (ms.?.len != 2) return null;
+    const m = std.fmt.parseInt(i64, ms.?, 10) catch return null;
+    if (m < 1 or m > 12) return null;
+    if (ds == null) {
+        const ny = if (m == 12) y + 1 else y;
+        const nm = if (m == 12) 1 else m + 1;
+        return .{ .start = daysFromCivil(y, m, 1) * 86400, .end = daysFromCivil(ny, nm, 1) * 86400 - 1 };
+    }
+    if (ds.?.len != 2) return null;
+    const d = std.fmt.parseInt(i64, ds.?, 10) catch return null;
+    if (d < 1 or d > 31) return null;
+    const start = daysFromCivil(y, m, d) * 86400;
+    return .{ .start = start, .end = start + 86399 };
+}
+
+/// "1500", "10k", "1.5mb", "2gb" as a number of bytes.
+fn parseSize(text: []const u8) ?i64 {
+    var t = text;
+    var mult: i64 = 1;
+    const units = [_]struct { []const u8, i64 }{ .{ "kb", 1 << 10 }, .{ "mb", 1 << 20 }, .{ "gb", 1 << 30 }, .{ "k", 1 << 10 }, .{ "m", 1 << 20 }, .{ "g", 1 << 30 }, .{ "b", 1 } };
+    for (units) |u| if (t.len > u[0].len and std.ascii.eqlIgnoreCase(t[t.len - u[0].len ..], u[0])) {
+        mult = u[1];
+        t = t[0 .. t.len - u[0].len];
+        break;
+    };
+    if (t.len == 0) return null;
+    const v = std.fmt.parseFloat(f64, t) catch return null;
+    if (!(v >= 0) or v > 1e15) return null;
+    return @intFromFloat(v * @as(f64, @floatFromInt(mult)));
+}
+
+const Range = struct { min: ?i64 = null, max: ?i64 = null };
+
+/// A numeric condition: `>x`, `>=x`, `<x`, `<=x`, `a..b`, a single value (the
+/// whole period for a date), or for dates a span back from now (`7d`, `3w`,
+/// `6m`, `1y`).
+fn parseRange(field: search.FilterField, value: []const u8, now: i64) ?Range {
+    const is_date = field != .size;
+    const Edge = struct { lo: i64, hi: i64 };
+    const edge = struct {
+        fn of(f: search.FilterField, v: []const u8) ?Edge {
+            if (f == .size) {
+                const n = parseSize(v) orelse return null;
+                return .{ .lo = n, .hi = n };
+            }
+            const p = datePeriod(v) orelse return null;
+            return .{ .lo = p.start, .hi = p.end };
+        }
+    }.of;
+    if (std.mem.indexOf(u8, value, "..")) |dots| {
+        const a = value[0..dots];
+        const b = value[dots + 2 ..];
+        var r: Range = .{};
+        if (a.len > 0) r.min = (edge(field, a) orelse return null).lo;
+        if (b.len > 0) r.max = (edge(field, b) orelse return null).hi;
+        if (a.len == 0 and b.len == 0) return null;
+        return r;
+    }
+    if (std.mem.startsWith(u8, value, ">=")) return .{ .min = (edge(field, value[2..]) orelse return null).lo };
+    if (std.mem.startsWith(u8, value, "<=")) return .{ .max = (edge(field, value[2..]) orelse return null).hi };
+    if (std.mem.startsWith(u8, value, ">")) {
+        const e = edge(field, value[1..]) orelse return null;
+        return .{ .min = e.hi + 1 };
+    }
+    if (std.mem.startsWith(u8, value, "<")) {
+        const e = edge(field, value[1..]) orelse return null;
+        return .{ .max = e.lo - 1 };
+    }
+    if (is_date) {
+        // A span back from now: 7d, 3w, 6m, 1y.
+        if (value.len >= 2 and now > 0) {
+            const unit = value[value.len - 1];
+            const per: ?i64 = switch (unit) {
+                'd' => 86400,
+                'w' => 7 * 86400,
+                'm' => 30 * 86400,
+                'y' => 365 * 86400,
+                else => null,
+            };
+            if (per) |sec| if (std.fmt.parseInt(i64, value[0 .. value.len - 1], 10)) |n| {
+                if (n >= 0 and n <= 100000) return .{ .min = now - n * sec };
+            } else |_| {};
+        }
+    }
+    const e = edge(field, value) orelse return null;
+    return .{ .min = e.lo, .max = e.hi };
+}
+
+/// The filter a `key:value` token stands for, or null if the value makes no
+/// sense for that key (the token is then searched as ordinary text).
+fn makeFilter(arena: Allocator, key: []const u8, value_in: []const u8, now: i64) Allocator.Error!?search.Filter {
+    const value = std.mem.trim(u8, value_in, " \t");
+    if (value.len == 0 or value.len > max_filter_text) return null;
+    if (std.mem.indexOfScalar(u8, value, 0) != null) return null;
+    var field: ?search.FilterField = null;
+    var meta_key: []const u8 = "";
+    for (filter_names) |f| if (std.mem.eql(u8, key, f[0])) {
+        field = f[1];
+    };
+    if (field == null and isMetaKey(key)) {
+        field = .meta;
+        meta_key = try std.ascii.allocLowerString(arena, key[(std.mem.indexOfScalar(u8, key, '.') orelse 0) + 1 ..]);
+    }
+    const f = field orelse return null;
+    switch (f) {
+        .size, .modified, .created, .indexed => {
+            const r = parseRange(f, value, now) orelse return null;
+            return .{ .field = f, .min = r.min, .max = r.max };
+        },
+        .ext => {
+            var v = value;
+            if (v[0] == '.') v = v[1..];
+            if (v.len == 0 or v.len > 8) return null;
+            for (v) |b| if (!std.ascii.isAlphanumeric(b)) return null;
+            return .{ .field = f, .text = try std.ascii.allocLowerString(arena, v) };
+        },
+        .domain => {
+            for (value) |b| if (!(std.ascii.isAlphanumeric(b) or b == '.' or b == '-')) return null;
+            return .{ .field = f, .text = try std.ascii.allocLowerString(arena, value) };
+        },
+        .source, .language, .path, .author => return .{ .field = f, .text = try arena.dupe(u8, value) },
+        .mime, .kind, .tag => return .{ .field = f, .text = try std.ascii.allocLowerString(arena, value) },
+        .meta => return .{ .field = f, .key = meta_key, .text = try std.ascii.allocLowerString(arena, value) },
+    }
+}
+
 const Parser = struct {
     arena: Allocator,
     lex: Lexer,
@@ -197,6 +443,11 @@ const Parser = struct {
     too_many: bool = false,
     fuzzy_words: bool = false,
     fuzzy_applied: bool = false,
+    now: i64 = 0,
+    filters: std.ArrayList(search.Filter) = .empty,
+    /// How each filter was written, for showing the query back ("-ext:pdf").
+    filter_text: std.ArrayList([]const u8) = .empty,
+    pending_column: ?Column = null,
 
     fn peek(self: *Parser) Lexer.Token {
         if (self.peeked == null) self.peeked = self.lex.next();
@@ -249,13 +500,38 @@ const Parser = struct {
                     self.advanced = true;
                     negate_next = true;
                 },
+                .column => |col| {
+                    _ = self.take();
+                    self.advanced = true;
+                    self.pending_column = col;
+                },
+                .filter => |f| {
+                    _ = self.take();
+                    self.advanced = true;
+                    const made = if (self.filters.items.len < max_filters) try makeFilter(self.arena, f.key, f.value, self.now) else null;
+                    if (made) |flt| {
+                        var fl = flt;
+                        fl.negate = negate_next;
+                        try self.filters.append(self.arena, fl);
+                        try self.filter_text.append(self.arena, try std.fmt.allocPrint(self.arena, "{s}{s}:{s}", .{ if (negate_next) "-" else "", f.key, f.value }));
+                    } else if (self.terms < max_terms) {
+                        // Not a condition that makes sense: search for it as text.
+                        self.terms += 1;
+                        const lit = try std.fmt.allocPrint(self.arena, "{s}:{s}", .{ f.key, f.value });
+                        if (Lexer.hasWordChar(lit)) try (if (negate_next) node.negative else node.positive).append(self.arena, .{ .term = .{ .text = lit, .kind = .word } });
+                    }
+                    negate_next = false;
+                },
                 .lparen => {
                     _ = self.take();
                     if (depth + 1 >= max_depth) continue; // too deep: the parenthesis is ignored
+                    // A column in front of a group restricts the whole group, not its first term.
+                    const group_column = self.pending_column;
+                    self.pending_column = null;
                     const inner = try self.parseOr(depth + 1);
                     if (self.peek() == .rparen) _ = self.take(); // a missing ")" is supplied
                     self.advanced = true;
-                    const unit: Unit = .{ .group = inner };
+                    const unit: Unit = .{ .group = .{ .node = inner, .column = group_column } };
                     try (if (negate_next) node.negative else node.positive).append(self.arena, unit);
                     negate_next = false;
                 },
@@ -273,7 +549,8 @@ const Parser = struct {
                         kind = .fuzzy; // asked for through the options, not by the person: not "advanced"
                         self.fuzzy_applied = true;
                     }
-                    const unit: Unit = .{ .term = .{ .text = w.text, .kind = kind } };
+                    const unit: Unit = .{ .term = .{ .text = w.text, .kind = kind, .column = self.pending_column } };
+                    self.pending_column = null;
                     try (if (negate_next) node.negative else node.positive).append(self.arena, unit);
                     negate_next = false;
                 },
@@ -287,7 +564,8 @@ const Parser = struct {
                     self.terms += 1;
                     const kind: Kind = if (p.near != null) .near else .phrase;
                     if (kind == .near) self.advanced = true;
-                    const unit: Unit = .{ .term = .{ .text = p.text, .kind = kind, .n = p.near orelse 0 } };
+                    const unit: Unit = .{ .term = .{ .text = p.text, .kind = kind, .n = p.near orelse 0, .column = self.pending_column } };
+                    self.pending_column = null;
                     try (if (negate_next) node.negative else node.positive).append(self.arena, unit);
                     negate_next = false;
                 },
@@ -314,16 +592,30 @@ pub fn parseWith(arena: Allocator, text: []const u8, options: Options) Error!Par
     if (text.len > max_query_bytes) return error.InvalidQuery;
     // A NUL would end the string early inside SQLite's C code.
     if (std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidQuery;
-    var p: Parser = .{ .arena = arena, .lex = .{ .text = text }, .fuzzy_words = options.fuzzy_words };
+    var p: Parser = .{ .arena = arena, .lex = .{ .text = text }, .fuzzy_words = options.fuzzy_words, .now = options.now };
     const root = try p.parseOr(0);
     if (p.too_many) return error.InvalidQuery;
 
     var fts: std.ArrayList(u8) = .empty;
-    if (!try emitOr(arena, &fts, root)) return error.EmptyQuery;
+    const has_terms = try emitOr(arena, &fts, root);
+    if (!has_terms) {
+        // Nothing to look for in the text. Conditions alone are a valid search
+        // (everything that satisfies them), but only if at least one is positive.
+        var positive = false;
+        for (p.filters.items) |f| if (!f.negate) {
+            positive = true;
+        };
+        if (!positive) return error.EmptyQuery;
+        fts.items.len = 0;
+    }
     if (fts.items.len > max_expression_bytes) return error.InvalidQuery;
     var shown: std.ArrayList(u8) = .empty;
     _ = try showOr(arena, &shown, root);
-    return .{ .fts = fts.items, .shown = shown.items, .advanced = p.advanced, .fuzzy_applied = p.fuzzy_applied };
+    for (p.filter_text.items) |t| {
+        if (shown.items.len > 0) try shown.append(arena, ' ');
+        try shown.appendSlice(arena, t);
+    }
+    return .{ .fts = fts.items, .shown = shown.items, .advanced = p.advanced, .fuzzy_applied = p.fuzzy_applied, .filters = p.filters.items };
 }
 
 // ------------------------------------------------------------- FTS5 output
@@ -418,13 +710,29 @@ fn emitFuzzy(arena: Allocator, out: *std.ArrayList(u8), word: []const u8) Alloca
     try out.append(arena, ')');
 }
 
+fn columnPrefix(arena: Allocator, out: *std.ArrayList(u8), col: ?Column) Allocator.Error!void {
+    if (col) |c| try out.appendSlice(arena, switch (c) {
+        .title => "title : ",
+        .body => "body : ",
+    });
+}
+
 fn emitUnit(arena: Allocator, out: *std.ArrayList(u8), u: Unit) Allocator.Error!bool {
     switch (u) {
-        .term => |t| return emitTerm(arena, out, t),
+        .term => |t| {
+            const mark = out.items.len;
+            try columnPrefix(arena, out, t.column);
+            if (!try emitTerm(arena, out, t)) {
+                out.items.len = mark;
+                return false;
+            }
+            return true;
+        },
         .group => |g| {
             const mark = out.items.len;
+            try columnPrefix(arena, out, g.column);
             try out.append(arena, '(');
-            if (!try emitOr(arena, out, g)) {
+            if (!try emitOr(arena, out, g.node)) {
                 out.items.len = mark;
                 return false;
             }
@@ -500,18 +808,27 @@ fn showTerm(arena: Allocator, out: *std.ArrayList(u8), t: Term) Allocator.Error!
     }
 }
 
+fn showColumn(arena: Allocator, out: *std.ArrayList(u8), col: ?Column) Allocator.Error!void {
+    if (col) |c| try out.appendSlice(arena, switch (c) {
+        .title => "title:",
+        .body => "body:",
+    });
+}
+
 fn showUnit(arena: Allocator, out: *std.ArrayList(u8), u: Unit) Allocator.Error!bool {
     switch (u) {
         .term => |t| {
             // A term with nothing searchable in it is not shown.
             if (!Lexer.hasWordChar(t.text)) return false;
+            try showColumn(arena, out, t.column);
             try showTerm(arena, out, t);
             return true;
         },
         .group => |g| {
             const mark = out.items.len;
+            try showColumn(arena, out, g.column);
             try out.append(arena, '(');
-            if (!try showOr(arena, out, g)) {
+            if (!try showOr(arena, out, g.node)) {
                 out.items.len = mark;
                 return false;
             }
@@ -634,8 +951,105 @@ test "fuzzy_words expands plain words only, and says whether it did" {
     try testing.expect(!plain.advanced);
 }
 
+fn parseNow(text: []const u8, now: i64, arena: Allocator) !Parsed {
+    return parseWith(arena, text, .{ .now = now });
+}
+
+test "filters: text fields, negation, quoting, aliases" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parse(a, "kernel ext:PDF -domain:Example.org author:\"Jo Smith\" tag:Linux site:docs.rs lang:en type:pdf source:notes mime:image/*");
+    try testing.expectEqualStrings("\"kernel\"", p.fts);
+    try testing.expect(p.advanced);
+    try testing.expectEqual(@as(usize, 9), p.filters.len);
+    try testing.expectEqual(search.FilterField.ext, p.filters[0].field);
+    try testing.expectEqualStrings("pdf", p.filters[0].text); // lower-cased
+    try testing.expectEqual(search.FilterField.domain, p.filters[1].field);
+    try testing.expect(p.filters[1].negate);
+    try testing.expectEqualStrings("example.org", p.filters[1].text);
+    try testing.expectEqualStrings("Jo Smith", p.filters[2].text); // a quoted value keeps its spaces and case
+    try testing.expectEqualStrings("linux", p.filters[3].text);
+    try testing.expectEqual(search.FilterField.domain, p.filters[4].field); // site: is domain:
+    try testing.expectEqual(search.FilterField.kind, p.filters[6].field); // type: is kind:
+    try testing.expectEqualStrings("image/*", p.filters[8].text);
+    try testing.expectEqualStrings("kernel ext:PDF -domain:Example.org author:Jo Smith tag:Linux site:docs.rs lang:en type:pdf source:notes mime:image/*", p.shown);
+}
+
+test "filters: sizes and dates, ranges, relative spans" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const day = 86400;
+    const jan1 = 20454 * day; // 2026-01-01 00:00 UTC
+    var p = try parseNow("x size:>1mb size:<=10k size:1kb..2kb", 0, a);
+    try testing.expectEqual(@as(?i64, (1 << 20) + 1), p.filters[0].min);
+    try testing.expectEqual(@as(?i64, 10 * 1024), p.filters[1].max);
+    try testing.expectEqual(@as(?i64, 1024), p.filters[2].min);
+    try testing.expectEqual(@as(?i64, 2048), p.filters[2].max);
+
+    p = try parseNow("x modified:>2026-01-01 created:2026-01 indexed:2025..2026-02-03 modified:<=2026-01-01", 0, a);
+    try testing.expectEqual(@as(?i64, jan1 + day), p.filters[0].min); // after that day
+    try testing.expectEqual(@as(?i64, jan1), p.filters[1].min); // the whole month
+    try testing.expectEqual(@as(?i64, jan1 + 31 * day - 1), p.filters[1].max);
+    try testing.expectEqual(@as(?i64, 20089 * day), p.filters[2].min); // 2025-01-01
+    try testing.expectEqual(@as(?i64, (jan1 + 33 * day) + day - 1), p.filters[2].max); // end of 2026-02-03
+    try testing.expectEqual(@as(?i64, jan1 + day - 1), p.filters[3].max);
+
+    // Relative spans need a clock.
+    p = try parseNow("x modified:7d", jan1, a);
+    try testing.expectEqual(@as(?i64, jan1 - 7 * day), p.filters[0].min);
+    p = try parseNow("x modified:7d", 0, a);
+    try testing.expectEqual(@as(usize, 0), p.filters.len); // not understood: searched as text
+    try testing.expectEqualStrings("\"x\" AND \"modified:7d\"", p.fts);
+}
+
+test "filters alone are a search; negated filters alone are not; bad values are text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const only = try parse(a, "ext:pdf");
+    try testing.expectEqualStrings("", only.fts);
+    try testing.expectEqual(@as(usize, 1), only.filters.len);
+    try testing.expectEqualStrings("ext:pdf", only.shown);
+    try testing.expectError(error.EmptyQuery, parse(a, "-ext:pdf"));
+    try testing.expectError(error.EmptyQuery, parse(a, "NOT type:image"));
+    for ([_][]const u8{ "size:big", "modified:yesterday", "ext:", "ext:toolongextension", "domain:bad_domain!", "created:2026-13" }) |q| {
+        errdefer std.debug.print("query: {s}\n", .{q});
+        const p = try parse(a, q);
+        try testing.expectEqual(@as(usize, 0), p.filters.len);
+        try testing.expect(p.fts.len > 0); // searched as ordinary text
+    }
+    // Unknown keys stay ordinary text, as before.
+    const unknown = try parse(a, "color:red");
+    try testing.expectEqualStrings("\"color:red\"", unknown.fts);
+    try testing.expectEqual(@as(usize, 0), unknown.filters.len);
+}
+
+test "meta fields and columns" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const m = try parse(a, "x meta.Camera:ACME field.page-count:12");
+    try testing.expectEqual(search.FilterField.meta, m.filters[0].field);
+    try testing.expectEqualStrings("camera", m.filters[0].key);
+    try testing.expectEqualStrings("acme", m.filters[0].text);
+    try testing.expectEqualStrings("page-count", m.filters[1].key);
+
+    // Columns restrict a term or a group to the title or the body.
+    const c1 = try parse(a, "title:kernel body:module");
+    try testing.expectEqualStrings("title : \"kernel\" AND body : \"module\"", c1.fts);
+    const c2 = try parse(a, "title:\"window manager\" title:(linux OR bsd)");
+    try testing.expectEqualStrings("title : \"window manager\" AND title : (\"linux\" OR \"bsd\")", c2.fts);
+    try testing.expectEqualStrings("title:\"window manager\" AND title:(linux OR bsd)", c2.shown);
+    const c3 = try parse(a, "x title:");
+    try testing.expectEqualStrings("\"x\"", c3.fts); // a dangling column restricts nothing
+}
+
 test "syntax cannot reach FTS5: operators, column filters and quotes are inert" {
-    try expectFts("title:foo", "\"title:foo\"");
+    try expectFts("title:foo", "title : \"foo\""); // a column restriction the parser itself writes
+    try expectFts("bogus:foo", "\"bogus:foo\""); // any other key: is just text
+    try expectFts("title:\"a\" : x", "title : \"a\" AND \"x\"");
     try expectFts("^start", "\"^start\"");
     try expectFts("NEAR(a b)", "\"NEAR\" AND (\"a\" AND \"b\")");
     try expectFts("a\"b", "\"a\" AND \"b\"");
@@ -713,7 +1127,8 @@ test "random queries never crash and always give balanced, quote-safe output" {
             switch (ch) {
                 '(' => depth += 1,
                 ')' => depth -= 1,
-                ' ', '*', ',', '0'...'9', 'A', 'N', 'D', 'O', 'R', 'T', 'E' => {},
+                // The only words the parser writes outside quotes: AND OR NOT NEAR title body.
+                ' ', '*', ',', ':', '0'...'9', 'A', 'N', 'D', 'O', 'R', 'T', 'E', 'a'...'z' => {},
                 else => return error.UnexpectedCharacterOutsideQuotes,
             }
             try testing.expect(depth >= 0);
