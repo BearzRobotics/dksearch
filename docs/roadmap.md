@@ -9,7 +9,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 - **Audio and video, metadata (done):** tags and technical details through `ffprobe` (title, artist, album, year, genre, duration, codecs) for `mp3`, `m4a`, `ogg`, `flac`, `mp4` and similar, and subtitle or lyrics files next to the media (`.srt`, `.vtt`, `.lrc`) as searchable text.
 - **Rich viewer (done):** Markdown rendered through `md-zig` and the HTML sanitizer; ZIM articles shown from the ZIM file with their images and internal links working.
 - **Search results in the API (done):** file kind, size, dates, domain and the rest of what the index knows in the JSON, `filter` parameters and sort modes.
-- **Office and ebook text (mostly done):** `docx`, `odt` and `epub` extraction on `xml-zig` (zip plus XML) and an HTML option for the files connector are built (`office = true`, `html = true`); the switch of the Wikipedia connector from Expat to `xml-zig` is still to do.
+- **Office and ebook text (mostly done):** `docx`, `odt` and `epub` extraction on `xml-zig` (zip plus XML) and an HTML option for the files connector are built (`office = true`, `html = true`); the Wikipedia, feeds and crawl connectors now read XML with `xml-zig` too and the C Expat is gone.
 - **Parallel external extraction:** several `pdftotext` processes at once, for libraries of tens of thousands of PDFs (a 28,000-PDF library is the test case).
 - **Admin panel, feature complete (in progress):** every source option as a labelled field with help and validation (done); a Settings page for the search, server and admin settings (done); runs and schedules (done: `schedule` per source, run by the server), a list of skipped items with the reason (done: examples per job).
 

@@ -240,7 +240,7 @@ pub const FeedsConnector = struct {
         defer entry_arena.deinit();
         var h: FeedHandler = .{ .conn = self, .sink = sink, .control = control, .rel = rel, .file_arena = &file_arena, .entry_arena = &entry_arena };
         var parser: xml.Parser(FeedHandler) = undefined;
-        parser.init(&h) catch return .out_of_memory;
+        parser.init(self.gpa, &h) catch return .out_of_memory;
         defer parser.deinit();
         parser.feed(data, true) catch |e| {
             if (h.fail) |f| return switch (f) {

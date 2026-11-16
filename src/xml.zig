@@ -1,21 +1,23 @@
-//! A thin push-parser wrapper over the vendored Expat.
+//! A small push-style wrapper over xml-zig, for the connectors that hand a whole document to a handler
+//! (feeds, sitemaps). The Wikipedia connector, which reads gigabytes, uses xml-zig's pull reader directly.
 //!
-//! `Parser(Handler)` calls three methods of `Handler`, each taking the
-//! parser so it can stop it or ask where it is:
+//! `Parser(Handler)` calls three methods of `Handler`, each taking the parser so it can stop it:
 //!
 //!   startElement(h: *Handler, p: *P, name: []const u8, attrs: Attrs) void
 //!   endElement(h: *Handler, p: *P, name: []const u8) void
 //!   characters(h: *Handler, p: *P, bytes: []const u8) void
 //!
-//! Safety: Expat is built without DTD support and without general entity
-//! expansion (vendor/expat/expat_config.h), and a document type declaration
-//! is refused outright, so a hostile document cannot make entities expand.
-//! The predefined entities and character references still work. The parser
-//! holds no more than the current token in memory; the caller feeds it in
-//! chunks.
+//! Names are as written in the document (`dc:creator`); no namespace is resolved. A document type
+//! declaration is refused, so no entity can expand beyond the five predefined ones and character
+//! references. The document is collected until `feed(..., true)` and parsed then, so it must fit in
+//! memory (the callers already hold it whole; `max_document_bytes` bounds it).
 
 const std = @import("std");
-const c = @import("expat_c");
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const xmlzig = @import("xmlzig");
+
+pub const max_document_bytes = 256 * 1024 * 1024;
 
 pub const Error = error{
     /// Not well-formed XML, or a DOCTYPE was present.
@@ -27,16 +29,12 @@ pub const Error = error{
 
 /// The attributes of a start tag.
 pub const Attrs = struct {
-    raw: [*c][*c]const c.XML_Char,
+    list: []const xmlzig.Attribute,
 
-    /// The value of attribute `name`, if present. The slice is valid during
-    /// the handler call only.
+    /// The value of attribute `name` (as written, `xml:lang`), if present. The slice is valid during the
+    /// handler call only.
     pub fn get(self: Attrs, name: []const u8) ?[]const u8 {
-        var i: usize = 0;
-        while (self.raw[i] != null) : (i += 2) {
-            const k = std.mem.span(@as([*:0]const u8, @ptrCast(self.raw[i])));
-            if (std.mem.eql(u8, k, name)) return std.mem.span(@as([*:0]const u8, @ptrCast(self.raw[i + 1])));
-        }
+        for (self.list) |a| if (std.mem.eql(u8, a.name.qualified, name)) return a.value;
         return null;
     }
 };
@@ -45,82 +43,115 @@ pub fn Parser(comptime Handler: type) type {
     return struct {
         const Self = @This();
 
-        parser: c.XML_Parser,
+        gpa: Allocator,
         handler: *Handler,
+        buf: std.ArrayList(u8) = .empty,
+        stopped: bool = false,
 
-        /// `self` must not move after `init` (Expat keeps a pointer to it).
-        pub fn init(self: *Self, handler: *Handler) error{OutOfMemory}!void {
-            const p = c.XML_ParserCreate(null) orelse return error.OutOfMemory;
-            self.* = .{ .parser = p, .handler = handler };
-            c.XML_SetUserData(p, self);
-            c.XML_SetElementHandler(p, onStart, onEnd);
-            c.XML_SetCharacterDataHandler(p, onChars);
-            c.XML_SetStartDoctypeDeclHandler(p, onDoctype);
+        /// `self` must not move between `init` and the end of `feed`.
+        pub fn init(self: *Self, gpa: Allocator, handler: *Handler) error{OutOfMemory}!void {
+            self.* = .{ .gpa = gpa, .handler = handler };
         }
 
         pub fn deinit(self: *Self) void {
-            c.XML_ParserFree(self.parser);
+            self.buf.deinit(self.gpa);
             self.* = undefined;
         }
 
-        /// Feeds `data`; `final` marks the end of the document.
+        /// Collects `data`; with `final` set, parses the whole document and calls the handler.
         pub fn feed(self: *Self, data: []const u8, final: bool) Error!void {
-            var rest = data;
-            // Expat takes an int length; chunks are small, but stay correct.
-            while (true) {
-                const n: usize = @min(rest.len, 1 << 30);
-                const is_last = final and n == rest.len;
-                const st = c.XML_Parse(self.parser, @ptrCast(rest.ptr), @intCast(n), @intFromBool(is_last));
-                if (st == c.XML_STATUS_ERROR) {
-                    return switch (c.XML_GetErrorCode(self.parser)) {
-                        c.XML_ERROR_ABORTED => error.Stopped,
-                        c.XML_ERROR_NO_MEMORY => error.OutOfMemory,
-                        else => error.Malformed,
-                    };
-                }
-                rest = rest[n..];
-                if (rest.len == 0) return;
-            }
+            if (self.buf.items.len + data.len > max_document_bytes) return error.Malformed;
+            try self.buf.appendSlice(self.gpa, data);
+            if (!final) return;
+            return self.parse();
         }
 
         /// Makes the current or next `feed` fail with `error.Stopped`.
         pub fn stop(self: *Self) void {
-            _ = c.XML_StopParser(self.parser, c.XML_FALSE);
+            self.stopped = true;
         }
 
-        /// Offset, in bytes fed so far, of the start of the current event.
-        pub fn byteIndex(self: *const Self) i64 {
-            return @intCast(c.XML_GetCurrentByteIndex(self.parser));
-        }
-
-        /// Length in bytes of the current event.
-        pub fn byteCount(self: *const Self) i64 {
-            return @intCast(c.XML_GetCurrentByteCount(self.parser));
-        }
-
-        fn self_(ud: ?*anyopaque) *Self {
-            return @ptrCast(@alignCast(ud.?));
-        }
-
-        fn onStart(ud: ?*anyopaque, name: [*c]const c.XML_Char, atts: [*c][*c]const c.XML_Char) callconv(.c) void {
-            const s = self_(ud);
-            s.handler.startElement(s, std.mem.span(@as([*:0]const u8, @ptrCast(name))), .{ .raw = atts });
-        }
-
-        fn onEnd(ud: ?*anyopaque, name: [*c]const c.XML_Char) callconv(.c) void {
-            const s = self_(ud);
-            s.handler.endElement(s, std.mem.span(@as([*:0]const u8, @ptrCast(name))));
-        }
-
-        fn onChars(ud: ?*anyopaque, text: [*c]const c.XML_Char, len: c_int) callconv(.c) void {
-            const s = self_(ud);
-            if (len <= 0) return;
-            s.handler.characters(s, @as([*]const u8, @ptrCast(text))[0..@intCast(len)]);
-        }
-
-        fn onDoctype(ud: ?*anyopaque, _: [*c]const c.XML_Char, _: [*c]const c.XML_Char, _: [*c]const c.XML_Char, _: c_int) callconv(.c) void {
-            // Refuse any document type declaration: dumps have none.
-            _ = c.XML_StopParser(self_(ud).parser, c.XML_FALSE);
+        fn parse(self: *Self) Error!void {
+            var src: Io.Reader = .fixed(self.buf.items);
+            var rd = xmlzig.Reader.init(self.gpa, &src, .{ .namespaces = false, .doctype = .reject, .max_input_bytes = max_document_bytes }, null);
+            defer rd.deinit();
+            var depth: u32 = 0;
+            while (true) {
+                const ev = rd.next() catch |e| return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.Malformed,
+                };
+                switch (ev) {
+                    .start_element => |s| {
+                        depth += 1;
+                        self.handler.startElement(self, s.name.qualified, .{ .list = s.attributes });
+                    },
+                    .end_element => |e| {
+                        self.handler.endElement(self, e.name.qualified);
+                        depth -= 1;
+                    },
+                    .text, .cdata => |t| if (t.len > 0) self.handler.characters(self, t),
+                    .end_of_document => return,
+                    else => {},
+                }
+                if (self.stopped) return error.Stopped;
+            }
         }
     };
+}
+
+const testing = std.testing;
+
+const Collect = struct {
+    out: std.ArrayList(u8) = .empty,
+    stop_at: ?[]const u8 = null,
+    const P = Parser(Collect);
+
+    pub fn startElement(self: *Collect, p: *P, name: []const u8, attrs: Attrs) void {
+        self.out.print(testing.allocator, "<{s}", .{name}) catch return p.stop();
+        if (attrs.get("xml:lang")) |l| self.out.print(testing.allocator, "[{s}]", .{l}) catch return p.stop();
+        if (self.stop_at) |s| if (std.mem.eql(u8, s, name)) p.stop();
+    }
+    pub fn endElement(self: *Collect, p: *P, name: []const u8) void {
+        self.out.print(testing.allocator, ">{s}", .{name}) catch p.stop();
+    }
+    pub fn characters(self: *Collect, p: *P, bytes: []const u8) void {
+        self.out.appendSlice(testing.allocator, bytes) catch p.stop();
+    }
+};
+
+fn run(doc: []const u8, h: *Collect) Error!void {
+    var p: Collect.P = undefined;
+    try p.init(testing.allocator, h);
+    defer p.deinit();
+    // In two pieces, as callers may feed them.
+    const mid = doc.len / 2;
+    try p.feed(doc[0..mid], false);
+    return p.feed(doc[mid..], true);
+}
+
+test "elements, attributes as written, text with references expanded and CDATA" {
+    var h: Collect = .{};
+    defer h.out.deinit(testing.allocator);
+    try run("<?xml version=\"1.0\"?><a xml:lang=\"en\"><dc:b>x &amp; y &#233;</dc:b><c><![CDATA[<raw>]]></c></a>", &h);
+    try testing.expectEqualStrings("<a[en]<dc:bx & y é>dc:b<c<raw>>c>a", h.out.items);
+}
+
+test "malformed documents, a DOCTYPE and a handler's stop are errors" {
+    var h: Collect = .{};
+    defer h.out.deinit(testing.allocator);
+    try testing.expectError(error.Malformed, run("<a><b></a>", &h));
+    try testing.expectError(error.Malformed, run("not xml at all", &h));
+    try testing.expectError(error.Malformed, run("<!DOCTYPE a [<!ENTITY e \"v\">]><a>&e;</a>", &h));
+    var h2: Collect = .{ .stop_at = "b" };
+    defer h2.out.deinit(testing.allocator);
+    try testing.expectError(error.Stopped, run("<a><b/><c/></a>", &h2));
+    try testing.expect(std.mem.indexOf(u8, h2.out.items, "<c") == null);
+}
+
+test "ISO-8859-1 and UTF-16 documents are converted" {
+    var h: Collect = .{};
+    defer h.out.deinit(testing.allocator);
+    try run("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>caf\xe9</a>", &h);
+    try testing.expectEqualStrings("<acafé>a", h.out.items);
 }

@@ -715,7 +715,7 @@ const Run = struct {
         defer h.text.deinit(self.conn.gpa);
         h.gpa = self.conn.gpa;
         var parser: xml.Parser(SitemapHandler) = undefined;
-        parser.init(&h) catch return error.OutOfMemory;
+        parser.init(self.conn.gpa, &h) catch return error.OutOfMemory;
         defer parser.deinit();
         parser.feed(body, true) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,

@@ -32,7 +32,7 @@ const api = @import("../connector.zig");
 const doc = @import("../document.zig");
 const files = @import("files.zig");
 const bz2 = @import("wikipedia/bz2.zig");
-const xml = @import("../xml.zig");
+const xmlzig = @import("xmlzig");
 const wikitext = @import("wikipedia/wikitext.zig");
 
 pub const kind = "wikipedia";
@@ -218,58 +218,74 @@ pub const WikipediaConnector = struct {
             .start_offset = start,
             .xml_checkpoints = !is_bz2,
         };
-        var parser: xml.Parser(PageHandler) = undefined;
-        parser.init(&h) catch return error.OutOfMemory;
-        defer parser.deinit();
-
-        // A resumed run begins in the middle of the document: give the
-        // parser the root element the real file opened earlier.
-        if (start > 0) parser.feed(synthetic_root, false) catch return error.SourceFailed;
-
-        const buf = self.gpa.alloc(u8, read_chunk) catch return error.OutOfMemory;
-        defer self.gpa.free(buf);
 
         var dec: ?bz2.Decoder = null;
         defer if (dec) |*d| d.deinit();
         if (is_bz2) dec = bz2.Decoder.init(self.gpa, io, file, start) catch return error.OutOfMemory;
-        var plain_pos: u64 = start;
+        // A resumed run begins in the middle of the document: the reader is first given the root element
+        // the real file opened earlier.
+        var dump: DumpReader = .{
+            .io = io,
+            .file = file,
+            .dec = if (dec) |*d| d else null,
+            .plain_pos = start,
+            .size = size,
+            .control = control,
+            .synthetic = if (start > 0) synthetic_root else "",
+            .interface = .{ .vtable = &.{ .stream = DumpReader.stream }, .buffer = &.{}, .seek = 0, .end = 0 },
+        };
+        const rbuf = self.gpa.alloc(u8, read_chunk) catch return error.OutOfMemory;
+        defer self.gpa.free(rbuf);
+        dump.interface.buffer = rbuf;
+
+        var rd = xmlzig.Reader.init(self.gpa, &dump.interface, .{
+            .namespaces = false,
+            .doctype = .reject,
+            .max_depth = max_depth + 2,
+            // One article's text is one run; the handler refuses articles over `max_article_bytes`, this only
+            // keeps a hostile file from growing without bound.
+            .max_token_bytes = 256 * 1024 * 1024,
+        }, null);
+        defer rd.deinit();
+        var ctl: Ctl = .{};
+        var prev_pos: u64 = 0;
 
         while (true) {
-            const n: usize = if (dec) |*d| d.read(buf) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.SourceFailed, // not bzip2, damaged or cut off
-            } else blk: {
-                var bufs = [_][]u8{buf};
-                const got = file.readPositional(io, &bufs, plain_pos) catch return error.SourceFailed;
-                plain_pos += got;
-                break :blk got;
-            };
-
-            // For bzip2 only the decoder knows the real end: a stream can end
-            // without a byte of output, which must not look like end of file.
-            const final = if (dec) |*d| d.eof else n == 0;
-            control.setProgress(if (dec) |*d| d.next_fetch else plain_pos, size);
-            parser.feed(buf[0..n], final) catch |e| {
+            const ev = rd.next() catch |e| {
                 if (h.fail) |f| return self.finish(f);
                 return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
-                    // Malformed XML, a DOCTYPE, or a truncated file.
+                    // Malformed XML, a DOCTYPE, a truncated file, or not bzip2 / damaged / cut off.
                     else => error.SourceFailed,
                 };
             };
+            ctl.consumed = dump.position(&rd);
+            switch (ev) {
+                .start_element => |se| h.startElement(&ctl, se.name.qualified),
+                .end_element => |ee| h.endElement(&ctl, ee.name.qualified),
+                .text, .cdata => |t| if (t.len > 0) h.characters(&ctl, t),
+                .end_of_document => break,
+                else => {},
+            }
+            if (ctl.stopped and h.fail == null) h.fail = .stopped;
             if (h.fail) |f| return self.finish(f);
-            if (final) break;
 
-            // A bzip2 stream just ended between pages: a clean place to resume.
-            if (dec) |*d| if (d.takeBoundary()) |off| {
+            // A bzip2 stream just ended between pages: a clean place to resume. The end may fall inside the
+            // white space between two pages, so a boundary anywhere in this event counts when the parser is
+            // between pages before and after it.
+            if (is_bz2) {
                 if (h.depth == 1 and !h.in_page) {
-                    const pos = self.setCheckpoint("bz2", off);
-                    sink.checkpoint(pos) catch |e| switch (e) {
-                        error.Stopped => return self.finish(.stopped),
-                        else => return error.SourceFailed,
-                    };
+                    if (dump.boundaryIn(prev_pos, ctl.consumed)) |off| {
+                        const pos = self.setCheckpoint("bz2", off);
+                        sink.checkpoint(pos) catch |e| switch (e) {
+                            error.Stopped => return self.finish(.stopped),
+                            else => return error.SourceFailed,
+                        };
+                    }
                 }
-            };
+                dump.forgetBoundariesBefore(ctl.consumed);
+            }
+            prev_pos = ctl.consumed;
         }
         return .{};
     }
@@ -289,7 +305,120 @@ const Fail = enum { stopped, cancelled, out_of_memory, too_deep };
 
 const Node = enum { other, page, revision, title, ns, page_id, rev_id, timestamp, text, redirect };
 
-/// The Expat handler: follows the dump's structure and, at the end of each
+/// What the page handler may ask of the reading loop.
+const Ctl = struct {
+    stopped: bool = false,
+    /// Bytes of the document consumed up to and including the current event.
+    consumed: u64 = 0,
+
+    fn stop(self: *Ctl) void {
+        self.stopped = true;
+    }
+};
+
+/// The dump as an `Io.Reader` for xml-zig: the synthetic root of a resumed run, then the decoded (or plain)
+/// file. It notes where each bzip2 stream ended in the decoded bytes, so that the loop can save a position
+/// when the parser has consumed exactly up to such a boundary.
+const DumpReader = struct {
+    interface: Io.Reader,
+    io: Io,
+    file: Io.File,
+    dec: ?*bz2.Decoder,
+    plain_pos: u64,
+    size: u64,
+    control: *api.Control,
+    synthetic: []const u8,
+    /// Decoded bytes read but not yet handed on.
+    pending: []const u8 = &.{},
+    chunk: [read_chunk]u8 = undefined,
+    /// Bytes handed to the reader so far (the synthetic root included).
+    produced: u64 = 0,
+    done: bool = false,
+    /// Ends of bzip2 streams: (offset in the bytes handed on, offset in the file where the next stream starts).
+    bounds: [8]Boundary = undefined,
+    nbounds: usize = 0,
+
+    const Boundary = struct { plain: u64, file_off: u64 };
+
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const self: *DumpReader = @fieldParentPtr("interface", r);
+        if (self.synthetic.len > 0) {
+            const n = limit.minInt(self.synthetic.len);
+            try w.writeAll(self.synthetic[0..n]);
+            self.synthetic = self.synthetic[n..];
+            self.produced += n;
+            return n;
+        }
+        while (self.pending.len == 0) {
+            if (self.done) return error.EndOfStream;
+            self.fill() catch return error.ReadFailed;
+        }
+        const n = limit.minInt(self.pending.len);
+        try w.writeAll(self.pending[0..n]);
+        self.pending = self.pending[n..];
+        self.produced += n;
+        return n;
+    }
+
+    fn fill(self: *DumpReader) error{Failed}!void {
+        if (self.dec) |d| {
+            const n = d.read(&self.chunk) catch return error.Failed; // not bzip2, damaged or cut off
+            // For bzip2 only the decoder knows the real end: a stream can end without a byte of output.
+            self.done = d.eof;
+            self.control.setProgress(d.next_fetch, self.size);
+            self.pending = self.chunk[0..n];
+            if (d.takeBoundary()) |off| {
+                // A read never crosses a stream boundary, so it lies at the end of these bytes.
+                if (self.nbounds < self.bounds.len) {
+                    self.bounds[self.nbounds] = .{ .plain = self.produced + n, .file_off = off };
+                    self.nbounds += 1;
+                }
+            }
+        } else {
+            var bufs = [_][]u8{&self.chunk};
+            const n = self.file.readPositional(self.io, &bufs, self.plain_pos) catch return error.Failed;
+            self.plain_pos += n;
+            self.done = n == 0;
+            self.control.setProgress(self.plain_pos, self.size);
+            self.pending = self.chunk[0..n];
+        }
+    }
+
+    /// How many bytes of the document the parser has used: what was handed to its reader, less what that reader
+    /// still holds and what the parser read ahead and pushed back. (The parser's own counter does not include
+    /// the bytes it looks at to detect the encoding.)
+    fn position(self: *const DumpReader, rd: *const xmlzig.Reader) u64 {
+        return self.produced - (self.interface.end - self.interface.seek) - rd.push_len;
+    }
+
+    /// The file offset to resume from if a stream ended at or between `from` and `to` bytes of the document.
+    fn boundaryIn(self: *DumpReader, from: u64, to: u64) ?u64 {
+        var found: ?usize = null;
+        for (self.bounds[0..self.nbounds], 0..) |b, i| if (b.plain >= from and b.plain <= to) {
+            found = i; // the latest one wins
+        };
+        const i = found orelse return null;
+        const off = self.bounds[i].file_off;
+        // It is used up, and so is any earlier one.
+        std.mem.copyForwards(Boundary, self.bounds[0 .. self.nbounds - i - 1], self.bounds[i + 1 .. self.nbounds]);
+        self.nbounds -= i + 1;
+        return off;
+    }
+
+    /// Forgets the boundaries the parser has gone past without their being usable.
+    fn forgetBoundariesBefore(self: *DumpReader, consumed: u64) void {
+        var keep: usize = 0;
+        for (self.bounds[0..self.nbounds]) |b| {
+            if (b.plain >= consumed) {
+                self.bounds[keep] = b;
+                keep += 1;
+            }
+        }
+        self.nbounds = keep;
+    }
+};
+
+/// The page handler: follows the dump's structure and, at the end of each
 /// page, converts and submits it.
 const PageHandler = struct {
     conn: *WikipediaConnector,
@@ -319,7 +448,7 @@ const PageHandler = struct {
     oversized: bool = false,
     broken: bool = false, // a field overflowed or memory ran out
 
-    const P = xml.Parser(PageHandler);
+    const P = Ctl;
 
     fn fieldList(self: *PageHandler, n: Node) ?*std.ArrayList(u8) {
         return switch (n) {
@@ -333,7 +462,7 @@ const PageHandler = struct {
         };
     }
 
-    pub fn startElement(self: *PageHandler, p: *P, name: []const u8, _: xml.Attrs) void {
+    pub fn startElement(self: *PageHandler, p: *P, name: []const u8) void {
         if (self.fail != null) return;
         self.depth += 1;
         if (self.depth > max_depth) {
@@ -442,8 +571,7 @@ const PageHandler = struct {
         if (self.pages_since_checkpoint < checkpoint_every_pages) return;
         self.pages_since_checkpoint = 0;
         // Plain XML: the position just after this page's closing tag.
-        const end: i64 = p.byteIndex() + p.byteCount();
-        const file_off: u64 = self.start_offset + @as(u64, @intCast(end)) - self.synthetic;
+        const file_off: u64 = self.start_offset + p.consumed - self.synthetic;
         const pos = self.conn.setCheckpoint("xml", file_off);
         self.sink.checkpoint(pos) catch |e| switch (e) {
             error.Stopped => self.abort(p, .stopped),

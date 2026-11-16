@@ -1,6 +1,6 @@
 # 0026: Our own XML library (xml-zig), vendored
 
-Status: vendored and building; not used yet. Replacing Expat is a later step.
+Status: implemented. xml-zig reads all XML in the program; Expat has been removed (see the addendum).
 
 ## Context
 
@@ -28,3 +28,12 @@ asked for an XML library of the same kind.
 
 - `vendor/xml-zig/ai/SPEC.md`, `vendor/xml-zig/docs/decisions/0001-pull-parser-and-scope.md`.
 - XML 1.0 (Fifth Edition), https://www.w3.org/TR/xml/ ; Namespaces in XML 1.0, https://www.w3.org/TR/xml-names/ .
+
+## Addendum: Expat removed (2026-11)
+
+The Wikipedia, feeds and crawl (sitemap) connectors now read XML with xml-zig and the vendored C Expat is gone.
+
+- `src/xml.zig` is a small push-style wrapper over xml-zig for the connectors that hold a whole document (feeds, sitemaps): same handler interface as before, names as written, no namespace resolution, DOCTYPE refused.
+- The Wikipedia connector reads its dump through xml-zig's pull reader over a reader of its own (`DumpReader`) that serves the decoded bzip2 or plain bytes. Positions for resuming are found as before: a bzip2 stream boundary counts when the parser is between pages on both sides of the event that contains it (a stream may end inside the white space between two pages, so exact equality with the end of an event is not enough; found by the resume test).
+- Measured on Simple English Wikipedia (286,047 articles, the same count and no skips with either): CPU 136 s user + 58 s system with Expat, 167 s + 65 s with xml-zig, about 22 % more user time overall (wall time 5:22 and 6:00 on a busy machine), 22.8 MB and 24.1 MB resident. The XML reader is slower than Expat; the cost is accepted for dropping a C dependency and a build step. Speeding it up is a matter for xml-zig.
+- A single text run (one article) must fit in memory up to 256 MiB; the connector's own limit (`max_article_bytes`, at most 64 MiB) refuses larger articles before that matters.

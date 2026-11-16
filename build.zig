@@ -37,14 +37,14 @@ pub fn build(b: *std.Build) void {
     });
 
     // Optional XML-based connectors and the C libraries they need: Wikipedia
-    // (bzip2 for the dump's compression, Expat for its XML) and feeds (Expat).
+    // (bzip2 for the dump's compression) and feeds. Both read XML with the vendored xml-zig.
     // `-Dwikipedia=false` and `-Dfeeds=false` leave them out; a library that no
     // enabled connector needs is not compiled or linked at all (docs/decisions/
     // 0007, 0011, 0016). Windows is not supported yet.
     const target_os = target.result.os.tag;
     const supported = target_os != .windows;
-    const want_wikipedia = b.option(bool, "wikipedia", "Build the Wikipedia connector with vendored bzip2 and Expat (default: on, except on Windows)") orelse supported;
-    const want_feeds = b.option(bool, "feeds", "Build the RSS/Atom feeds connector with vendored Expat (default: on, except on Windows)") orelse supported;
+    const want_wikipedia = b.option(bool, "wikipedia", "Build the Wikipedia connector with vendored bzip2 (default: on, except on Windows)") orelse supported;
+    const want_feeds = b.option(bool, "feeds", "Build the RSS/Atom feeds connector (default: on, except on Windows)") orelse supported;
     if ((want_wikipedia or want_feeds) and !supported) @panic("the Wikipedia and feeds connectors are not supported on Windows yet; pass -Dwikipedia=false -Dfeeds=false");
     // The web crawler uses Zig's standard HTTP and TLS client (no C library)
     // and the bundled Mozilla CA file (docs/decisions/0018).
@@ -54,8 +54,6 @@ pub fn build(b: *std.Build) void {
     // with the image modules (docs/decisions/0023).
     const want_media = b.option(bool, "media", "Build image decoding (search by image) with vendored Wuffs (default: on, except on Windows)") orelse supported;
     if (want_media and !supported) @panic("image support is not supported on Windows yet; pass -Dmedia=false");
-    // The crawler reads sitemaps with Expat too.
-    const need_expat = want_wikipedia or want_feeds or want_crawler;
 
     const bz2_c: ?*std.Build.Module = if (want_wikipedia) blk: {
         const tc = b.addTranslateC(.{
@@ -72,43 +70,6 @@ pub fn build(b: *std.Build) void {
             .flags = &.{"-D_FILE_OFFSET_BITS=64"},
         });
         m.addIncludePath(b.path("vendor/bzip2"));
-        break :blk m;
-    } else null;
-
-    const expat_c: ?*std.Build.Module = if (need_expat) blk: {
-        const tc = b.addTranslateC(.{
-            .root_source_file = b.path("vendor/expat_c.h"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        tc.addIncludePath(b.path("vendor/expat"));
-        const m = tc.createModule();
-        // Expat salts its hash tables with system entropy; which source to
-        // use depends on the target. XML_GE=0 (no entity expansion) and no DTD
-        // support are set in vendor/expat/expat_config.h.
-        const little = target.result.cpu.arch.endian() == .little;
-        const entropy_flags: []const []const u8 = if (target_os == .linux)
-            &.{ "-DHAVE_GETRANDOM", "-DXML_DEV_URANDOM" }
-        else
-            &.{"-DHAVE_ARC4RANDOM_BUF"};
-        const entropy_files: []const []const u8 = if (target_os == .linux)
-            &.{ "random_getrandom.c", "random_dev_urandom.c" }
-        else
-            &.{"random_arc4random_buf.c"};
-        const byte_order: []const u8 = if (little) "-DBYTEORDER=1234" else "-DBYTEORDER=4321";
-        const expat_flags = std.mem.concat(b.allocator, []const u8, &.{ &.{ "-DHAVE_EXPAT_CONFIG_H", byte_order }, entropy_flags }) catch @panic("out of memory");
-        m.addCSourceFiles(.{
-            .root = b.path("vendor/expat"),
-            .files = &.{ "xcs.c", "xmlparse.c", "xmlrole.c", "xmltok.c" },
-            .flags = expat_flags,
-        });
-        m.addCSourceFiles(.{
-            .root = b.path("vendor/expat"),
-            .files = entropy_files,
-            .flags = expat_flags,
-        });
-        m.addIncludePath(b.path("vendor/expat"));
         break :blk m;
     } else null;
 
@@ -135,7 +96,6 @@ pub fn build(b: *std.Build) void {
     core_options.addOption(bool, "feeds", want_feeds);
     core_options.addOption(bool, "crawler", want_crawler);
     core_options.addOption(bool, "media", want_media);
-    core_options.addOption(bool, "xml", need_expat);
 
     // The core library: search, storage and ingestion, plus the bundled
     // connectors behind the one connector interface. The search, storage and
@@ -157,7 +117,6 @@ pub fn build(b: *std.Build) void {
     if (want_crawler) core.addAnonymousImport("cacert_pem", .{ .root_source_file = b.path("vendor/cacert/cacert.pem") });
     if (wuffs_c) |m| core.addImport("wuffs_c", m);
     if (bz2_c) |m| core.addImport("bz2_c", m);
-    if (expat_c) |m| core.addImport("expat_c", m);
 
     // The HTTP adapter: a separate module that imports the core.
     const http = b.addModule("dksearch_http", .{

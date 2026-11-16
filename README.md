@@ -6,7 +6,7 @@ Status: version 0.0.0, pre-release. It works end to end and is tested (over 220 
 
 ## Build
 
-Needs Zig 0.17.1 and nothing else. All dependencies are vendored (SQLite, a TOML parser, the Mozilla CA certificates, and for the Wikipedia, feeds and crawl connectors Expat and, for Wikipedia, bzip2). The web crawler uses Zig's own HTTP and TLS client.
+Needs Zig 0.17.1 and nothing else. All dependencies are vendored (SQLite, a TOML parser, the Mozilla CA certificates, and an XML parser, and, for Wikipedia, bzip2). The web crawler uses Zig's own HTTP and TLS client.
 
     zig build -Doptimize=ReleaseSafe     # binary: zig-out/bin/dksearch
     zig build test                       # all tests; they run offline
@@ -55,4 +55,4 @@ Sources are optional. With none configured, `serve` still works and serves whate
 
 ## License
 
-GPL-2.0-only, see `LICENSE`. Vendored code keeps its own licenses (SQLite: public domain; toml-zig and Expat: MIT; bzip2: BSD-style), recorded in `vendor/*/README.md`. Data you import (Project Gutenberg books, Wikipedia text) has its own terms, which you must follow.
+GPL-2.0-only, see `LICENSE`. Vendored code keeps its own licenses (SQLite: public domain; toml-zig and xml-zig: MIT; bzip2: BSD-style), recorded in `vendor/*/README.md`. Data you import (Project Gutenberg books, Wikipedia text) has its own terms, which you must follow.
