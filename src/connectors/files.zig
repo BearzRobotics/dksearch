@@ -29,7 +29,7 @@ pub const kind = "files";
 pub const default_max_file_bytes: u32 = 4 * 1024 * 1024;
 pub const hard_max_file_bytes: u32 = 64 * 1024 * 1024;
 const checkpoint_every = 100;
-const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals" };
+const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text" };
 
 /// Checks a source's options without touching the filesystem.
 pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!void {
@@ -72,13 +72,15 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
             },
         }
     }
-    if (source.option("serve_originals")) |v| switch (v) {
-        .boolean => {},
-        else => {
-            diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].serve_originals", .{source.name}) catch "serve_originals", "expected true or false", .{});
-            return error.WrongType;
-        },
-    };
+    inline for (.{ "serve_originals", "pdf_text" }) |bool_key| {
+        if (source.option(bool_key)) |v| switch (v) {
+            .boolean => {},
+            else => {
+                diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}]." ++ bool_key, .{source.name}) catch bool_key, "expected true or false", .{});
+                return error.WrongType;
+            },
+        };
+    }
     if (source.option("language")) |v| {
         const key = std.fmt.bufPrint(&kbuf, "source[{s}].language", .{source.name}) catch "language";
         switch (v) {
@@ -109,6 +111,8 @@ pub const FilesConnector = struct {
     root: []const u8,
     max_file_bytes: u32,
     language: ?[]const u8,
+    /// Index PDFs by running the external `pdftotext` program (`pdf_text = true`).
+    pdf_text: bool,
     /// Backs the checkpoint handed back in an `Outcome`.
     checkpoint_buf: std.ArrayList(u8) = .empty,
 
@@ -126,6 +130,7 @@ pub const FilesConnector = struct {
             .root = root,
             .max_file_bytes = @intCast(source.optionInt("max_file_bytes") orelse default_max_file_bytes),
             .language = language,
+            .pdf_text = source.optionBool("pdf_text") orelse false,
         };
     }
 
@@ -169,9 +174,13 @@ pub const FilesConnector = struct {
 
         var dir = Io.Dir.cwd().openDir(io, self.root, .{ .iterate = true }) catch return error.InvalidSource;
         defer dir.close(io);
+        if (self.pdf_text and !pdftotextWorks(self.gpa, io)) {
+            std.debug.print("files source \"{s}\": pdf_text = true needs the pdftotext program (on Ubuntu: sudo apt install poppler-utils), and it could not be run\n", .{self.name});
+            return error.SourceFailed;
+        }
 
         const base_abs = Io.Dir.cwd().realPathFileAlloc(io, self.root, arena) catch return error.InvalidSource;
-        const paths = collect(arena, io, dir) catch |e| switch (e) {
+        const paths = collect(arena, io, dir, self.pdf_text) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SourceFailed,
         };
@@ -187,6 +196,7 @@ pub const FilesConnector = struct {
 
             switch (self.readOne(arena, io, dir, base_abs, rel)) {
                 .skip => {},
+                .no_text => control.reject(.no_text),
                 .refused => _ = control.rejected.fetchAdd(1, .monotonic),
                 .document => |d| {
                     sink.submit(d) catch |e| switch (e) {
@@ -218,11 +228,17 @@ pub const FilesConnector = struct {
         return .{ .interrupted = true, .checkpoint = self.checkpoint_buf.items };
     }
 
-    const Read = union(enum) {
+    fn readPdf(self: *FilesConnector, arena: Allocator, io: Io, st: Io.File.Stat, base_abs: []const u8, rel: []const u8) Read {
+        return readPdfImpl(self, arena, io, st, base_abs, rel);
+    }
+
+    pub const Read = union(enum) {
         /// Nothing to index (an empty file, or the file vanished): not an error.
         skip,
         /// Present but unacceptable (too large, unreadable): counted as rejected.
         refused,
+        /// A PDF with no text layer (a scan): counted and reported as "no_text".
+        no_text,
         document: doc.Document,
         out_of_memory,
     };
@@ -230,6 +246,7 @@ pub const FilesConnector = struct {
     fn readOne(self: *FilesConnector, arena: Allocator, io: Io, dir: Io.Dir, base_abs: []const u8, rel: []const u8) Read {
         const st = dir.statFile(io, rel, .{ .follow_symlinks = false }) catch return .refused;
         if (st.kind != .file) return .refused; // replaced by a link or directory since listing
+        if (hasExtension(rel, ".pdf")) return self.readPdf(arena, io, st, base_abs, rel);
         if (st.size > self.max_file_bytes) return .refused;
         if (st.size == 0) return .skip;
 
@@ -256,8 +273,57 @@ pub const FilesConnector = struct {
     }
 };
 
+const pdf_timeout_seconds = 60;
+
+/// True if the `pdftotext` program (poppler-utils) can be run.
+fn pdftotextWorks(gpa: Allocator, io: Io) bool {
+    const r = std.process.run(gpa, io, .{ .argv = &.{ "pdftotext", "-v" }, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return false;
+    gpa.free(r.stdout);
+    gpa.free(r.stderr);
+    return true; // `pdftotext -v` prints its version and some builds exit non-zero; it ran
+}
+
+fn readPdfImpl(self: *FilesConnector, arena: Allocator, io: Io, st: Io.File.Stat, base_abs: []const u8, rel: []const u8) FilesConnector.Read {
+    if (st.size > hard_max_file_bytes) return .refused;
+    if (st.size == 0) return .skip;
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ base_abs, rel }) catch return .out_of_memory;
+    const result = std.process.run(arena, io, .{
+        .argv = &.{ "pdftotext", "-enc", "UTF-8", "-layout", "-q", path, "-" },
+        .stdout_limit = .limited(self.max_file_bytes + 1),
+        .stderr_limit = .limited(64 * 1024),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(pdf_timeout_seconds), .clock = .awake } },
+    }) catch |e| switch (e) {
+        error.OutOfMemory => return .out_of_memory,
+        else => return .refused, // too much text, a timeout, or the program could not run
+    };
+    if (!result.term.success()) return .refused; // damaged, encrypted, or not a PDF
+    if (result.stdout.len > self.max_file_bytes) return .refused;
+    // Page breaks (form feeds) become blank lines; anything else that is not text is dropped.
+    var text: std.ArrayList(u8) = .empty;
+    for (result.stdout) |b| switch (b) {
+        0x0C => text.appendSlice(arena, "\n\n") catch return .out_of_memory,
+        0 => {},
+        else => text.append(arena, b) catch return .out_of_memory,
+    };
+    const trimmed = std.mem.trim(u8, text.items, " \t\r\n");
+    if (trimmed.len == 0) return .no_text;
+    if (!std.unicode.utf8ValidateSlice(trimmed)) return .refused;
+    const url = fileUrl(arena, base_abs, rel) catch return .out_of_memory;
+    const mtime_s: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s));
+    return .{ .document = .{
+        .connector = self.name,
+        .source_id = rel,
+        .canonical_url = url,
+        .title = titleOf(trimmed, rel, false),
+        .text = trimmed,
+        .language = self.language,
+        .content_type = "application/pdf",
+        .modified_at = mtime_s,
+    } };
+}
+
 /// Paths (relative, '/'-separated) of every eligible file under `dir`.
-fn collect(arena: Allocator, io: Io, dir: Io.Dir) !([][]const u8) {
+fn collect(arena: Allocator, io: Io, dir: Io.Dir, pdf: bool) !([][]const u8) {
     var walker = try dir.walkSelectively(arena);
     defer walker.deinit();
     var list: std.ArrayList([]const u8) = .empty;
@@ -265,7 +331,7 @@ fn collect(arena: Allocator, io: Io, dir: Io.Dir) !([][]const u8) {
         if (entry.basename.len == 0 or entry.basename[0] == '.') continue; // hidden: skipped, not entered
         switch (entry.kind) {
             .directory => try walker.enter(io, entry),
-            .file => if (hasExtension(entry.path, ".txt") or hasExtension(entry.path, ".md")) {
+            .file => if (hasExtension(entry.path, ".txt") or hasExtension(entry.path, ".md") or (pdf and hasExtension(entry.path, ".pdf"))) {
                 try list.append(arena, try arena.dupe(u8, entry.path));
             },
             else => {}, // symlinks, devices, sockets, ...: never followed or read
@@ -326,6 +392,16 @@ const state_sqlite = @import("../state_sqlite.zig");
 
 fn src(opts: []const config.Option) config.Source {
     return .{ .name = "notes", .kind = "files", .options = opts };
+}
+
+test "validate: pdf_text and serve_originals are booleans" {
+    var d: config.Diagnostic = .{};
+    try validate(src(&.{ .{ .key = "path", .value = .{ .string = "/x" } }, .{ .key = "pdf_text", .value = .{ .boolean = true } }, .{ .key = "serve_originals", .value = .{ .boolean = false } } }), &d);
+    try testing.expectError(error.WrongType, validate(src(&.{ .{ .key = "path", .value = .{ .string = "/x" } }, .{ .key = "pdf_text", .value = .{ .string = "yes" } } }), &d));
+    try testing.expectError(error.WrongType, validate(src(&.{
+        .{ .key = "path", .value = .{ .string = "/x" } },
+        .{ .key = "serve_originals", .value = .{ .integer = 1 } },
+    }), &d));
 }
 
 test "validate: path is required; unknown and mistyped options are named" {

@@ -1458,7 +1458,7 @@ const kind_infos = [_]KindInfo{
         .title = "A folder of text files",
         .blurb = "Indexes the .txt and Markdown files in a folder on this machine, such as your notes.",
         .needs = "The folder's path.",
-        .template = "path = \"/home/me/notes\"   # the folder to index (change this)\n",
+        .template = "path = \"/home/me/notes\"   # the folder to index (change this)\n# pdf_text = true         # also index PDFs (needs the pdftotext program: sudo apt install poppler-utils)\n# serve_originals = true  # let results open the original file in the browser (restart the server after changing)\n",
     },
     .{
         .kind = "wikipedia",

@@ -256,12 +256,18 @@ enabled	Boolean	true	A disabled source stays in the file but is never run.
 retain_text	Boolean	true	Keep each document's text so the index can be rebuilt without reading the source again. Set false for a source whose terms forbid keeping its text; its documents are then skipped by **rebuild**.
 rights	String	connector default	Override the redistribution flag (`unknown`, `allowed`, `restricted`, `forbidden`) of every document from this source. Defaults are conservative guesses, not legal advice; the decision is yours. Only documents that are added or changed afterwards pick it up; unchanged ones keep the flag they were stored with.
 
-Kind `files` indexes `.txt` and `.md` files (extension case-insensitive) under a directory, including subdirectories:
+Kind `files` indexes `.txt` and `.md` files (and `.pdf` files with `pdf_text`; extensions are case-insensitive) under a directory, including subdirectories:
 
 Key	Type	Default	Description
 path	String	required	The directory to index, absolute or relative to the working directory.
 max_file_bytes	Integer	4194304	Largest file accepted, 1-67108864. Larger files are skipped, never truncated.
 language	String	none	Language tag stored on every document, such as `en` or `pt-BR`.
+pdf_text	Boolean	false	Also index `.pdf` files, by running the external program **pdftotext** (package `poppler-utils`; on Ubuntu `sudo apt install poppler-utils`). See below.
+serve_originals	Boolean	false	Let the document viewer offer the original file of each document from this source, so the browser can open it. See below.
+
+PDFs with `pdf_text = true`: each PDF is read by `pdftotext -layout` and the text is indexed with the page breaks kept as blank lines. A PDF with no text layer (a scan) is skipped and counted as `no_text`; damaged or encrypted ones are refused. The program runs with a 60 second limit per file and its output is limited by `max_file_bytes`; a PDF itself may be up to 64 MiB. If **pdftotext** is not installed the source fails with a message saying so. This only reads the text layer: it keeps no page numbers or structure, and it does no OCR. Tools such as MinerU or Docling convert PDFs far better (tables, formulas, scans); their Markdown output can be indexed as ordinary `.md` files with this same connector.
+
+Original files with `serve_originals = true`: the viewer page of a document gets an "Open the original file" button (address `/doc/ID/file` on the search server). A file is read only from inside the source's `path` (symbolic links are resolved first, so a link cannot lead out of it), and only up to 64 MiB. PDFs and common images (PNG, JPEG, GIF, WebP, BMP) open in the browser; text, Markdown and HTML files are sent as plain text, never as a page; anything else, including SVG, is a download. Turn this on only for folders whose files anyone who can reach the search page may read. The setting is read when the server starts.
 
 Files are read in sorted path order. Symbolic links are never followed. Hidden files and directories (names starting with `.`) are skipped. Files that are not valid UTF-8, contain a NUL byte, or are empty are skipped. The title is the first Markdown `# heading` in a `.md` file, otherwise the file name without its extension. The document id is derived from the source name and the path relative to `path`.
 
