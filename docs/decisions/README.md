@@ -45,3 +45,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0027 | Showing documents: md-zig and an allow-list sanitizer |
 | 0028 | Downloading ZIM files from the Kiwix library |
 | 0029 | Ranking controls, stop words and synonyms, schedules, skip examples |
+| 0030 | Retrieval API for RAG |

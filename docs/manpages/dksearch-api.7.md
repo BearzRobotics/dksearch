@@ -6,7 +6,10 @@ NAME
 dksearch-api - HTTP interface of dksearch: JSON API version 1 and the HTML search page
 
 SYNOPSIS
-GET /api/v1/search?q=TEXT[&language=L][&content_type=T][&connector=C][&filter=F]...[&sort=ORDER][&explain=1][&limit=N][&offset=N][&regex=PATTERN[&regex_flags=i][&regex_dialect=perl|ere]]
+GET /api/v1/search?q=TEXT[&language=L][&content_type=T][&connector=C][&source=S]...[&filter=F]...[&sort=ORDER][&explain=1][&limit=N][&offset=N][&regex=PATTERN[&regex_flags=i][&regex_dialect=perl|ere]]
+
+GET /api/v1/retrieve?q=TEXT[&source=S]...[&filter=F]...[&k=N][&candidates=N][&context=N][&chunk_chars=N][&overlap=N]
+: Passages for a RAG client: the best chunks of the documents a search for `q` finds. `q`, `source`, `connector` and `filter` mean what they mean for search (`regex` is not available here), and `q` needs at least one word to look for. The first `candidates` documents (default 30, at most 100) have their stored texts split into chunks of about `chunk_chars` bytes (default 1200, 200 to 8000, cut at paragraph ends and never across a heading unless the section is tiny) with `overlap` bytes (default 150) of the previous chunk repeated, and the chunks are ranked on the query's words with BM25 (a word in a heading counts double). Returns `chunks` (at most `k`, default 8, at most 50), `candidates` and `without_text` (candidates that have no stored text). Each chunk has `doc_id`, `view_url`, `source`, `title`, `url`, `heading` (the headings above it, outermost first), `index` and `of` (its place among the document's chunks), `start` and `end` (its byte span in the document's stored text), `page` (when the text has page breaks, else null), `score`, `text`, and `before` and `after`: the texts of up to `context` neighbouring chunks (0 to 3, default 0). Chunks are made when asked, from the stored text, so nothing needs rebuilding. Errors: 400 `invalid_parameter` or `empty_query`, 503 `no_content` when nothing has been imported yet.
 
 GET /api/v1/health
 
@@ -38,6 +41,9 @@ filter
 
 sort
 : Optional order of the results: `relevance` (the default), `newest` or `oldest` (by the date the source gave, else the date it was added), `largest` or `smallest` (by the size of the file when the source knows it, else of the text) or `title` (A to Z, ignoring case). Documents without the date or size come last. Ties fall back to relevance. Other values are `invalid_parameter`. Ordering by anything but relevance has to rank every matching document, so on a very large index a very common word may reach the time limit (503 `search_timeout`).
+
+source
+: Optional, may be repeated (at most 64): a source name, or `kind:NAME` for every source of a kind (`kind:zim`). Several are alternatives. Without any, all sources are searched. Together with `connector` they are all alternatives.
 
 language, content_type, connector
 : Optional exact-match filters on the document's language tag, media type and source connector. At most 64 bytes, no control characters. An empty value means no filter.

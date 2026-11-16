@@ -122,7 +122,7 @@ const PublicApp = struct {
 
     fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/search", "/api/v1/search", "/api/v1/health", "/assets/style.css" }) |known| {
+        for ([_][]const u8{ "/", "/search", "/api/v1/search", "/api/v1/retrieve", "/api/v1/health", "/assets/style.css" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";

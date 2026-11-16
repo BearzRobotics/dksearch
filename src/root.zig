@@ -20,6 +20,7 @@ pub const ziparchive = @import("ziparchive.zig");
 pub const kiwix = @import("kiwix.zig");
 pub const lexicon = @import("lexicon.zig");
 pub const scheduler = @import("scheduler.zig");
+pub const retrieve = @import("retrieve.zig");
 pub const optioninfo = @import("optioninfo.zig");
 pub const settinginfo = @import("settinginfo.zig");
 pub const officetext = @import("officetext.zig");
@@ -63,6 +64,7 @@ test {
     _ = kiwix;
     _ = lexicon;
     _ = scheduler;
+    _ = retrieve;
     _ = optioninfo;
     _ = settinginfo;
     _ = officetext;

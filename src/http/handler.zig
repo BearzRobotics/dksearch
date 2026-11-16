@@ -48,7 +48,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, api_search, api_health, style, document, zim, other };
+const Route = enum { help_search, help_regex, home, search_page, api_search, api_retrieve, api_health, style, document, zim, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -56,6 +56,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/help") or std.mem.eql(u8, path, "/help/search")) return .help_search;
     if (std.mem.eql(u8, path, "/help/regex")) return .help_regex;
     if (std.mem.eql(u8, path, "/api/v1/search")) return .api_search;
+    if (std.mem.eql(u8, path, "/api/v1/retrieve")) return .api_retrieve;
     if (std.mem.eql(u8, path, "/api/v1/health")) return .api_health;
     if (std.mem.eql(u8, path, "/assets/style.css")) return .style;
     if (std.mem.startsWith(u8, path, "/doc/")) return .document;
@@ -158,7 +159,8 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Service
             html.writeHelpRegex(&aw.writer, if (regex) |svc| svc.limits else null) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
-        .api_search => try apiSearch(arena, searcher, regex, try sourceBoosts(arena, services), t.params),
+        .api_search => try apiSearch(arena, searcher, regex, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
+        .api_retrieve => try apiRetrieve(arena, searcher, services, t.params),
         .search_page => try pageSearch(arena, searcher, regex, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
         .document => try documentPage(arena, searcher, services, t.path, t.params),
         .zim => try zimPage(arena, services, t.path),
@@ -315,13 +317,17 @@ pub fn regexSearch(arena: Allocator, searcher: dk.search.Searcher, service: ?*dk
     return .{ .ok = r };
 }
 
-fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
+fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
     const parsed = switch (try parseQuery(arena, params, false)) {
         .ok => |p| p,
         .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
     var q = parsed.q;
     q.boosts = boosts;
+    switch (try applySources(arena, &q, sources, params)) {
+        .ok => {},
+        .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
+    }
     if (params.get("explain")) |v| q.explain = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
     if (parsed.re) |req| {
         const r = switch (try regexSearch(arena, searcher, regex, q, req)) {
@@ -520,23 +526,20 @@ fn originalFile(arena: Allocator, svc: *const dk.originals.Service, hit: dk.sear
 
 // ------------------------------------------------------------ HTML pages
 
-fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
-    const parsed = switch (try parseQuery(arena, params, true)) {
-        .ok => |p| p,
-        .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
-    };
-    var q = parsed.q;
-    q.boosts = boosts;
-    // The ticked sources (`source`, repeatable) and the older single `connector`: each is a source name or
-    // `kind:NAME` for every source of a kind. They are alternatives (`kind:zim` is all its sources).
+/// Turns the ticked sources (`source`, repeatable) and the single `connector` into source conditions on `q`: each is
+/// a source name or `kind:NAME` for every source of a kind, and they are alternatives. Returns what was picked.
+fn applySources(arena: Allocator, q: *dk.search.Query, sources: []const html.SourceChoice, params: query.Params) error{OutOfMemory}!union(enum) { ok: []const []const u8, bad: ParamError } {
     var picked: std.ArrayList([]const u8) = .empty;
     for (try params.all(arena, "source")) |v| {
-        if (!validFilter(v)) return htmlError(arena, .bad_request, "Bad request", "source: invalid value");
-        if (picked.items.len >= 64) return htmlError(arena, .bad_request, "Bad request", "source: at most 64 sources");
+        if (!validFilter(v)) return .{ .bad = .{ .name = "source", .message = "invalid value" } };
+        if (picked.items.len >= 64) return .{ .bad = .{ .name = "source", .message = "at most 64 sources" } };
         try picked.append(arena, v);
     }
+    // The single `connector` is an exact match unless it names a kind or is combined with ticked sources.
+    const connector_is_kind = if (q.connector) |c| std.mem.startsWith(u8, c, "kind:") else false;
+    const fold = picked.items.len > 0 or connector_is_kind;
     if (q.connector) |c| try picked.append(arena, c);
-    if (picked.items.len > 0) {
+    if (fold) {
         var list: std.ArrayList(dk.search.Filter) = .empty;
         for (picked.items) |c| {
             if (std.mem.startsWith(u8, c, "kind:")) {
@@ -548,7 +551,155 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         q.filters = list.items;
         q.connector = null;
     }
-    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .picked = picked.items, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .sort = params.get("sort") orelse "" };
+    return .{ .ok = picked.items };
+}
+
+// ------------------------------------------------------------ retrieval API
+
+const max_retrieve_text_bytes = 8 * 1024 * 1024; // of one document read for chunking
+const max_retrieve_total_bytes = 64 * 1024 * 1024; // of all candidates together
+
+const RetrievedChunk = struct {
+    doc_id: []const u8,
+    view_url: []const u8,
+    source: []const u8,
+    title: ?[]const u8,
+    url: ?[]const u8,
+    /// Headings above the chunk, outermost first.
+    heading: []const []const u8,
+    /// Position among the document's chunks, and how many there are.
+    index: u32,
+    of: u32,
+    /// Byte span in the document's stored text.
+    start: usize,
+    end: usize,
+    /// Page, when the text has page breaks.
+    page: ?u32,
+    score: f64,
+    text: []const u8,
+    before: []const []const u8,
+    after: []const []const u8,
+};
+
+/// `GET /api/v1/retrieve`: the best passages for a question, for a RAG client. The candidate documents are found
+/// the way a search finds them (so every filter and source choice works), their stored text is split into
+/// chunks and the chunks are ranked on the query's words. No model is involved.
+fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Services, params: query.Params) error{OutOfMemory}!Response {
+    const store = services.content orelse return apiError(arena, .service_unavailable, "no_content", "document texts are not available (nothing has been imported yet)");
+    const parsed = switch (try parseQuery(arena, params, false)) {
+        .ok => |p| p,
+        .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
+    };
+    var q = parsed.q;
+    q.boosts = try sourceBoosts(arena, services);
+    switch (try applySources(arena, &q, try sourceChoices(arena, services), params)) {
+        .ok => {},
+        .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
+    }
+    const bounded = struct {
+        fn get(ps: query.Params, name: []const u8, default: u32, min: u32, max: u32) error{Bad}!u32 {
+            const v = ps.get(name) orelse return default;
+            if (v.len == 0) return default;
+            const n = std.fmt.parseInt(u32, v, 10) catch return error.Bad;
+            if (n < min or n > max) return error.Bad;
+            return n;
+        }
+    };
+    const k = bounded.get(params, "k", 8, 1, 50) catch return apiError(arena, .bad_request, "invalid_parameter", "k: must be 1 to 50");
+    const candidates = bounded.get(params, "candidates", 30, 1, 100) catch return apiError(arena, .bad_request, "invalid_parameter", "candidates: must be 1 to 100");
+    const context = bounded.get(params, "context", 0, 0, 3) catch return apiError(arena, .bad_request, "invalid_parameter", "context: must be 0 to 3");
+    const chunk_chars = bounded.get(params, "chunk_chars", 1200, dk.retrieve.min_chunk_chars, dk.retrieve.max_chunk_chars) catch return apiError(arena, .bad_request, "invalid_parameter", "chunk_chars: must be 200 to 8000");
+    const overlap = bounded.get(params, "overlap", 150, 0, 2000) catch return apiError(arena, .bad_request, "invalid_parameter", "overlap: must be 0 to 2000");
+    const terms = try dk.retrieve.queryTerms(arena, q.text);
+    if (terms.len == 0) return apiError(arena, .bad_request, "empty_query", "retrieval needs at least one word to look for");
+
+    q.limit = candidates;
+    q.offset = 0;
+    q.sort = .relevance;
+    const page = searcher.search(arena, q) catch |e| return searchFailure(arena, e, true);
+
+    // Chunk the candidates' stored texts.
+    const Doc = struct { hit: dk.search.Hit, chunks: []const dk.retrieve.Chunk };
+    var docs: std.ArrayList(Doc) = .empty;
+    var all_text: std.ArrayList([]const u8) = .empty;
+    var all_head: std.ArrayList([]const u8) = .empty;
+    var owner: std.ArrayList(struct { doc: u32, chunk: u32 }) = .empty;
+    var total: usize = 0;
+    var skipped: u32 = 0;
+    for (page.hits) |h| {
+        if (total >= max_retrieve_total_bytes) {
+            skipped += 1;
+            continue;
+        }
+        const bytes = store.get(arena, h.id) catch {
+            skipped += 1; // no stored text (the source does not keep it, or it is gone)
+            continue;
+        };
+        var text = bytes;
+        if (text.len > max_retrieve_text_bytes) {
+            var end: usize = max_retrieve_text_bytes;
+            while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+            text = text[0..end];
+        }
+        total += text.len;
+        const cs = dk.retrieve.chunk(arena, text, .{ .chunk_chars = chunk_chars, .overlap = overlap }) catch return error.OutOfMemory;
+        const di: u32 = @intCast(docs.items.len);
+        try docs.append(arena, .{ .hit = h, .chunks = cs });
+        for (cs) |c| {
+            try all_text.append(arena, c.text);
+            try all_head.append(arena, try std.mem.join(arena, " / ", c.heading));
+            try owner.append(arena, .{ .doc = di, .chunk = c.index });
+        }
+    }
+    const ranked = try dk.retrieve.rank(arena, terms, all_text.items, all_head.items);
+    const n_out = @min(ranked.len, k);
+    const out = try arena.alloc(RetrievedChunk, n_out);
+    for (ranked[0..n_out], out) |r, *o| {
+        const ow = owner.items[r.at];
+        const d = docs.items[ow.doc];
+        const c = d.chunks[ow.chunk];
+        const lo = ow.chunk -| context;
+        const hi = @min(ow.chunk + context + 1, @as(u32, @intCast(d.chunks.len)));
+        const before = try arena.alloc([]const u8, ow.chunk - lo);
+        for (before, lo..) |*b, i| b.* = d.chunks[i].text;
+        const after = try arena.alloc([]const u8, hi - (ow.chunk + 1));
+        for (after, ow.chunk + 1..) |*b, i| b.* = d.chunks[i].text;
+        const hex = std.fmt.bytesToHex(d.hit.id, .lower);
+        o.* = .{
+            .doc_id = try arena.dupe(u8, &hex),
+            .view_url = try std.fmt.allocPrint(arena, "/doc/{s}", .{hex}),
+            .source = d.hit.connector,
+            .title = d.hit.title,
+            .url = d.hit.url,
+            .heading = c.heading,
+            .index = c.index,
+            .of = @intCast(d.chunks.len),
+            .start = c.start,
+            .end = c.end,
+            .page = c.page,
+            .score = r.score,
+            .text = c.text,
+            .before = before,
+            .after = after,
+        };
+    }
+    return jsonResponse(arena, .ok, .{ .chunks = out, .candidates = @as(u32, @intCast(page.hits.len)), .without_text = skipped });
+}
+
+fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
+    const parsed = switch (try parseQuery(arena, params, true)) {
+        .ok => |p| p,
+        .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
+    };
+    var q = parsed.q;
+    q.boosts = boosts;
+    // The ticked sources (`source`, repeatable) and the older single `connector`: each is a source name or
+    // `kind:NAME` for every source of a kind. They are alternatives (`kind:zim` is all its sources).
+    const picked = switch (try applySources(arena, &q, sources, params)) {
+        .ok => |p| p,
+        .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
+    };
+    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .picked = picked, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .sort = params.get("sort") orelse "" };
     if (parsed.re) |req| {
         // A pattern typed in the box is already part of `q` and travels with it; only one given
         // as a parameter has to be carried separately (the pager and the exact-spelling link).
@@ -882,6 +1033,47 @@ test "the API tells what it knows about each hit, takes filter and sort paramete
     try testing.expect(std.mem.indexOf(u8, page.body, "<option value=\"newest\" selected>Newest</option>") != null);
 }
 
+test "retrieval: the best passages of the candidate documents, with headings, spans, neighbours and attribution" {
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    const id_a: dk.document.Id = .{ 0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const id_b: dk.document.Id = .{ 0xbb, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try mem.store().put(id_a, "# Mythology\n\n## Norse\n\nOdin had two ravens, Huginn and Muninn, who flew over the world.\n\n## Greek\n\nZeus ruled from Olympus and threw thunderbolts.");
+    try mem.store().put(id_b, "A cookbook about bread and soup, with nothing about birds.");
+    const hits = [_]dk.search.Hit{
+        .{ .id = id_a, .connector = "books", .url = "file:///x/myth.md", .title = "Myths", .snippet = null, .score = 2 },
+        .{ .id = id_b, .connector = "cooking", .url = null, .title = "Cooking", .snippet = null, .score = 1 },
+    };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
+    const services: Services = .{ .content = mem.store() };
+    const r = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/api/v1/retrieve?q=odin+ravens&k=3&context=1&chunk_chars=200&overlap=0");
+    try testing.expectEqual(http.Status.ok, r.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, r.body, .{});
+    defer parsed.deinit();
+    const chunks = parsed.value.object.get("chunks").?.array.items;
+    try testing.expect(chunks.len >= 1);
+    const first = chunks[0].object;
+    try testing.expectEqualStrings("books", first.get("source").?.string);
+    try testing.expect(std.mem.indexOf(u8, first.get("text").?.string, "ravens") != null);
+    try testing.expectEqualStrings("Mythology", first.get("heading").?.array.items[0].string);
+    try testing.expect(std.mem.startsWith(u8, first.get("view_url").?.string, "/doc/aa"));
+    try testing.expect(first.get("end").?.integer > first.get("start").?.integer);
+    try testing.expect(first.get("of").?.integer >= 1);
+    try testing.expect(first.get("page").? == .null);
+    for (chunks) |c| try testing.expect(!std.mem.eql(u8, c.object.get("source").?.string, "cooking")); // no matching passage
+    try testing.expectEqual(@as(i64, 2), parsed.value.object.get("candidates").?.integer);
+    // The candidates were asked for like a search: the query's words, the sources picked.
+    _ = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/api/v1/retrieve?q=odin&source=books&candidates=5");
+    try testing.expectEqual(@as(u32, 5), fake.last.?.limit);
+    try testing.expectEqualStrings("books", fake.last.?.filters[0].text);
+    // Bad parameters and a query with no words are refused, and so is a server with no stored texts.
+    try testing.expectEqual(http.Status.bad_request, handleServices(ar.allocator(), fake.searcher(), services, .GET, "/api/v1/retrieve?q=odin&k=0").status);
+    try testing.expectEqual(http.Status.bad_request, handleServices(ar.allocator(), fake.searcher(), services, .GET, "/api/v1/retrieve?q=ext%3Amd").status);
+    try testing.expectEqual(http.Status.service_unavailable, handleServices(ar.allocator(), fake.searcher(), .{}, .GET, "/api/v1/retrieve?q=odin").status);
+}
+
 test "the Source filter is a list of tick boxes grouped by kind; the ticked ones are searched and stay ticked" {
     var store = dk.sourcestore.Store.init(testing.allocator, testing.io, &.{
         .{ .name = "wiki", .kind = "wikipedia" },
@@ -933,7 +1125,7 @@ test "the Source filter is a list of tick boxes grouped by kind; the ticked ones
     // The older single `connector=` parameter still works.
     const old = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=wiki");
     try testing.expect(std.mem.indexOf(u8, old.body, "value=\"wiki\" checked>") != null);
-    try testing.expectEqualStrings("wiki", fake.last.?.filters[0].text);
+    try testing.expectEqualStrings("wiki", fake.last.?.connector.?);
 
     // A kind with no sources matches nothing, never everything.
     _ = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&source=kind:feeds");
