@@ -24,12 +24,13 @@ const Allocator = std.mem.Allocator;
 const config = @import("../config.zig");
 const api = @import("../connector.zig");
 const doc = @import("../document.zig");
+const avmeta = @import("../avmeta.zig");
 
 pub const kind = "files";
 pub const default_max_file_bytes: u32 = 4 * 1024 * 1024;
 pub const hard_max_file_bytes: u32 = 64 * 1024 * 1024;
 const checkpoint_every = 100;
-const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text" };
+const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text", "media" };
 
 /// Checks a source's options without touching the filesystem.
 pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!void {
@@ -72,7 +73,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
             },
         }
     }
-    inline for (.{ "serve_originals", "pdf_text" }) |bool_key| {
+    inline for (.{ "serve_originals", "pdf_text", "media" }) |bool_key| {
         if (source.option(bool_key)) |v| switch (v) {
             .boolean => {},
             else => {
@@ -113,6 +114,10 @@ pub const FilesConnector = struct {
     language: ?[]const u8,
     /// Index PDFs by running the external `pdftotext` program (`pdf_text = true`).
     pdf_text: bool,
+    /// Index audio and video through `ffprobe` and their subtitle or lyrics files (`media = true`).
+    media: bool,
+    /// Subtitle and lyrics files of this run, found next to their media (set by `run`).
+    sidecars: SidecarMap = .empty,
     /// Backs the checkpoint handed back in an `Outcome`.
     checkpoint_buf: std.ArrayList(u8) = .empty,
 
@@ -131,6 +136,7 @@ pub const FilesConnector = struct {
             .max_file_bytes = @intCast(source.optionInt("max_file_bytes") orelse default_max_file_bytes),
             .language = language,
             .pdf_text = source.optionBool("pdf_text") orelse false,
+            .media = source.optionBool("media") orelse false,
         };
     }
 
@@ -174,17 +180,25 @@ pub const FilesConnector = struct {
 
         var dir = Io.Dir.cwd().openDir(io, self.root, .{ .iterate = true }) catch return error.InvalidSource;
         defer dir.close(io);
+        if (self.media and !ffprobeWorks(self.gpa, io)) {
+            std.debug.print("files source \"{s}\": media = true needs the ffprobe program (on Ubuntu: sudo apt install ffmpeg), and it could not be run\n", .{self.name});
+            return error.SourceFailed;
+        }
         if (self.pdf_text and !pdftotextWorks(self.gpa, io)) {
             std.debug.print("files source \"{s}\": pdf_text = true needs the pdftotext program (on Ubuntu: sudo apt install poppler-utils), and it could not be run\n", .{self.name});
             return error.SourceFailed;
         }
 
         const base_abs = Io.Dir.cwd().realPathFileAlloc(io, self.root, arena) catch return error.InvalidSource;
-        const paths = collect(arena, io, dir, self.pdf_text) catch |e| switch (e) {
+        self.sidecars = .empty;
+        var sidecar_paths: std.ArrayList([]const u8) = .empty;
+        const paths = collect(arena, io, dir, self.pdf_text, self.media, &sidecar_paths) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SourceFailed,
         };
         std.mem.sort([]const u8, paths, {}, lessThan);
+        std.mem.sort([]const u8, sidecar_paths.items, {}, lessThan);
+        for (sidecar_paths.items) |sp| self.addSidecar(arena, sp) catch return error.OutOfMemory;
 
         var done: ?[]const u8 = null; // last path fully handled
         var since_checkpoint: u32 = 0;
@@ -228,6 +242,26 @@ pub const FilesConnector = struct {
         return .{ .interrupted = true, .checkpoint = self.checkpoint_buf.items };
     }
 
+    fn readMedia(self: *FilesConnector, arena: Allocator, io: Io, dir: Io.Dir, st: Io.File.Stat, base_abs: []const u8, rel: []const u8, fmt: avmeta.Format) Read {
+        return readMediaImpl(self, arena, io, dir, st, base_abs, rel, fmt);
+    }
+
+    /// Remembers a subtitle or lyrics file under the name of the media it belongs to: `song.en.srt`
+    /// and `song.srt` both belong to `song.mp3`.
+    fn addSidecar(self: *FilesConnector, arena: Allocator, rel: []const u8) Allocator.Error!void {
+        const ext_len = avmeta.extensionOf(rel).len + 1;
+        var stem = rel[0 .. rel.len - ext_len];
+        // A language code before the extension: `.en`, `.eng`, `.pt-BR`.
+        if (std.mem.lastIndexOfScalar(u8, stem, '.')) |dot| {
+            const tag = stem[dot + 1 ..];
+            if (isLanguageCode(tag)) stem = stem[0..dot];
+        }
+        const key = try arena.dupe(u8, stem);
+        const gop = try self.sidecars.getOrPut(arena, key);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(arena, try arena.dupe(u8, rel));
+    }
+
     fn readPdf(self: *FilesConnector, arena: Allocator, io: Io, st: Io.File.Stat, base_abs: []const u8, rel: []const u8) Read {
         return readPdfImpl(self, arena, io, st, base_abs, rel);
     }
@@ -247,6 +281,7 @@ pub const FilesConnector = struct {
         const st = dir.statFile(io, rel, .{ .follow_symlinks = false }) catch return .refused;
         if (st.kind != .file) return .refused; // replaced by a link or directory since listing
         if (hasExtension(rel, ".pdf")) return self.readPdf(arena, io, st, base_abs, rel);
+        if (self.media) if (avmeta.formatOf(rel)) |fmt| return self.readMedia(arena, io, dir, st, base_abs, rel, fmt);
         if (st.size > self.max_file_bytes) return .refused;
         if (st.size == 0) return .skip;
 
@@ -274,6 +309,128 @@ pub const FilesConnector = struct {
 };
 
 const pdf_timeout_seconds = 60;
+const media_timeout_seconds = 30;
+/// The most subtitle or lyrics files read for one media file, and the largest of them.
+const max_sidecars_per_media = 3;
+const max_sidecar_bytes = 2 * 1024 * 1024;
+
+const SidecarMap = std.StringHashMapUnmanaged(std.ArrayList([]const u8));
+
+fn isLanguageCode(tag: []const u8) bool {
+    if (tag.len < 2 or tag.len > 8) return false;
+    for (tag) |c| if (!std.ascii.isAlphabetic(c) and c != '-') return false;
+    return true;
+}
+
+/// True if the `ffprobe` program (ffmpeg) can be run.
+fn ffprobeWorks(gpa: Allocator, io: Io) bool {
+    const r = std.process.run(gpa, io, .{ .argv = &.{ "ffprobe", "-version" }, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return false;
+    gpa.free(r.stdout);
+    gpa.free(r.stderr);
+    return true;
+}
+
+/// The size of the original file, for the `size:` filter (the index would otherwise use the length of the text).
+fn fileSizeExtra(arena: Allocator, size: u64) Allocator.Error![]const doc.Extra {
+    const one = try arena.alloc(doc.Extra, 1);
+    one[0] = .{ .key = "file_size", .value = try std.fmt.allocPrint(arena, "{d}", .{size}) };
+    return one;
+}
+
+fn appendLine(arena: Allocator, text: *std.ArrayList(u8), label: []const u8, value: ?[]const u8) Allocator.Error!void {
+    const v = value orelse return;
+    try text.print(arena, "{s}: {s}\n", .{ label, v });
+}
+
+fn readMediaImpl(self: *FilesConnector, arena: Allocator, io: Io, dir: Io.Dir, st: Io.File.Stat, base_abs: []const u8, rel: []const u8, fmt: avmeta.Format) FilesConnector.Read {
+    if (st.size == 0) return .skip;
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ base_abs, rel }) catch return .out_of_memory;
+    const result = std.process.run(arena, io, .{
+        .argv = &.{ "ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(media_timeout_seconds), .clock = .awake } },
+    }) catch |e| switch (e) {
+        error.OutOfMemory => return .out_of_memory,
+        else => return .refused,
+    };
+    if (!result.term.success()) return .refused; // not readable as media
+    const info = avmeta.parseProbe(arena, result.stdout) catch |e| switch (e) {
+        error.OutOfMemory => return .out_of_memory,
+        error.BadProbe => return .refused,
+    };
+
+    const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |i| rel[i + 1 ..] else rel;
+    const stem_name = base[0 .. base.len - avmeta.extensionOf(base).len - 1];
+    const title = info.title orelse stem_name;
+
+    // The text that makes the file findable: its tags, its name and whatever words come with it.
+    var text: std.ArrayList(u8) = .empty;
+    mediaText(arena, &text, info, stem_name, fmt, dir, io, self, rel) catch return .out_of_memory;
+
+    var extras: std.ArrayList(doc.Extra) = .empty;
+    mediaExtras(arena, &extras, info, st.size) catch return .out_of_memory;
+
+    const url = fileUrl(arena, base_abs, rel) catch return .out_of_memory;
+    const mtime_s: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s));
+    return .{ .document = .{
+        .connector = self.name,
+        .source_id = rel,
+        .canonical_url = url,
+        .title = title,
+        .text = text.items,
+        .language = self.language,
+        .content_type = fmt.content_type,
+        .author = info.artist orelse info.album_artist,
+        .published_at = if (info.date) |d| avmeta.yearStart(d) else null,
+        .modified_at = mtime_s,
+        .extra = extras.items,
+    } };
+}
+
+fn mediaText(arena: Allocator, text: *std.ArrayList(u8), info: avmeta.Info, stem_name: []const u8, fmt: avmeta.Format, dir: Io.Dir, io: Io, self: *FilesConnector, rel: []const u8) Allocator.Error!void {
+    try appendLine(arena, text, "Title", info.title orelse stem_name);
+    try appendLine(arena, text, "Artist", info.artist);
+    try appendLine(arena, text, "Album artist", info.album_artist);
+    try appendLine(arena, text, "Album", info.album);
+    try appendLine(arena, text, "Composer", info.composer);
+    try appendLine(arena, text, "Genre", info.genre);
+    try appendLine(arena, text, "Date", info.date);
+    try appendLine(arena, text, "Track", info.track);
+    try appendLine(arena, text, "Comment", info.comment);
+    try text.print(arena, "{s}", .{if (fmt.kind == .audio) "Kind: audio" else "Kind: video"});
+    if (info.duration_seconds) |d| try text.print(arena, ", duration {s}", .{try avmeta.formatDuration(arena, d)});
+    try text.append(arena, '\n');
+    if (info.lyrics) |l| try text.print(arena, "\nLyrics:\n{s}\n", .{l});
+
+    // Subtitle and lyrics files next to it.
+    const ext_len = avmeta.extensionOf(rel).len + 1;
+    const stem = rel[0 .. rel.len - ext_len];
+    const found = self.sidecars.get(stem) orelse return;
+    for (found.items, 0..) |sp, n| {
+        if (n >= max_sidecars_per_media) break;
+        const bytes = dir.readFileAlloc(io, sp, arena, .limited(max_sidecar_bytes)) catch continue;
+        if (!std.unicode.utf8ValidateSlice(bytes)) continue;
+        const words = try avmeta.sidecarText(arena, bytes, avmeta.extensionOf(sp));
+        if (words.len == 0) continue;
+        const label = if (std.ascii.eqlIgnoreCase(avmeta.extensionOf(sp), "lrc")) "Lyrics" else "Subtitles";
+        try text.print(arena, "\n{s}:\n{s}", .{ label, words });
+    }
+}
+
+fn mediaExtras(arena: Allocator, extras: *std.ArrayList(doc.Extra), info: avmeta.Info, file_size: u64) Allocator.Error!void {
+    const strings = [_]struct { []const u8, ?[]const u8 }{
+        .{ "artist", info.artist },           .{ "album", info.album }, .{ "genre", info.genre },
+        .{ "composer", info.composer },       .{ "track", info.track }, .{ "audio_codec", info.audio_codec },
+        .{ "video_codec", info.video_codec },
+    };
+    for (strings) |kv| if (kv[1]) |v| if (v.len <= 256) try extras.append(arena, .{ .key = kv[0], .value = v });
+    if (info.date) |d| if (d.len >= 4) try extras.append(arena, .{ .key = "year", .value = d[0..4] });
+    if (info.duration_seconds) |d| try extras.append(arena, .{ .key = "duration_seconds", .value = try std.fmt.allocPrint(arena, "{d}", .{d}) });
+    if (info.bit_rate_kbps) |b| try extras.append(arena, .{ .key = "bitrate_kbps", .value = try std.fmt.allocPrint(arena, "{d}", .{b}) });
+    if (info.width != null and info.height != null) try extras.append(arena, .{ .key = "resolution", .value = try std.fmt.allocPrint(arena, "{d}x{d}", .{ info.width.?, info.height.? }) });
+    try extras.append(arena, .{ .key = "file_size", .value = try std.fmt.allocPrint(arena, "{d}", .{file_size}) });
+}
 
 /// True if the `pdftotext` program (poppler-utils) can be run.
 fn pdftotextWorks(gpa: Allocator, io: Io) bool {
@@ -319,11 +476,12 @@ fn readPdfImpl(self: *FilesConnector, arena: Allocator, io: Io, st: Io.File.Stat
         .language = self.language,
         .content_type = "application/pdf",
         .modified_at = mtime_s,
+        .extra = fileSizeExtra(arena, st.size) catch return .out_of_memory,
     } };
 }
 
 /// Paths (relative, '/'-separated) of every eligible file under `dir`.
-fn collect(arena: Allocator, io: Io, dir: Io.Dir, pdf: bool) !([][]const u8) {
+fn collect(arena: Allocator, io: Io, dir: Io.Dir, pdf: bool, media: bool, sidecars: *std.ArrayList([]const u8)) !([][]const u8) {
     var walker = try dir.walkSelectively(arena);
     defer walker.deinit();
     var list: std.ArrayList([]const u8) = .empty;
@@ -331,8 +489,15 @@ fn collect(arena: Allocator, io: Io, dir: Io.Dir, pdf: bool) !([][]const u8) {
         if (entry.basename.len == 0 or entry.basename[0] == '.') continue; // hidden: skipped, not entered
         switch (entry.kind) {
             .directory => try walker.enter(io, entry),
-            .file => if (hasExtension(entry.path, ".txt") or hasExtension(entry.path, ".md") or (pdf and hasExtension(entry.path, ".pdf"))) {
-                try list.append(arena, try arena.dupe(u8, entry.path));
+            .file => {
+                const wanted = hasExtension(entry.path, ".txt") or hasExtension(entry.path, ".md") or
+                    (pdf and hasExtension(entry.path, ".pdf")) or (media and avmeta.formatOf(entry.path) != null);
+                if (wanted) {
+                    try list.append(arena, try arena.dupe(u8, entry.path));
+                } else if (media and avmeta.isSidecar(entry.path)) {
+                    // Not a document of its own: its text goes with the media file it sits next to.
+                    try sidecars.append(arena, try arena.dupe(u8, entry.path));
+                }
             },
             else => {}, // symlinks, devices, sockets, ...: never followed or read
         }
@@ -806,4 +971,76 @@ test "removeSource stops when cancelled and can be repeated" {
     const r2 = try runner.removeSource(e.arena.allocator(), &e.state, &e.pipe, "s", &ctl2);
     try testing.expect(r2.complete);
     try testing.expectEqual(@as(u64, 0), try e.idx.count());
+}
+
+/// A WAV file of `samples` samples of silence: a valid media file that needs no tools to make.
+fn silentWav(arena: Allocator, samples: u32) ![]u8 {
+    const data_len: u32 = samples * 2;
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, "RIFF");
+    try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u32, 36 + data_len)));
+    try out.appendSlice(arena, "WAVEfmt ");
+    try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u32, 16)));
+    try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u16, 1))); // PCM
+    try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u16, 1))); // mono
+    try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u32, 8000)));
+    try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u32, 16000)));
+    try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u16, 2)));
+    try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u16, 16)));
+    try out.appendSlice(arena, "data");
+    try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u32, data_len)));
+    try out.appendNTimes(arena, 0, data_len);
+    return out.items;
+}
+
+test "media = true: audio is found by its name, with its subtitle or lyrics text, and file size is the file's" {
+    if (!ffprobeWorks(testing.allocator, testing.io)) return error.SkipZigTest; // the program is optional
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const wav = try silentWav(arena.allocator(), 16000); // two seconds
+    try tmp.dir.createDirPath(testing.io, "talks");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "talks/Evening Lecture.wav", .data = wav });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "talks/Evening Lecture.en.srt", .data = "1\n00:00:01,000 --> 00:00:02,000\nThe lighthouse keeper spoke softly\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "talks/Evening Lecture.lrc", .data = "[ar:Someone]\n[00:01.00]a lantern verse\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "talks/broken.mp3", .data = "this is not audio at all" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "talks/readme.txt", .data = "plain words" });
+
+    var pb: [200]u8 = undefined;
+    const off = try treeSource(&tmp, &pb, &.{});
+    defer testing.allocator.free(off.options);
+    var fc_off = try FilesConnector.init(testing.allocator, testing.io, off);
+    defer fc_off.deinit();
+    var e: E2e = undefined;
+    try e.init();
+    defer e.deinit();
+    var ctl: api.Control = .{};
+    // Without the option the media files are not touched.
+    const r0 = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc_off.connector(), "notes", &ctl, E2e.now);
+    try testing.expectEqual(@as(u64, 1), r0.submitted);
+
+    var pb2: [200]u8 = undefined;
+    const on = try treeSource(&tmp, &pb2, &.{.{ .key = "media", .value = .{ .boolean = true } }});
+    defer testing.allocator.free(on.options);
+    var fc = try FilesConnector.init(testing.allocator, testing.io, on);
+    defer fc.deinit();
+    const r = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc.connector(), "notes", &ctl, E2e.now);
+    try testing.expectEqual(state_sqlite.JobState.completed, r.state);
+    // The WAV is indexed (and readme.txt is offered again, unchanged); the file that is not audio
+    // is refused; the subtitle files are not documents.
+    try testing.expectEqual(@as(u64, 2), r.submitted);
+    try testing.expectEqual(@as(u64, 1), r.rejected);
+    try testing.expectEqual(@as(u64, 2), try e.idx.count()); // readme.txt and the WAV
+
+    try testing.expectEqual(@as(usize, 1), try e.hits("evening lecture")); // by name
+    try testing.expectEqual(@as(usize, 1), try e.hits("lighthouse keeper")); // by its subtitles
+    try testing.expectEqual(@as(usize, 1), try e.hits("lantern")); // by its lyrics file
+    try testing.expectEqual(@as(usize, 0), try e.hits("Someone")); // LRC metadata lines are not text
+
+    const page = try e.idx.searcher().search(e.arena.allocator(), .{ .text = "evening" });
+    try testing.expectEqual(@as(usize, 1), page.hits.len);
+    try testing.expectEqualStrings("audio", page.hits[0].kind.?);
+    try testing.expectEqualStrings("audio/wav", page.hits[0].content_type.?);
+    try testing.expectEqual(@as(?u64, wav.len), page.hits[0].size); // the file's size, not the text's
 }

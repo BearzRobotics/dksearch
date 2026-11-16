@@ -6,7 +6,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 ## Next
 
-- **Audio and video, metadata (in progress):** tags and technical details through `ffprobe` (title, artist, album, year, genre, duration, codecs) for `mp3`, `m4a`, `ogg`, `flac`, `mp4` and similar, and subtitle or lyrics files next to the media (`.srt`, `.vtt`, `.lrc`) as searchable text.
+- **Audio and video, metadata (done):** tags and technical details through `ffprobe` (title, artist, album, year, genre, duration, codecs) for `mp3`, `m4a`, `ogg`, `flac`, `mp4` and similar, and subtitle or lyrics files next to the media (`.srt`, `.vtt`, `.lrc`) as searchable text.
 - **Rich viewer:** Markdown rendered through `md-zig` and the HTML sanitizer; ZIM articles shown from the ZIM file with their images and internal links working; plain text with paragraphs kept.
 - **Search results in the API:** file kind, size, dates, domain and the rest of what the index knows in the JSON, plus filter parameters and sort modes.
 - **Office and ebook text:** `docx`, `odt` and `epub` extraction on `xml-zig` (zip plus XML), an HTML option for the files connector, and the switch of the Wikipedia connector from Expat to `xml-zig`.

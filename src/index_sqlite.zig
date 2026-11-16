@@ -448,7 +448,7 @@ pub const SqliteIndex = struct {
         }
         var stored: usize = 0;
         for (d.extra) |e| {
-            if (std.mem.eql(u8, e.key, "phash")) continue;
+            if (std.mem.eql(u8, e.key, "phash") or std.mem.eql(u8, e.key, "file_size")) continue;
             if (stored >= max_meta_fields or e.key.len == 0 or e.key.len > 32 or e.value.len == 0 or e.value.len > 256) continue;
             const st = try Stmt.prepare(self.db, "INSERT INTO doc_meta(doc, key, value) VALUES(?1, lower(?2), ?3)");
             defer st.deinit();

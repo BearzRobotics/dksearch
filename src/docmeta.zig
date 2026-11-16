@@ -36,6 +36,12 @@ pub fn derive(d: doc.Document) Derived {
     if (d.canonical_url) |url| split(&out, url);
     out.kind = kindOf(d.content_type, if (out.ext_len > 0) out.ext_buf[0..out.ext_len] else null);
     if (d.text orelse d.summary) |t| out.size = @intCast(t.len);
+    // A connector that knows the size of the original file says so; that is the size people mean.
+    for (d.extra) |e| if (std.mem.eql(u8, e.key, "file_size")) {
+        if (std.fmt.parseInt(i64, e.value, 10)) |n| {
+            if (n >= 0) out.size = n;
+        } else |_| {}
+    };
     return out;
 }
 
