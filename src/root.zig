@@ -17,6 +17,7 @@ pub const originals = @import("originals.zig");
 pub const avmeta = @import("avmeta.zig");
 pub const render = @import("render.zig");
 pub const ziparchive = @import("ziparchive.zig");
+pub const optioninfo = @import("optioninfo.zig");
 pub const officetext = @import("officetext.zig");
 pub const zimserve = @import("zimserve.zig");
 /// A tiny ZIM file for tests of the HTTP layer.
@@ -55,6 +56,7 @@ test {
     _ = avmeta;
     _ = render;
     _ = ziparchive;
+    _ = optioninfo;
     _ = officetext;
     _ = zimserve;
     _ = htmlsafe;

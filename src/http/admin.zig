@@ -383,7 +383,7 @@ pub const App = struct {
 
     // --------------------------------------------------- editing sources
 
-    fn spec_from(params: query.Params) dk.sourceedit.Spec {
+    fn spec_from(arena: Allocator, params: query.Params) error{OutOfMemory}!dk.sourceedit.Spec {
         const checked = struct {
             fn on(v: ?[]const u8) bool {
                 const t = v orelse return false;
@@ -398,7 +398,12 @@ pub const App = struct {
             .enabled = if (params.get("form") != null) checked(params.get("enabled")) else (if (params.get("enabled")) |v| checked(v) else true),
             .retain_text = if (params.get("form") != null) checked(params.get("retain_text")) else (if (params.get("retain_text")) |v| checked(v) else true),
             .rights = if (params.get("rights")) |r| (if (r.len > 0) r else null) else null,
-            .options = params.get("options") orelse "",
+            // The form posts one field per option (`opt_KEY`) and a box for any other settings; the
+            // API (and older forms) send the settings as one text.
+            .options = if (params.get("fields") != null)
+                try dk.optioninfo.compose(arena, params.get("kind") orelse "", params, params.get("options") orelse "")
+            else
+                params.get("options") orelse "",
         };
     }
 
@@ -413,7 +418,7 @@ pub const App = struct {
         const store = self.opts.store orelse return actionFailure(arena, is_api, .{ .status = .conflict, .code = "no_config_file", .message = "editing sources is not available here" });
 
         const op = params.get("op") orelse "save";
-        const spec = spec_from(params);
+        const spec = try spec_from(arena, params);
         const original: ?[]const u8 = if (params.get("original")) |o| (if (o.len > 0) o else null) else null;
         const edit: dk.sourceedit.Edit = if (std.mem.eql(u8, op, "save"))
             .{ .save = .{ .original = original, .spec = spec } }
@@ -501,6 +506,9 @@ pub const App = struct {
         var spec: dk.sourceedit.Spec = .{ .name = "", .kind = "" };
         var original: ?[]const u8 = null;
         const existing = params.get("name") orelse "";
+        // No source and no kind chosen: the form would have nothing to ask, so offer the kinds.
+        const kind_param: []const u8 = params.get("kind") orelse "";
+        if (existing.len == 0 and kind_param.len == 0) return self.pageSourcesNew(arena, csrf);
         if (existing.len > 0) {
             const found = for (self.sources()) |src| {
                 if (std.mem.eql(u8, src.name, existing)) break src;
@@ -528,7 +536,7 @@ pub const App = struct {
         var aw: Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         writePage(w, if (original != null) "Edit source" else "Add a source", csrf, "sources") catch return error.OutOfMemory;
-        writeSourceForm(w, csrf orelse "", spec, original, problem) catch return error.OutOfMemory;
+        writeSourceForm(arena, w, csrf orelse "", spec, original, problem) catch return error.OutOfMemory;
         w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
         var r = handler.htmlResponse(arena, status, aw.written());
         r.status = status;
@@ -1536,7 +1544,64 @@ fn kindAvailable(kind: []const u8) bool {
     return false;
 }
 
-fn writeSourceForm(w: *Io.Writer, csrf: []const u8, spec: dk.sourceedit.Spec, original: ?[]const u8, problem: ?[]const u8) !void {
+/// One labelled field for each option of the source's kind, filled from its current settings,
+/// and a box for any setting the form does not know.
+fn writeOptionFields(arena: Allocator, w: *Io.Writer, spec: dk.sourceedit.Spec) !void {
+    const opts = dk.optioninfo.forKind(spec.kind);
+    const split = try dk.optioninfo.split(arena, spec.kind, spec.options);
+    try w.writeAll("<fieldset class=\"options\"><legend>Settings of this kind of source</legend>");
+    for (opts, split.values) |o, current| {
+        switch (o.type) {
+            .flag => {
+                const on = if (current) |v| std.mem.eql(u8, v, "true") else o.default_on;
+                try w.writeAll("<label class=\"check\"><input type=\"checkbox\" name=\"opt_");
+                try html.writeEscaped(w, o.key);
+                try w.print("\" value=\"1\"{s}> ", .{if (on) " checked" else ""});
+                try html.writeEscaped(w, o.label);
+                try w.writeAll("<small>");
+                try html.writeEscaped(w, o.help);
+                try w.writeAll("</small></label>");
+            },
+            else => {
+                try w.writeAll("<label>");
+                try html.writeEscaped(w, o.label);
+                if (o.required) try w.writeAll(" <span class=\"req\" title=\"required\">*</span>");
+                try w.print(" <input name=\"opt_{s}\" type=\"{s}\"", .{ o.key, if (o.type == .number) "number" else "text" });
+                if (o.type == .number) try w.print(" min=\"{d}\" max=\"{d}\"", .{ o.min, o.max });
+                if (o.type != .number) try w.writeAll(" spellcheck=\"false\" autocomplete=\"off\"");
+                try w.writeAll(" maxlength=\"2000\"");
+                if (o.required) try w.writeAll(" required");
+                const hint = if (o.placeholder.len > 0) o.placeholder else o.default;
+                if (hint.len > 0) {
+                    try w.writeAll(" placeholder=\"");
+                    try html.writeEscaped(w, hint);
+                    try w.writeByte('"');
+                }
+                if (current) |v| {
+                    try w.writeAll(" value=\"");
+                    try html.writeEscaped(w, v);
+                    try w.writeByte('"');
+                }
+                try w.writeAll("><small>");
+                try html.writeEscaped(w, o.help);
+                if (o.default.len > 0) {
+                    try w.writeAll(" Default: ");
+                    try html.writeEscaped(w, o.default);
+                    try w.writeAll(".");
+                }
+                try w.writeAll("</small></label>");
+            },
+        }
+    }
+    try w.writeAll("</fieldset>");
+    try w.writeAll("<details");
+    if (split.rest.len > 0) try w.writeAll(" open");
+    try w.writeAll("><summary>Other settings</summary><label>Anything else, one <code>key = value</code> per line <textarea name=\"options\" rows=\"3\" spellcheck=\"false\" maxlength=\"16384\">");
+    try html.writeEscaped(w, split.rest);
+    try w.writeAll("</textarea><small>For a setting this form does not list. Saving checks everything and tells you what is wrong.</small></label></details>");
+}
+
+fn writeSourceForm(arena: Allocator, w: *Io.Writer, csrf: []const u8, spec: dk.sourceedit.Spec, original: ?[]const u8, problem: ?[]const u8) !void {
     if (problem) |p| {
         try w.writeAll("<p class=\"notice err\" role=\"alert\">");
         try html.writeEscaped(w, p);
@@ -1549,11 +1614,12 @@ fn writeSourceForm(w: *Io.Writer, csrf: []const u8, spec: dk.sourceedit.Spec, or
     try w.writeAll("\"><label>Name <input name=\"name\" required maxlength=\"64\" pattern=\"[a-z0-9][a-z0-9_\\-]*\" autocomplete=\"off\" value=\"");
     try html.writeEscaped(w, spec.name);
     try w.writeAll("\"><small>Letters a-z, digits, - and _. Renaming a source starts its import history afresh.</small></label>");
-    try w.writeAll("<label>Kind <select name=\"kind\" required>");
-    for (dk.connectors.kinds) |k| {
-        try w.print("<option value=\"{s}\"{s}>{s}</option>", .{ k, if (std.mem.eql(u8, k, spec.kind)) " selected" else "", k });
-    }
-    try w.writeAll("</select></label>");
+    // The kind is fixed once chosen (the options below belong to it); a new source picks it in the chooser.
+    try w.writeAll("<p>Kind: <strong>");
+    try html.writeEscaped(w, spec.kind);
+    try w.writeAll("</strong><input type=\"hidden\" name=\"kind\" value=\"");
+    try html.writeEscaped(w, spec.kind);
+    try w.writeAll("\"><input type=\"hidden\" name=\"fields\" value=\"1\"></p>");
     try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{s}> enabled</label>", .{if (spec.enabled) " checked" else ""});
     try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"retain_text\" value=\"1\"{s}> keep each document&rsquo;s text (needed to rebuild the index without the source)</label>", .{if (spec.retain_text) " checked" else ""});
     try w.writeAll("<label>Rights <select name=\"rights\">");
@@ -1562,9 +1628,7 @@ fn writeSourceForm(w: *Io.Writer, csrf: []const u8, spec: dk.sourceedit.Spec, or
         try w.print("<option value=\"{s}\"{s}>{s}</option>", .{ r, if (sel) " selected" else "", if (r.len == 0) "the connector&rsquo;s default" else r });
     }
     try w.writeAll("</select><small>What may be done with the content. This is your decision, not legal advice.</small></label>");
-    try w.writeAll("<label>Options <textarea name=\"options\" rows=\"8\" spellcheck=\"false\" maxlength=\"16384\">");
-    try html.writeEscaped(w, spec.options);
-    try w.writeAll("</textarea><small>One <code>key = value</code> per line, text in double quotes. See the examples below for each kind.</small></label>");
+    try writeOptionFields(arena, w, spec);
     try w.writeAll("<p><button type=\"submit\" class=\"btn\">Save</button> <a class=\"btn secondary\" href=\"/sources\">Cancel</a></p></form>\n");
     if (kindInfo(spec.kind)) |info| {
         try w.print("<details open><summary>About {s}</summary><p>", .{info.title});
@@ -2323,9 +2387,13 @@ test "sources can be added, edited, disabled and deleted from the interface, and
     const csrf = csrfOf(list.body);
 
     // The add form is there; saving a valid source takes effect at once.
-    const form = try f.call(a, .GET, "/sources/edit", .{ .cookie = cookie });
+    const form = try f.call(a, .GET, "/sources/edit?kind=feeds", .{ .cookie = cookie });
     try testing.expectEqual(http.Status.ok, form.status);
-    try testing.expect(std.mem.indexOf(u8, form.body, "name=\"options\"") != null);
+    try testing.expect(std.mem.indexOf(u8, form.body, "name=\"options\"") != null); // for settings the form has no field for
+    try testing.expect(std.mem.indexOf(u8, form.body, "name=\"opt_path\"") != null); // a field for each setting of the kind
+    // Without a kind the page offers the choice of kinds instead of an empty form.
+    const chooser = try f.call(a, .GET, "/sources/edit", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, chooser.body, "opt_path") == null);
     const add = try std.fmt.allocPrint(a, "op=save&form=1&csrf={s}&original=&name=news&kind=feeds&enabled=1&retain_text=1&rights=restricted&options=path+%3D+%22%2Fsrv%2Ffeeds%22", .{csrf});
     const saved = try f.call(a, .POST, "/actions/sources", .{ .cookie = cookie, .body = add });
     try testing.expectEqual(http.Status.see_other, saved.status);
@@ -2342,6 +2410,27 @@ test "sources can be added, edited, disabled and deleted from the interface, and
     // The dashboard's import buttons follow the new list.
     const dash = try f.call(a, .GET, "/", .{ .cookie = cookie });
     try testing.expect(std.mem.indexOf(u8, dash.body, "Import news") != null);
+
+    // The form's own fields: typed, quoted, and read back into the fields when editing.
+    const fielded = try std.fmt.allocPrint(a, "op=save&form=1&fields=1&csrf={s}&original=&name=pages&kind=crawl&enabled=1&retain_text=1&opt_seeds_file=%2Fetc%2Fseeds.txt&opt_user_agent=test%2F1.0+%28me%29&opt_max_depth=1&opt_follow_external=1&opt_delay_ms=&options=", .{csrf});
+    const fsaved = try f.call(a, .POST, "/actions/sources", .{ .cookie = cookie, .body = fielded });
+    try testing.expectEqual(http.Status.see_other, fsaved.status);
+    const file2 = try f.tmp.dir.readFileAlloc(testing.io, "cfg.toml", a, .limited(10_000));
+    try testing.expect(std.mem.indexOf(u8, file2, "max_depth = 1") != null);
+    try testing.expect(std.mem.indexOf(u8, file2, "follow_external = true") != null);
+    try testing.expect(std.mem.indexOf(u8, file2, "seeds_file = \"/etc/seeds.txt\"") != null);
+    try testing.expect(std.mem.indexOf(u8, file2, "delay_ms") == null); // an empty field leaves the default
+    const refill = try f.call(a, .GET, "/sources/edit?name=pages", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, refill.body, "value=\"/etc/seeds.txt\"") != null);
+    try testing.expect(std.mem.indexOf(u8, refill.body, "name=\"opt_follow_external\" value=\"1\" checked") != null);
+    // A number that is not a number is refused by name.
+    const bad_number = try std.fmt.allocPrint(a, "op=save&form=1&fields=1&csrf={s}&original=pages&name=pages&kind=crawl&enabled=1&retain_text=1&opt_seeds_file=%2Fetc%2Fseeds.txt&opt_user_agent=test%2F1.0+%28me%29&opt_delay_ms=fast&options=", .{csrf});
+    const bn = try f.call(a, .POST, "/actions/sources", .{ .cookie = cookie, .body = bad_number });
+    try testing.expectEqual(http.Status.bad_request, bn.status);
+    try testing.expect(std.mem.indexOf(u8, bn.body, "delay_ms") != null);
+    const del_pages = try std.fmt.allocPrint(a, "op=delete&name=pages&csrf={s}", .{csrf});
+    try testing.expectEqual(http.Status.see_other, (try f.call(a, .POST, "/actions/sources", .{ .cookie = cookie, .body = del_pages })).status);
+    try testing.expectEqual(@as(usize, 2), store.snapshot().len);
 
     // A bad edit is refused with the reason, the form comes back filled in, the file is untouched.
     const before_bad = try f.tmp.dir.readFileAlloc(testing.io, "cfg.toml", a, .limited(10_000));
