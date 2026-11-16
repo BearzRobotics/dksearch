@@ -99,6 +99,7 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
 
 /// The left panel: the search syntax at a glance, with links to the full guides.
 fn writeSidePanel(w: *Writer, regex_enabled: bool) Writer.Error!void {
+    try w.writeAll("<input type=\"checkbox\" id=\"sidetoggle\" class=\"sidetoggle\" aria-label=\"Show search tips\"><label for=\"sidetoggle\" class=\"burger\" title=\"Search tips\">&#9776;</label><label for=\"sidetoggle\" class=\"scrim\"></label>");
     try w.writeAll("<aside class=\"side\" aria-label=\"Search tips\"><h2>Search tips</h2>");
     try w.writeAll("<h3>Words</h3><dl><dt><code>\"exact phrase\"</code></dt><dd>words together, in order</dd>" ++
         "<dt><code>a OR b</code></dt><dd>either word</dd>" ++
@@ -130,21 +131,23 @@ pub fn writeHome(w: *Writer, notice: ?[]const u8) Writer.Error!void {
 /// The home page; `regex_enabled` adds the regex filter to the form.
 pub fn writeHomeWith(w: *Writer, notice: ?[]const u8, regex_enabled: bool) Writer.Error!void {
     try writeHead(w, "dksearch");
-    try w.writeAll("<body class=\"home\"><div class=\"layout\"><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
+    try w.writeAll("<body class=\"home\">");
+    try writeSidePanel(w, regex_enabled);
+    try w.writeAll("<main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
     try writeForm(w, .{ .regex_enabled = regex_enabled });
     if (notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
         try writeEscaped(w, n);
         try w.writeAll("</p>");
     }
-    try w.writeAll("</main>");
-    try writeSidePanel(w, regex_enabled);
-    try w.writeAll("</div></body></html>\n");
+    try w.writeAll("</main></body></html>\n");
 }
 
 pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page_size: u32) Writer.Error!void {
     try writeHead(w, if (f.q.len > 0) f.q else "dksearch");
-    try w.writeAll("<body><div class=\"layout\"><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
+    try w.writeAll("<body>");
+    try writeSidePanel(w, f.regex_enabled);
+    try w.writeAll("<main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
     try writeForm(w, f);
     try writeInterpretation(w, f, page, offset);
 
@@ -167,9 +170,7 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
         if (page.has_more) try writePagerLink(w, f, offset + page_size, "Next &rarr;");
         try w.writeAll("</span></nav>\n");
     }
-    try w.writeAll("</main>");
-    try writeSidePanel(w, f.regex_enabled);
-    try w.writeAll("</div></body></html>\n");
+    try w.writeAll("</main></body></html>\n");
 }
 
 /// How the query was read, and whether similar spellings were included.

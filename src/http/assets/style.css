@@ -23,21 +23,35 @@ body {
   color: var(--fg);
   font: 16px/1.5 system-ui, sans-serif;
 }
-main { max-width: 44rem; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
-/* Search pages: the tips panel is left of the results on wide screens and below them on narrow ones. */
-.layout { display: flex; flex-direction: column; }
-.side { max-width: 44rem; margin: 0 auto; padding: 0 1rem 3rem; color: var(--muted); font-size: 0.9rem; width: 100%; }
-.side h2 { font-size: 1rem; margin: 0 0 0.4rem; color: var(--fg); }
-.side h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; margin: 1rem 0 0.3rem; }
-.side dl { margin: 0; }
-.side dt { margin-top: 0.4rem; }
-.side dd { margin: 0 0 0 0.6rem; }
-.side .small { margin: 0.8rem 0 0; }
-@media (min-width: 62rem) {
-  .layout { display: grid; grid-template-columns: 16rem minmax(0, 44rem); gap: 1rem; justify-content: center; align-items: start; }
-  .layout > main { grid-column: 2; grid-row: 1; margin: 0; }
-  .layout > .side { grid-column: 1; grid-row: 1; margin: 0; padding: 3.6rem 0 2rem 1rem; position: sticky; top: 0; max-height: 100vh; overflow-y: auto; }
+main { max-width: 44rem; margin: 0 auto; padding: 3.4rem 1rem 4rem; }
+/* The search-tips drawer: a checkbox (no script) opens it from the hamburger button. */
+.sidetoggle { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.burger {
+  position: fixed; top: 0.6rem; left: 0.6rem; z-index: 30;
+  width: 2.4rem; height: 2.4rem; display: flex; align-items: center; justify-content: center;
+  font-size: 1.3rem; line-height: 1; cursor: pointer; color: var(--fg);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem;
 }
+.sidetoggle:focus-visible + .burger { outline: 2px solid var(--accent); outline-offset: 2px; }
+.scrim { display: none; position: fixed; inset: 0; z-index: 19; background: rgba(0, 0, 0, 0.35); }
+.side {
+  position: fixed; top: 0; left: 0; bottom: 0; z-index: 20; width: min(19rem, 86vw);
+  padding: 3.6rem 1rem 1.5rem; overflow-y: auto;
+  background: var(--bg); border-right: 1px solid var(--border);
+  color: var(--muted); font-size: 0.8rem; line-height: 1.4;
+  transform: translateX(-102%); visibility: hidden;
+  transition: transform 0.18s ease, visibility 0.18s;
+}
+.sidetoggle:checked ~ .side { transform: none; visibility: visible; }
+.sidetoggle:checked ~ .scrim { display: block; }
+.side h2 { font-size: 0.95rem; margin: 0 0 0.3rem; color: var(--fg); }
+.side h3 { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; margin: 0.9rem 0 0.2rem; }
+.side dl { margin: 0; }
+.side dt { margin-top: 0.3rem; }
+.side dt code { font-size: 0.95em; }
+.side dd { margin: 0 0 0 0.5rem; }
+.side .small { margin: 0.8rem 0 0; }
+@media (prefers-reduced-motion: reduce) { .side { transition: none; } }
 .brand { font-size: 1.5rem; margin: 0 0 1rem; }
 .brand a { color: inherit; text-decoration: none; }
 .home main { padding-top: 18vh; text-align: center; }
@@ -194,4 +208,3 @@ pre { background: var(--card); border: 1px solid var(--border); border-radius: 0
   .stat-n { font-size: 1.3rem; }
   .card { padding: 0.8rem; }
 }
-@media (min-width: 62rem) { .home .layout > .side { padding-top: calc(18vh + 2rem); } }
