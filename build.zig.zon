@@ -7,6 +7,7 @@
         .toml = .{ .path = "vendor/toml-zig" },
         .regex = .{ .path = "vendor/regex-zig" },
         .xml = .{ .path = "vendor/xml-zig" },
+        .md = .{ .path = "vendor/md-zig" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "vendor", "ai", "docs" },
 }

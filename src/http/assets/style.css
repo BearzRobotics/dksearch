@@ -216,3 +216,11 @@ dl.meta dt { color: var(--muted); }
 dl.meta dd { margin: 0; overflow-wrap: anywhere; }
 .doctext { white-space: pre-wrap; overflow-wrap: anywhere; font: 0.85rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--card); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.8rem 1rem; max-height: 70vh; overflow: auto; }
 .button { display: inline-block; padding: 0.45rem 0.9rem; color: #fff; background: var(--accent); border-radius: 0.5rem; text-decoration: none; }
+.doctext.rendered { white-space: normal; font: 1rem/1.6 system-ui, sans-serif; max-height: none; background: var(--bg); }
+.rendered h1, .rendered h2, .rendered h3, .rendered h4 { line-height: 1.25; margin: 1.2em 0 0.5em; }
+.rendered h1 { font-size: 1.5rem; } .rendered h2 { font-size: 1.25rem; } .rendered h3 { font-size: 1.1rem; }
+.rendered p, .rendered ul, .rendered ol, .rendered pre, .rendered table, .rendered blockquote { margin: 0.7em 0; }
+.rendered pre { white-space: pre; overflow: auto; background: var(--card); border: 1px solid var(--border); border-radius: 0.4rem; padding: 0.6rem 0.8rem; font: 0.85rem/1.5 ui-monospace, monospace; }
+.rendered blockquote { margin-left: 0; padding-left: 1rem; border-left: 3px solid var(--border); color: var(--muted); }
+.rendered table { border-collapse: collapse; display: block; overflow: auto; }
+.rendered th, .rendered td { border: 1px solid var(--border); padding: 0.25rem 0.6rem; }

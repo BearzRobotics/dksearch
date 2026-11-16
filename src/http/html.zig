@@ -323,7 +323,7 @@ fn writeDate(w: *Writer, secs: i64) Writer.Error!void {
 }
 
 /// The viewer page for one document: what is known about it and its stored text.
-pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, can_open_original: bool) Writer.Error!void {
+pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, can_open_original: bool, rendered: ?[]const u8, is_markdown: bool) Writer.Error!void {
     try writeHead(w, h.title orelse h.url orelse "Document");
     try w.writeAll("<body><main class=\"docpage\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n<h2 class=\"doctitle\">");
     try writeEscaped(w, h.title orelse h.url orelse "(untitled)");
@@ -362,10 +362,23 @@ pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool,
         try writeIdHex(w, h.id);
         try w.writeAll("/file\">Open the original file</a></p>\n");
     }
-    if (text) |t| {
+    if (rendered) |html_body| {
+        // `html_body` was made safe by the sanitizer.
+        try w.writeAll("<h3>Document</h3>\n<div class=\"doctext rendered\">");
+        try w.writeAll(html_body);
+        try w.writeAll("</div>\n<p class=\"muted small\"><a href=\"/doc/");
+        try writeIdHex(w, h.id);
+        try w.writeAll("?view=text\">Show the plain text</a></p>\n");
+        if (cut) try w.writeAll("<p class=\"muted small\">Only the beginning is shown.</p>\n");
+    } else if (text) |t| {
         try w.writeAll("<h3>Stored text</h3>\n<pre class=\"doctext\">");
         try writeEscaped(w, t);
         try w.writeAll("</pre>\n");
+        if (is_markdown) {
+            try w.writeAll("<p class=\"muted small\"><a href=\"/doc/");
+            try writeIdHex(w, h.id);
+            try w.writeAll("\">Show it formatted</a></p>\n");
+        }
         if (cut) try w.writeAll("<p class=\"muted small\">Only the beginning is shown.</p>\n");
     } else {
         try w.writeAll("<p class=\"notice\">The text of this document is not stored on this server (the source may be set to keep only what it needs for searching), so only what is known about it is shown.</p>\n");

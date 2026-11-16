@@ -147,7 +147,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Service
         },
         .api_search => try apiSearch(arena, searcher, regex, t.params),
         .search_page => try pageSearch(arena, searcher, regex, try sourceNames(arena, services), t.params),
-        .document => try documentPage(arena, searcher, services, t.path),
+        .document => try documentPage(arena, searcher, services, t.path, t.params),
         .other => unreachable,
     };
 }
@@ -351,7 +351,7 @@ pub fn apiError(arena: Allocator, status: http.Status, code: []const u8, message
 /// Longest stored text shown on the viewer page, in bytes.
 const max_view_bytes = 512 * 1024;
 
-fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Services, path: []const u8) error{OutOfMemory}!Response {
+fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Services, path: []const u8, params: query.Params) error{OutOfMemory}!Response {
     var hex = path["/doc/".len..];
     var want_file = false;
     if (std.mem.endsWith(u8, hex, "/file")) {
@@ -379,8 +379,18 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
             } else text = bytes;
         } else |_| {}
     }
+    // Markdown is shown formatted (safely), with a link to the plain text.
+    const is_markdown = if (hit.content_type) |ct| std.mem.startsWith(u8, ct, "text/markdown") else false;
+    const plain_view = if (params.get("view")) |v| std.mem.eql(u8, v, "text") else false;
+    var rendered: ?[]const u8 = null;
+    if (is_markdown and !plain_view) if (text) |t| {
+        rendered = dk.render.markdown(arena, t) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TooLarge => null, // too big to format: the plain text is shown
+        };
+    };
     var aw: std.Io.Writer.Allocating = .init(arena);
-    html.writeDocument(&aw.writer, hit, text, cut, can_open) catch return error.OutOfMemory;
+    html.writeDocument(&aw.writer, hit, text, cut, can_open, rendered, is_markdown) catch return error.OutOfMemory;
     return htmlResponse(arena, .ok, aw.written());
 }
 
@@ -753,13 +763,18 @@ test "the document viewer shows what is known and the stored text, escaped; unkn
     const target = try std.fmt.allocPrint(ar.allocator(), "/doc/{s}", .{hex});
     const r = handleServices(ar.allocator(), idx.searcher(), .{ .content = store.store() }, .GET, target);
     try testing.expectEqual(http.Status.ok, r.status);
-    for ([_][]const u8{ "Trip &lt;plan&gt;", "Packing list &amp; &lt;b&gt;route&lt;/b&gt;", "file:///home/me/notes/trip.md", "markdown", "2023-11-14", "Jo", "notes" }) |needle| {
+    for ([_][]const u8{ "Trip &lt;plan&gt;", "Packing list &amp; <b>route</b>", "file:///home/me/notes/trip.md", "markdown", "2023-11-14", "Jo", "notes" }) |needle| {
         errdefer std.debug.print("missing: {s}\n{s}\n", .{ needle, r.body });
         try testing.expect(std.mem.indexOf(u8, r.body, needle) != null);
     }
+    // Markdown is formatted, safely; the plain view is the escaped text.
+    try testing.expect(std.mem.indexOf(u8, r.body, "class=\"doctext rendered\"") != null);
+    const as_text = handleServices(ar.allocator(), idx.searcher(), .{ .content = store.store() }, .GET, try std.fmt.allocPrint(ar.allocator(), "{s}?view=text", .{target}));
+    try testing.expect(std.mem.indexOf(u8, as_text.body, "<pre class=\"doctext\">") != null);
+    try testing.expect(std.mem.indexOf(u8, as_text.body, "Packing list &amp; &lt;b&gt;route&lt;/b&gt;") != null); // plain text is escaped
+    try testing.expect(std.mem.indexOf(u8, as_text.body, "Show it formatted") != null);
     // The file address is shown as text, never as a link a browser cannot follow.
     try testing.expect(std.mem.indexOf(u8, r.body, "href=\"file:") == null);
-    try testing.expect(std.mem.indexOf(u8, r.body, "<b>route</b>") == null);
 
     // Without the content store only the metadata is shown.
     const bare = handleServices(ar.allocator(), idx.searcher(), .{}, .GET, target);

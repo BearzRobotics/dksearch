@@ -215,7 +215,9 @@ fn isNumber(v: []const u8) bool {
     return true;
 }
 
-fn writeAttrs(arena: Allocator, w: *Io.Writer, tag: Tag, options: Options) Error!void {
+/// Writes the allowed attributes of `tag`. Returns true if an image kept its `src`.
+fn writeAttrs(arena: Allocator, w: *Io.Writer, tag: Tag, options: Options) Error!bool {
+    var src_kept = false;
     const is_a = std.ascii.eqlIgnoreCase(tag.name, "a");
     const is_img = std.ascii.eqlIgnoreCase(tag.name, "img");
     var it: AttrIter = .{ .s = tag.attrs };
@@ -260,8 +262,17 @@ fn writeAttrs(arena: Allocator, w: *Io.Writer, tag: Tag, options: Options) Error
         try w.print(" {s}=\"", .{name});
         try writeEscaped(w, final);
         try w.writeByte('"');
+        if (is_src) src_kept = true;
     }
     if (is_a) try w.writeAll(" rel=\"noopener noreferrer nofollow\"");
+    return src_kept;
+}
+
+/// The `alt` text of an image tag, decoded, or "".
+fn altOf(arena: Allocator, tag: Tag) Allocator.Error![]const u8 {
+    var it: AttrIter = .{ .s = tag.attrs };
+    while (it.next()) |a| if (std.ascii.eqlIgnoreCase(a.name, "alt")) return decodeAttr(arena, a.value);
+    return "";
 }
 
 /// Writes a safe version of `html` to `w`.
@@ -388,8 +399,25 @@ pub fn sanitize(arena: Allocator, html: []const u8, w: *Io.Writer, options: Opti
             continue;
         }
         if (stack.items.len >= options.max_depth and !is_void) continue;
+        if (std.mem.eql(u8, lname, "img")) {
+            // An image whose address was refused would show as a broken picture: its alt text stands in.
+            var tmp: Io.Writer.Allocating = .init(arena);
+            const kept = try writeAttrs(arena, &tmp.writer, tag, options);
+            if (kept) {
+                try w.writeAll("<img");
+                try w.writeAll(tmp.written());
+                try w.writeAll(">");
+            } else {
+                const alt = try altOf(arena, tag);
+                if (alt.len > 0) {
+                    try writeEscaped(w, alt);
+                    written += alt.len;
+                }
+            }
+            continue;
+        }
         try w.print("<{s}", .{lname});
-        try writeAttrs(arena, w, tag, options);
+        _ = try writeAttrs(arena, w, tag, options);
         if (is_void) {
             try w.writeAll(">");
         } else {
@@ -457,8 +485,8 @@ test "links: only http, https, mailto and relative survive; script schemes in an
     }
     // Images: data: images of known types are fine, other data: is not.
     try expectClean("<img src=\"data:image/png;base64,AAAA\">", "<img src=\"data:image/png;base64,AAAA\">");
-    try expectClean("<img src=\"data:text/html,<script>\">", "<img>");
-    try expectClean("<img src=\"javascript:x\">", "<img>");
+    try expectClean("<img src=\"data:text/html,<script>\">", "");
+    try expectClean("<img src=\"javascript:x\" alt=\"a <b> picture\">", "a &lt;b&gt; picture"); // the alt text stands in
 }
 
 test "the rewrite hook changes or refuses addresses, and cannot smuggle a script scheme" {

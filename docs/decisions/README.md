@@ -42,3 +42,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0024 | Query language and typo tolerance |
 | 0025 | ZIM (Kiwix) connector |
 | 0026 | Our own XML library (xml-zig), vendored |
+| 0027 | Showing documents: md-zig and an allow-list sanitizer |

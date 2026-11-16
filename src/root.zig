@@ -15,6 +15,7 @@ pub const queryparse = @import("queryparse.zig");
 pub const docmeta = @import("docmeta.zig");
 pub const originals = @import("originals.zig");
 pub const avmeta = @import("avmeta.zig");
+pub const render = @import("render.zig");
 pub const htmlsafe = @import("htmlsafe.zig");
 pub const exif = @import("exif.zig");
 pub const sourcestore = @import("sourcestore.zig");
@@ -47,6 +48,7 @@ test {
     _ = docmeta;
     _ = originals;
     _ = avmeta;
+    _ = render;
     _ = htmlsafe;
     _ = exif;
     _ = sourcestore;

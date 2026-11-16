@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
     const toml = b.dependency("toml", .{ .target = target, .optimize = optimize }).module("toml");
     const regex = b.dependency("regex", .{ .target = target, .optimize = optimize }).module("regex");
     const xml = b.dependency("xml", .{ .target = target, .optimize = optimize }).module("xml");
+    const md = b.dependency("md", .{ .target = target, .optimize = optimize }).module("md");
 
     // Vendored SQLite (public domain). The header is translated to a Zig
     // module and the amalgamation is compiled into it. Compile-time options:
@@ -148,6 +149,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "toml", .module = toml },
             .{ .name = "regex", .module = regex },
             .{ .name = "xmlzig", .module = xml },
+            .{ .name = "mdzig", .module = md },
             .{ .name = "sqlite_c", .module = sqlite },
             .{ .name = "build_options", .module = core_options.createModule() },
         },
