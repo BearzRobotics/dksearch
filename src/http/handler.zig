@@ -81,7 +81,22 @@ pub const Services = struct {
     content: ?dk.storage.ContentStore = null,
     /// Original files of the sources that allow them to be opened (`serve_originals`).
     originals: ?*const dk.originals.Service = null,
+    /// The configured sources, for the Source drop-down (follows edits made in the admin panel).
+    sources: ?*dk.sourcestore.Store = null,
 };
+
+/// Names of the enabled sources, sorted, for the Source drop-down.
+fn sourceNames(arena: Allocator, services: Services) error{OutOfMemory}![]const []const u8 {
+    const store = services.sources orelse return &.{};
+    var names: std.ArrayList([]const u8) = .empty;
+    for (store.snapshot()) |src| if (src.enabled) try names.append(arena, try arena.dupe(u8, src.name));
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return names.items;
+}
 
 pub fn handleServices(arena: Allocator, searcher: dk.search.Searcher, services: Services, method: http.Method, target: []const u8) Response {
     return handleInner(arena, searcher, services, method, target) catch |e| switch (e) {
@@ -115,7 +130,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Service
     return switch (r) {
         .home => blk: {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHomeWith(&aw.writer, null, regex != null) catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, null, .{ .regex_enabled = regex != null, .sources = try sourceNames(arena, services) }) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
@@ -131,7 +146,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Service
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .api_search => try apiSearch(arena, searcher, regex, t.params),
-        .search_page => try pageSearch(arena, searcher, regex, t.params),
+        .search_page => try pageSearch(arena, searcher, regex, try sourceNames(arena, services), t.params),
         .document => try documentPage(arena, searcher, services, t.path),
         .other => unreachable,
     };
@@ -390,13 +405,13 @@ fn originalFile(arena: Allocator, svc: *const dk.originals.Service, hit: dk.sear
 
 // ------------------------------------------------------------ HTML pages
 
-fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, params: query.Params) error{OutOfMemory}!Response {
+fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, sources: []const []const u8, params: query.Params) error{OutOfMemory}!Response {
     const parsed = switch (try parseQuery(arena, params, true)) {
         .ok => |p| p,
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
     const q = parsed.q;
-    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .connector = q.connector orelse "", .regex_enabled = regex != null, .exact_only = q.fuzzy == .off };
+    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .connector = q.connector orelse "", .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources };
     if (parsed.re) |req| {
         // A pattern typed in the box is already part of `q` and travels with it; only one given
         // as a parameter has to be carried separately (the pager and the exact-spelling link).
@@ -425,7 +440,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         // An empty box just shows the form again.
         error.EmptyQuery => {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHome(&aw.writer, "Enter something to search for.") catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, "Enter something to search for.", .{ .regex_enabled = regex != null, .sources = sources }) catch return error.OutOfMemory;
             return htmlResponse(arena, .ok, aw.written());
         },
         else => return searchFailure(arena, e, false),
@@ -685,6 +700,30 @@ test "end to end against the real index" {
         const r = handle(ar.allocator(), idx.searcher(), .GET, t);
         try testing.expect(r.status == .ok or r.status == .bad_request);
     }
+}
+
+test "the Source filter is a drop-down of the enabled sources, and keeps the choice" {
+    var store = dk.sourcestore.Store.init(testing.allocator, testing.io, &.{
+        .{ .name = "wiki", .kind = "wikipedia" },
+        .{ .name = "notes", .kind = "files" },
+        .{ .name = "off", .kind = "files", .enabled = false },
+    });
+    defer store.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    const services: Services = .{ .sources = &store };
+    const home = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/");
+    try testing.expect(std.mem.indexOf(u8, home.body, "<select name=\"connector\"><option value=\"\">All sources</option><option value=\"notes\">notes</option><option value=\"wiki\">wiki</option></select>") != null);
+    try testing.expect(std.mem.indexOf(u8, home.body, "\"off\"") == null); // disabled sources are not offered
+    const picked = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=wiki");
+    try testing.expect(std.mem.indexOf(u8, picked.body, "<option value=\"wiki\" selected>wiki</option>") != null);
+    // A name that is not in the list (a removed source, or typed into the address) stays selected, escaped.
+    const odd = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=gone");
+    try testing.expect(std.mem.indexOf(u8, odd.body, "<option value=\"gone\" selected>gone</option>") != null);
+    // With no source store the list is just "All sources".
+    const bare = handleServices(ar.allocator(), fake.searcher(), .{}, .GET, "/");
+    try testing.expect(std.mem.indexOf(u8, bare.body, "<option value=\"\">All sources</option></select>") != null);
 }
 
 test "pages link the stylesheet by a content fingerprint, and the versioned address serves it" {

@@ -78,6 +78,8 @@ pub const Form = struct {
     regex_notice: ?[]const u8 = null,
     /// The searcher asked for exact spelling (`fuzzy=0`); kept when paging.
     exact_only: bool = false,
+    /// Names of the sources this server has, for the Source drop-down.
+    sources: []const []const u8 = &.{},
 };
 
 pub fn writeHead(w: *Writer, title: []const u8) Writer.Error!void {
@@ -96,9 +98,26 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
     const open = if (f.language.len > 0 or f.connector.len > 0) " open" else "";
     try w.print("<details{s}><summary><span>Filters</span><a class=\"tips\" href=\"/help/search\">Search tips</a></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
     try writeEscaped(w, f.language);
-    try w.writeAll("\"></label><label>Source <input name=\"connector\" maxlength=\"64\" value=\"");
-    try writeEscaped(w, f.connector);
-    try w.writeAll("\"></label>");
+    try w.writeAll("\"></label><label>Source <select name=\"connector\"><option value=\"\">All sources</option>");
+    var listed = false;
+    for (f.sources) |name| {
+        const selected = std.mem.eql(u8, name, f.connector);
+        if (selected) listed = true;
+        try w.writeAll("<option value=\"");
+        try writeEscaped(w, name);
+        try w.writeAll(if (selected) "\" selected>" else "\">");
+        try writeEscaped(w, name);
+        try w.writeAll("</option>");
+    }
+    // A source named in the address but not in the list (removed, or typed by hand) stays selected.
+    if (f.connector.len > 0 and !listed) {
+        try w.writeAll("<option value=\"");
+        try writeEscaped(w, f.connector);
+        try w.writeAll("\" selected>");
+        try writeEscaped(w, f.connector);
+        try w.writeAll("</option>");
+    }
+    try w.writeAll("</select></label>");
     try w.writeAll("</details></form>\n");
     if (f.regex_notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
@@ -140,11 +159,17 @@ pub fn writeHome(w: *Writer, notice: ?[]const u8) Writer.Error!void {
 
 /// The home page; `regex_enabled` adds the regex filter to the form.
 pub fn writeHomeWith(w: *Writer, notice: ?[]const u8, regex_enabled: bool) Writer.Error!void {
+    return writeHomeForm(w, notice, .{ .regex_enabled = regex_enabled });
+}
+
+/// The home page with a prepared form (the source list and so on).
+pub fn writeHomeForm(w: *Writer, notice: ?[]const u8, form: Form) Writer.Error!void {
+    const regex_enabled = form.regex_enabled;
     try writeHead(w, "dksearch");
     try w.writeAll("<body class=\"home\">");
     try writeSidePanel(w, regex_enabled);
     try w.writeAll("<main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
-    try writeForm(w, .{ .regex_enabled = regex_enabled });
+    try writeForm(w, form);
     if (notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
         try writeEscaped(w, n);
