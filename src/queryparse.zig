@@ -434,6 +434,26 @@ fn makeFilter(arena: Allocator, key: []const u8, value_in: []const u8, now: i64)
     }
 }
 
+/// A condition written on its own, as in the query language: `ext:pdf`, `-domain:example.org`,
+/// `size:>1mb`. Null if it is not one (an unknown key, or a value that makes no sense).
+pub fn parseFilterString(arena: Allocator, text: []const u8, now: i64) Allocator.Error!?search.Filter {
+    var t = std.mem.trim(u8, text, " \t");
+    var negate = false;
+    if (t.len > 0 and t[0] == '-') {
+        negate = true;
+        t = t[1..];
+    }
+    const colon = std.mem.indexOfScalar(u8, t, ':') orelse return null;
+    if (colon == 0 or colon > 48) return null;
+    const key = try std.ascii.allocLowerString(arena, t[0..colon]);
+    if (!isFilterKey(key)) return null;
+    var value = t[colon + 1 ..];
+    if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
+    var f = (try makeFilter(arena, key, value, now)) orelse return null;
+    f.negate = negate;
+    return f;
+}
+
 const Parser = struct {
     arena: Allocator,
     lex: Lexer,

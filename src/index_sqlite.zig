@@ -584,11 +584,21 @@ pub const SqliteIndex = struct {
         if (@as(u64, q.offset) + limit > search.max_window) return error.InvalidQuery;
 
         const now: i64 = if (self.timeout) |t| @intCast(@divTrunc(Io.Timestamp.now(t.io, .real).nanoseconds, std.time.ns_per_s)) else 0;
-        if (q.filters.len > max_filters) return error.InvalidQuery;
+        if (q.filters.len + q.filter_strings.len > max_filters) return error.InvalidQuery;
+        // Conditions given as separate strings are read the way the query language reads them.
+        const base_filters = blk: {
+            if (q.filter_strings.len == 0) break :blk q.filters;
+            const out = try arena.alloc(search.Filter, q.filters.len + q.filter_strings.len);
+            @memcpy(out[0..q.filters.len], q.filters);
+            for (q.filter_strings, out[q.filters.len..]) |text, *dst| {
+                dst.* = (try queryparse.parseFilterString(arena, text, now)) orelse return error.InvalidQuery;
+            }
+            break :blk out;
+        };
 
         if (self.simple_syntax) {
             const m = try buildMatchSimple(arena, q.text);
-            return self.runMatch(arena, q, q.filters, limit, m, null, false);
+            return self.runMatch(arena, q, base_filters, limit, m, null, false);
         }
 
         // Typo tolerance: forced on or off by the search, or by the server's mode;
@@ -604,10 +614,10 @@ pub const SqliteIndex = struct {
         };
         const first = parseQuery(arena, q.text, forced orelse false, now) catch |e| {
             // Conditions given as parameters can stand alone, without words to find.
-            if (e == error.EmptyQuery and q.filters.len > 0) return self.runMatch(arena, q, q.filters, limit, "", null, false);
+            if (e == error.EmptyQuery and base_filters.len > 0) return self.runMatch(arena, q, base_filters, limit, "", null, false);
             return e;
         };
-        const all = try mergeFilters(arena, q.filters, first.filters);
+        const all = try mergeFilters(arena, base_filters, first.filters);
         const page = try self.runMatch(arena, q, all, limit, first.fts, interpretedOf(first), first.fuzzy_applied);
         if (forced == null and page.hits.len < auto_fuzzy_below and q.offset == 0 and first.fts.len > 0) {
             if (parseQuery(arena, q.text, true, now)) |second| {
@@ -763,6 +773,27 @@ pub const SqliteIndex = struct {
         }
     }
 
+    /// The ORDER BY clause: relevance (or, with no words to rank by, recency) unless asked otherwise.
+    /// Documents without the property sort last; ties fall back to relevance and then to the id.
+    fn orderBy(sort: search.Sort, text_mode: bool) []const u8 {
+        const date = "COALESCE(d.modified_at, d.published_at, d.indexed_at";
+        if (text_mode) return switch (sort) {
+            .relevance => " ORDER BY bm25(fts, 10.0, 1.0), d.id",
+            .newest => " ORDER BY " ++ date ++ ", -1) DESC, bm25(fts, 10.0, 1.0), d.id",
+            .oldest => " ORDER BY " ++ date ++ ", 9223372036854775807) ASC, bm25(fts, 10.0, 1.0), d.id",
+            .largest => " ORDER BY COALESCE(d.size, -1) DESC, bm25(fts, 10.0, 1.0), d.id",
+            .smallest => " ORDER BY COALESCE(d.size, 9223372036854775807) ASC, bm25(fts, 10.0, 1.0), d.id",
+            .title => " ORDER BY lower(COALESCE(d.title, '')) ASC, bm25(fts, 10.0, 1.0), d.id",
+        };
+        return switch (sort) {
+            .relevance, .newest => " ORDER BY " ++ date ++ ", 0) DESC, d.id",
+            .oldest => " ORDER BY " ++ date ++ ", 9223372036854775807) ASC, d.id",
+            .largest => " ORDER BY COALESCE(d.size, -1) DESC, d.id",
+            .smallest => " ORDER BY COALESCE(d.size, 9223372036854775807) ASC, d.id",
+            .title => " ORDER BY lower(COALESCE(d.title, '')) ASC, d.id",
+        };
+    }
+
     fn runMatch(self: *SqliteIndex, arena: Allocator, q: search.Query, filters: []const search.Filter, limit: u32, match: []const u8, interpreted: ?[]const u8, fuzzy: bool) search.Error!search.Page {
         if (filters.len > 0 and !self.has_meta) return error.InvalidQuery; // an index from before filters: `rebuild` upgrades it
         const columns = if (self.has_meta) "d.language, d.content_type, d.modified_at, d.size, d.author, d.kind, d.domain" else "d.language, d.content_type, NULL, NULL, NULL, NULL, NULL";
@@ -786,11 +817,9 @@ pub const SqliteIndex = struct {
             \\  AND (?6 IS NULL OR d.connector = ?6)
         );
         try filterSql(arena, filters, &sql, &binds);
-        // Without words to rank by, the most recently changed come first.
-        try sql.appendSlice(arena, if (text_mode)
-            " ORDER BY bm25(fts, 10.0, 1.0), d.id LIMIT ?7 OFFSET ?8"
-        else
-            " ORDER BY COALESCE(d.modified_at, d.published_at, d.indexed_at, 0) DESC, d.id LIMIT ?7 OFFSET ?8");
+        if (q.sort != .relevance and q.sort != .title and !self.has_meta) return error.InvalidQuery; // an old index: `rebuild` upgrades it
+        try sql.appendSlice(arena, orderBy(q.sort, text_mode));
+        try sql.appendSlice(arena, " LIMIT ?7 OFFSET ?8");
         const st = Stmt.prepare(self.db, try arena.dupeSentinel(u8, sql.items, 0)) catch |e| return searchError(e);
         defer st.deinit();
         if (text_mode) {
@@ -1651,4 +1680,47 @@ test "the metadata columns are added to an older index, and removal clears tags"
     defer st.deinit();
     _ = try st.step();
     try testing.expectEqual(@as(i64, 0), st.colInt(0));
+}
+
+test "results can be ordered by date, size or title, and conditions can be given as strings" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const day = 86400;
+    try putDoc(&idx, .{ .connector = "d", .source_id = "1", .title = "Charlie", .text = "kernel", .canonical_url = "file:///a/c.pdf", .modified_at = 10 * day, .extra = &.{.{ .key = "file_size", .value = "500" }} });
+    try putDoc(&idx, .{ .connector = "d", .source_id = "2", .title = "alpha", .text = "kernel kernel kernel", .canonical_url = "file:///a/a.md", .modified_at = 30 * day, .extra = &.{.{ .key = "file_size", .value = "9000" }} });
+    try putDoc(&idx, .{ .connector = "d", .source_id = "3", .title = "Bravo", .text = "kernel", .canonical_url = "file:///a/b.pdf", .modified_at = 20 * day, .extra = &.{.{ .key = "file_size", .value = "70" }} });
+    try putDoc(&idx, .{ .connector = "d", .source_id = "4", .title = "Undated", .text = "kernel", .canonical_url = "file:///a/u.txt" });
+
+    const order = struct {
+        fn of(ar: Allocator, i: *SqliteIndex, sort: search.Sort, strings: []const []const u8) ![]const u8 {
+            const page = try i.searcher().search(ar, .{ .text = "kernel", .sort = sort, .filter_strings = strings });
+            var out: std.ArrayList(u8) = .empty;
+            for (page.hits) |h| {
+                if (out.items.len > 0) try out.append(ar, ',');
+                try out.appendSlice(ar, h.title.?);
+            }
+            return out.items;
+        }
+    }.of;
+    try testing.expectEqualStrings("alpha,Bravo,Charlie,Undated", try order(a, &idx, .newest, &.{}));
+    try testing.expectEqualStrings("Charlie,Bravo,alpha,Undated", try order(a, &idx, .oldest, &.{}));
+    try testing.expectEqualStrings("alpha,Charlie,Bravo,Undated", try order(a, &idx, .largest, &.{}));
+    // A document whose source gives no file size is as large as its text (here six bytes).
+    try testing.expectEqualStrings("Undated,Bravo,Charlie,alpha", try order(a, &idx, .smallest, &.{}));
+    try testing.expectEqualStrings("alpha,Bravo,Charlie,Undated", try order(a, &idx, .title, &.{})); // case-insensitive
+    const rel = try order(a, &idx, .relevance, &.{});
+    try testing.expect(std.mem.startsWith(u8, rel, "alpha,")); // the most repeated word ranks first
+    // Strings are conditions in the query language's spelling.
+    try testing.expectEqualStrings("Charlie,Bravo", try order(a, &idx, .oldest, &.{"ext:pdf"}));
+    try testing.expectEqualStrings("Bravo", try order(a, &idx, .oldest, &.{ "ext:pdf", "-size:>100" }));
+    try testing.expectEqualStrings("Charlie,Bravo,alpha,Undated", try order(a, &idx, .oldest, &.{"-ext:zip"}));
+    try testing.expectError(error.InvalidQuery, idx.searcher().search(a, .{ .text = "kernel", .filter_strings = &.{"nonsense:1"} }));
+    try testing.expectError(error.InvalidQuery, idx.searcher().search(a, .{ .text = "kernel", .filter_strings = &.{"size:big"} }));
+    // An index from before filters cannot sort by date.
+    idx.has_meta = false;
+    try testing.expectError(error.InvalidQuery, idx.searcher().search(a, .{ .text = "kernel", .sort = .newest }));
+    _ = try idx.searcher().search(a, .{ .text = "kernel", .sort = .title });
 }

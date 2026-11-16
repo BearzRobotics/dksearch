@@ -80,6 +80,8 @@ pub const Form = struct {
     exact_only: bool = false,
     /// Names of the sources this server has, for the Source drop-down.
     sources: []const []const u8 = &.{},
+    /// The chosen order (`newest`, ...); empty for best match first.
+    sort: []const u8 = "",
 };
 
 pub fn writeHead(w: *Writer, title: []const u8) Writer.Error!void {
@@ -95,7 +97,7 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
         "<input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Search\" autofocus value=\"");
     try writeEscaped(w, f.q);
     try w.writeAll("\"><button type=\"submit\">Search</button>");
-    const open = if (f.language.len > 0 or f.connector.len > 0) " open" else "";
+    const open = if (f.language.len > 0 or f.connector.len > 0 or f.sort.len > 0) " open" else "";
     try w.print("<details{s}><summary><span>Filters</span><a class=\"tips\" href=\"/help/search\">Search tips</a></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
     try writeEscaped(w, f.language);
     try w.writeAll("\"></label><label>Source <select name=\"connector\"><option value=\"\">All sources</option>");
@@ -116,6 +118,11 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
         try w.writeAll("\" selected>");
         try writeEscaped(w, f.connector);
         try w.writeAll("</option>");
+    }
+    try w.writeAll("</select></label><label>Order <select name=\"sort\">");
+    const orders = [_][2][]const u8{ .{ "", "Best match" }, .{ "newest", "Newest" }, .{ "oldest", "Oldest" }, .{ "largest", "Largest" }, .{ "smallest", "Smallest" }, .{ "title", "Title" } };
+    for (orders) |o| {
+        try w.print("<option value=\"{s}\"{s}>{s}</option>", .{ o[0], if (std.mem.eql(u8, o[0], f.sort)) " selected" else "", o[1] });
     }
     try w.writeAll("</select></label>");
     try w.writeAll("</details></form>\n");
@@ -216,6 +223,10 @@ fn writeInterpretation(w: *Writer, f: Form, page: dk.search.Page, offset: u32) W
         // Offer the strict search back, keeping the rest of the query.
         try w.writeAll("<a href=\"/search?q=");
         try query.writeEncoded(w, f.q);
+        if (f.sort.len > 0) {
+            try w.writeAll("&amp;sort=");
+            try query.writeEncoded(w, f.sort);
+        }
         if (f.language.len > 0) {
             try w.writeAll("&amp;language=");
             try query.writeEncoded(w, f.language);
@@ -437,6 +448,10 @@ fn metaRow(w: *Writer, name: []const u8, value: []const u8) Writer.Error!void {
 fn writePagerLink(w: *Writer, f: Form, offset: u32, label_html: []const u8) Writer.Error!void {
     try w.writeAll("<a href=\"/search?q=");
     try query.writeEncoded(w, f.q);
+    if (f.sort.len > 0) {
+        try w.writeAll("&amp;sort=");
+        try query.writeEncoded(w, f.sort);
+    }
     if (f.language.len > 0) {
         try w.writeAll("&amp;language=");
         try query.writeEncoded(w, f.language);

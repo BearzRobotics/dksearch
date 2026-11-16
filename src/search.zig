@@ -77,7 +77,25 @@ pub const Filter = struct {
     max: ?i64 = null,
 };
 
+/// How results are ordered.
+pub const Sort = enum {
+    /// Best match first (the default).
+    relevance,
+    /// Most recently modified first (documents without a date last).
+    newest,
+    oldest,
+    /// Largest file first.
+    largest,
+    smallest,
+    /// By title, A to Z.
+    title,
+};
+
 pub const Query = struct {
+    /// Conditions in the query language's own spelling (`ext:pdf`, `-domain:example.org`,
+    /// `size:>1mb`, `modified:7d`), for callers that take them as separate parameters.
+    filter_strings: []const []const u8 = &.{},
+    sort: Sort = .relevance,
     /// Conditions on the documents, all of which must hold. Filters written in
     /// the query text itself (`ext:pdf`) are added to these.
     filters: []const Filter = &.{},

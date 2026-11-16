@@ -8,7 +8,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 - **Audio and video, metadata (done):** tags and technical details through `ffprobe` (title, artist, album, year, genre, duration, codecs) for `mp3`, `m4a`, `ogg`, `flac`, `mp4` and similar, and subtitle or lyrics files next to the media (`.srt`, `.vtt`, `.lrc`) as searchable text.
 - **Rich viewer (done):** Markdown rendered through `md-zig` and the HTML sanitizer; ZIM articles shown from the ZIM file with their images and internal links working.
-- **Search results in the API:** file kind, size, dates, domain and the rest of what the index knows in the JSON, plus filter parameters and sort modes.
+- **Search results in the API (done):** file kind, size, dates, domain and the rest of what the index knows in the JSON, `filter` parameters and sort modes.
 - **Office and ebook text:** `docx`, `odt` and `epub` extraction on `xml-zig` (zip plus XML), an HTML option for the files connector, and the switch of the Wikipedia connector from Expat to `xml-zig`.
 - **Parallel external extraction:** several `pdftotext` processes at once, for libraries of tens of thousands of PDFs (a 28,000-PDF library is the test case).
 - **Admin panel, feature complete:** every source option as a labelled field with help and validation, server settings, runs and schedules, a list of skipped items with the reason.
@@ -24,6 +24,8 @@ Standing rules that shape every item: the core stays lexical and works with no A
 - **Management:** saved searches, opt-in statistics (no query logging by default), caching, rate limits, a Kiwix library helper that downloads ZIM files after confirmation.
 
 ## Later, optional
+
+- **Reddit content, by permitted routes only:** the crawler obeys `robots.txt` and Reddit disallows all crawlers, so there is no crawl source for it. Candidates: subreddit `.rss` feeds through the feeds connector (works today), a connector for the account's own data export, the official API (OAuth, rate limits, its terms), and shared archive dumps (JSON lines), each after checking the terms.
 
 - **Speech-to-text:** transcribe spoken-word audio and video with an external program (whisper.cpp or faster-whisper), producing timestamped chunks so a result can start playback at the right moment. Off by default; slow on a CPU, so tried on a sample first.
 - **Playing media in the browser:** an embedded player in the viewer, with HTTP range requests and streaming for original files (today an original is sent whole, up to 64 MiB), and a start time taken from the result.

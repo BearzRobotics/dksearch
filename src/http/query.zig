@@ -23,6 +23,13 @@ pub const Pair = struct { name: []const u8, value: []const u8 };
 pub const Params = struct {
     pairs: []const Pair,
 
+    /// Every value given for `name`, in order (for parameters that may repeat).
+    pub fn all(self: Params, arena: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        for (self.pairs) |p| if (std.mem.eql(u8, p.name, name) and p.value.len > 0) try out.append(arena, p.value);
+        return out.items;
+    }
+
     /// First value for `name`, or null. Later duplicates are ignored.
     pub fn get(self: Params, name: []const u8) ?[]const u8 {
         for (self.pairs) |p| if (std.mem.eql(u8, p.name, name)) return p.value;

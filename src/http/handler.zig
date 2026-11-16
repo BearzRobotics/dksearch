@@ -183,6 +183,13 @@ fn parseQuery(arena: Allocator, params: query.Params, html_mode: bool) error{Out
             q.fuzzy = .off;
         } else return .{ .bad = .{ .name = "fuzzy", .message = "must be 1 (always allow typos), 0 (exact words only), or left out (the server's default)" } };
     };
+    if (params.get("sort")) |v| if (v.len > 0) {
+        q.sort = std.meta.stringToEnum(dk.search.Sort, v) orelse
+            return .{ .bad = .{ .name = "sort", .message = "must be relevance, newest, oldest, largest, smallest or title" } };
+    };
+    q.filter_strings = params.all(arena, "filter") catch return error.OutOfMemory;
+    if (q.filter_strings.len > 16) return .{ .bad = .{ .name = "filter", .message = "at most 16 filters" } };
+    for (q.filter_strings) |f| if (f.len > 200) return .{ .bad = .{ .name = "filter", .message = "a filter is at most 200 characters" } };
     if (html_mode) {
         q.limit = html_page_size; // the page size is not user-controlled
     } else if (params.get("limit")) |v| if (v.len > 0) {
@@ -261,6 +268,18 @@ const ApiHit = struct {
     title: ?[]const u8,
     snippet: ?[]const u8,
     score: f64,
+    /// A page on this server for the document: its details, stored text and original (`/doc/<id>`).
+    view_url: []const u8,
+    language: ?[]const u8,
+    content_type: ?[]const u8,
+    /// page, text, markdown, pdf, image, video, audio, data or other.
+    kind: ?[]const u8,
+    domain: ?[]const u8,
+    author: ?[]const u8,
+    /// Size in bytes (of the original file when the source knows it, otherwise of the text).
+    size: ?u64,
+    /// Unix time in seconds, when the source gave one.
+    modified_at: ?i64,
 };
 const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false };
 
@@ -317,6 +336,14 @@ fn apiHit(arena: Allocator, h: dk.search.Hit) error{OutOfMemory}!ApiHit {
         .title = h.title,
         .snippet = h.snippet,
         .score = h.score,
+        .view_url = try std.fmt.allocPrint(arena, "/doc/{s}", .{std.fmt.bytesToHex(h.id, .lower)}),
+        .language = h.language,
+        .content_type = h.content_type,
+        .kind = h.kind,
+        .domain = h.domain,
+        .author = h.author,
+        .size = h.size,
+        .modified_at = h.modified_at,
     };
 }
 
@@ -483,7 +510,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
     const q = parsed.q;
-    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .connector = q.connector orelse "", .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources };
+    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .connector = q.connector orelse "", .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .sort = params.get("sort") orelse "" };
     if (parsed.re) |req| {
         // A pattern typed in the box is already part of `q` and travels with it; only one given
         // as a parameter has to be carried separately (the pager and the exact-spelling link).
@@ -772,6 +799,49 @@ test "end to end against the real index" {
         const r = handle(ar.allocator(), idx.searcher(), .GET, t);
         try testing.expect(r.status == .ok or r.status == .bad_request);
     }
+}
+
+test "the API tells what it knows about each hit, takes filter and sort parameters, and refuses bad ones" {
+    var idx = try dk.index_sqlite.SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const day = 86400;
+    const docs = [_]dk.document.Document{
+        .{ .connector = "notes", .source_id = "a", .title = "Alpha", .text = "kernel notes", .canonical_url = "https://docs.example.org/guide/a.pdf", .content_type = "application/pdf", .author = "Jo", .language = "en", .modified_at = 20 * day, .extra = &.{.{ .key = "file_size", .value = "4096" }} },
+        .{ .connector = "notes", .source_id = "b", .title = "Beta", .text = "kernel readme", .canonical_url = "https://example.org/b.md", .content_type = "text/markdown", .modified_at = 10 * day },
+    };
+    for (docs) |d| try idx.indexer().add(d.id(), d);
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const r = handle(a, idx.searcher(), .GET, "/api/v1/search?q=kernel&sort=oldest");
+    try testing.expectEqual(http.Status.ok, r.status);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, r.body, .{});
+    const hits = parsed.object.get("hits").?.array.items;
+    try testing.expectEqual(@as(usize, 2), hits.len);
+    try testing.expectEqualStrings("Beta", hits[0].object.get("title").?.string); // oldest first
+    const first = hits[1].object;
+    try testing.expectEqualStrings("pdf", first.get("kind").?.string);
+    try testing.expectEqualStrings("docs.example.org", first.get("domain").?.string);
+    try testing.expectEqualStrings("application/pdf", first.get("content_type").?.string);
+    try testing.expectEqualStrings("Jo", first.get("author").?.string);
+    try testing.expectEqual(@as(i64, 4096), first.get("size").?.integer);
+    try testing.expectEqual(@as(i64, 20 * day), first.get("modified_at").?.integer);
+    try testing.expect(std.mem.startsWith(u8, first.get("view_url").?.string, "/doc/"));
+
+    // Repeated filter parameters, in the query language's spelling.
+    const f = handle(a, idx.searcher(), .GET, "/api/v1/search?q=kernel&filter=ext:md&filter=-domain:docs.example.org");
+    const only = (try std.json.parseFromSliceLeaky(std.json.Value, a, f.body, .{})).object.get("hits").?.array.items;
+    try testing.expectEqual(@as(usize, 1), only.len);
+    try testing.expectEqualStrings("Beta", only[0].object.get("title").?.string);
+    // Mistakes are 400 with a name, never a crash.
+    for ([_][]const u8{ "/api/v1/search?q=kernel&sort=sideways", "/api/v1/search?q=kernel&filter=nonsense:1", "/api/v1/search?q=kernel&filter=size:big" }) |t| {
+        errdefer std.debug.print("target: {s}\n", .{t});
+        try testing.expectEqual(http.Status.bad_request, handle(a, idx.searcher(), .GET, t).status);
+    }
+    // The page keeps the chosen order and offers it.
+    const page = handle(a, idx.searcher(), .GET, "/search?q=kernel&sort=newest");
+    try testing.expect(std.mem.indexOf(u8, page.body, "<option value=\"newest\" selected>Newest</option>") != null);
 }
 
 test "the Source filter is a drop-down of the enabled sources, and keeps the choice" {
