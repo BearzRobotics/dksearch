@@ -61,12 +61,31 @@ pub const Options = struct {
     fuzzy_words: bool = false,
     /// Stop words and synonyms (see `lexicon.zig`); null leaves the query as typed.
     lexicon: ?*const lexicon.Lexicon = null,
+    /// Finds the words of the index that are within a number of edits of a word, for typo tolerance. Without it
+    /// a fuzzy word is expanded to every spelling one edit away, whether or not it exists.
+    expander: ?Expander = null,
 };
+
+/// Looks words up in the index's vocabulary. `f` returns the words within `max_edits` of `word` (not `word`
+/// itself), best first, at most `max_expansions`.
+pub const Expander = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, arena: Allocator, word: []const u8, max_edits: u8) Allocator.Error![]const []const u8,
+};
+
+/// How many edits a fuzzy word may be off: one for words of three to five letters, two from six, unless the
+/// person wrote `word~1` or `word~2`.
+pub fn autoEdits(len: usize) u8 {
+    return if (len < fuzzy_min_len) 0 else if (len <= 5) 1 else 2;
+}
+
+pub const max_expansions = 12;
 
 /// What the output stage needs besides the words: the lexicon, and whether stop words are in force.
 const Lx = struct {
     lexicon: ?*const lexicon.Lexicon = null,
     stops: bool = false,
+    expander: ?Expander = null,
 };
 
 pub const Parsed = struct {
@@ -92,7 +111,7 @@ const Column = enum { title, body };
 const Term = struct {
     text: []const u8,
     kind: Kind,
-    /// Distance for `near`.
+    /// Distance for `near`; for `fuzzy`, the edits asked for with `~1` or `~2` (0: by the word's length).
     n: u32 = 0,
     column: ?Column = null,
 };
@@ -121,7 +140,7 @@ const Lexer = struct {
     key_buf: [48]u8 = undefined,
 
     const Token = union(enum) {
-        word: struct { text: []const u8, prefix: bool, fuzzy: bool },
+        word: struct { text: []const u8, prefix: bool, fuzzy: bool, edits: u8 = 0 },
         phrase: struct { text: []const u8, near: ?u32 },
         /// `key:value`, with a key from `filter_keys`.
         filter: struct { key: []const u8, value: []const u8 },
@@ -225,7 +244,8 @@ const Lexer = struct {
         var w = word;
         var prefix = false;
         var fuzzy = false;
-        // `word~` or `word~1` (any digits are accepted; one edit is what it means).
+        var edits: u8 = 0;
+        // `word~` (the number of edits follows the word's length), `word~1` or `word~2`; any other digits mean `~2`.
         if (std.mem.lastIndexOfScalar(u8, w, '~')) |t| {
             const tail = w[t + 1 ..];
             var all_digits = true;
@@ -234,6 +254,7 @@ const Lexer = struct {
             };
             if (all_digits and t > 0) {
                 fuzzy = true;
+                edits = if (tail.len == 0) 0 else if (tail[0] == '1') 1 else 2;
                 w = w[0..t];
             }
         }
@@ -241,7 +262,7 @@ const Lexer = struct {
             prefix = true;
             w = w[0 .. w.len - 1];
         }
-        return .{ .word = .{ .text = w, .prefix = prefix, .fuzzy = fuzzy } };
+        return .{ .word = .{ .text = w, .prefix = prefix, .fuzzy = fuzzy, .edits = edits } };
     }
 };
 
@@ -578,7 +599,7 @@ const Parser = struct {
                         kind = .fuzzy; // asked for through the options, not by the person: not "advanced"
                         self.fuzzy_applied = true;
                     }
-                    const unit: Unit = .{ .term = .{ .text = w.text, .kind = kind, .column = self.pending_column } };
+                    const unit: Unit = .{ .term = .{ .text = w.text, .kind = kind, .n = w.edits, .column = self.pending_column } };
                     self.pending_column = null;
                     try (if (negate_next) node.negative else node.positive).append(self.arena, unit);
                     negate_next = false;
@@ -626,7 +647,7 @@ pub fn parseWith(arena: Allocator, text: []const u8, options: Options) Error!Par
     if (p.too_many) return error.InvalidQuery;
 
     var fts: std.ArrayList(u8) = .empty;
-    var lx: Lx = .{ .lexicon = options.lexicon, .stops = options.lexicon != null and options.lexicon.?.stops.count() > 0 };
+    var lx: Lx = .{ .lexicon = options.lexicon, .stops = options.lexicon != null and options.lexicon.?.stops.count() > 0, .expander = options.expander };
     var has_terms = try emitOr(arena, &fts, lx, root);
     if (!has_terms and lx.stops) {
         // Only stop words were typed (`the`): search for them after all rather than for nothing.
@@ -690,7 +711,7 @@ fn emitTerm(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, t: Term) Allocato
         },
         .fuzzy => {
             if (lx.stops and (lx.lexicon.?).isStop(t.text)) return false;
-            try emitFuzzy(arena, out, t.text);
+            try emitFuzzy(arena, out, lx, t.text, @intCast(t.n));
         },
         .near => {
             // Split into words; one word is just that word.
@@ -718,7 +739,7 @@ const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
 /// `word` and every word one edit away (a letter dropped, swapped with its
 /// neighbour, replaced or inserted), as an OR. Words that are not plain
 /// letters and digits, or are too short or long, are searched as written.
-fn emitFuzzy(arena: Allocator, out: *std.ArrayList(u8), word: []const u8) Allocator.Error!void {
+fn emitFuzzy(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, word: []const u8, asked_edits: u8) Allocator.Error!void {
     var plain = word.len >= fuzzy_min_len and word.len <= fuzzy_max_len;
     if (plain) for (word) |b| if (!std.ascii.isAlphanumeric(b)) {
         plain = false;
@@ -726,6 +747,20 @@ fn emitFuzzy(arena: Allocator, out: *std.ArrayList(u8), word: []const u8) Alloca
     if (!plain) return quoted(arena, out, word);
 
     const lower = try std.ascii.allocLowerString(arena, word);
+    // With the index's vocabulary: the words that exist within the allowed number of edits, best first.
+    if (lx.expander) |ex| {
+        const edits = if (asked_edits > 0) asked_edits else autoEdits(lower.len);
+        const found = try ex.f(ex.ctx, arena, lower, edits);
+        try out.append(arena, '(');
+        try quoted(arena, out, lower);
+        for (found[0..@min(found.len, max_expansions)]) |w| {
+            if (std.mem.eql(u8, w, lower)) continue;
+            try out.appendSlice(arena, " OR ");
+            try quoted(arena, out, w);
+        }
+        try out.append(arena, ')');
+        return;
+    }
     try out.append(arena, '(');
     try quoted(arena, out, lower);
     var buf: [fuzzy_max_len + 1]u8 = undefined;
@@ -856,7 +891,7 @@ fn showTerm(arena: Allocator, out: *std.ArrayList(u8), t: Term) Allocator.Error!
     switch (t.kind) {
         .word => try out.appendSlice(arena, t.text),
         .prefix => try out.print(arena, "{s}*", .{t.text}),
-        .fuzzy => try out.print(arena, "{s}~", .{t.text}),
+        .fuzzy => if (t.n > 0) try out.print(arena, "{s}~{d}", .{ t.text, t.n }) else try out.print(arena, "{s}~", .{t.text}),
         .phrase => try out.print(arena, "\"{s}\"", .{t.text}),
         .near => try out.print(arena, "\"{s}\"~{d}", .{ t.text, t.n }),
     }

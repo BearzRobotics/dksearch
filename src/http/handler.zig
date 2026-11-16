@@ -1685,7 +1685,7 @@ test "help pages explain the search syntax and regex, with this server's limits"
     defer ar.deinit();
     const tips = f.get(&ar, true, "/help/search");
     try testing.expectEqual(http.Status.ok, tips.status);
-    for ([_][]const u8{ "AND", "OR", "NOT", "comp*", "compositor~", "~5", "one typo away", "regular expressions" }) |needle| {
+    for ([_][]const u8{ "AND", "OR", "NOT", "comp*", "compositor~", "~5", "a typo or two away", "regular expressions" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, tips.body, needle) != null);
     }
     try testing.expectEqualStrings(tips.body, f.get(&ar, true, "/help").body);

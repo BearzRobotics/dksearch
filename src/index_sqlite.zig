@@ -30,6 +30,7 @@ const image_mod = @import("image.zig");
 const queryparse = @import("queryparse.zig");
 const lexicon_mod = @import("lexicon.zig");
 const retrieve = @import("retrieve.zig");
+const editdistance = @import("editdistance.zig");
 const docmeta = @import("docmeta.zig");
 const derive = docmeta.derive;
 
@@ -136,6 +137,8 @@ pub const SqliteIndex = struct {
     /// True if the `docs` table has the metadata columns filters use (an index
     /// made before they existed gets them on its next writable open).
     has_meta: bool = false,
+    /// True if the vocabulary table exists (typo tolerance then uses the words that are really in the index).
+    has_vocab: bool = false,
 
     /// Opens (creating if needed) the index at `path`; ":memory:" gives a
     /// throwaway index.
@@ -151,6 +154,7 @@ pub const SqliteIndex = struct {
         registerFunctions(self.db);
         try self.initSchema(options);
         self.has_meta = self.detectMeta();
+        self.has_vocab = self.detectVocab();
         self.chunk_min_bytes = options.chunk_min_bytes;
         return self;
     }
@@ -199,12 +203,26 @@ pub const SqliteIndex = struct {
         try self.exec("PRAGMA query_only = 1;");
         registerFunctions(db);
         self.has_meta = self.detectMeta();
+        self.has_vocab = self.detectVocab();
         return self;
     }
 
     /// SQL functions the queries use: `dk_hamming(a, b)`, the number of differing bits.
     fn registerFunctions(db: *c.sqlite3) void {
         _ = c.sqlite3_create_function(db, "dk_hamming", 2, c.SQLITE_UTF8 | c.SQLITE_DETERMINISTIC, null, hammingFn, null, null);
+        _ = c.sqlite3_create_function(db, "dk_edits", 3, c.SQLITE_UTF8 | c.SQLITE_DETERMINISTIC, null, editsFn, null, null);
+    }
+
+    /// `dk_edits(a, b, limit)`: the edit distance of two words if at most `limit`, else NULL.
+    fn editsFn(ctx: ?*c.sqlite3_context, argc: c_int, argv: [*c]?*c.sqlite3_value) callconv(.c) void {
+        _ = argc;
+        const pa = c.sqlite3_value_text(argv[0]);
+        const pb = c.sqlite3_value_text(argv[1]);
+        if (pa == null or pb == null) return c.sqlite3_result_null(ctx);
+        const a = pa[0..@intCast(c.sqlite3_value_bytes(argv[0]))];
+        const b = pb[0..@intCast(c.sqlite3_value_bytes(argv[1]))];
+        const limit: u8 = @intCast(std.math.clamp(c.sqlite3_value_int(argv[2]), 0, 3));
+        if (editdistance.within(a, b, limit)) |d| c.sqlite3_result_int(ctx, d) else c.sqlite3_result_null(ctx);
     }
 
     fn hammingFn(ctx: ?*c.sqlite3_context, argc: c_int, argv: [*c]?*c.sqlite3_value) callconv(.c) void {
@@ -245,7 +263,7 @@ pub const SqliteIndex = struct {
             if (options.tokenizer) |want| {
                 if (have != want) {
                     if (!options.retokenize) return error.TokenizerMismatch;
-                    try self.exec("DROP TABLE fts; DROP TABLE docs; DROP TABLE IF EXISTS doc_meta; DROP TABLE IF EXISTS chunks_fts; DROP TABLE IF EXISTS chunk_map;");
+                    try self.exec("DROP TABLE IF EXISTS fts_vocab; DROP TABLE fts; DROP TABLE docs; DROP TABLE IF EXISTS doc_meta; DROP TABLE IF EXISTS chunks_fts; DROP TABLE IF EXISTS chunk_map;");
                 }
             } else tokenizer = have; // keep what the index has
         }
@@ -266,6 +284,8 @@ pub const SqliteIndex = struct {
             \\CREATE INDEX IF NOT EXISTS docs_connector ON docs(connector);
         );
         try self.exec(create);
+        // The index's words with their document counts, for typo tolerance (see `expandWord`).
+        try self.exec("CREATE VIRTUAL TABLE IF NOT EXISTS fts_vocab USING fts5vocab(fts, 'row');");
         // The passages of large documents: a contentless full-text index (the text is read back from the stored
         // document and re-chunked) and the map from its rows to documents. Created if missing; derived data like
         // the rest, refilled by `rebuild`.
@@ -290,6 +310,12 @@ pub const SqliteIndex = struct {
             \\) WITHOUT ROWID;
         );
         if (v == 0) try self.exec("PRAGMA user_version = 1");
+    }
+
+    fn detectVocab(self: SqliteIndex) bool {
+        const st = Stmt.prepare(self.db, "SELECT 1 FROM sqlite_master WHERE name = 'fts_vocab'") catch return false;
+        defer st.deinit();
+        return st.step() catch false;
     }
 
     fn detectMeta(self: SqliteIndex) bool {
@@ -821,8 +847,72 @@ pub const SqliteIndex = struct {
         return out;
     }
 
+    /// The words of the index within `max_edits` edits of `word`, closest first and, among equals, the most common first.
+    /// The words that begin like `word` are looked at first (most typos keep the first letter); if there are none, all
+    /// words of about the same length are. Time-limited like a search.
+    fn expandCb(ctx: *anyopaque, arena: Allocator, word: []const u8, max_edits: u8) Allocator.Error![]const []const u8 {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ctx));
+        return self.expandWord(arena, word, max_edits) catch &.{};
+    }
+
+    fn expandWord(self: *SqliteIndex, arena: Allocator, word: []const u8, max_edits: u8) search.Error![]const []const u8 {
+        if (word.len == 0 or max_edits == 0) return &.{};
+        const Found = struct { term: []const u8, edits: u8, docs: i64 };
+        var found: std.ArrayList(Found) = .empty;
+        const lo_len: i64 = @as(i64, @intCast(word.len)) - max_edits;
+        const hi_len: i64 = @as(i64, @intCast(word.len)) + max_edits;
+        var guard: Deadline = undefined;
+        if (self.timeout) |t| {
+            const ms: u32 = @min(t.ms, 1500);
+            guard = .{ .io = t.io, .deadline_ns = Io.Timestamp.now(t.io, .awake).nanoseconds + @as(i96, ms) * std.time.ns_per_ms };
+            c.sqlite3_progress_handler(self.db, 2000, progressCallback, &guard);
+        } else guard = .{ .io = undefined, .deadline_ns = 0 };
+        defer if (self.timeout != null) c.sqlite3_progress_handler(self.db, 0, null, null);
+        var tier: u8 = 0;
+        while (tier < 2) : (tier += 1) {
+            // Tier 0: words with the same first letter (a range of the vocabulary). Tier 1: all of them.
+            const sql = if (tier == 0)
+                "SELECT term, doc, dk_edits(term, ?1, ?2) FROM fts_vocab WHERE term >= ?3 AND term < ?4 AND length(term) BETWEEN ?5 AND ?6 AND dk_edits(term, ?1, ?2) IS NOT NULL"
+            else
+                "SELECT term, doc, dk_edits(term, ?1, ?2) FROM fts_vocab WHERE length(term) BETWEEN ?5 AND ?6 AND dk_edits(term, ?1, ?2) IS NOT NULL";
+            const st = Stmt.prepare(self.db, sql) catch return &.{}; // an index made before this table: variants are used
+            defer st.deinit();
+            st.text(1, word) catch |e| return searchError(e);
+            st.int(2, max_edits) catch |e| return searchError(e);
+            if (tier == 0) {
+                // The first character, however many bytes it takes, as the bounds of the range.
+                const n = std.unicode.utf8ByteSequenceLength(word[0]) catch 1;
+                const first = word[0..@min(n, word.len)];
+                st.text(3, first) catch |e| return searchError(e);
+                var upper = try arena.dupe(u8, first);
+                upper[upper.len - 1] +%= 1;
+                st.text(4, upper) catch |e| return searchError(e);
+            }
+            st.int(5, @max(lo_len, 1)) catch |e| return searchError(e);
+            st.int(6, hi_len) catch |e| return searchError(e);
+            while (st.step() catch |e| return if (guard.fired) &.{} else searchError(e)) {
+                const term = st.colText(0) orelse continue;
+                if (std.mem.eql(u8, term, word)) continue;
+                try found.append(arena, .{ .term = try arena.dupe(u8, term), .edits = @intCast(st.colInt(2)), .docs = st.colInt(1) });
+                if (found.items.len >= 2000) break;
+            }
+            if (found.items.len > 0) break;
+        }
+        std.mem.sort(Found, found.items, {}, struct {
+            fn lt(_: void, a: Found, b: Found) bool {
+                if (a.edits != b.edits) return a.edits < b.edits;
+                if (a.docs != b.docs) return a.docs > b.docs;
+                return std.mem.lessThan(u8, a.term, b.term);
+            }
+        }.lt);
+        const n = @min(found.items.len, queryparse.max_expansions);
+        const out = try arena.alloc([]const u8, n);
+        for (found.items[0..n], out) |f, *o| o.* = f.term;
+        return out;
+    }
+
     fn parseQuery(self: *const SqliteIndex, arena: Allocator, text: []const u8, fuzzy_words: bool, now: i64) search.Error!queryparse.Parsed {
-        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now, .lexicon = self.lexicon }) catch |e| switch (e) {
+        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now, .lexicon = self.lexicon, .expander = if (self.has_vocab) .{ .ctx = @constCast(self), .f = expandCb } else null }) catch |e| switch (e) {
             error.EmptyQuery => error.EmptyQuery,
             error.InvalidQuery => error.InvalidQuery,
             error.OutOfMemory => error.OutOfMemory,
@@ -1492,6 +1582,32 @@ test "title matches outrank body matches; ties break by id" {
     try testing.expectEqual(body_id, page.hits[1].id);
     try testing.expect(page.hits[0].score > page.hits[1].score);
     try testing.expect(!page.has_more);
+}
+
+test "typo tolerance uses the words of the index: two edits for longer words, ranked by closeness" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    _ = try put(&idx, "t", "1", "Zoo", "The elephant walked slowly through the zoo.");
+    _ = try put(&idx, "t", "2", "Mail", "Please receive the parcel at the front door.");
+    _ = try put(&idx, "t", "3", "Other", "A completely unrelated sentence about bread.");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Two edits (f for ph) on a long word; a swap; one edit on a short word.
+    try testing.expectEqual(@as(usize, 1), (try searchAll(a, &idx, "elefant~")).hits.len);
+    try testing.expectEqual(@as(usize, 1), (try searchAll(a, &idx, "recieve~")).hits.len);
+    try testing.expectEqual(@as(usize, 1), (try searchAll(a, &idx, "zooo~")).hits.len);
+    // ~1 asks for one edit only; two edits away is then not found.
+    try testing.expectEqual(@as(usize, 0), (try searchAll(a, &idx, "elefant~1")).hits.len);
+    try testing.expectEqual(@as(usize, 1), (try searchAll(a, &idx, "elefant~2")).hits.len);
+    // A word with nothing close finds nothing, and the interpreted query shows what was searched.
+    try testing.expectEqual(@as(usize, 0), (try searchAll(a, &idx, "xylophonist~")).hits.len);
+    const p = try searchAll(a, &idx, "elefant~");
+    try testing.expect(std.mem.indexOf(u8, p.interpreted.?, "elefant~") != null);
+    // The expansion is bounded however large the vocabulary: only real words, closest first.
+    const words = try idx.expandWord(a, "elefant", 2);
+    try testing.expect(words.len >= 1 and std.mem.eql(u8, words[0], "elephant"));
+    try testing.expect(words.len <= queryparse.max_expansions);
 }
 
 test "passages of large documents are indexed, found with their conditions, replaced on update and removed" {

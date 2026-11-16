@@ -37,4 +37,4 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 ## Known limits (see the manual and the decision records)
 
-Fuzzy matching is one edit; regex is bytewise; the crawler does not detect a hostname that resolves to a private address; ZIM support is tested on small real files only; Wuffs (image decoding) is alpha upstream.
+Fuzzy matching allows up to two edits (from the vocabulary); regex is bytewise; the crawler does not detect a hostname that resolves to a private address; ZIM support is tested on small real files only; Wuffs (image decoding) is alpha upstream.

@@ -204,7 +204,7 @@ fn writeSidePanel(w: *Writer, regex_enabled: bool) Writer.Error!void {
         "<dt><code>a OR b</code></dt><dd>either word</dd>" ++
         "<dt><code>a -b</code></dt><dd>a, but not b</dd>" ++
         "<dt><code>comp*</code></dt><dd>words starting with comp</dd>" ++
-        "<dt><code>word~</code></dt><dd>allow one typo</dd>" ++
+        "<dt><code>word~</code></dt><dd>allow typos (up to two for longer words)</dd>" ++
         "<dt><code>title:word</code></dt><dd>only in the title</dd></dl>");
     try w.writeAll("<h3>Filters</h3><dl><dt><code>ext:pdf</code></dt><dd>file extension</dd>" ++
         "<dt><code>type:image</code></dt><dd>page, text, pdf, document, image, video, audio&hellip;</dd>" ++
@@ -545,7 +545,7 @@ pub fn writeHelpSearch(w: *Writer, regex_enabled: bool) Writer.Error!void {
         .{ "+linux", "linux must be there (already the default; allowed for habit)" },
         .{ "(linux OR bsd) AND kernel", "grouping with parentheses" },
         .{ "comp*", "words that start with comp: compositor, compiler, computer&hellip;" },
-        .{ "compositor~", "the word, or any word one typo away from it" },
+        .{ "compositor~", "the word, or a word of the index a typo or two away from it" },
         .{ "\"window manager\"~5", "the two words within five words of each other, in any order" },
     };
     for (rows) |r| try w.print("<tr><td><code>{s}</code></td><td>{s}</td></tr>", .{ r[0], r[1] });
@@ -570,7 +570,7 @@ pub fn writeHelpSearch(w: *Writer, regex_enabled: bool) Writer.Error!void {
     };
     for (filter_rows) |r| try w.print("<tr><td><code>{s}</code></td><td>{s}</td></tr>", .{ r[0], r[1] });
     try w.writeAll("</tbody></table></div>\n<p>Several filters must all hold, except that the same filter written twice means either (<code>ext:pdf ext:md</code> finds PDFs and Markdown). A filter that does not make sense (<code>size:big</code>) is searched as ordinary text. Documents indexed before filters existed have no type, size or dates until they are imported again or the index is rebuilt.</p>\n");
-    try w.writeAll("<h3>You do not have to spell everything right</h3><p>If a search finds fewer than three results, dksearch automatically tries again with words that are one typo away (a letter missing, extra, wrong or swapped) and tells you it did, with a link to search exactly as typed. Short words (three letters or fewer) are never guessed at. To force it for one word, write <code>word~</code>.</p>\n");
+    try w.writeAll("<h3>You do not have to spell everything right</h3><p>If a search finds fewer than three results, dksearch automatically tries again with words of the index that are a typo away (a letter missing, extra, wrong or swapped; two typos for words of six letters or more) and tells you it did, with a link to search exactly as typed. Short words (three letters or fewer) are never guessed at. To force it for one word, write <code>word~</code>, or <code>word~1</code> or <code>word~2</code> to say how many typos to allow.</p>\n");
     try w.writeAll("<h3>Good to know</h3><ul><li><code>AND</code>, <code>OR</code> and <code>NOT</code> only count as operators in capital letters; <code>and</code> or <code>or</code> in lower case are ordinary words. To search for the word itself, put it in quotes: <code>\"OR\"</code>.</li><li>A search with only excluded words (<code>-android</code>) has nothing to look for: add a word you do want.</li><li>When your query used these features, the results page shows how it was read (&ldquo;Searching for: &hellip;&rdquo;).</li>");
     if (regex_enabled) try w.writeAll("<li>For patterns that words cannot express (codes, dates, phone numbers), see <a href=\"/help/regex\">regular expressions</a>.</li>");
     try w.writeAll("</ul><p><a href=\"/\">&larr; Back to search</a></p></main></body></html>\n");

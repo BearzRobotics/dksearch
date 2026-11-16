@@ -46,3 +46,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0028 | Downloading ZIM files from the Kiwix library |
 | 0029 | Ranking controls, stop words and synonyms, schedules, skip examples |
 | 0030 | Retrieval API for RAG |
+| 0031 | Typo tolerance from the index's vocabulary (edit distance 2) |
