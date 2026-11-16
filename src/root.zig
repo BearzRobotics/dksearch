@@ -64,3 +64,11 @@ test {
     if (connectors.have_crawler) _ = connectors.archive;
     _ = @import("sqlite.zig");
 }
+
+test "the vendored xml-zig library is available" {
+    const std = @import("std");
+    const xmlzig = @import("xmlzig");
+    var doc = try xmlzig.Document.parse(std.testing.allocator, "<a><!--kept--><b x='1'>text</b></a>", .{}, null);
+    defer doc.deinit();
+    try std.testing.expectEqualStrings("1", doc.root.child("b").?.attr("x").?);
+}
