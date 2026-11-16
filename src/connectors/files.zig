@@ -25,12 +25,15 @@ const config = @import("../config.zig");
 const api = @import("../connector.zig");
 const doc = @import("../document.zig");
 const avmeta = @import("../avmeta.zig");
+const htmltext = @import("../htmltext.zig");
+const officetext = @import("../officetext.zig");
+const ziparchive = @import("../ziparchive.zig");
 
 pub const kind = "files";
 pub const default_max_file_bytes: u32 = 4 * 1024 * 1024;
 pub const hard_max_file_bytes: u32 = 64 * 1024 * 1024;
 const checkpoint_every = 100;
-const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text", "media" };
+const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text", "media", "office", "html" };
 
 /// Checks a source's options without touching the filesystem.
 pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!void {
@@ -73,7 +76,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
             },
         }
     }
-    inline for (.{ "serve_originals", "pdf_text", "media" }) |bool_key| {
+    inline for (.{ "serve_originals", "pdf_text", "media", "office", "html" }) |bool_key| {
         if (source.option(bool_key)) |v| switch (v) {
             .boolean => {},
             else => {
@@ -116,6 +119,10 @@ pub const FilesConnector = struct {
     pdf_text: bool,
     /// Index audio and video through `ffprobe` and their subtitle or lyrics files (`media = true`).
     media: bool,
+    /// Index Word (`docx`), OpenDocument text (`odt`) and `epub` files (`office = true`).
+    office: bool,
+    /// Index `.html` and `.htm` files as web pages (`html = true`).
+    html: bool,
     /// Subtitle and lyrics files of this run, found next to their media (set by `run`).
     sidecars: SidecarMap = .empty,
     /// Backs the checkpoint handed back in an `Outcome`.
@@ -137,6 +144,8 @@ pub const FilesConnector = struct {
             .language = language,
             .pdf_text = source.optionBool("pdf_text") orelse false,
             .media = source.optionBool("media") orelse false,
+            .office = source.optionBool("office") orelse false,
+            .html = source.optionBool("html") orelse false,
         };
     }
 
@@ -192,7 +201,7 @@ pub const FilesConnector = struct {
         const base_abs = Io.Dir.cwd().realPathFileAlloc(io, self.root, arena) catch return error.InvalidSource;
         self.sidecars = .empty;
         var sidecar_paths: std.ArrayList([]const u8) = .empty;
-        const paths = collect(arena, io, dir, self.pdf_text, self.media, &sidecar_paths) catch |e| switch (e) {
+        const paths = collect(arena, io, dir, .{ .pdf = self.pdf_text, .media = self.media, .office = self.office, .html = self.html }, &sidecar_paths) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SourceFailed,
         };
@@ -282,6 +291,8 @@ pub const FilesConnector = struct {
         if (st.kind != .file) return .refused; // replaced by a link or directory since listing
         if (hasExtension(rel, ".pdf")) return self.readPdf(arena, io, st, base_abs, rel);
         if (self.media) if (avmeta.formatOf(rel)) |fmt| return self.readMedia(arena, io, dir, st, base_abs, rel, fmt);
+        if (self.office) if (officetext.kindOf(rel)) |office_kind| return readOfficeImpl(self, arena, io, dir, st, base_abs, rel, office_kind);
+        if (self.html and (hasExtension(rel, ".html") or hasExtension(rel, ".htm"))) return readHtmlImpl(self, arena, io, dir, st, base_abs, rel);
         if (st.size > self.max_file_bytes) return .refused;
         if (st.size == 0) return .skip;
 
@@ -309,6 +320,68 @@ pub const FilesConnector = struct {
 };
 
 const pdf_timeout_seconds = 60;
+/// Largest `docx`, `odt` or `epub` file opened (only its text parts are read, one at a time).
+const hard_max_office_bytes: u64 = 512 * 1024 * 1024;
+
+fn readOfficeImpl(self: *FilesConnector, arena: Allocator, io: Io, dir: Io.Dir, st: Io.File.Stat, base_abs: []const u8, rel: []const u8, office_kind: officetext.Kind) FilesConnector.Read {
+    if (st.size == 0) return .skip;
+    if (st.size > hard_max_office_bytes) return .refused;
+    var file = dir.openFile(io, rel, .{}) catch return .refused;
+    defer file.close(io);
+    var archive: ziparchive.Archive = undefined;
+    archive.open(arena, io, file) catch |e| return switch (e) {
+        error.OutOfMemory => .out_of_memory,
+        else => .refused, // not a zip (an old binary .doc, an encrypted file), or damaged
+    };
+    const got = officetext.extract(arena, &archive, office_kind, self.max_file_bytes) catch |e| return switch (e) {
+        error.OutOfMemory => .out_of_memory,
+        else => .refused, // too much text, damaged parts, or not the kind of document its name says
+    };
+    if (got.text.len == 0) return .no_text;
+    if (!std.unicode.utf8ValidateSlice(got.text)) return .refused;
+    const url = fileUrl(arena, base_abs, rel) catch return .out_of_memory;
+    const mtime_s: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s));
+    return .{ .document = .{
+        .connector = self.name,
+        .source_id = rel,
+        .canonical_url = url,
+        .title = got.title orelse titleOf(got.text, rel, false),
+        .text = got.text,
+        .language = got.language orelse self.language,
+        .content_type = office_kind.contentType(),
+        .author = got.author,
+        .published_at = if (got.date) |d| avmeta.yearStart(d) else null,
+        .modified_at = mtime_s,
+        .extra = fileSizeExtra(arena, st.size) catch return .out_of_memory,
+    } };
+}
+
+fn readHtmlImpl(self: *FilesConnector, arena: Allocator, io: Io, dir: Io.Dir, st: Io.File.Stat, base_abs: []const u8, rel: []const u8) FilesConnector.Read {
+    if (st.size == 0) return .skip;
+    if (st.size > self.max_file_bytes) return .refused;
+    const raw = dir.readFileAlloc(io, rel, arena, .limited(self.max_file_bytes + 1)) catch |e| switch (e) {
+        error.OutOfMemory => return .out_of_memory,
+        else => return .refused,
+    };
+    if (raw.len > self.max_file_bytes) return .refused;
+    if (!std.unicode.utf8ValidateSlice(raw) or std.mem.indexOfScalar(u8, raw, 0) != null) return .refused;
+    const text = htmltext.toText(arena, raw) catch return .out_of_memory;
+    if (text.len == 0) return .no_text;
+    const title = htmltext.titleOf(arena, raw) catch return .out_of_memory;
+    const url = fileUrl(arena, base_abs, rel) catch return .out_of_memory;
+    const mtime_s: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s));
+    return .{ .document = .{
+        .connector = self.name,
+        .source_id = rel,
+        .canonical_url = url,
+        .title = title orelse titleOf(text, rel, false),
+        .text = text,
+        .language = self.language,
+        .content_type = "text/html",
+        .modified_at = mtime_s,
+        .extra = fileSizeExtra(arena, st.size) catch return .out_of_memory,
+    } };
+}
 const media_timeout_seconds = 30;
 /// The most subtitle or lyrics files read for one media file, and the largest of them.
 const max_sidecars_per_media = 3;
@@ -481,7 +554,11 @@ fn readPdfImpl(self: *FilesConnector, arena: Allocator, io: Io, st: Io.File.Stat
 }
 
 /// Paths (relative, '/'-separated) of every eligible file under `dir`.
-fn collect(arena: Allocator, io: Io, dir: Io.Dir, pdf: bool, media: bool, sidecars: *std.ArrayList([]const u8)) !([][]const u8) {
+const Wanted = struct { pdf: bool, media: bool, office: bool, html: bool };
+
+fn collect(arena: Allocator, io: Io, dir: Io.Dir, want: Wanted, sidecars: *std.ArrayList([]const u8)) !([][]const u8) {
+    const pdf = want.pdf;
+    const media = want.media;
     var walker = try dir.walkSelectively(arena);
     defer walker.deinit();
     var list: std.ArrayList([]const u8) = .empty;
@@ -491,7 +568,9 @@ fn collect(arena: Allocator, io: Io, dir: Io.Dir, pdf: bool, media: bool, sideca
             .directory => try walker.enter(io, entry),
             .file => {
                 const wanted = hasExtension(entry.path, ".txt") or hasExtension(entry.path, ".md") or
-                    (pdf and hasExtension(entry.path, ".pdf")) or (media and avmeta.formatOf(entry.path) != null);
+                    (pdf and hasExtension(entry.path, ".pdf")) or (media and avmeta.formatOf(entry.path) != null) or
+                    (want.office and officetext.kindOf(entry.path) != null) or
+                    (want.html and (hasExtension(entry.path, ".html") or hasExtension(entry.path, ".htm")));
                 if (wanted) {
                     try list.append(arena, try arena.dupe(u8, entry.path));
                 } else if (media and avmeta.isSidecar(entry.path)) {
@@ -1043,4 +1122,59 @@ test "media = true: audio is found by its name, with its subtitle or lyrics text
     try testing.expectEqualStrings("audio", page.hits[0].kind.?);
     try testing.expectEqualStrings("audio/wav", page.hits[0].content_type.?);
     try testing.expectEqual(@as(?u64, wav.len), page.hits[0].size); // the file's size, not the text's
+}
+
+test "office = true and html = true: Word, OpenDocument, EPUB and HTML files are found by their text" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "lib");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib/report.docx", .data = @embedFile("../testdata/office/sample.docx") });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib/notes.odt", .data = @embedFile("../testdata/office/sample.odt") });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib/almanac.epub", .data = @embedFile("../testdata/office/sample.epub") });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib/page.html", .data = "<html><head><title>Cape Page</title><script>var x=1</script></head><body><h1>Cape</h1><p>Gannets nest on the cape.</p></body></html>" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib/old.docx", .data = "this is not a zip file, as an old binary document is not" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib/readme.txt", .data = "plain words" });
+
+    var e: E2e = undefined;
+    try e.init();
+    defer e.deinit();
+    var ctl: api.Control = .{};
+
+    var pb0: [200]u8 = undefined;
+    const off = try treeSource(&tmp, &pb0, &.{});
+    defer testing.allocator.free(off.options);
+    var fc_off = try FilesConnector.init(testing.allocator, testing.io, off);
+    defer fc_off.deinit();
+    const r0 = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc_off.connector(), "notes", &ctl, E2e.now);
+    try testing.expectEqual(@as(u64, 1), r0.submitted); // only readme.txt
+
+    var pb: [200]u8 = undefined;
+    const on = try treeSource(&tmp, &pb, &.{ .{ .key = "office", .value = .{ .boolean = true } }, .{ .key = "html", .value = .{ .boolean = true } } });
+    defer testing.allocator.free(on.options);
+    var fc = try FilesConnector.init(testing.allocator, testing.io, on);
+    defer fc.deinit();
+    const r = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc.connector(), "notes", &ctl, E2e.now);
+    try testing.expectEqual(state_sqlite.JobState.completed, r.state);
+    try testing.expectEqual(@as(u64, 5), r.submitted); // readme again, the four documents
+    try testing.expectEqual(@as(u64, 1), r.rejected); // old.docx is not a zip
+    try testing.expectEqual(@as(u64, 5), try e.idx.count());
+
+    try testing.expectEqual(@as(usize, 1), try e.hits("spring tides")); // the Word document
+    try testing.expectEqual(@as(usize, 1), try e.hits("lantern")); // the OpenDocument text
+    try testing.expectEqual(@as(usize, 1), try e.hits("zeppelins")); // the second chapter of the EPUB
+    try testing.expectEqual(@as(usize, 1), try e.hits("gannets")); // the HTML page
+    try testing.expectEqual(@as(usize, 0), try e.hits("removed")); // tracked deletions are not text
+    try testing.expectEqual(@as(usize, 0), try e.hits("alert")); // a script is not text
+
+    const page = try e.idx.searcher().search(e.arena.allocator(), .{ .text = "tides" });
+    try testing.expectEqual(@as(usize, 1), page.hits.len);
+    try testing.expectEqualStrings("Harbour Report", page.hits[0].title.?); // from the document's own properties
+    try testing.expectEqualStrings("document", page.hits[0].kind.?);
+    try testing.expectEqualStrings("Ada Quill", page.hits[0].author.?);
+    const html_hit = try e.idx.searcher().search(e.arena.allocator(), .{ .text = "cape" });
+    var found_html = false;
+    for (html_hit.hits) |h| if (std.mem.eql(u8, h.title.?, "Cape Page") and std.mem.eql(u8, h.kind.?, "page")) {
+        found_html = true;
+    };
+    try testing.expect(found_html);
 }

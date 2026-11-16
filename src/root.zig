@@ -16,6 +16,8 @@ pub const docmeta = @import("docmeta.zig");
 pub const originals = @import("originals.zig");
 pub const avmeta = @import("avmeta.zig");
 pub const render = @import("render.zig");
+pub const ziparchive = @import("ziparchive.zig");
+pub const officetext = @import("officetext.zig");
 pub const zimserve = @import("zimserve.zig");
 /// A tiny ZIM file for tests of the HTTP layer.
 pub const zim_sample = @import("connectors/zim.zig").sample;
@@ -52,6 +54,8 @@ test {
     _ = originals;
     _ = avmeta;
     _ = render;
+    _ = ziparchive;
+    _ = officetext;
     _ = zimserve;
     _ = htmlsafe;
     _ = exif;

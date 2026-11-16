@@ -144,7 +144,7 @@ fn writeSidePanel(w: *Writer, regex_enabled: bool) Writer.Error!void {
         "<dt><code>word~</code></dt><dd>allow one typo</dd>" ++
         "<dt><code>title:word</code></dt><dd>only in the title</dd></dl>");
     try w.writeAll("<h3>Filters</h3><dl><dt><code>ext:pdf</code></dt><dd>file extension</dd>" ++
-        "<dt><code>type:image</code></dt><dd>page, text, pdf, image, video, audio&hellip;</dd>" ++
+        "<dt><code>type:image</code></dt><dd>page, text, pdf, document, image, video, audio&hellip;</dd>" ++
         "<dt><code>site:example.org</code></dt><dd>one website</dd>" ++
         "<dt><code>size:&gt;1mb</code></dt><dd>bigger or smaller</dd>" ++
         "<dt><code>modified:7d</code></dt><dd>changed in the last 7 days</dd>" ++
@@ -497,7 +497,7 @@ pub fn writeHelpSearch(w: *Writer, regex_enabled: bool) Writer.Error!void {
     try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>You type</th><th>It means</th></tr></thead><tbody>");
     const filter_rows = [_][2][]const u8{
         .{ "ext:pdf", "files with that extension (also <code>-ext:pdf</code> to leave them out)" },
-        .{ "type:image", "a kind of document: page, text, markdown, pdf, image, video, audio, data, other" },
+        .{ "type:image", "a kind of document: page, text, markdown, pdf, document, image, video, audio, data, other" },
         .{ "mime:text/*", "a media type, exactly (<code>mime:application/pdf</code>) or a whole family (<code>mime:image/*</code>)" },
         .{ "source:notes", "documents from the source with that name" },
         .{ "lang:en", "documents in that language (<code>en</code> also finds <code>en-US</code>)" },

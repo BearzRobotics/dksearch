@@ -272,7 +272,7 @@ const ApiHit = struct {
     view_url: []const u8,
     language: ?[]const u8,
     content_type: ?[]const u8,
-    /// page, text, markdown, pdf, image, video, audio, data or other.
+    /// page, text, markdown, pdf, document, image, video, audio, data or other.
     kind: ?[]const u8,
     domain: ?[]const u8,
     author: ?[]const u8,

@@ -29,7 +29,7 @@ pub const Derived = struct {
 };
 
 /// The groups of file types `type:` / `kind:` accept.
-pub const kinds = [_][]const u8{ "page", "text", "markdown", "pdf", "image", "video", "audio", "data", "other" };
+pub const kinds = [_][]const u8{ "page", "text", "markdown", "pdf", "image", "video", "audio", "document", "data", "other" };
 
 pub fn derive(d: doc.Document) Derived {
     var out: Derived = .{};
@@ -96,6 +96,8 @@ pub fn kindOf(content_type: ?[]const u8, ext: ?[]const u8) []const u8 {
         if (startsWithIgnoreCase(ct, "video/")) return "video";
         if (startsWithIgnoreCase(ct, "audio/")) return "audio";
         if (startsWithIgnoreCase(ct, "application/pdf")) return "pdf";
+        if (std.ascii.findIgnoreCase(ct, "wordprocessingml") != null or std.ascii.findIgnoreCase(ct, "opendocument") != null or
+            startsWithIgnoreCase(ct, "application/epub") or startsWithIgnoreCase(ct, "application/msword") or startsWithIgnoreCase(ct, "application/rtf")) return "document";
         if (startsWithIgnoreCase(ct, "text/html") or startsWithIgnoreCase(ct, "application/xhtml")) return "page";
         if (startsWithIgnoreCase(ct, "text/markdown")) return "markdown";
         if (startsWithIgnoreCase(ct, "application/json") or startsWithIgnoreCase(ct, "application/xml") or
@@ -116,19 +118,21 @@ pub fn kindOf(content_type: ?[]const u8, ext: ?[]const u8) []const u8 {
 
 fn fromExt(e: []const u8) []const u8 {
     const table = [_]struct { []const u8, []const u8 }{
-        .{ "html", "page" },   .{ "htm", "page" },          .{ "xhtml", "page" },
-        .{ "md", "markdown" }, .{ "markdown", "markdown" }, .{ "txt", "text" },
-        .{ "text", "text" },   .{ "rst", "text" },          .{ "org", "text" },
-        .{ "pdf", "pdf" },     .{ "jpg", "image" },         .{ "jpeg", "image" },
-        .{ "png", "image" },   .{ "gif", "image" },         .{ "webp", "image" },
-        .{ "bmp", "image" },   .{ "svg", "image" },         .{ "tif", "image" },
-        .{ "tiff", "image" },  .{ "avif", "image" },        .{ "mp4", "video" },
-        .{ "mkv", "video" },   .{ "webm", "video" },        .{ "avi", "video" },
-        .{ "mov", "video" },   .{ "mp3", "audio" },         .{ "flac", "audio" },
-        .{ "ogg", "audio" },   .{ "wav", "audio" },         .{ "m4a", "audio" },
-        .{ "opus", "audio" },  .{ "json", "data" },         .{ "xml", "data" },
-        .{ "csv", "data" },    .{ "tsv", "data" },          .{ "yaml", "data" },
-        .{ "yml", "data" },    .{ "toml", "data" },
+        .{ "html", "page" },    .{ "htm", "page" },          .{ "xhtml", "page" },
+        .{ "md", "markdown" },  .{ "markdown", "markdown" }, .{ "txt", "text" },
+        .{ "text", "text" },    .{ "rst", "text" },          .{ "org", "text" },
+        .{ "pdf", "pdf" },      .{ "docx", "document" },     .{ "doc", "document" },
+        .{ "odt", "document" }, .{ "epub", "document" },     .{ "rtf", "document" },
+        .{ "jpg", "image" },    .{ "jpeg", "image" },        .{ "png", "image" },
+        .{ "gif", "image" },    .{ "webp", "image" },        .{ "bmp", "image" },
+        .{ "svg", "image" },    .{ "tif", "image" },         .{ "tiff", "image" },
+        .{ "avif", "image" },   .{ "mp4", "video" },         .{ "mkv", "video" },
+        .{ "webm", "video" },   .{ "avi", "video" },         .{ "mov", "video" },
+        .{ "mp3", "audio" },    .{ "flac", "audio" },        .{ "ogg", "audio" },
+        .{ "wav", "audio" },    .{ "m4a", "audio" },         .{ "opus", "audio" },
+        .{ "json", "data" },    .{ "xml", "data" },          .{ "csv", "data" },
+        .{ "tsv", "data" },     .{ "yaml", "data" },         .{ "yml", "data" },
+        .{ "toml", "data" },
     };
     for (table) |row| if (std.ascii.eqlIgnoreCase(e, row[0])) return row[1];
     return "other";
@@ -164,6 +168,13 @@ test "host, path and extension from URLs" {
 
     const v6 = derived("http://[::1]:8080/x", null, null);
     try testing.expect(v6.host() != null); // an IPv6 literal is kept whole, brackets included
+}
+
+test "office documents and ebooks are documents" {
+    try testing.expectEqualStrings("document", kindOf("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"));
+    try testing.expectEqualStrings("document", kindOf("application/vnd.oasis.opendocument.text", null));
+    try testing.expectEqualStrings("document", kindOf("application/epub+zip", "epub"));
+    try testing.expectEqualStrings("document", kindOf(null, "odt"));
 }
 
 test "kinds from media types" {
