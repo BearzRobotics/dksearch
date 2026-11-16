@@ -353,7 +353,8 @@ pub fn download(gpa: Allocator, io: Io, arena: Allocator, req: Request, control:
         error.BadCatalog => error.BadCatalog,
     };
     if (!std.mem.eql(u8, meta.file_name, req.file_name)) return error.BadCatalog;
-    if (req.size != 0 and meta.size != req.size) return error.BadCatalog;
+    // The catalogue's size is rounded to whole KiB; the Metalink's is exact and is the one verified.
+    if (req.size != 0 and (if (meta.size > req.size) meta.size - req.size else req.size - meta.size) > 1024) return error.BadCatalog;
     if (meta.urls.len == 0) return error.BadCatalog;
 
     control.setProgress(0, meta.size);
@@ -656,7 +657,7 @@ test "a wrong checksum is refused and nothing is kept; a stale partial file is r
 
     // The catalogue and the Metalink must name the same file and size; names must be plain.
     try testing.expectError(error.BadCatalog, download(testing.allocator, testing.io, a, .{ .meta4_url = server.url(&url_buf, "/good_2026-01.zim.meta4"), .dest_dir = dir, .file_name = "other_2026-01.zim" }, &ctl, .{ .allow_http = true }));
-    try testing.expectError(error.BadCatalog, download(testing.allocator, testing.io, a, .{ .meta4_url = server.url(&url_buf, "/size_2026-01.zim.meta4"), .dest_dir = dir, .file_name = "size_2026-01.zim", .size = 1 }, &ctl, .{ .allow_http = true }));
+    try testing.expectError(error.BadCatalog, download(testing.allocator, testing.io, a, .{ .meta4_url = server.url(&url_buf, "/size_2026-01.zim.meta4"), .dest_dir = dir, .file_name = "size_2026-01.zim", .size = content.len + 100000 }, &ctl, .{ .allow_http = true }));
     try testing.expectError(error.BadName, download(testing.allocator, testing.io, a, .{ .meta4_url = "https://x/a.meta4", .dest_dir = dir, .file_name = "../evil.zim" }, &ctl, .{}));
     // Plain http is refused unless a test allows it.
     try testing.expectError(error.BadCatalog, download(testing.allocator, testing.io, a, .{ .meta4_url = "http://127.0.0.1:1/a.zim.meta4", .dest_dir = dir, .file_name = "a.zim" }, &ctl, .{}));

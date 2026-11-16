@@ -21,7 +21,8 @@ Standing rules that shape every item: the core stays lexical and works with no A
 - **Collections and access control:** collections, scoped and federated search, API keys with per-collection scopes.
 - **Search by image everywhere:** the files connector reading EXIF and perceptual hashes, a `find-image` command, admin upload.
 - **Presentation:** result grouping, several snippets, similar documents, autocomplete (server side, no script required), did-you-mean, cursor paging.
-- **Management:** saved searches, opt-in statistics (no query logging by default), caching, rate limits, a Kiwix library helper that downloads ZIM files after confirmation.
+- **Management:** saved searches, opt-in statistics (no query logging by default), caching, rate limits.
+- **Kiwix library helper (done):** search the catalogue and download ZIM files after confirmation from the admin interface (ADR 0028). Still to come: adding the source automatically, a free-space check.
 
 ## Later, optional
 

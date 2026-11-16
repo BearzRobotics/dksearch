@@ -43,3 +43,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0025 | ZIM (Kiwix) connector |
 | 0026 | Our own XML library (xml-zig), vendored |
 | 0027 | Showing documents: md-zig and an allow-list sanitizer |
+| 0028 | Downloading ZIM files from the Kiwix library |
