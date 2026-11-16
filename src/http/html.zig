@@ -10,6 +10,16 @@ const query = @import("query.zig");
 
 pub const style_css = @embedFile("assets/style.css");
 
+/// A short fingerprint of an embedded asset, put in its address (`style.css?v=…`) so a browser
+/// that cached an older copy fetches the new one as soon as the content changes.
+pub fn assetVersion(comptime content: []const u8) []const u8 {
+    @setEvalBranchQuota(content.len * 20 + 1000);
+    const h = std.hash.Fnv1a_64.hash(content);
+    return std.fmt.comptimePrint("{x}", .{@as(u32, @truncate(h ^ (h >> 32)))});
+}
+
+pub const style_version = assetVersion(style_css);
+
 pub fn writeEscaped(w: *Writer, s: []const u8) Writer.Error!void {
     for (s) |b| switch (b) {
         '&' => try w.writeAll("&amp;"),
@@ -75,7 +85,7 @@ pub fn writeHead(w: *Writer, title: []const u8) Writer.Error!void {
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
         "<title>");
     try writeEscaped(w, title);
-    try w.writeAll("</title><link rel=\"stylesheet\" href=\"/assets/style.css\"></head>\n");
+    try w.writeAll("</title><link rel=\"stylesheet\" href=\"/assets/style.css?v=" ++ style_version ++ "\"></head>\n");
 }
 
 fn writeForm(w: *Writer, f: Form) Writer.Error!void {

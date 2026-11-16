@@ -15,6 +15,7 @@ const dk = @import("dksearch");
 const server = @import("server.zig");
 const handler = @import("handler.zig");
 const admin_js = @embedFile("assets/admin.js");
+const admin_js_version = html.assetVersion(admin_js);
 const html = @import("html.zig");
 const query = @import("query.zig");
 
@@ -1048,7 +1049,7 @@ fn writePage(w: *Io.Writer, title: []const u8, csrf: ?[]const u8, current: []con
         try html.writeEscaped(w, token);
         try w.writeAll("\"><button type=\"submit\" class=\"btn secondary\">Sign out</button></form>");
     }
-    try w.print("</div></header><main><script src=\"/assets/admin.js\" defer></script><h1>{s}</h1>\n", .{title});
+    try w.print("</div></header><main><script src=\"/assets/admin.js?v={s}\" defer></script><h1>{s}</h1>\n", .{ admin_js_version, title });
 }
 
 fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.search.Searcher, q: dk.search.Query, rx: handler.RegexParams) !void {

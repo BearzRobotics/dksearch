@@ -659,6 +659,18 @@ test "end to end against the real index" {
     }
 }
 
+test "pages link the stylesheet by a content fingerprint, and the versioned address serves it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    const home = handle(ar.allocator(), fake.searcher(), .GET, "/");
+    const want = "href=\"/assets/style.css?v=" ++ html.style_version ++ "\"";
+    try testing.expect(std.mem.indexOf(u8, home.body, want) != null);
+    const css = handle(ar.allocator(), fake.searcher(), .GET, "/assets/style.css?v=" ++ html.style_version);
+    try testing.expectEqual(http.Status.ok, css.status);
+    try testing.expect(std.mem.indexOf(u8, css.body, ".sidetoggle") != null);
+}
+
 test "the document viewer shows what is known and the stored text, escaped; unknown ids are 404" {
     var idx = try dk.index_sqlite.SqliteIndex.open(":memory:", .{});
     defer idx.close();
