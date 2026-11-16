@@ -1178,7 +1178,7 @@ fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.sear
     if (examined) |e| try w.print("<p class=\"muted\">Regex checked {d} candidate document(s){s}.</p>\n", .{ e.n, if (e.truncated) "; a limit was reached, so more matches may exist" else "" });
     if (page.hits.len == 0) return w.writeAll("<p>No results.</p>\n");
     try w.print("<p class=\"muted\">{d} result(s){s}.</p>\n", .{ page.hits.len, if (page.has_more) ", more exist" else "" });
-    try w.writeAll("<table><thead><tr><th>#</th><th>Score</th><th>Title</th><th>Source</th><th>Id</th></tr></thead><tbody>\n");
+    try w.writeAll("<table><thead><tr><th>#</th><th>Score</th><th>Title</th><th>Source</th><th>Kind</th><th>Size</th><th>Modified</th><th>Id</th></tr></thead><tbody>\n");
     for (page.hits, 1..) |h, i| {
         try w.print("<tr><td>{d}</td><td>{d:.4}</td><td>", .{ i, h.score });
         const title = h.title orelse "(untitled)";
@@ -1191,9 +1191,15 @@ fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.sear
         } else try html.writeEscaped(w, title) else try html.writeEscaped(w, title);
         try w.writeAll("</td><td>");
         try html.writeEscaped(w, h.connector);
+        try w.writeAll("</td><td>");
+        if (h.kind) |k| try html.writeEscaped(w, k);
+        try w.writeAll("</td><td>");
+        if (h.size) |n| try html.writeSize(w, n);
+        try w.writeAll("</td><td>");
+        if (h.modified_at) |t| try html.writeDate(w, t);
         try w.print("</td><td><code>{x}</code></td></tr>\n", .{h.id});
         if (h.snippet) |sn| {
-            try w.writeAll("<tr><td></td><td colspan=\"4\" class=\"muted\">");
+            try w.writeAll("<tr><td></td><td colspan=\"7\" class=\"muted\">");
             try html.writeSnippet(w, sn);
             try w.writeAll("</td></tr>\n");
         }

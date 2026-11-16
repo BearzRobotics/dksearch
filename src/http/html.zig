@@ -319,7 +319,7 @@ fn writeIdHex(w: *Writer, id: dk.document.Id) Writer.Error!void {
 }
 
 /// `1.5 MB`, `300 B`: sizes people read.
-fn writeSize(w: *Writer, n: u64) Writer.Error!void {
+pub fn writeSize(w: *Writer, n: u64) Writer.Error!void {
     if (n < 1024) return w.print("{d} B", .{n});
     const units = [_][]const u8{ "KB", "MB", "GB", "TB" };
     var v: f64 = @floatFromInt(n);
@@ -330,7 +330,7 @@ fn writeSize(w: *Writer, n: u64) Writer.Error!void {
 }
 
 /// A Unix time as `2026-11-16` (UTC).
-fn writeDate(w: *Writer, secs: i64) Writer.Error!void {
+pub fn writeDate(w: *Writer, secs: i64) Writer.Error!void {
     const days = @divFloor(secs, 86400);
     // Civil-from-days (Howard Hinnant's algorithm).
     const z = days + 719468;
