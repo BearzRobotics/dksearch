@@ -220,6 +220,9 @@ pub const SearchSettings = struct {
     /// `recency_half_life_days` of age.
     recency_boost: u32 = 0,
     recency_half_life_days: u32 = 365,
+    /// Files of stop words and of synonym groups applied to searches (see the manual); null for none.
+    stop_words_file: ?[]const u8 = null,
+    synonyms_file: ?[]const u8 = null,
     /// "advanced": the query language (OR, NOT, grouping, prefix*, word~, "a b"~5, +, -);
     /// "simple": every word is plain text, as in earlier versions.
     advanced_syntax: bool = true,
@@ -272,7 +275,7 @@ const server_keys = [_][]const u8{
 const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions", "backup_dir", "zim_dir" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
-const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
+const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
 const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source" };
 
 /// Parses and validates configuration text. `source_name` is only used in
@@ -395,6 +398,15 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
         }
         if (try intIn(src, "search", t, "title_weight", 1, 1000, diag)) |n| cfg.search.title_weight = @intCast(n);
         if (try intIn(src, "search", t, "body_weight", 1, 1000, diag)) |n| cfg.search.body_weight = @intCast(n);
+        inline for (.{ "stop_words_file", "synonyms_file" }) |key| {
+            if (try str(src, "search", t, key, diag)) |v| {
+                if (v.len == 0) {
+                    diag.set(src, "search." ++ key, "must not be empty (omit the key to turn it off)", .{});
+                    return error.InvalidValue;
+                }
+                @field(cfg.search, key) = try a.dupe(u8, v);
+            }
+        }
         if (try intIn(src, "search", t, "recency_boost", 0, 1000, diag)) |n| cfg.search.recency_boost = @intCast(n);
         if (try intIn(src, "search", t, "recency_half_life_days", 1, 36500, diag)) |n| cfg.search.recency_half_life_days = @intCast(n);
         if (try intIn(src, "search", t, "query_timeout_ms", 0, 60_000, diag)) |n| cfg.search.query_timeout_ms = @intCast(n);

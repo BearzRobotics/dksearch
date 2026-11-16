@@ -26,6 +26,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const search = @import("search.zig");
+const lexicon = @import("lexicon.zig");
 
 pub const max_query_bytes = 1024;
 pub const max_terms = 32;
@@ -58,6 +59,14 @@ pub const Options = struct {
     /// words one typo away. Applies to words only (not phrases, prefixes or
     /// words that are not plain letters and digits).
     fuzzy_words: bool = false,
+    /// Stop words and synonyms (see `lexicon.zig`); null leaves the query as typed.
+    lexicon: ?*const lexicon.Lexicon = null,
+};
+
+/// What the output stage needs besides the words: the lexicon, and whether stop words are in force.
+const Lx = struct {
+    lexicon: ?*const lexicon.Lexicon = null,
+    stops: bool = false,
 };
 
 pub const Parsed = struct {
@@ -617,7 +626,14 @@ pub fn parseWith(arena: Allocator, text: []const u8, options: Options) Error!Par
     if (p.too_many) return error.InvalidQuery;
 
     var fts: std.ArrayList(u8) = .empty;
-    const has_terms = try emitOr(arena, &fts, root);
+    var lx: Lx = .{ .lexicon = options.lexicon, .stops = options.lexicon != null and options.lexicon.?.stops.count() > 0 };
+    var has_terms = try emitOr(arena, &fts, lx, root);
+    if (!has_terms and lx.stops) {
+        // Only stop words were typed (`the`): search for them after all rather than for nothing.
+        lx.stops = false;
+        fts.items.len = 0;
+        has_terms = try emitOr(arena, &fts, lx, root);
+    }
     if (!has_terms) {
         // Nothing to look for in the text. Conditions alone are a valid search
         // (everything that satisfies them), but only if at least one is positive.
@@ -650,14 +666,32 @@ fn quoted(arena: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocator.Er
 }
 
 /// Emits one term; false if it ends up with nothing to search for.
-fn emitTerm(arena: Allocator, out: *std.ArrayList(u8), t: Term) Allocator.Error!bool {
+fn emitTerm(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, t: Term) Allocator.Error!bool {
     switch (t.kind) {
-        .word, .phrase => try quoted(arena, out, t.text),
+        .word => {
+            if (lx.stops and (lx.lexicon.?).isStop(t.text)) return false;
+            const syn: []const []const u8 = if (lx.lexicon) |l| l.synonymsOf(t.text) else &.{};
+            if (syn.len == 0) {
+                try quoted(arena, out, t.text);
+            } else {
+                try out.append(arena, '(');
+                try quoted(arena, out, t.text);
+                for (syn) |sw| {
+                    try out.appendSlice(arena, " OR ");
+                    try quoted(arena, out, sw);
+                }
+                try out.append(arena, ')');
+            }
+        },
+        .phrase => try quoted(arena, out, t.text),
         .prefix => {
             try quoted(arena, out, t.text);
             try out.append(arena, '*');
         },
-        .fuzzy => try emitFuzzy(arena, out, t.text),
+        .fuzzy => {
+            if (lx.stops and (lx.lexicon.?).isStop(t.text)) return false;
+            try emitFuzzy(arena, out, t.text);
+        },
         .near => {
             // Split into words; one word is just that word.
             var words: std.ArrayList([]const u8) = .empty;
@@ -737,12 +771,12 @@ fn columnPrefix(arena: Allocator, out: *std.ArrayList(u8), col: ?Column) Allocat
     });
 }
 
-fn emitUnit(arena: Allocator, out: *std.ArrayList(u8), u: Unit) Allocator.Error!bool {
+fn emitUnit(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, u: Unit) Allocator.Error!bool {
     switch (u) {
         .term => |t| {
             const mark = out.items.len;
             try columnPrefix(arena, out, t.column);
-            if (!try emitTerm(arena, out, t)) {
+            if (!try emitTerm(arena, out, lx, t)) {
                 out.items.len = mark;
                 return false;
             }
@@ -752,7 +786,7 @@ fn emitUnit(arena: Allocator, out: *std.ArrayList(u8), u: Unit) Allocator.Error!
             const mark = out.items.len;
             try columnPrefix(arena, out, g.column);
             try out.append(arena, '(');
-            if (!try emitOr(arena, out, g.node)) {
+            if (!try emitOr(arena, out, lx, g.node)) {
                 out.items.len = mark;
                 return false;
             }
@@ -763,14 +797,14 @@ fn emitUnit(arena: Allocator, out: *std.ArrayList(u8), u: Unit) Allocator.Error!
 }
 
 /// `(p1 AND p2) NOT (n1 OR n2)`; false if there is no positive part.
-fn emitAnd(arena: Allocator, out: *std.ArrayList(u8), a: *const And) Allocator.Error!bool {
+fn emitAnd(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, a: *const And) Allocator.Error!bool {
     const mark = out.items.len;
     var wrote: usize = 0;
     if (a.negative.items.len > 0) try out.append(arena, '(');
     for (a.positive.items) |u| {
         const at = out.items.len;
         if (wrote > 0) try out.appendSlice(arena, " AND ");
-        if (try emitUnit(arena, out, u)) {
+        if (try emitUnit(arena, out, lx, u)) {
             wrote += 1;
         } else out.items.len = at;
     }
@@ -784,7 +818,7 @@ fn emitAnd(arena: Allocator, out: *std.ArrayList(u8), a: *const And) Allocator.E
         for (a.negative.items) |u| {
             const at = out.items.len;
             if (neg > 0) try out.appendSlice(arena, " OR ");
-            if (try emitUnit(arena, out, u)) {
+            if (try emitUnit(arena, out, lx, u)) {
                 neg += 1;
             } else out.items.len = at;
         }
@@ -796,7 +830,7 @@ fn emitAnd(arena: Allocator, out: *std.ArrayList(u8), a: *const And) Allocator.E
             for (a.positive.items) |u| {
                 const at = out.items.len;
                 if (wrote > 0) try out.appendSlice(arena, " AND ");
-                if (try emitUnit(arena, out, u)) wrote += 1 else out.items.len = at;
+                if (try emitUnit(arena, out, lx, u)) wrote += 1 else out.items.len = at;
             }
         }
         try out.append(arena, ')');
@@ -804,12 +838,12 @@ fn emitAnd(arena: Allocator, out: *std.ArrayList(u8), a: *const And) Allocator.E
     return true;
 }
 
-fn emitOr(arena: Allocator, out: *std.ArrayList(u8), o: *const Or) Allocator.Error!bool {
+fn emitOr(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, o: *const Or) Allocator.Error!bool {
     var wrote: usize = 0;
     for (o.branches.items) |b| {
         const at = out.items.len;
         if (wrote > 0) try out.appendSlice(arena, " OR ");
-        if (try emitAnd(arena, out, b)) {
+        if (try emitAnd(arena, out, lx, b)) {
             wrote += 1;
         } else out.items.len = at;
     }
@@ -897,6 +931,31 @@ fn expectFts(text: []const u8, want: []const u8) !void {
     defer arena.deinit();
     const p = try parse(arena.allocator(), text);
     try testing.expectEqualStrings(want, p.fts);
+}
+
+fn ftsWith(arena: Allocator, lex: *const lexicon.Lexicon, text: []const u8) ![]const u8 {
+    return (try parseWith(arena, text, .{ .lexicon = lex })).fts;
+}
+
+test "stop words are left out, unless nothing else is left; synonyms widen a word" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var lex: lexicon.Lexicon = .{};
+    var problem: lexicon.Problem = .{};
+    try lexicon.addStopWords(a, &lex, "the\nof\n", &problem);
+    try lexicon.addSynonyms(a, &lex, "car, auto, motor car\n", &problem);
+
+    try testing.expectEqualStrings("\"history\" AND \"Rome\"", try ftsWith(a, &lex, "the history of Rome"));
+    try testing.expectEqualStrings("\"the\" AND \"of\"", try ftsWith(a, &lex, "the of")); // only stop words: kept
+    try testing.expectEqualStrings("\"the end\"", try ftsWith(a, &lex, "\"the end\"")); // inside a phrase: kept
+    try testing.expectEqualStrings("(\"car\" OR \"auto\" OR \"motor car\") AND \"repair\"", try ftsWith(a, &lex, "car repair"));
+    try testing.expectEqualStrings("title : (\"car\" OR \"auto\" OR \"motor car\")", try ftsWith(a, &lex, "title:car"));
+    // The readable form shows the query as typed, without the expansions.
+    const p = try parseWith(a, "the car", .{ .lexicon = &lex });
+    try testing.expectEqualStrings("the AND car", p.shown);
+    // Without a lexicon nothing changes.
+    try expectFts("the history of Rome", "\"the\" AND \"history\" AND \"of\" AND \"Rome\"");
 }
 
 test "plain words and phrases behave as before" {

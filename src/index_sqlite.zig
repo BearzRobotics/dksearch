@@ -28,6 +28,7 @@ const idx_api = @import("indexer.zig");
 const search = @import("search.zig");
 const image_mod = @import("image.zig");
 const queryparse = @import("queryparse.zig");
+const lexicon_mod = @import("lexicon.zig");
 const docmeta = @import("docmeta.zig");
 const derive = docmeta.derive;
 
@@ -119,6 +120,8 @@ pub const SqliteIndex = struct {
     /// `recency_days` of age (`[search] recency_boost`, `recency_half_life_days`).
     recency_percent: u32 = 0,
     recency_days: u32 = 365,
+    /// Stop words and synonyms applied to searches (must outlive the index); null for none.
+    lexicon: ?*const lexicon_mod.Lexicon = null,
     /// A time limit for each search, if set (`setQueryTimeout`).
     timeout: ?struct { io: Io, ms: u32 } = null,
     /// True if the `docs` table has the metadata columns filters use (an index
@@ -162,6 +165,10 @@ pub const SqliteIndex = struct {
     pub fn setWeights(self: *SqliteIndex, title: u32, body: u32) void {
         self.title_weight = title;
         self.body_weight = body;
+    }
+
+    pub fn setLexicon(self: *SqliteIndex, l: ?*const lexicon_mod.Lexicon) void {
+        self.lexicon = l;
     }
 
     pub fn setRecency(self: *SqliteIndex, percent: u32, half_life_days: u32) void {
@@ -627,7 +634,7 @@ pub const SqliteIndex = struct {
                 .auto => null,
             },
         };
-        const first = parseQuery(arena, q.text, forced orelse false, now) catch |e| {
+        const first = self.parseQuery(arena, q.text, forced orelse false, now) catch |e| {
             // Conditions given as parameters can stand alone, without words to find.
             if (e == error.EmptyQuery and base_filters.len > 0) return self.runMatch(arena, q, base_filters, limit, "", null, false);
             return e;
@@ -635,7 +642,7 @@ pub const SqliteIndex = struct {
         const all = try mergeFilters(arena, base_filters, first.filters);
         const page = try self.runMatch(arena, q, all, limit, first.fts, interpretedOf(first), first.fuzzy_applied);
         if (forced == null and page.hits.len < auto_fuzzy_below and q.offset == 0 and first.fts.len > 0) {
-            if (parseQuery(arena, q.text, true, now)) |second| {
+            if (self.parseQuery(arena, q.text, true, now)) |second| {
                 if (second.fuzzy_applied) {
                     const again = try self.runMatch(arena, q, all, limit, second.fts, interpretedOf(second), true);
                     if (again.hits.len > page.hits.len) return again;
@@ -654,8 +661,8 @@ pub const SqliteIndex = struct {
         return out;
     }
 
-    fn parseQuery(arena: Allocator, text: []const u8, fuzzy_words: bool, now: i64) search.Error!queryparse.Parsed {
-        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now }) catch |e| switch (e) {
+    fn parseQuery(self: *const SqliteIndex, arena: Allocator, text: []const u8, fuzzy_words: bool, now: i64) search.Error!queryparse.Parsed {
+        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now, .lexicon = self.lexicon }) catch |e| switch (e) {
             error.EmptyQuery => error.EmptyQuery,
             error.InvalidQuery => error.InvalidQuery,
             error.OutOfMemory => error.OutOfMemory,
@@ -976,6 +983,10 @@ pub const SearchPool = struct {
 
     pub fn setWeights(self: *SearchPool, title: u32, body: u32) void {
         for (self.slots) |*sl| sl.index.setWeights(title, body);
+    }
+
+    pub fn setLexicon(self: *SearchPool, l: ?*const lexicon_mod.Lexicon) void {
+        for (self.slots) |*sl| sl.index.setLexicon(l);
     }
 
     pub fn setRecency(self: *SearchPool, percent: u32, half_life_days: u32) void {

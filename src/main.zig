@@ -620,6 +620,34 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         .auto => .auto,
         .always => .always,
     };
+    // Stop words and synonyms: read once now; an unreadable or malformed file stops the server rather than
+    // silently searching without it.
+    var lexicon_arena = std.heap.ArenaAllocator.init(gpa);
+    defer lexicon_arena.deinit();
+    var lexicon: dk.lexicon.Lexicon = .{};
+    inline for (.{ "stop_words_file", "synonyms_file" }) |key| {
+        if (@field(cfg.search, key)) |path| {
+            const text = Io.Dir.cwd().readFileAlloc(io, path, lexicon_arena.allocator(), .limited(4 * 1024 * 1024)) catch |e| {
+                err(io, "cannot read search.{s} {s}: {t}", .{ key, path, e });
+                return exit_config;
+            };
+            var problem: dk.lexicon.Problem = .{};
+            (if (comptime std.mem.eql(u8, key, "stop_words_file"))
+                dk.lexicon.addStopWords(lexicon_arena.allocator(), &lexicon, text, &problem)
+            else
+                dk.lexicon.addSynonyms(lexicon_arena.allocator(), &lexicon, text, &problem)) catch |e| {
+                switch (e) {
+                    error.BadLine => err(io, "search.{s} {s}: line {d} is not usable (a synonym group needs at least two comma-separated members, without quotes)", .{ key, path, problem.line }),
+                    error.TooMany => err(io, "search.{s} {s} has too many entries", .{ key, path }),
+                    error.OutOfMemory => err(io, "out of memory", .{}),
+                }
+                return exit_config;
+            };
+        }
+    }
+    const lexicon_ptr: ?*const dk.lexicon.Lexicon = if (lexicon.isEmpty()) null else &lexicon;
+    if (pool) |*p| p.setLexicon(lexicon_ptr);
+    index.setLexicon(lexicon_ptr);
     if (pool) |*p| {
         p.setFuzzyMode(fuzzy_mode);
         p.setSimpleSyntax(!cfg.search.advanced_syntax);
