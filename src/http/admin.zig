@@ -55,6 +55,9 @@ pub const Options = struct {
     admin_stats: *const server.Stats,
     /// Name of the index tokenizer, shown on the query-testing page.
     tokenizer: []const u8 = "unicode61",
+    /// The ranking weights in force, shown on the query-testing API.
+    title_weight: u32 = 10,
+    body_weight: u32 = 1,
     /// Present only when actions are enabled (`admin.actions`): lets the
     /// interface start and cancel imports. Null means strictly read-only.
     jobs: ?*dk.jobs.Manager = null,
@@ -289,7 +292,7 @@ pub const App = struct {
         const Hit = struct { id: []const u8, connector: []const u8, url: ?[]const u8, title: ?[]const u8, snippet: ?[]const u8, score: f64 };
         const hits = try arena.alloc(Hit, page.hits.len);
         for (page.hits, hits) |h, *o| o.* = .{ .id = try arena.dupe(u8, &std.fmt.bytesToHex(h.id, .lower)), .connector = h.connector, .url = h.url, .title = h.title, .snippet = h.snippet, .score = h.score };
-        return handler.jsonResponse(arena, .ok, .{ .tokenizer = self.opts.tokenizer, .title_weight = 10, .body_weight = 1, .hits = hits, .has_more = page.has_more });
+        return handler.jsonResponse(arena, .ok, .{ .tokenizer = self.opts.tokenizer, .title_weight = self.opts.title_weight, .body_weight = self.opts.body_weight, .hits = hits, .has_more = page.has_more });
     }
 
     fn pageSearchTest(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {

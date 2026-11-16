@@ -623,7 +623,9 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     if (pool) |*p| {
         p.setFuzzyMode(fuzzy_mode);
         p.setSimpleSyntax(!cfg.search.advanced_syntax);
+        p.setWeights(cfg.search.title_weight, cfg.search.body_weight);
     }
+    index.setWeights(cfg.search.title_weight, cfg.search.body_weight);
     index.setFuzzyMode(fuzzy_mode);
     index.setSimpleSyntax(!cfg.search.advanced_syntax);
     const searcher = if (pool) |*p| p.searcher() else index.searcher();
@@ -764,6 +766,8 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .searcher = searcher,
             .regex = if (admin_regex_service) |*r| r else null,
             .tokenizer = @tagName(cfg.tokenizer),
+            .title_weight = cfg.search.title_weight,
+            .body_weight = cfg.search.body_weight,
             .index_path = paths.index,
             .state_path = paths.state,
             .content_path = paths.content,

@@ -39,9 +39,6 @@ const max_filters = 16;
 /// Bumped when the table layout changes. Stored in `PRAGMA user_version`.
 pub const schema_version = 1;
 
-/// Title matches count ten times as much as body matches.
-const bm25_weights = "10.0, 1.0";
-
 /// In `auto` mode, an exact search with fewer hits than this is repeated with
 /// typo tolerance (and the fuller result is used if it finds more).
 const auto_fuzzy_below = 3;
@@ -114,6 +111,10 @@ pub const SqliteIndex = struct {
     /// code using the index directly gets exact words; `serve` sets it from
     /// `[search] fuzzy` (default `auto`).
     fuzzy_mode: FuzzyMode = .off,
+    /// How much a match in the title counts against one in the body when ranking
+    /// (`[search] title_weight`, `body_weight`).
+    title_weight: u32 = 10,
+    body_weight: u32 = 1,
     /// A time limit for each search, if set (`setQueryTimeout`).
     timeout: ?struct { io: Io, ms: u32 } = null,
     /// True if the `docs` table has the metadata columns filters use (an index
@@ -152,6 +153,11 @@ pub const SqliteIndex = struct {
 
     pub fn setFuzzyMode(self: *SqliteIndex, mode: FuzzyMode) void {
         self.fuzzy_mode = mode;
+    }
+
+    pub fn setWeights(self: *SqliteIndex, title: u32, body: u32) void {
+        self.title_weight = title;
+        self.body_weight = body;
     }
 
     pub fn setQueryTimeout(self: *SqliteIndex, io: Io, ms: u32) void {
@@ -775,15 +781,15 @@ pub const SqliteIndex = struct {
 
     /// The ORDER BY clause: relevance (or, with no words to rank by, recency) unless asked otherwise.
     /// Documents without the property sort last; ties fall back to relevance and then to the id.
-    fn orderBy(sort: search.Sort, text_mode: bool) []const u8 {
+    fn orderBy(arena: Allocator, sort: search.Sort, text_mode: bool, bm: []const u8) Allocator.Error![]const u8 {
         const date = "COALESCE(d.modified_at, d.published_at, d.indexed_at";
         if (text_mode) return switch (sort) {
-            .relevance => " ORDER BY bm25(fts, 10.0, 1.0), d.id",
-            .newest => " ORDER BY " ++ date ++ ", -1) DESC, bm25(fts, 10.0, 1.0), d.id",
-            .oldest => " ORDER BY " ++ date ++ ", 9223372036854775807) ASC, bm25(fts, 10.0, 1.0), d.id",
-            .largest => " ORDER BY COALESCE(d.size, -1) DESC, bm25(fts, 10.0, 1.0), d.id",
-            .smallest => " ORDER BY COALESCE(d.size, 9223372036854775807) ASC, bm25(fts, 10.0, 1.0), d.id",
-            .title => " ORDER BY lower(COALESCE(d.title, '')) ASC, bm25(fts, 10.0, 1.0), d.id",
+            .relevance => try std.fmt.allocPrint(arena, " ORDER BY {s}, d.id", .{bm}),
+            .newest => try std.fmt.allocPrint(arena, " ORDER BY {s}, -1) DESC, {s}, d.id", .{ date, bm }),
+            .oldest => try std.fmt.allocPrint(arena, " ORDER BY {s}, 9223372036854775807) ASC, {s}, d.id", .{ date, bm }),
+            .largest => try std.fmt.allocPrint(arena, " ORDER BY COALESCE(d.size, -1) DESC, {s}, d.id", .{bm}),
+            .smallest => try std.fmt.allocPrint(arena, " ORDER BY COALESCE(d.size, 9223372036854775807) ASC, {s}, d.id", .{bm}),
+            .title => try std.fmt.allocPrint(arena, " ORDER BY lower(COALESCE(d.title, '')) ASC, {s}, d.id", .{bm}),
         };
         return switch (sort) {
             .relevance, .newest => " ORDER BY " ++ date ++ ", 0) DESC, d.id",
@@ -798,16 +804,17 @@ pub const SqliteIndex = struct {
         if (filters.len > 0 and !self.has_meta) return error.InvalidQuery; // an index from before filters: `rebuild` upgrades it
         const columns = if (self.has_meta) "d.language, d.content_type, d.modified_at, d.size, d.author, d.kind, d.domain" else "d.language, d.content_type, NULL, NULL, NULL, NULL, NULL";
         const text_mode = match.len > 0;
+        const bm = try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0)", .{ self.title_weight, self.body_weight });
         var sql: std.ArrayList(u8) = .empty;
         var binds: std.ArrayList(Bind) = .empty;
         if (text_mode) {
             try sql.print(arena,
                 \\SELECT d.id, d.connector, d.url, d.title,
                 \\       snippet(fts, 1, ?1, ?2, '…', 16),
-                \\       -bm25(fts, 10.0, 1.0), {s}
+                \\       -{s}, {s}
                 \\FROM fts JOIN docs d ON d.rowid = fts.rowid
                 \\WHERE fts MATCH ?3
-            , .{columns});
+            , .{ bm, columns });
         } else {
             try sql.print(arena, "SELECT d.id, d.connector, d.url, d.title, NULL, 0.0, {s} FROM docs d WHERE 1", .{columns});
         }
@@ -818,7 +825,7 @@ pub const SqliteIndex = struct {
         );
         try filterSql(arena, filters, &sql, &binds);
         if (q.sort != .relevance and q.sort != .title and !self.has_meta) return error.InvalidQuery; // an old index: `rebuild` upgrades it
-        try sql.appendSlice(arena, orderBy(q.sort, text_mode));
+        try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm));
         try sql.appendSlice(arena, " LIMIT ?7 OFFSET ?8");
         const st = Stmt.prepare(self.db, try arena.dupeSentinel(u8, sql.items, 0)) catch |e| return searchError(e);
         defer st.deinit();
@@ -927,6 +934,10 @@ pub const SearchPool = struct {
 
     pub fn setFuzzyMode(self: *SearchPool, mode: FuzzyMode) void {
         for (self.slots) |*sl| sl.index.setFuzzyMode(mode);
+    }
+
+    pub fn setWeights(self: *SearchPool, title: u32, body: u32) void {
+        for (self.slots) |*sl| sl.index.setWeights(title, body);
     }
 
     /// See `SqliteIndex.setQueryTimeout`; call before searching.
@@ -1255,6 +1266,22 @@ test "title matches outrank body matches; ties break by id" {
     try testing.expectEqual(body_id, page.hits[1].id);
     try testing.expect(page.hits[0].score > page.hits[1].score);
     try testing.expect(!page.has_more);
+}
+
+test "the title and body weights decide which counts more" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const body_id = try put(&idx, "t", "body", "Something else", "a long text that mentions truth once");
+    const title_id = try put(&idx, "t", "title", "The truth", "unrelated words here");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(title_id, (try searchAll(a, &idx, "truth")).hits[0].id);
+    idx.setWeights(1, 1000); // the text matters far more than the title
+    const flipped = try searchAll(a, &idx, "truth");
+    try testing.expectEqual(body_id, flipped.hits[0].id);
+    idx.setWeights(1000, 1);
+    try testing.expectEqual(title_id, (try searchAll(a, &idx, "truth")).hits[0].id);
 }
 
 test "re-adding an id replaces the old text; remove deletes" {
