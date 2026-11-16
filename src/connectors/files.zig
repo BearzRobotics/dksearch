@@ -29,7 +29,7 @@ pub const kind = "files";
 pub const default_max_file_bytes: u32 = 4 * 1024 * 1024;
 pub const hard_max_file_bytes: u32 = 64 * 1024 * 1024;
 const checkpoint_every = 100;
-const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language" };
+const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals" };
 
 /// Checks a source's options without touching the filesystem.
 pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!void {
@@ -72,6 +72,13 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
             },
         }
     }
+    if (source.option("serve_originals")) |v| switch (v) {
+        .boolean => {},
+        else => {
+            diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].serve_originals", .{source.name}) catch "serve_originals", "expected true or false", .{});
+            return error.WrongType;
+        },
+    };
     if (source.option("language")) |v| {
         const key = std.fmt.bufPrint(&kbuf, "source[{s}].language", .{source.name}) catch "language";
         switch (v) {

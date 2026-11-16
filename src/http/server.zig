@@ -108,12 +108,11 @@ pub const Dispatcher = struct {
 
 const PublicApp = struct {
     searcher: dk.search.Searcher,
-    regex: ?*dk.regexsearch.Service = null,
-    content: ?dk.storage.ContentStore = null,
+    services: handler.Services = .{},
 
     fn handle(ptr: *anyopaque, arena: Allocator, req: Request) handler.Response {
         const self: *PublicApp = @ptrCast(@alignCast(ptr));
-        return handler.handleServices(arena, self.searcher, .{ .regex = self.regex, .content = self.content }, req.method, req.target);
+        return handler.handleServices(arena, self.searcher, self.services, req.method, req.target);
     }
 
     var dummy_for_tests: PublicApp = .{ .searcher = FixedSearch.searcher() };
@@ -219,13 +218,13 @@ pub fn listen(io: Io, address: net.IpAddress) net.IpAddress.ListenError!net.Serv
 /// a normal return) or the task is cancelled (immediate; returns
 /// `error.Canceled`).
 pub fn serve(gpa: Allocator, io: Io, listener: *net.Server, searcher: dk.search.Searcher, limits: Limits, stats: *Stats, control: *Control) ServeError!void {
-    return servePublic(gpa, io, listener, searcher, null, null, null, limits, stats, control);
+    return servePublic(gpa, io, listener, searcher, .{}, null, limits, stats, control);
 }
 
 /// The public search interface, with an optional regular-expression service
 /// and an optional access log.
-pub fn servePublic(gpa: Allocator, io: Io, listener: *net.Server, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, content: ?dk.storage.ContentStore, access_log: ?*AccessLog, limits: Limits, stats: *Stats, control: *Control) ServeError!void {
-    var app: PublicApp = .{ .searcher = searcher, .regex = regex, .content = content };
+pub fn servePublic(gpa: Allocator, io: Io, listener: *net.Server, searcher: dk.search.Searcher, services: handler.Services, access_log: ?*AccessLog, limits: Limits, stats: *Stats, control: *Control) ServeError!void {
+    var app: PublicApp = .{ .searcher = searcher, .services = services };
     const d: Dispatcher = .{ .ptr = &app, .handle = PublicApp.handle, .label = PublicApp.label };
     return serveWith(gpa, io, listener, d, access_log, limits, stats, control);
 }

@@ -13,6 +13,8 @@ pub const evaluate = @import("evaluate.zig");
 pub const image = @import("image.zig");
 pub const queryparse = @import("queryparse.zig");
 pub const docmeta = @import("docmeta.zig");
+pub const originals = @import("originals.zig");
+pub const htmlsafe = @import("htmlsafe.zig");
 pub const exif = @import("exif.zig");
 pub const sourcestore = @import("sourcestore.zig");
 pub const sourceedit = @import("sourceedit.zig");
@@ -42,6 +44,8 @@ test {
     _ = image;
     _ = queryparse;
     _ = docmeta;
+    _ = originals;
+    _ = htmlsafe;
     _ = exif;
     _ = sourcestore;
     _ = sourceedit;

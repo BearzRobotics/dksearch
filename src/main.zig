@@ -649,6 +649,18 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         err(io, "note: the document viewer and the regex filter are off until something has been imported ({s} does not exist yet); restart after the first import", .{paths.content});
     }
 
+    // Original files are served only from `files` sources that say `serve_originals = true`.
+    var origin_roots: std.ArrayList(dk.originals.Root) = .empty;
+    defer origin_roots.deinit(gpa);
+    for (cfg.sources) |src| {
+        if (!std.mem.eql(u8, src.kind, "files") or !src.enabled) continue;
+        if (!(src.optionBool("serve_originals") orelse false)) continue;
+        const base = src.optionString("path") orelse continue;
+        origin_roots.append(gpa, .{ .connector = src.name, .base = base }) catch break;
+    }
+    var originals_service: ?dk.originals.Service = if (origin_roots.items.len > 0) .{ .io = io, .roots = origin_roots.items } else null;
+    if (originals_service != null) err(io, "note: original files are served for {d} source(s) (serve_originals = true)", .{origin_roots.items.len});
+
     // Validated as a literal at load time, so this cannot fail.
     const address = Io.net.IpAddress.parse(cfg.server.address, cfg.server.port) catch unreachable;
     var listener = dkhttp.server.listen(io, address) catch |e| {
@@ -773,7 +785,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
 
     installSignalHandlers(onServeSignal);
     var result: u8 = exit_ok;
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, if (regex_service) |*r| r else null, if (content_pool) |*p| p.store() else null, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

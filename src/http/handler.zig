@@ -79,6 +79,8 @@ pub const Services = struct {
     regex: ?*dk.regexsearch.Service = null,
     /// Stored document texts, for the document viewer.
     content: ?dk.storage.ContentStore = null,
+    /// Original files of the sources that allow them to be opened (`serve_originals`).
+    originals: ?*const dk.originals.Service = null,
 };
 
 pub fn handleServices(arena: Allocator, searcher: dk.search.Searcher, services: Services, method: http.Method, target: []const u8) Response {
@@ -335,12 +337,19 @@ pub fn apiError(arena: Allocator, status: http.Status, code: []const u8, message
 const max_view_bytes = 512 * 1024;
 
 fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Services, path: []const u8) error{OutOfMemory}!Response {
-    const hex = path["/doc/".len..];
+    var hex = path["/doc/".len..];
+    var want_file = false;
+    if (std.mem.endsWith(u8, hex, "/file")) {
+        want_file = true;
+        hex = hex[0 .. hex.len - "/file".len];
+    }
     var id: dk.document.Id = undefined;
     if (hex.len != 2 * @sizeOf(dk.document.Id)) return htmlError(arena, .not_found, "Not found", "No such document.");
     _ = std.fmt.hexToBytes(&id, hex) catch return htmlError(arena, .not_found, "Not found", "No such document.");
     const info = searcher.info(arena, id) catch |e| return searchFailure(arena, e, false);
     const hit = info orelse return htmlError(arena, .not_found, "Not found", "No such document.");
+    const can_open = if (services.originals) |o| (if (hit.url) |u| o.serves(hit.connector, u) else false) else false;
+    if (want_file) return if (can_open) originalFile(arena, services.originals.?, hit) else htmlError(arena, .not_found, "Not found", "The original file of this document is not available here.");
 
     var text: ?[]const u8 = null;
     var cut = false;
@@ -356,8 +365,27 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
         } else |_| {}
     }
     var aw: std.Io.Writer.Allocating = .init(arena);
-    html.writeDocument(&aw.writer, hit, text, cut, services.regex != null) catch return error.OutOfMemory;
+    html.writeDocument(&aw.writer, hit, text, cut, can_open) catch return error.OutOfMemory;
     return htmlResponse(arena, .ok, aw.written());
+}
+
+/// The original file of a document, for the browser to show or download.
+fn originalFile(arena: Allocator, svc: *const dk.originals.Service, hit: dk.search.Hit) error{OutOfMemory}!Response {
+    const served = svc.read(arena, hit.connector, hit.url.?) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.NotServed, error.NotFound, error.Forbidden => htmlError(arena, .not_found, "Not found", "The original file is not available (it may have been moved or removed)."),
+        error.TooLarge => htmlError(arena, .payload_too_large, "Too large", "That file is too large to be served here."),
+        error.Io => htmlError(arena, .internal_server_error, "Error", "The file could not be read."),
+    };
+    // No script policy beyond "nothing may frame this": the browser's own PDF viewer needs room, and
+    // what is served inline (PDF, images, plain text) cannot run script on this origin.
+    const headers = try arena.alloc(Header, 5);
+    headers[0] = .{ .name = "x-content-type-options", .value = "nosniff" };
+    headers[1] = .{ .name = "referrer-policy", .value = "no-referrer" };
+    headers[2] = .{ .name = "content-security-policy", .value = "frame-ancestors 'none'" };
+    headers[3] = .{ .name = "cross-origin-resource-policy", .value = "same-origin" };
+    headers[4] = .{ .name = "content-disposition", .value = try dk.originals.dispositionFor(arena, served.inline_view, served.filename) };
+    return .{ .status = .ok, .content_type = served.content_type, .body = served.bytes, .headers = headers };
 }
 
 // ------------------------------------------------------------ HTML pages
@@ -708,6 +736,70 @@ test "the document viewer shows what is known and the stored text, escaped; unkn
         errdefer std.debug.print("target: {s}\n", .{t});
         try testing.expectEqual(http.Status.not_found, nf.status);
     }
+}
+
+test "original files are served only for sources that allow it, from inside their folder" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "notes");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "notes/a.pdf", .data = "%PDF-1.4 fake" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "notes/page.html", .data = "<script>alert(1)</script>" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "secret.txt", .data = "outside" });
+
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const abs = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    const base = try std.fmt.allocPrint(a, "{s}/notes", .{abs});
+
+    var idx = try dk.index_sqlite.SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const mk = struct {
+        fn doc(connector: []const u8, id: []const u8, url: []const u8) dk.document.Document {
+            return .{ .connector = connector, .source_id = id, .title = id, .text = "text", .canonical_url = url };
+        }
+    };
+    const pdf = mk.doc("notes", "pdf", try std.fmt.allocPrint(a, "file://{s}/a.pdf", .{base}));
+    const html_doc = mk.doc("notes", "html", try std.fmt.allocPrint(a, "file://{s}/page.html", .{base}));
+    const outside = mk.doc("notes", "out", try std.fmt.allocPrint(a, "file://{s}/secret.txt", .{abs}));
+    const other = mk.doc("elsewhere", "other", try std.fmt.allocPrint(a, "file://{s}/a.pdf", .{base}));
+    for ([_]dk.document.Document{ pdf, html_doc, outside, other }) |d| try idx.indexer().add(d.id(), d);
+
+    const roots = [_]dk.originals.Root{.{ .connector = "notes", .base = base }};
+    const svc: dk.originals.Service = .{ .io = testing.io, .roots = &roots };
+    const services: Services = .{ .originals = &svc };
+    const get = struct {
+        fn at(arena: Allocator, searcher: dk.search.Searcher, sv: Services, d: dk.document.Document, suffix: []const u8) !Response {
+            const hex = std.fmt.bytesToHex(d.id(), .lower);
+            return handleServices(arena, searcher, sv, .GET, try std.fmt.allocPrint(arena, "/doc/{s}{s}", .{ hex, suffix }));
+        }
+    }.at;
+
+    const r = try get(a, idx.searcher(), services, pdf, "/file");
+    try testing.expectEqual(http.Status.ok, r.status);
+    try testing.expectEqualStrings("application/pdf", r.content_type);
+    try testing.expectEqualStrings("%PDF-1.4 fake", r.body);
+    var disposition: []const u8 = "";
+    for (r.headers) |h| if (std.mem.eql(u8, h.name, "content-disposition")) {
+        disposition = h.value;
+    };
+    try testing.expect(std.mem.startsWith(u8, disposition, "inline;"));
+
+    // HTML is only ever shown as text.
+    const h = try get(a, idx.searcher(), services, html_doc, "/file");
+    try testing.expectEqualStrings("text/plain; charset=utf-8", h.content_type);
+
+    // The viewer offers the original only where it can be opened.
+    const page = try get(a, idx.searcher(), services, pdf, "");
+    try testing.expect(std.mem.indexOf(u8, page.body, "/file\">Open the original file") != null);
+    const page_off = try get(a, idx.searcher(), .{}, pdf, "");
+    try testing.expect(std.mem.indexOf(u8, page_off.body, "Open the original file") == null);
+
+    // Not allowed: no service, another source, a file outside the folder.
+    try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), .{}, pdf, "/file")).status);
+    try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, other, "/file")).status);
+    try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, outside, "/file")).status);
+    try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, pdf, "/file/x")).status);
 }
 
 // ----------------------------------------------------- regular-expression filter

@@ -298,8 +298,7 @@ fn writeDate(w: *Writer, secs: i64) Writer.Error!void {
 }
 
 /// The viewer page for one document: what is known about it and its stored text.
-pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, regex_enabled: bool) Writer.Error!void {
-    _ = regex_enabled;
+pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, can_open_original: bool) Writer.Error!void {
     try writeHead(w, h.title orelse h.url orelse "Document");
     try w.writeAll("<body><main class=\"docpage\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n<h2 class=\"doctitle\">");
     try writeEscaped(w, h.title orelse h.url orelse "(untitled)");
@@ -333,6 +332,11 @@ pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool,
         }
     }
     try w.writeAll("</dl>\n");
+    if (can_open_original) {
+        try w.writeAll("<p><a class=\"button\" href=\"/doc/");
+        try writeIdHex(w, h.id);
+        try w.writeAll("/file\">Open the original file</a></p>\n");
+    }
     if (text) |t| {
         try w.writeAll("<h3>Stored text</h3>\n<pre class=\"doctext\">");
         try writeEscaped(w, t);
