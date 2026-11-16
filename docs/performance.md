@@ -70,10 +70,36 @@ Caches were warm (the whole data set fits in the page cache). The tail comes fro
 
 The English Wikipedia is about 20 times the size of this dump in text. The numbers scale roughly linearly in what was measured here (import time, `index.db` about 2 times the text), which would put it at an hour or so for import and tens of GB of index; that is still a guess, and the free space on this machine's drive (95 GB) was too small to try.
 
+## Full English Wikipedia (2026-11)
+
+One import of the full English dump on the same machine (data on a separate disk with room for it):
+
+| Measure | Value |
+|---|---|
+| Import wall time | 5 h 47 min 48 s |
+| Data directory after the import | 64.8 GB (all three files together) |
+| `dksearch check` | 7,937 s (2 h 12 min), nothing corrupt |
+| `dksearch backup` (content and state) | 1,544 s (26 min) |
+
+This is a little over the "hour or so, tens of GB" guessed from the Simple English dump, so that guess was too optimistic about time (the import is bound by the bzip2 decoder and by SQLite writes, which grow with the index) and about right about size. The `rebuild` time was not recorded.
+
+## Books pilot: 571 PDFs and some media (2026-11-16)
+
+A folder of economics and banking books (`files` source with `pdf_text`, `pdf_workers = 4`, `media`, `office`, `html`; 12 GB on disk including 41 mp4, 34 flv and a few audio files):
+
+| Measure | Value |
+|---|---|
+| Files seen / imported / skipped | 622 / 526 / 96 (88 had no extractable text, mostly scans) |
+| Import wall time | 9 min 34 s (142 s user, 20 s system), 4 PDF workers, 76 MB resident |
+| `index.db` | 356 MB |
+| `content.db` | 88 MB |
+
+The skipped scans are what OCR (on the roadmap) is for. Three PDFs were over this run's 64 MiB limit and were refused.
+
 ## Extrapolation from the synthetic data (a guess, not a measurement)
 
 English Wikipedia's article text is on the order of 20 GB. Scaling the numbers above linearly gives roughly an hour of CPU for an import, an index of about twice the text size (tens of GB), compressed content of a few GB, and a `state.db` that would be several GB with the current per-record rights text. Real text has a larger vocabulary and longer articles, so treat every one of these as a rough order of magnitude and measure with a real dump before planning hardware.
 
 ## Not measured
 
-The full English Wikipedia (millions of articles, tens of GB); the effect of the `porter` tokenizer; cold-cache latency; and the admin interface under load.
+The effect of the `porter` tokenizer; cold-cache latency; and the admin interface under load.
