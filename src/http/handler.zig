@@ -88,17 +88,19 @@ pub const Services = struct {
     sources: ?*dk.sourcestore.Store = null,
 };
 
-/// Names of the enabled sources, sorted, for the Source drop-down.
-fn sourceNames(arena: Allocator, services: Services) error{OutOfMemory}![]const []const u8 {
+/// The enabled sources, sorted by kind and then name, for the Source drop-down.
+fn sourceChoices(arena: Allocator, services: Services) error{OutOfMemory}![]const html.SourceChoice {
     const store = services.sources orelse return &.{};
-    var names: std.ArrayList([]const u8) = .empty;
-    for (store.snapshot()) |src| if (src.enabled) try names.append(arena, try arena.dupe(u8, src.name));
-    std.mem.sort([]const u8, names.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
+    var out: std.ArrayList(html.SourceChoice) = .empty;
+    for (store.snapshot()) |src| if (src.enabled) try out.append(arena, .{ .name = try arena.dupe(u8, src.name), .kind = try arena.dupe(u8, src.kind) });
+    std.mem.sort(html.SourceChoice, out.items, {}, struct {
+        fn lt(_: void, a: html.SourceChoice, b: html.SourceChoice) bool {
+            const k = std.mem.order(u8, a.kind, b.kind);
+            if (k != .eq) return k == .lt;
+            return std.mem.lessThan(u8, a.name, b.name);
         }
     }.lt);
-    return names.items;
+    return out.items;
 }
 
 pub fn handleServices(arena: Allocator, searcher: dk.search.Searcher, services: Services, method: http.Method, target: []const u8) Response {
@@ -133,7 +135,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Service
     return switch (r) {
         .home => blk: {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHomeForm(&aw.writer, null, .{ .regex_enabled = regex != null, .sources = try sourceNames(arena, services) }) catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, null, .{ .regex_enabled = regex != null, .sources = try sourceChoices(arena, services) }) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
@@ -149,7 +151,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Service
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .api_search => try apiSearch(arena, searcher, regex, t.params),
-        .search_page => try pageSearch(arena, searcher, regex, try sourceNames(arena, services), t.params),
+        .search_page => try pageSearch(arena, searcher, regex, try sourceChoices(arena, services), t.params),
         .document => try documentPage(arena, searcher, services, t.path, t.params),
         .zim => try zimPage(arena, services, t.path),
         .other => unreachable,
@@ -504,13 +506,23 @@ fn originalFile(arena: Allocator, svc: *const dk.originals.Service, hit: dk.sear
 
 // ------------------------------------------------------------ HTML pages
 
-fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, sources: []const []const u8, params: query.Params) error{OutOfMemory}!Response {
+fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, sources: []const html.SourceChoice, params: query.Params) error{OutOfMemory}!Response {
     const parsed = switch (try parseQuery(arena, params, true)) {
         .ok => |p| p,
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
-    const q = parsed.q;
-    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .connector = q.connector orelse "", .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .sort = params.get("sort") orelse "" };
+    var q = parsed.q;
+    const chosen_connector: []const u8 = q.connector orelse "";
+    // "All sources of this kind" (`connector=kind:zim`): every source of the kind, as alternatives.
+    if (q.connector) |c| if (std.mem.startsWith(u8, c, "kind:")) {
+        var list: std.ArrayList(dk.search.Filter) = .empty;
+        for (sources) |src| if (std.mem.eql(u8, src.kind, c["kind:".len..])) try list.append(arena, .{ .field = .source, .text = src.name });
+        // A kind with no sources matches nothing rather than everything.
+        if (list.items.len == 0) try list.append(arena, .{ .field = .source, .text = "(no source of that kind)" });
+        q.filters = list.items;
+        q.connector = null;
+    };
+    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .connector = chosen_connector, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .sort = params.get("sort") orelse "" };
     if (parsed.re) |req| {
         // A pattern typed in the box is already part of `q` and travels with it; only one given
         // as a parameter has to be carried separately (the pager and the exact-spelling link).
@@ -844,10 +856,13 @@ test "the API tells what it knows about each hit, takes filter and sort paramete
     try testing.expect(std.mem.indexOf(u8, page.body, "<option value=\"newest\" selected>Newest</option>") != null);
 }
 
-test "the Source filter is a drop-down of the enabled sources, and keeps the choice" {
+test "the Source filter is a drop-down grouped by kind, and keeps the choice" {
     var store = dk.sourcestore.Store.init(testing.allocator, testing.io, &.{
         .{ .name = "wiki", .kind = "wikipedia" },
         .{ .name = "notes", .kind = "files" },
+        .{ .name = "docs", .kind = "files" },
+        .{ .name = "knots", .kind = "zim" },
+        .{ .name = "chemistry", .kind = "zim" },
         .{ .name = "off", .kind = "files", .enabled = false },
     });
     defer store.deinit();
@@ -856,10 +871,30 @@ test "the Source filter is a drop-down of the enabled sources, and keeps the cho
     var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
     const services: Services = .{ .sources = &store };
     const home = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/");
-    try testing.expect(std.mem.indexOf(u8, home.body, "<select name=\"connector\"><option value=\"\">All sources</option><option value=\"notes\">notes</option><option value=\"wiki\">wiki</option></select>") != null);
+    for ([_][]const u8{
+        "<option value=\"\">All sources</option>",
+        "<optgroup label=\"Local files\"><option value=\"kind:files\">All Local files</option><option value=\"docs\">docs</option><option value=\"notes\">notes</option></optgroup>",
+        "<optgroup label=\"ZIM files\"><option value=\"kind:zim\">All ZIM files</option><option value=\"chemistry\">chemistry</option><option value=\"knots\">knots</option></optgroup>",
+        "<optgroup label=\"Wikipedia\"><option value=\"wiki\">wiki</option></optgroup>", // one source: no "all" choice
+    }) |n| {
+        errdefer std.debug.print("missing: {s}\n", .{n});
+        try testing.expect(std.mem.indexOf(u8, home.body, n) != null);
+    }
     try testing.expect(std.mem.indexOf(u8, home.body, "\"off\"") == null); // disabled sources are not offered
     const picked = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=wiki");
     try testing.expect(std.mem.indexOf(u8, picked.body, "<option value=\"wiki\" selected>wiki</option>") != null);
+    // "All ZIM files" searches every source of the kind, as alternatives, and stays selected.
+    const kind = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=kind:zim");
+    try testing.expect(std.mem.indexOf(u8, kind.body, "<option value=\"kind:zim\" selected>All ZIM files</option>") != null);
+    const used = fake.last.?;
+    try testing.expect(used.connector == null);
+    try testing.expectEqual(@as(usize, 2), used.filters.len);
+    try testing.expectEqualStrings("chemistry", used.filters[0].text);
+    try testing.expectEqualStrings("knots", used.filters[1].text);
+    // A kind with no sources matches nothing, never everything.
+    _ = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=kind:feeds");
+    try testing.expectEqual(@as(usize, 1), fake.last.?.filters.len);
+    try testing.expectEqualStrings("(no source of that kind)", fake.last.?.filters[0].text);
     // A name that is not in the list (a removed source, or typed into the address) stays selected, escaped.
     const odd = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=gone");
     try testing.expect(std.mem.indexOf(u8, odd.body, "<option value=\"gone\" selected>gone</option>") != null);

@@ -66,6 +66,23 @@ pub fn writeSnippet(w: *Writer, snippet: []const u8) Writer.Error!void {
     if (open) try w.writeAll("</mark>");
 }
 
+/// A source offered in the Source drop-down.
+pub const SourceChoice = struct { name: []const u8, kind: []const u8 };
+
+fn kindLabel(kind: []const u8) []const u8 {
+    const labels = [_][2][]const u8{
+        .{ "files", "Local files" },
+        .{ "gutenberg", "Project Gutenberg" },
+        .{ "wikipedia", "Wikipedia" },
+        .{ "zim", "ZIM files" },
+        .{ "feeds", "Feeds" },
+        .{ "crawl", "Web crawls" },
+        .{ "archive", "Internet Archive" },
+    };
+    for (labels) |l| if (std.mem.eql(u8, l[0], kind)) return l[1];
+    return kind;
+}
+
 pub const Form = struct {
     q: []const u8 = "",
     language: []const u8 = "",
@@ -78,8 +95,8 @@ pub const Form = struct {
     regex_notice: ?[]const u8 = null,
     /// The searcher asked for exact spelling (`fuzzy=0`); kept when paging.
     exact_only: bool = false,
-    /// Names of the sources this server has, for the Source drop-down.
-    sources: []const []const u8 = &.{},
+    /// The sources this server has, for the Source drop-down (grouped by kind).
+    sources: []const SourceChoice = &.{},
     /// The chosen order (`newest`, ...); empty for best match first.
     sort: []const u8 = "",
 };
@@ -101,15 +118,36 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
     try w.print("<details{s}><summary><span>Filters</span><a class=\"tips\" href=\"/help/search\">Search tips</a></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
     try writeEscaped(w, f.language);
     try w.writeAll("\"></label><label>Source <select name=\"connector\"><option value=\"\">All sources</option>");
+    // Sources are grouped by kind; a group of several also offers "all of this kind".
     var listed = false;
-    for (f.sources) |name| {
-        const selected = std.mem.eql(u8, name, f.connector);
-        if (selected) listed = true;
-        try w.writeAll("<option value=\"");
-        try writeEscaped(w, name);
-        try w.writeAll(if (selected) "\" selected>" else "\">");
-        try writeEscaped(w, name);
-        try w.writeAll("</option>");
+    var i: usize = 0;
+    while (i < f.sources.len) {
+        const kind = f.sources[i].kind;
+        var end = i;
+        while (end < f.sources.len and std.mem.eql(u8, f.sources[end].kind, kind)) end += 1;
+        try w.writeAll("<optgroup label=\"");
+        try writeEscaped(w, kindLabel(kind));
+        try w.writeAll("\">");
+        if (end - i > 1) {
+            const selected = std.mem.startsWith(u8, f.connector, "kind:") and std.mem.eql(u8, f.connector["kind:".len..], kind);
+            if (selected) listed = true;
+            try w.writeAll("<option value=\"kind:");
+            try writeEscaped(w, kind);
+            try w.writeAll(if (selected) "\" selected>All " else "\">All ");
+            try writeEscaped(w, kindLabel(kind));
+            try w.writeAll("</option>");
+        }
+        for (f.sources[i..end]) |src| {
+            const selected = std.mem.eql(u8, src.name, f.connector);
+            if (selected) listed = true;
+            try w.writeAll("<option value=\"");
+            try writeEscaped(w, src.name);
+            try w.writeAll(if (selected) "\" selected>" else "\">");
+            try writeEscaped(w, src.name);
+            try w.writeAll("</option>");
+        }
+        try w.writeAll("</optgroup>");
+        i = end;
     }
     // A source named in the address but not in the list (removed, or typed by hand) stays selected.
     if (f.connector.len > 0 and !listed) {
