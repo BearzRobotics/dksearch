@@ -86,7 +86,9 @@ fn kindLabel(kind: []const u8) []const u8 {
 pub const Form = struct {
     q: []const u8 = "",
     language: []const u8 = "",
-    connector: []const u8 = "",
+    /// The sources ticked in the Source list: names, or `kind:NAME` for every source of a kind. Empty means
+    /// all sources.
+    picked: []const []const u8 = &.{},
     /// Regular-expression filter; the field is only shown when `regex_enabled`.
     regex: []const u8 = "",
     regex_ignore_case: bool = false,
@@ -109,55 +111,78 @@ pub fn writeHead(w: *Writer, title: []const u8) Writer.Error!void {
     try w.writeAll("</title><link rel=\"stylesheet\" href=\"/assets/style.css?v=" ++ style_version ++ "\"></head>\n");
 }
 
-fn writeForm(w: *Writer, f: Form) Writer.Error!void {
-    try w.writeAll("<form class=\"search\" action=\"/search\" method=\"get\" role=\"search\">" ++
-        "<input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Search\" autofocus value=\"");
-    try writeEscaped(w, f.q);
-    try w.writeAll("\"><button type=\"submit\">Search</button>");
-    const open = if (f.language.len > 0 or f.connector.len > 0 or f.sort.len > 0) " open" else "";
-    try w.print("<details{s}><summary><span>Filters</span><a class=\"tips\" href=\"/help/search\">Search tips</a></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
-    try writeEscaped(w, f.language);
-    try w.writeAll("\"></label><label>Source <select name=\"connector\"><option value=\"\">All sources</option>");
-    // Sources are grouped by kind; a group of several also offers "all of this kind".
-    var listed = false;
+fn isPicked(picked: []const []const u8, value: []const u8) bool {
+    for (picked) |p| if (std.mem.eql(u8, p, value)) return true;
+    return false;
+}
+
+/// The sources as tick boxes grouped by kind (works without JavaScript). Ticking a kind's "All" box means
+/// every source of that kind, now and later. Nothing ticked searches everything.
+fn writeSourcePicker(w: *Writer, f: Form) Writer.Error!void {
+    if (f.sources.len == 0 and f.picked.len == 0) return;
+    try w.writeAll("<fieldset class=\"sources\"><legend>Sources <small>(none ticked: all)</small></legend>");
     var i: usize = 0;
     while (i < f.sources.len) {
         const kind = f.sources[i].kind;
         var end = i;
         while (end < f.sources.len and std.mem.eql(u8, f.sources[end].kind, kind)) end += 1;
-        try w.writeAll("<optgroup label=\"");
+        var kind_value_buf: [80]u8 = undefined;
+        const kind_value = std.fmt.bufPrint(&kind_value_buf, "kind:{s}", .{kind}) catch "kind:";
+        const whole_kind = isPicked(f.picked, kind_value);
+        try w.writeAll("<div class=\"srcgroup\"><strong>");
         try writeEscaped(w, kindLabel(kind));
-        try w.writeAll("\">");
+        try w.writeAll("</strong>");
         if (end - i > 1) {
-            const selected = std.mem.startsWith(u8, f.connector, "kind:") and std.mem.eql(u8, f.connector["kind:".len..], kind);
-            if (selected) listed = true;
-            try w.writeAll("<option value=\"kind:");
-            try writeEscaped(w, kind);
-            try w.writeAll(if (selected) "\" selected>All " else "\">All ");
-            try writeEscaped(w, kindLabel(kind));
-            try w.writeAll("</option>");
+            try w.writeAll("<label class=\"check\"><input type=\"checkbox\" name=\"source\" value=\"");
+            try writeEscaped(w, kind_value);
+            try w.writeAll(if (whole_kind) "\" checked> all of these</label>" else "\"> all of these</label>");
         }
         for (f.sources[i..end]) |src| {
-            const selected = std.mem.eql(u8, src.name, f.connector);
-            if (selected) listed = true;
-            try w.writeAll("<option value=\"");
+            try w.writeAll("<label class=\"check\"><input type=\"checkbox\" name=\"source\" value=\"");
             try writeEscaped(w, src.name);
-            try w.writeAll(if (selected) "\" selected>" else "\">");
+            try w.writeAll(if (whole_kind or isPicked(f.picked, src.name)) "\" checked> " else "\"> ");
             try writeEscaped(w, src.name);
-            try w.writeAll("</option>");
+            try w.writeAll("</label>");
         }
-        try w.writeAll("</optgroup>");
+        try w.writeAll("</div>");
         i = end;
     }
-    // A source named in the address but not in the list (removed, or typed by hand) stays selected.
-    if (f.connector.len > 0 and !listed) {
-        try w.writeAll("<option value=\"");
-        try writeEscaped(w, f.connector);
-        try w.writeAll("\" selected>");
-        try writeEscaped(w, f.connector);
-        try w.writeAll("</option>");
+    // A choice that is not in the list (a source since removed, or typed into the address) stays ticked, so it
+    // is visible and can be unticked.
+    for (f.picked) |p| {
+        var known = false;
+        const is_kind = std.mem.startsWith(u8, p, "kind:");
+        for (f.sources) |src| {
+            if (if (is_kind) std.mem.eql(u8, src.kind, p["kind:".len..]) else std.mem.eql(u8, src.name, p)) known = true;
+        }
+        if (known) continue;
+        try w.writeAll("<div class=\"srcgroup\"><strong>Not configured</strong><label class=\"check\"><input type=\"checkbox\" name=\"source\" value=\"");
+        try writeEscaped(w, p);
+        try w.writeAll("\" checked> ");
+        try writeEscaped(w, p);
+        try w.writeAll("</label></div>");
     }
-    try w.writeAll("</select></label><label>Order <select name=\"sort\">");
+    try w.writeAll("</fieldset>");
+}
+
+fn writeSourceParams(w: *Writer, picked: []const []const u8) Writer.Error!void {
+    for (picked) |p| {
+        try w.writeAll("&amp;source=");
+        try query.writeEncoded(w, p);
+    }
+}
+
+fn writeForm(w: *Writer, f: Form) Writer.Error!void {
+    try w.writeAll("<form class=\"search\" action=\"/search\" method=\"get\" role=\"search\">" ++
+        "<input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Search\" autofocus value=\"");
+    try writeEscaped(w, f.q);
+    try w.writeAll("\"><button type=\"submit\">Search</button>");
+    const open = if (f.language.len > 0 or f.picked.len > 0 or f.sort.len > 0) " open" else "";
+    try w.print("<details{s}><summary><span>Filters</span><a class=\"tips\" href=\"/help/search\">Search tips</a></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
+    try writeEscaped(w, f.language);
+    try w.writeAll("\"></label>");
+    try writeSourcePicker(w, f);
+    try w.writeAll("<label>Order <select name=\"sort\">");
     const orders = [_][2][]const u8{ .{ "", "Best match" }, .{ "newest", "Newest" }, .{ "oldest", "Oldest" }, .{ "largest", "Largest" }, .{ "smallest", "Smallest" }, .{ "title", "Title" } };
     for (orders) |o| {
         try w.print("<option value=\"{s}\"{s}>{s}</option>", .{ o[0], if (std.mem.eql(u8, o[0], f.sort)) " selected" else "", o[1] });
@@ -269,10 +294,7 @@ fn writeInterpretation(w: *Writer, f: Form, page: dk.search.Page, offset: u32) W
             try w.writeAll("&amp;language=");
             try query.writeEncoded(w, f.language);
         }
-        if (f.connector.len > 0) {
-            try w.writeAll("&amp;connector=");
-            try query.writeEncoded(w, f.connector);
-        }
+        try writeSourceParams(w, f.picked);
         if (f.regex.len > 0) {
             try w.writeAll("&amp;regex=");
             try query.writeEncoded(w, f.regex);
@@ -494,10 +516,7 @@ fn writePagerLink(w: *Writer, f: Form, offset: u32, label_html: []const u8) Writ
         try w.writeAll("&amp;language=");
         try query.writeEncoded(w, f.language);
     }
-    if (f.connector.len > 0) {
-        try w.writeAll("&amp;connector=");
-        try query.writeEncoded(w, f.connector);
-    }
+    try writeSourceParams(w, f.picked);
     if (f.regex.len > 0) {
         try w.writeAll("&amp;regex=");
         try query.writeEncoded(w, f.regex);

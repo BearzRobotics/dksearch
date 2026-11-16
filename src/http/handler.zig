@@ -527,17 +527,28 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
     };
     var q = parsed.q;
     q.boosts = boosts;
-    const chosen_connector: []const u8 = q.connector orelse "";
-    // "All sources of this kind" (`connector=kind:zim`): every source of the kind, as alternatives.
-    if (q.connector) |c| if (std.mem.startsWith(u8, c, "kind:")) {
+    // The ticked sources (`source`, repeatable) and the older single `connector`: each is a source name or
+    // `kind:NAME` for every source of a kind. They are alternatives (`kind:zim` is all its sources).
+    var picked: std.ArrayList([]const u8) = .empty;
+    for (try params.all(arena, "source")) |v| {
+        if (!validFilter(v)) return htmlError(arena, .bad_request, "Bad request", "source: invalid value");
+        if (picked.items.len >= 64) return htmlError(arena, .bad_request, "Bad request", "source: at most 64 sources");
+        try picked.append(arena, v);
+    }
+    if (q.connector) |c| try picked.append(arena, c);
+    if (picked.items.len > 0) {
         var list: std.ArrayList(dk.search.Filter) = .empty;
-        for (sources) |src| if (std.mem.eql(u8, src.kind, c["kind:".len..])) try list.append(arena, .{ .field = .source, .text = src.name });
-        // A kind with no sources matches nothing rather than everything.
+        for (picked.items) |c| {
+            if (std.mem.startsWith(u8, c, "kind:")) {
+                for (sources) |src| if (std.mem.eql(u8, src.kind, c["kind:".len..])) try list.append(arena, .{ .field = .source, .text = src.name });
+            } else try list.append(arena, .{ .field = .source, .text = c });
+        }
+        // Only kinds with no sources: match nothing rather than everything.
         if (list.items.len == 0) try list.append(arena, .{ .field = .source, .text = "(no source of that kind)" });
         q.filters = list.items;
         q.connector = null;
-    };
-    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .connector = chosen_connector, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .sort = params.get("sort") orelse "" };
+    }
+    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .picked = picked.items, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .sort = params.get("sort") orelse "" };
     if (parsed.re) |req| {
         // A pattern typed in the box is already part of `q` and travels with it; only one given
         // as a parameter has to be carried separately (the pager and the exact-spelling link).
@@ -871,7 +882,7 @@ test "the API tells what it knows about each hit, takes filter and sort paramete
     try testing.expect(std.mem.indexOf(u8, page.body, "<option value=\"newest\" selected>Newest</option>") != null);
 }
 
-test "the Source filter is a drop-down grouped by kind, and keeps the choice" {
+test "the Source filter is a list of tick boxes grouped by kind; the ticked ones are searched and stay ticked" {
     var store = dk.sourcestore.Store.init(testing.allocator, testing.io, &.{
         .{ .name = "wiki", .kind = "wikipedia" },
         .{ .name = "notes", .kind = "files" },
@@ -887,35 +898,55 @@ test "the Source filter is a drop-down grouped by kind, and keeps the choice" {
     const services: Services = .{ .sources = &store };
     const home = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/");
     for ([_][]const u8{
-        "<option value=\"\">All sources</option>",
-        "<optgroup label=\"Local files\"><option value=\"kind:files\">All Local files</option><option value=\"docs\">docs</option><option value=\"notes\">notes</option></optgroup>",
-        "<optgroup label=\"ZIM files\"><option value=\"kind:zim\">All ZIM files</option><option value=\"chemistry\">chemistry</option><option value=\"knots\">knots</option></optgroup>",
-        "<optgroup label=\"Wikipedia\"><option value=\"wiki\">wiki</option></optgroup>", // one source: no "all" choice
+        "<fieldset class=\"sources\">",
+        "<strong>Local files</strong><label class=\"check\"><input type=\"checkbox\" name=\"source\" value=\"kind:files\"> all of these</label><label class=\"check\"><input type=\"checkbox\" name=\"source\" value=\"docs\"> docs</label><label class=\"check\"><input type=\"checkbox\" name=\"source\" value=\"notes\"> notes</label>",
+        "<strong>ZIM files</strong><label class=\"check\"><input type=\"checkbox\" name=\"source\" value=\"kind:zim\"> all of these</label><label class=\"check\"><input type=\"checkbox\" name=\"source\" value=\"chemistry\"> chemistry</label>",
+        "<strong>Wikipedia</strong><label class=\"check\"><input type=\"checkbox\" name=\"source\" value=\"wiki\"> wiki</label>", // one source: no "all" box
     }) |n| {
         errdefer std.debug.print("missing: {s}\n", .{n});
         try testing.expect(std.mem.indexOf(u8, home.body, n) != null);
     }
-    try testing.expect(std.mem.indexOf(u8, home.body, "\"off\"") == null); // disabled sources are not offered
-    const picked = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=wiki");
-    try testing.expect(std.mem.indexOf(u8, picked.body, "<option value=\"wiki\" selected>wiki</option>") != null);
-    // "All ZIM files" searches every source of the kind, as alternatives, and stays selected.
-    const kind = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=kind:zim");
-    try testing.expect(std.mem.indexOf(u8, kind.body, "<option value=\"kind:zim\" selected>All ZIM files</option>") != null);
+    try testing.expect(std.mem.indexOf(u8, home.body, "value=\"off\"") == null); // disabled sources are not offered
+    try testing.expect(std.mem.indexOf(u8, home.body, " checked>") == null); // nothing ticked: all sources
+
+    // Several ticked sources are alternatives, stay ticked, and travel with the paging links.
+    const two = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&source=wiki&source=notes");
+    try testing.expect(std.mem.indexOf(u8, two.body, "value=\"wiki\" checked>") != null);
+    try testing.expect(std.mem.indexOf(u8, two.body, "value=\"notes\" checked>") != null);
+    try testing.expect(std.mem.indexOf(u8, two.body, "value=\"docs\" checked>") == null);
+    const used2 = fake.last.?;
+    try testing.expect(used2.connector == null);
+    try testing.expectEqual(@as(usize, 2), used2.filters.len);
+    try testing.expectEqualStrings("wiki", used2.filters[0].text);
+    try testing.expectEqualStrings("notes", used2.filters[1].text);
+
+    // "All of these" for a kind searches every source of the kind and ticks them all.
+    const kind = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&source=kind:zim&source=wiki");
+    try testing.expect(std.mem.indexOf(u8, kind.body, "value=\"kind:zim\" checked>") != null);
+    try testing.expect(std.mem.indexOf(u8, kind.body, "value=\"knots\" checked>") != null);
     const used = fake.last.?;
-    try testing.expect(used.connector == null);
-    try testing.expectEqual(@as(usize, 2), used.filters.len);
+    try testing.expectEqual(@as(usize, 3), used.filters.len);
     try testing.expectEqualStrings("chemistry", used.filters[0].text);
     try testing.expectEqualStrings("knots", used.filters[1].text);
+    try testing.expectEqualStrings("wiki", used.filters[2].text);
+
+    // The older single `connector=` parameter still works.
+    const old = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=wiki");
+    try testing.expect(std.mem.indexOf(u8, old.body, "value=\"wiki\" checked>") != null);
+    try testing.expectEqualStrings("wiki", fake.last.?.filters[0].text);
+
     // A kind with no sources matches nothing, never everything.
-    _ = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=kind:feeds");
+    _ = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&source=kind:feeds");
     try testing.expectEqual(@as(usize, 1), fake.last.?.filters.len);
     try testing.expectEqualStrings("(no source of that kind)", fake.last.?.filters[0].text);
-    // A name that is not in the list (a removed source, or typed into the address) stays selected, escaped.
-    const odd = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&connector=gone");
-    try testing.expect(std.mem.indexOf(u8, odd.body, "<option value=\"gone\" selected>gone</option>") != null);
-    // With no source store the list is just "All sources".
+
+    // A name that is not in the list stays ticked (escaped), so it can be unticked.
+    const odd = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/search?q=x&source=gone%3Cb%3E");
+    try testing.expect(std.mem.indexOf(u8, odd.body, "<strong>Not configured</strong>") != null);
+    try testing.expect(std.mem.indexOf(u8, odd.body, "value=\"gone&lt;b&gt;\" checked>") != null);
+    // With no source store there is no list at all.
     const bare = handleServices(ar.allocator(), fake.searcher(), .{}, .GET, "/");
-    try testing.expect(std.mem.indexOf(u8, bare.body, "<option value=\"\">All sources</option></select>") != null);
+    try testing.expect(std.mem.indexOf(u8, bare.body, "fieldset") == null);
 }
 
 test "pages link the stylesheet by a content fingerprint, and the versioned address serves it" {
