@@ -290,6 +290,8 @@ Audio and video with `media = true`: files ending in `mp3`, `m4a`, `m4b`, `aac`,
 
 Original files with `serve_originals = true`: the viewer page of a document gets an "Open the original file" button (address `/doc/ID/file` on the search server). A file is read only from inside the source's `path` (symbolic links are resolved first, so a link cannot lead out of it), and only up to 64 MiB. PDFs and common images (PNG, JPEG, GIF, WebP, BMP) open in the browser; text, Markdown and HTML files are sent as plain text, never as a page; anything else, including SVG, is a download. Turn this on only for folders whose files anyone who can reach the search page may read. The setting is read when the server starts.
 
+Markdown files that carry pictures inline (`![](data:image/png;base64,...)`, as converters such as Docling write them) are indexed without the pictures, which are replaced by short references (`![](dkimg:N)`). With `serve_originals = true` the viewer shows those pictures (PNG, JPEG, GIF and WebP only) at `/doc/ID/image/N`, read from the original file, and `/api/v1/retrieve` lists the pictures that belong to each passage. Without it the pictures are simply not shown. The size limit (`max_file_bytes`) applies to a Markdown file after the pictures are removed (the file itself may be up to 64 MiB).
+
 Files are read in sorted path order. Symbolic links are never followed. Hidden files and directories (names starting with `.`) are skipped. Files that are not valid UTF-8, contain a NUL byte, or are empty are skipped. The title is the first Markdown `# heading` in a `.md` file, otherwise the file name without its extension. The document id is derived from the source name and the path relative to `path`.
 
 Example:

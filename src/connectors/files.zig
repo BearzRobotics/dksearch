@@ -389,8 +389,9 @@ pub const FilesConnector = struct {
         if (self.office) if (officetext.kindOf(rel)) |office_kind| return readOfficeImpl(self, arena, io, dir, st, base_abs, rel, office_kind);
         if (self.html and (hasExtension(rel, ".html") or hasExtension(rel, ".htm"))) return readHtmlImpl(self, arena, io, dir, st, base_abs, rel);
         const is_md = hasExtension(rel, ".md");
-        // Markdown from converters (Docling, ...) can carry its images inline as base64, which is most of the file
-        // and no use to a reader or a search, so the size limit applies to what is left after they are removed.
+        // Markdown from converters (Docling, ...) can carry its pictures inline as base64, which is most of the file
+        // and no use to a search. They are replaced by short references (`![](dkimg:N)`) that the viewer and the
+        // retrieval API can resolve against the original file, and the size limit applies to what is left.
         const read_limit: u32 = if (is_md) hard_max_file_bytes else self.max_file_bytes;
         if (st.size > read_limit) return .refused;
         if (st.size == 0) return .skip;
@@ -402,7 +403,7 @@ pub const FilesConnector = struct {
         if (text.len > read_limit) return .refused; // grew while reading
         if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return .refused;
         if (is_md) {
-            text = retrieve.withoutInlineImages(arena, text) catch return .out_of_memory;
+            text = retrieve.replaceInlineImages(arena, text) catch return .out_of_memory;
             if (text.len > self.max_file_bytes) return .refused;
             if (text.len == 0) return .skip;
         }

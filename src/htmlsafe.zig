@@ -248,8 +248,8 @@ fn writeAttrs(arena: Allocator, w: *Io.Writer, tag: Tag, options: Options) Error
         const is_src = is_img and std.mem.eql(u8, name, "src");
         if (!is_href and !is_src) continue;
         const scheme = try schemeOf(arena, value);
-        const ok = if (scheme.len == 0) true else if (is_href) (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https") or std.mem.eql(u8, scheme, "mailto")) else (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https") or (std.mem.eql(u8, scheme, "data") and isDataImage(value)));
-        if (!ok) continue;
+        const ok = if (scheme.len == 0) true else if (is_href) (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https") or std.mem.eql(u8, scheme, "mailto")) else (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https") or (std.mem.eql(u8, scheme, "data") and isDataImage(value)) or std.mem.eql(u8, scheme, "dkimg"));
+        if (!ok) continue; // (`dkimg:N` is our own reference to a picture of the original file: the hook turns it into an address, or it is dropped below)
         var url: ?[]const u8 = value;
         // A data: image is complete in itself; everything else may be rewritten.
         if (options.rewrite) |f| {

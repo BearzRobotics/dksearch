@@ -34,6 +34,8 @@ pub const Chunk = struct {
     page: ?u32,
     /// The text, without inline images.
     text: []const u8,
+    /// Pictures that sit in this chunk's span, as numbers for `nthInlineImage` (from `dkimg:N` references).
+    images: []const u32 = &.{},
 };
 
 const Block = struct {
@@ -43,6 +45,8 @@ const Block = struct {
     level: u8 = 0,
     /// For a heading: its text. For text: the block's kept text (images cut out).
     text: []const u8 = "",
+    /// Pictures of the original file placed in this block (`dkimg:N` references).
+    images: []const u32 = &.{},
     page: ?u32 = null,
     /// The heading path in force for this block (shared slices).
     path: []const []const u8 = &.{},
@@ -57,6 +61,96 @@ fn withoutFormFeeds(arena: Allocator, s: []const u8) Allocator.Error![]const u8 
     if (std.mem.indexOfScalar(u8, s, 0x0c) == null) return s;
     var out: std.ArrayList(u8) = .empty;
     for (s) |b| if (b != 0x0c) try out.append(arena, b);
+    return std.mem.trim(u8, out.items, " \t\r\n");
+}
+
+/// One inline data image: `![alt](data:MIME;base64,DATA)`.
+const DataImage = struct { start: usize, end: usize, mime: []const u8, data: []const u8 };
+
+/// The first inline data image at or after `from`.
+fn nextDataImage(s: []const u8, from: usize) ?DataImage {
+    var i = from;
+    while (std.mem.indexOfPos(u8, s, i, "![")) |at| {
+        i = at + 2;
+        // An image's alt text ends at the first `](`; it is an inline data image if what follows is `data:`.
+        const close = std.mem.indexOfPos(u8, s, at + 2, "](") orelse return null;
+        if (!std.mem.startsWith(u8, s[close..], "](data:")) continue;
+        if (std.mem.indexOfScalar(u8, s[at..close], '\n') != null) continue;
+        const paren = std.mem.indexOfScalarPos(u8, s, close, ')') orelse return null;
+        const body = s[close + "](data:".len .. paren];
+        const semi = std.mem.indexOfScalar(u8, body, ';') orelse continue;
+        const comma = std.mem.indexOfScalar(u8, body, ',') orelse continue;
+        if (comma < semi) continue;
+        return .{ .start = at, .end = paren + 1, .mime = body[0..semi], .data = body[comma + 1 ..] };
+    }
+    return null;
+}
+
+/// Replaces each inline data image with `![](dkimg:N)`, N counting from 0 in the order they occur, so the text stays
+/// small and the picture can still be fetched from the original file (see `nthInlineImage`).
+pub fn replaceInlineImages(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var pos: usize = 0;
+    var n: usize = 0;
+    while (nextDataImage(s, pos)) |img| {
+        try out.appendSlice(arena, s[pos..img.start]);
+        try out.print(arena, "![](dkimg:{d})", .{n});
+        n += 1;
+        pos = img.end;
+    }
+    if (n == 0) return s;
+    try out.appendSlice(arena, s[pos..]);
+    return out.items;
+}
+
+pub const Image = struct { mime: []const u8, bytes: []const u8 };
+
+/// The `n`th inline data image of a file's text (numbered as in `replaceInlineImages`), decoded. Only picture types
+/// that cannot carry script are returned.
+pub fn nthInlineImage(arena: Allocator, s: []const u8, n: usize) Allocator.Error!?Image {
+    var pos: usize = 0;
+    var k: usize = 0;
+    while (nextDataImage(s, pos)) |img| : (k += 1) {
+        pos = img.end;
+        if (k != n) continue;
+        const allowed = [_][]const u8{ "image/png", "image/jpeg", "image/gif", "image/webp" };
+        var ok = false;
+        for (allowed) |m| if (std.mem.eql(u8, m, img.mime)) {
+            ok = true;
+        };
+        if (!ok) return null;
+        const dec = std.base64.standard.decoderWithIgnore(" \t\r\n");
+        const size = dec.calcSizeUpperBound(img.data.len);
+        const buf = try arena.alloc(u8, size);
+        const got = dec.decode(buf, img.data) catch return null;
+        return .{ .mime = img.mime, .bytes = buf[0..got] };
+    }
+    return null;
+}
+
+/// The number in `dkimg:N` references of a text (`![](dkimg:3)`, any alt text), found in order, and the text without them.
+fn takeImageRefs(arena: Allocator, s: []const u8, refs: *std.ArrayList(u32)) Allocator.Error![]const u8 {
+    if (std.mem.indexOf(u8, s, "](dkimg:") == null) return s;
+    var out: std.ArrayList(u8) = .empty;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, s, pos, "![")) |at| {
+        const close = std.mem.indexOfPos(u8, s, at + 2, "](") orelse break;
+        if (!std.mem.startsWith(u8, s[close..], "](dkimg:") or std.mem.indexOfScalar(u8, s[at..close], '\n') != null) {
+            try out.appendSlice(arena, s[pos .. at + 2]);
+            pos = at + 2;
+            continue;
+        }
+        const paren = std.mem.indexOfScalarPos(u8, s, close, ')') orelse break;
+        const num = std.fmt.parseInt(u32, s[close + "](dkimg:".len .. paren], 10) catch {
+            try out.appendSlice(arena, s[pos .. at + 2]);
+            pos = at + 2;
+            continue;
+        };
+        try refs.append(arena, num);
+        try out.appendSlice(arena, s[pos..at]);
+        pos = paren + 1;
+    }
+    try out.appendSlice(arena, s[pos..]);
     return std.mem.trim(u8, out.items, " \t\r\n");
 }
 
@@ -140,7 +234,9 @@ fn blocks(arena: Allocator, text: []const u8) Allocator.Error![]Block {
             b.level = h.level;
             b.text = h.text;
         } else {
-            b.text = try withoutFormFeeds(arena, try withoutInlineImages(arena, trimmed));
+            var refs: std.ArrayList(u32) = .empty;
+            b.text = try withoutFormFeeds(arena, try takeImageRefs(arena, try withoutInlineImages(arena, trimmed), &refs));
+            b.images = refs.items;
         }
         b.page = if (saw_pages) page else null;
         const path = try arena.alloc([]const u8, stack.items.len);
@@ -199,7 +295,7 @@ fn splitLong(arena: Allocator, text: []const u8, max: usize, out: *std.ArrayList
     if (rest.len > 0) try out.append(arena, rest);
 }
 
-const Piece = struct { start: usize, end: usize, text: []const u8, page: ?u32, path: []const []const u8, heading: bool };
+const Piece = struct { start: usize, end: usize, text: []const u8, page: ?u32, path: []const []const u8, heading: bool, images: []const u32 = &.{} };
 
 /// Chunks `text`. Everything is allocated from `arena`.
 pub fn chunk(arena: Allocator, text: []const u8, options: Options) Allocator.Error![]const Chunk {
@@ -212,18 +308,18 @@ pub fn chunk(arena: Allocator, text: []const u8, options: Options) Allocator.Err
         .image, .page_break => {},
         .heading => try pieces.append(arena, .{ .start = b.start, .end = b.end, .text = text[b.start..b.end], .page = b.page, .path = b.path, .heading = true }),
         .text => {
-            if (b.text.len == 0) continue;
+            if (b.text.len == 0 and b.images.len == 0) continue;
             if (b.text.len <= max) {
-                try pieces.append(arena, .{ .start = b.start, .end = b.end, .text = b.text, .page = b.page, .path = b.path, .heading = false });
+                try pieces.append(arena, .{ .start = b.start, .end = b.end, .text = b.text, .page = b.page, .path = b.path, .heading = false, .images = b.images });
             } else {
                 var parts: std.ArrayList([]const u8) = .empty;
                 try splitLong(arena, b.text, max, &parts);
-                for (parts.items) |p| {
+                for (parts.items, 0..) |p, part_no| {
                     // The span of a part is found in the original block; images cut out make it approximate,
                     // so fall back to the whole block's span.
                     const at = std.mem.indexOf(u8, text[b.start..b.end], p[0..@min(p.len, 40)]);
                     const s = if (at) |a| b.start + a else b.start;
-                    try pieces.append(arena, .{ .start = s, .end = @min(s + p.len, b.end), .text = p, .page = b.page, .path = b.path, .heading = false });
+                    try pieces.append(arena, .{ .start = s, .end = @min(s + p.len, b.end), .text = p, .page = b.page, .path = b.path, .heading = false, .images = if (part_no == 0) b.images else &.{} });
                 }
             }
         },
@@ -236,7 +332,7 @@ pub fn chunk(arena: Allocator, text: []const u8, options: Options) Allocator.Err
         var size: usize = 0;
         while (j < pieces.items.len) {
             const p = pieces.items[j];
-            const add = p.text.len + 2;
+            const add = if (p.text.len == 0) 0 else p.text.len + 2;
             if (j > i) {
                 if (size + add > max) break;
                 // A new section starts a new chunk once this one has enough in it.
@@ -248,7 +344,10 @@ pub fn chunk(arena: Allocator, text: []const u8, options: Options) Allocator.Err
         // The chunk is pieces[i..j]; its text joins them with blank lines.
         var buf: std.ArrayList(u8) = .empty;
         var first_text: ?usize = null;
+        var imgs: std.ArrayList(u32) = .empty;
         for (pieces.items[i..j], i..) |p, k| {
+            try imgs.appendSlice(arena, p.images);
+            if (p.text.len == 0) continue;
             if (buf.items.len > 0) try buf.appendSlice(arena, "\n\n");
             try buf.appendSlice(arena, p.text);
             if (first_text == null and !p.heading) first_text = k;
@@ -261,6 +360,7 @@ pub fn chunk(arena: Allocator, text: []const u8, options: Options) Allocator.Err
             .heading = head.path,
             .page = pieces.items[i].page,
             .text = buf.items,
+            .images = imgs.items,
         });
         if (j >= pieces.items.len) break;
         // The next chunk starts with whole pieces from the end of this one, within the overlap budget, but
@@ -446,6 +546,37 @@ fn textsOf(arena: Allocator, cs: []const Chunk) ![]const []const u8 {
     const out = try arena.alloc([]const u8, cs.len);
     for (cs, out) |c, *o| o.* = c.text;
     return out;
+}
+
+test "inline pictures become numbered references, can be fetched by number, and travel with their chunk" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = "# Folk\n\nIntro.\n\n![Image](data:image/png;base64,iVBORw0KGgo=)\n\nCaption of the first picture.\n\n## More\n\n![](data:image/jpeg;base64,/9j/4AAQ)\n\nEnd.";
+    const slim = try replaceInlineImages(a, file);
+    try testing.expectEqualStrings("# Folk\n\nIntro.\n\n![](dkimg:0)\n\nCaption of the first picture.\n\n## More\n\n![](dkimg:1)\n\nEnd.", slim);
+    try testing.expectEqual(slim.ptr, (try replaceInlineImages(a, slim)).ptr); // nothing left to replace
+    const first = (try nthInlineImage(a, file, 0)).?;
+    try testing.expectEqualStrings("image/png", first.mime);
+    try testing.expectEqualStrings("\x89PNG\r\n\x1a\n", first.bytes);
+    try testing.expectEqualStrings("image/jpeg", (try nthInlineImage(a, file, 1)).?.mime);
+    try testing.expect((try nthInlineImage(a, file, 2)) == null);
+    try testing.expect((try nthInlineImage(a, "![](data:image/svg+xml;base64,PHN2Zz4=)", 0)) == null); // not a type to serve
+    // The chunk holding the first picture lists it, and its text has no markup.
+    const cs = try chunk(a, slim, .{ .chunk_chars = 200, .overlap = 0 });
+    var found0 = false;
+    var found1 = false;
+    for (cs) |c| {
+        try testing.expect(std.mem.indexOf(u8, c.text, "dkimg") == null);
+        for (c.images) |n| {
+            if (n == 0) {
+                found0 = true;
+                try testing.expect(std.mem.indexOf(u8, c.text, "Intro") != null or std.mem.indexOf(u8, c.text, "Caption") != null);
+            }
+            if (n == 1) found1 = true;
+        }
+    }
+    try testing.expect(found0 and found1);
 }
 
 test "a question becomes its meaningful words joined by OR; query-language queries are left alone" {

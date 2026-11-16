@@ -458,9 +458,13 @@ const max_view_bytes = 512 * 1024;
 fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Services, path: []const u8, params: query.Params) error{OutOfMemory}!Response {
     var hex = path["/doc/".len..];
     var want_file = false;
+    var want_image: ?usize = null;
     if (std.mem.endsWith(u8, hex, "/file")) {
         want_file = true;
         hex = hex[0 .. hex.len - "/file".len];
+    } else if (std.mem.indexOf(u8, hex, "/image/")) |at| {
+        want_image = std.fmt.parseInt(usize, hex[at + "/image/".len ..], 10) catch return htmlError(arena, .not_found, "Not found", "No such picture.");
+        hex = hex[0..at];
     }
     var id: dk.document.Id = undefined;
     if (hex.len != 2 * @sizeOf(dk.document.Id)) return htmlError(arena, .not_found, "Not found", "No such document.");
@@ -469,6 +473,7 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     const hit = info orelse return htmlError(arena, .not_found, "Not found", "No such document.");
     const can_open = if (services.originals) |o| (if (hit.url) |u| o.serves(hit.connector, u) else false) else false;
     if (want_file) return if (can_open) originalFile(arena, services.originals.?, hit) else htmlError(arena, .not_found, "Not found", "The original file of this document is not available here.");
+    if (want_image) |n| return if (can_open) documentImage(arena, services.originals.?, hit, n) else htmlError(arena, .not_found, "Not found", "The pictures of this document are not available here.");
     // A ZIM article can be read from the file itself.
     var open_link: ?html.OpenLink = null;
     if (can_open) {
@@ -495,7 +500,9 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     const plain_view = if (params.get("view")) |v| std.mem.eql(u8, v, "text") else false;
     var rendered: ?[]const u8 = null;
     if (is_markdown and !plain_view) if (text) |t| {
-        rendered = dk.render.markdown(arena, t) catch |e| switch (e) {
+        // Pictures that the converter embedded in the file are served from the original (`/doc/ID/image/N`).
+        const image_base: ?[]const u8 = if (can_open) try std.fmt.allocPrint(arena, "/doc/{s}/image/", .{hex}) else null;
+        rendered = dk.render.markdown(arena, t, image_base) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.TooLarge => null, // too big to format: the plain text is shown
         };
@@ -522,6 +529,23 @@ fn originalFile(arena: Allocator, svc: *const dk.originals.Service, hit: dk.sear
     headers[3] = .{ .name = "cross-origin-resource-policy", .value = "same-origin" };
     headers[4] = .{ .name = "content-disposition", .value = try dk.originals.dispositionFor(arena, served.inline_view, served.filename) };
     return .{ .status = .ok, .content_type = served.content_type, .body = served.bytes, .headers = headers };
+}
+
+/// One picture embedded in a Markdown original (`![](data:image/png;base64,...)`), numbered in order of appearance.
+fn documentImage(arena: Allocator, svc: *const dk.originals.Service, hit: dk.search.Hit, n: usize) error{OutOfMemory}!Response {
+    const served = svc.read(arena, hit.connector, hit.url.?) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.NotServed, error.NotFound, error.Forbidden => htmlError(arena, .not_found, "Not found", "The original file is not available (it may have been moved or removed)."),
+        error.TooLarge => htmlError(arena, .payload_too_large, "Too large", "That file is too large to be served here."),
+        error.Io => htmlError(arena, .internal_server_error, "Error", "The file could not be read."),
+    };
+    const img = (try dk.retrieve.nthInlineImage(arena, served.bytes, n)) orelse return htmlError(arena, .not_found, "Not found", "No such picture in this document.");
+    const headers = try arena.alloc(Header, 4);
+    headers[0] = .{ .name = "x-content-type-options", .value = "nosniff" };
+    headers[1] = .{ .name = "content-security-policy", .value = "default-src 'none'; sandbox" };
+    headers[2] = .{ .name = "cross-origin-resource-policy", .value = "same-origin" };
+    headers[3] = .{ .name = "cache-control", .value = "private, max-age=600" };
+    return .{ .status = .ok, .content_type = img.mime, .body = img.bytes, .headers = headers };
 }
 
 // ------------------------------------------------------------ HTML pages
@@ -579,7 +603,11 @@ const RetrievedChunk = struct {
     text: []const u8,
     before: []const []const u8,
     after: []const []const u8,
+    /// Pictures that sit in this passage of the original file: `n` and, when the original can be served, the address.
+    images: []const RetrievedImage,
 };
+
+const RetrievedImage = struct { n: u32, url: ?[]const u8 };
 
 /// `GET /api/v1/retrieve`: the best passages for a question, for a RAG client. The candidate documents are found
 /// the way a search finds them (so every filter and source choice works), their stored text is split into
@@ -694,6 +722,9 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
         const after = try arena.alloc([]const u8, hi - (ow.chunk + 1));
         for (after, ow.chunk + 1..) |*b, i| b.* = d.chunks[i].text;
         const hex = std.fmt.bytesToHex(d.hit.id, .lower);
+        const can_open = if (services.originals) |svc| (if (d.hit.url) |u| svc.serves(d.hit.connector, u) else false) else false;
+        const images = try arena.alloc(RetrievedImage, c.images.len);
+        for (c.images, images) |n, *im| im.* = .{ .n = n, .url = if (can_open) try std.fmt.allocPrint(arena, "/doc/{s}/image/{d}", .{ hex, n }) else null };
         o.* = .{
             .doc_id = try arena.dupe(u8, &hex),
             .view_url = try std.fmt.allocPrint(arena, "/doc/{s}", .{hex}),
@@ -710,6 +741,7 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
             .text = c.text,
             .before = before,
             .after = after,
+            .images = images,
         };
     }
     return jsonResponse(arena, .ok, .{ .chunks = out, .candidates = @as(u32, @intCast(kept.items.len)), .duplicates_merged = duplicates, .without_text = skipped });
@@ -1355,6 +1387,47 @@ test "original files are served only for sources that allow it, from inside thei
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, other, "/file")).status);
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, outside, "/file")).status);
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, pdf, "/file/x")).status);
+}
+
+test "pictures embedded in a Markdown original are served from it, and shown in the viewer" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "books");
+    // Two tiny pictures (1x1 PNG, then a GIF header) among text; and one of a type that is not served.
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    const file = "# Title\n\n![Image](data:image/png;base64," ++ png ++ ")\n\nText.\n\n![](data:image/gif;base64,R0lGODlhAQABAAAAACw=)\n\n![](data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=)\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "books/b.md", .data = file });
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const abs = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    const base = try std.fmt.allocPrint(a, "{s}/books", .{abs});
+    var idx = try dk.index_sqlite.SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    const d: dk.document.Document = .{ .connector = "books", .source_id = "b", .title = "B", .text = "# Title\n\n![](dkimg:0)\n\nText.\n\n![](dkimg:1)\n\n![](dkimg:2)", .canonical_url = try std.fmt.allocPrint(a, "file://{s}/b.md", .{base}), .content_type = "text/markdown" };
+    try idx.indexer().add(d.id(), d);
+    try mem.store().put(d.id(), d.text.?);
+    const roots = [_]dk.originals.Root{.{ .connector = "books", .base = base }};
+    const svc: dk.originals.Service = .{ .io = testing.io, .roots = &roots };
+    const services: Services = .{ .originals = &svc, .content = mem.store() };
+    const hex = std.fmt.bytesToHex(d.id(), .lower);
+    const img = handleServices(a, idx.searcher(), services, .GET, try std.fmt.allocPrint(a, "/doc/{s}/image/0", .{hex}));
+    try testing.expectEqual(http.Status.ok, img.status);
+    try testing.expectEqualStrings("image/png", img.content_type);
+    try testing.expectEqualStrings("\x89PNG", img.body[0..4]);
+    try testing.expectEqualStrings("image/gif", handleServices(a, idx.searcher(), services, .GET, try std.fmt.allocPrint(a, "/doc/{s}/image/1", .{hex})).content_type);
+    // A type that could carry script is not served; neither is a number that does not exist, or a source without originals.
+    try testing.expectEqual(http.Status.not_found, handleServices(a, idx.searcher(), services, .GET, try std.fmt.allocPrint(a, "/doc/{s}/image/2", .{hex})).status);
+    try testing.expectEqual(http.Status.not_found, handleServices(a, idx.searcher(), services, .GET, try std.fmt.allocPrint(a, "/doc/{s}/image/9", .{hex})).status);
+    try testing.expectEqual(http.Status.not_found, handleServices(a, idx.searcher(), services, .GET, try std.fmt.allocPrint(a, "/doc/{s}/image/x", .{hex})).status);
+    try testing.expectEqual(http.Status.not_found, handleServices(a, idx.searcher(), .{ .content = mem.store() }, .GET, try std.fmt.allocPrint(a, "/doc/{s}/image/0", .{hex})).status);
+    // The viewer shows them through that address.
+    const page = handleServices(a, idx.searcher(), services, .GET, try std.fmt.allocPrint(a, "/doc/{s}", .{hex}));
+    try testing.expect(std.mem.indexOf(u8, page.body, try std.fmt.allocPrint(a, "<img src=\"/doc/{s}/image/0\"", .{hex})) != null);
+    const page_off = handleServices(a, idx.searcher(), .{ .content = mem.store() }, .GET, try std.fmt.allocPrint(a, "/doc/{s}", .{hex}));
+    try testing.expect(std.mem.indexOf(u8, page_off.body, "<img") == null);
 }
 
 // ----------------------------------------------------- regular-expression filter
