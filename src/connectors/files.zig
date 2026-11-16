@@ -33,7 +33,7 @@ pub const kind = "files";
 pub const default_max_file_bytes: u32 = 4 * 1024 * 1024;
 pub const hard_max_file_bytes: u32 = 64 * 1024 * 1024;
 const checkpoint_every = 100;
-const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text", "media", "office", "html" };
+const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text", "pdf_workers", "media", "office", "html" };
 
 /// Checks a source's options without touching the filesystem.
 pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!void {
@@ -85,6 +85,19 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
             },
         };
     }
+    if (source.option("pdf_workers")) |v| {
+        const key = std.fmt.bufPrint(&kbuf, "source[{s}].pdf_workers", .{source.name}) catch "pdf_workers";
+        switch (v) {
+            .integer => |n| if (n < 1 or n > max_pdf_workers) {
+                diag.set("", key, "must be between 1 and {d}, got {d}", .{ max_pdf_workers, n });
+                return error.InvalidValue;
+            },
+            else => {
+                diag.set("", key, "expected integer", .{});
+                return error.WrongType;
+            },
+        }
+    }
     if (source.option("language")) |v| {
         const key = std.fmt.bufPrint(&kbuf, "source[{s}].language", .{source.name}) catch "language";
         switch (v) {
@@ -117,6 +130,10 @@ pub const FilesConnector = struct {
     language: ?[]const u8,
     /// Index PDFs by running the external `pdftotext` program (`pdf_text = true`).
     pdf_text: bool,
+    /// How many `pdftotext` programs run at once (`pdf_workers`).
+    pdf_workers: u32,
+    /// Text that was extracted ahead of time by the workers, by path (consumed in order).
+    pdf_cache: std.StringHashMapUnmanaged(PdfResult) = .empty,
     /// Index audio and video through `ffprobe` and their subtitle or lyrics files (`media = true`).
     media: bool,
     /// Index Word (`docx`), OpenDocument text (`odt`) and `epub` files (`office = true`).
@@ -144,6 +161,7 @@ pub const FilesConnector = struct {
             .language = language,
             .pdf_text = source.optionBool("pdf_text") orelse false,
             .media = source.optionBool("media") orelse false,
+            .pdf_workers = @intCast(source.optionInt("pdf_workers") orelse default_pdf_workers),
             .office = source.optionBool("office") orelse false,
             .html = source.optionBool("html") orelse false,
         };
@@ -211,13 +229,24 @@ pub const FilesConnector = struct {
 
         var done: ?[]const u8 = null; // last path fully handled
         var since_checkpoint: u32 = 0;
+        // Each file gets its own scratch memory, released before the next one: a library of
+        // tens of thousands of books must not keep all their text until the end of the run.
+        var file_arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer file_arena_state.deinit();
+        defer self.clearPdfCache();
         for (paths, 0..) |rel, path_index| {
+            _ = file_arena_state.reset(.retain_capacity);
+            const file_arena = file_arena_state.allocator();
             control.setProgress(path_index, paths.len);
             if (resume_from) |r| if (!std.mem.lessThan(u8, r, rel)) continue; // already done
 
             if (control.isCancelled()) return self.stopped(done);
 
-            switch (self.readOne(arena, io, dir, base_abs, rel)) {
+            // PDFs are extracted by several programs at once, a few files ahead of this one.
+            if (self.pdf_text and self.pdf_workers > 1 and hasExtension(rel, ".pdf") and !self.pdf_cache.contains(rel)) {
+                self.prefetchPdfs(arena, io, base_abs, paths, path_index, resume_from);
+            }
+            switch (self.readOne(file_arena, io, dir, base_abs, rel)) {
                 .skip => {},
                 .no_text => control.reject(.no_text),
                 .refused => _ = control.rejected.fetchAdd(1, .monotonic),
@@ -271,6 +300,51 @@ pub const FilesConnector = struct {
         try gop.value_ptr.append(arena, try arena.dupe(u8, rel));
     }
 
+    fn clearPdfCache(self: *FilesConnector) void {
+        var it = self.pdf_cache.iterator();
+        while (it.next()) |e| {
+            std.heap.page_allocator.free(e.value_ptr.stdout);
+            self.gpa.free(e.key_ptr.*);
+        }
+        self.pdf_cache.deinit(self.gpa);
+        self.pdf_cache = .empty;
+    }
+
+    /// Starts `pdftotext` on this PDF and the next few, all at once, and keeps what they print
+    /// until each file's turn comes. Memory held is bounded by `pdf_workers` times the text limit.
+    fn prefetchPdfs(self: *FilesConnector, arena: Allocator, io: Io, base_abs: []const u8, paths: []const []const u8, from: usize, resume_from: ?[]const u8) void {
+        const workers: usize = self.pdf_workers;
+        var jobs: [max_pdf_workers]PdfJob = undefined;
+        var rels: [max_pdf_workers][]const u8 = undefined;
+        var threads: [max_pdf_workers]?std.Thread = @splat(null);
+        var n: usize = 0;
+        var i = from;
+        while (i < paths.len and n < workers and i < from + workers * 8) : (i += 1) {
+            const rel = paths[i];
+            if (!hasExtension(rel, ".pdf") or self.pdf_cache.contains(rel)) continue;
+            if (resume_from) |r| if (!std.mem.lessThan(u8, r, rel)) continue;
+            const abs = std.fmt.allocPrint(arena, "{s}/{s}", .{ base_abs, rel }) catch return;
+            jobs[n] = .{ .io = io, .abs_path = abs, .max_out = self.max_file_bytes };
+            rels[n] = rel;
+            n += 1;
+        }
+        for (0..n) |k| threads[k] = std.Thread.spawn(.{}, runPdfJob, .{&jobs[k]}) catch null;
+        for (0..n) |k| {
+            if (threads[k]) |t| t.join() else runPdfJob(&jobs[k]); // could not start a thread: do it here
+        }
+        for (0..n) |k| {
+            const result = jobs[k].result orelse PdfResult{ .stdout = &.{}, .failed = true };
+            const key = self.gpa.dupe(u8, rels[k]) catch {
+                std.heap.page_allocator.free(result.stdout);
+                continue;
+            };
+            self.pdf_cache.put(self.gpa, key, result) catch {
+                self.gpa.free(key);
+                std.heap.page_allocator.free(result.stdout);
+            };
+        }
+    }
+
     fn readPdf(self: *FilesConnector, arena: Allocator, io: Io, st: Io.File.Stat, base_abs: []const u8, rel: []const u8) Read {
         return readPdfImpl(self, arena, io, st, base_abs, rel);
     }
@@ -320,6 +394,8 @@ pub const FilesConnector = struct {
 };
 
 const pdf_timeout_seconds = 60;
+pub const max_pdf_workers = 32;
+pub const default_pdf_workers = 4;
 /// Largest `docx`, `odt` or `epub` file opened (only its text parts are read, one at a time).
 const hard_max_office_bytes: u64 = 512 * 1024 * 1024;
 
@@ -505,6 +581,38 @@ fn mediaExtras(arena: Allocator, extras: *std.ArrayList(doc.Extra), info: avmeta
     try extras.append(arena, .{ .key = "file_size", .value = try std.fmt.allocPrint(arena, "{d}", .{file_size}) });
 }
 
+pub const PdfResult = struct {
+    /// What `pdftotext` printed (owned by the page allocator), or empty.
+    stdout: []u8,
+    /// The program failed or ran over its limits.
+    failed: bool = false,
+};
+
+const PdfJob = struct {
+    io: Io,
+    abs_path: []const u8,
+    max_out: u32,
+    result: ?PdfResult = null,
+};
+
+/// Runs `pdftotext` for one file (in a worker thread). The output belongs to the page allocator,
+/// which is safe to use from any thread.
+fn runPdfJob(job: *PdfJob) void {
+    const pa = std.heap.page_allocator;
+    const r = std.process.run(pa, job.io, .{
+        .argv = &.{ "pdftotext", "-enc", "UTF-8", "-layout", "-q", job.abs_path, "-" },
+        .stdout_limit = .limited(job.max_out + 1),
+        .stderr_limit = .limited(64 * 1024),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(pdf_timeout_seconds), .clock = .awake } },
+    }) catch return;
+    pa.free(r.stderr);
+    if (!r.term.success() or r.stdout.len > job.max_out) {
+        pa.free(r.stdout);
+        return;
+    }
+    job.result = .{ .stdout = r.stdout };
+}
+
 /// True if the `pdftotext` program (poppler-utils) can be run.
 fn pdftotextWorks(gpa: Allocator, io: Io) bool {
     const r = std.process.run(gpa, io, .{ .argv = &.{ "pdftotext", "-v" }, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return false;
@@ -516,21 +624,34 @@ fn pdftotextWorks(gpa: Allocator, io: Io) bool {
 fn readPdfImpl(self: *FilesConnector, arena: Allocator, io: Io, st: Io.File.Stat, base_abs: []const u8, rel: []const u8) FilesConnector.Read {
     if (st.size > hard_max_file_bytes) return .refused;
     if (st.size == 0) return .skip;
-    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ base_abs, rel }) catch return .out_of_memory;
-    const result = std.process.run(arena, io, .{
-        .argv = &.{ "pdftotext", "-enc", "UTF-8", "-layout", "-q", path, "-" },
-        .stdout_limit = .limited(self.max_file_bytes + 1),
-        .stderr_limit = .limited(64 * 1024),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(pdf_timeout_seconds), .clock = .awake } },
-    }) catch |e| switch (e) {
-        error.OutOfMemory => return .out_of_memory,
-        else => return .refused, // too much text, a timeout, or the program could not run
-    };
-    if (!result.term.success()) return .refused; // damaged, encrypted, or not a PDF
-    if (result.stdout.len > self.max_file_bytes) return .refused;
+    // Output prepared ahead of time by the workers, or run the program now.
+    var stdout: []const u8 = undefined;
+    var owned_by_page_allocator = false;
+    if (self.pdf_cache.fetchRemove(rel)) |kv| {
+        self.gpa.free(kv.key);
+        if (kv.value.failed) return .refused;
+        stdout = kv.value.stdout;
+        owned_by_page_allocator = true;
+    } else {
+        const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ base_abs, rel }) catch return .out_of_memory;
+        const result = std.process.run(arena, io, .{
+            .argv = &.{ "pdftotext", "-enc", "UTF-8", "-layout", "-q", path, "-" },
+            .stdout_limit = .limited(self.max_file_bytes + 1),
+            .stderr_limit = .limited(64 * 1024),
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(pdf_timeout_seconds), .clock = .awake } },
+        }) catch |e| switch (e) {
+            error.OutOfMemory => return .out_of_memory,
+            else => return .refused, // too much text, a timeout, or the program could not run
+        };
+        if (!result.term.success()) return .refused; // damaged, encrypted, or not a PDF
+        if (result.stdout.len > self.max_file_bytes) return .refused;
+        stdout = result.stdout;
+    }
+    defer if (owned_by_page_allocator) std.heap.page_allocator.free(@constCast(stdout));
+    // The text is copied below, so the buffer can be released as soon as this function returns.
     // Page breaks (form feeds) become blank lines; anything else that is not text is dropped.
     var text: std.ArrayList(u8) = .empty;
-    for (result.stdout) |b| switch (b) {
+    for (stdout) |b| switch (b) {
         0x0C => text.appendSlice(arena, "\n\n") catch return .out_of_memory,
         0 => {},
         else => text.append(arena, b) catch return .out_of_memory,
@@ -1177,4 +1298,72 @@ test "office = true and html = true: Word, OpenDocument, EPUB and HTML files are
         found_html = true;
     };
     try testing.expect(found_html);
+}
+
+/// A one-page PDF with `text` on it, built by hand (the cross-reference table needs the offsets).
+fn minimalPdf(arena: Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var offsets: [5]usize = undefined;
+    try out.appendSlice(arena, "%PDF-1.4\n");
+    const stream = try std.fmt.allocPrint(arena, "BT /F1 18 Tf 72 700 Td ({s}) Tj ET", .{text});
+    const objs = [_][]const u8{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        try std.fmt.allocPrint(arena, "<< /Length {d} >>\nstream\n{s}\nendstream", .{ stream.len, stream }),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    };
+    for (objs, 0..) |o, i| {
+        offsets[i] = out.items.len;
+        try out.print(arena, "{d} 0 obj\n{s}\nendobj\n", .{ i + 1, o });
+    }
+    const xref = out.items.len;
+    try out.print(arena, "xref\n0 6\n0000000000 65535 f \n", .{});
+    for (offsets) |o| try out.print(arena, "{d:0>10} 00000 n \n", .{o});
+    try out.print(arena, "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{d}\n%%EOF\n", .{xref});
+    return out.items;
+}
+
+test "pdf_text with several workers finds every PDF, refuses the broken one, and matches one worker" {
+    if (!pdftotextWorks(testing.allocator, testing.io)) return error.SkipZigTest; // the program is optional
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]i64{ 1, 4 }) |workers| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        for (0..11) |i| {
+            const name = try std.fmt.allocPrint(arena.allocator(), "book{d:0>2}.pdf", .{i});
+            const body = try minimalPdf(arena.allocator(), try std.fmt.allocPrint(arena.allocator(), "chapter about lighthouse{d}", .{i}));
+            try tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = body });
+        }
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "broken.pdf", .data = "%PDF-1.4 this is not a real pdf" });
+        var pb: [200]u8 = undefined;
+        const source = try treeSource(&tmp, &pb, &.{
+            .{ .key = "pdf_text", .value = .{ .boolean = true } },
+            .{ .key = "pdf_workers", .value = .{ .integer = workers } },
+        });
+        defer testing.allocator.free(source.options);
+        var fc = try FilesConnector.init(testing.allocator, testing.io, source);
+        defer fc.deinit();
+        var e: E2e = undefined;
+        try e.init();
+        defer e.deinit();
+        var ctl: api.Control = .{};
+        const r = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc.connector(), "notes", &ctl, E2e.now);
+        try testing.expectEqual(state_sqlite.JobState.completed, r.state);
+        try testing.expectEqual(@as(u64, 11), r.submitted);
+        try testing.expectEqual(@as(u64, 1), r.rejected);
+        try testing.expectEqual(@as(u64, 11), try e.idx.count());
+        try testing.expectEqual(@as(usize, 1), try e.hits("lighthouse7"));
+        try testing.expectEqual(@as(usize, 1), try e.hits("lighthouse10"));
+        try testing.expectEqual(@as(u32, 0), fc.pdf_cache.count()); // nothing is left over
+    }
+}
+
+test "pdf_workers is a number from 1 to 32" {
+    var d: config.Diagnostic = .{};
+    try validate(src(&.{ .{ .key = "path", .value = .{ .string = "/x" } }, .{ .key = "pdf_workers", .value = .{ .integer = 8 } } }), &d);
+    try testing.expectError(error.InvalidValue, validate(src(&.{ .{ .key = "path", .value = .{ .string = "/x" } }, .{ .key = "pdf_workers", .value = .{ .integer = 0 } } }), &d));
+    try testing.expectError(error.InvalidValue, validate(src(&.{ .{ .key = "path", .value = .{ .string = "/x" } }, .{ .key = "pdf_workers", .value = .{ .integer = 99 } } }), &d));
+    try testing.expectError(error.WrongType, validate(src(&.{ .{ .key = "path", .value = .{ .string = "/x" } }, .{ .key = "pdf_workers", .value = .{ .string = "4" } } }), &d));
 }
