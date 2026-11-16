@@ -14,7 +14,7 @@ Each note records: project and version or commit; subsystems studied; experiment
 
 | # | Project | Note | Status |
 |---|---|---|---|
-| 1 | Apache Lucene | [lucene.md](lucene.md) | not started |
+| 1 | Apache Lucene | [lucene.md](lucene.md) | first pass (source reading); experiments pending |
 | 2 | YaCy | [yacy.md](yacy.md) | not started |
 | 3 | Apache Nutch | [nutch.md](nutch.md) | not started |
 | 4 | Marginalia Search | [marginalia.md](marginalia.md) | not started |
