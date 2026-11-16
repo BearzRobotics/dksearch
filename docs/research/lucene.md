@@ -49,7 +49,7 @@ All paths are under `lucene/core/src/java/org/apache/lucene/`.
 
 ## Potential applications
 
-1. **Edit distance 2 for fuzzy search** by a precomputed term list (a sorted vocabulary file or table) queried with a Levenshtein automaton, instead of generating variants. Candidate; needs a vocabulary table.
+1. **Edit distance 2 for fuzzy search** (done, ADR 0031): instead of a Levenshtein automaton, the index's own `fts5vocab` table is scanned with a bounded edit distance (same first letter first). On the 300,000-document playground index a typo-tolerant search takes 30 to 70 ms, and 500 ms at worst when nothing is close. Findings from trying it: rare words two edits away outscore the word meant unless only the closest spellings are kept; and a full vocabulary scan needs its own short time limit.
 2. **Checksums for dksearch's own files.** `dksearch check` verifies SQLite integrity and text hashes; a per-backup checksum manifest would add Lucene's "detect before trusting" for restore. Small.
 3. **Index version policy.** dksearch has schema migrations and a tokenizer-mismatch check; stating the rule "a newer file is refused, an older one is migrated or rebuilt" in one place would match Lucene's discipline (ADR candidate).
 4. **Positions for citations.** Phrase search already needs positions; page and section references for retrieval are done outside the index (see ADR 0030). A stored-chunk index would be a second FTS table, not a new format.

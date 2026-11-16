@@ -862,14 +862,17 @@ pub const SqliteIndex = struct {
         const lo_len: i64 = @as(i64, @intCast(word.len)) - max_edits;
         const hi_len: i64 = @as(i64, @intCast(word.len)) + max_edits;
         var guard: Deadline = undefined;
-        if (self.timeout) |t| {
-            const ms: u32 = @min(t.ms, 1500);
-            guard = .{ .io = t.io, .deadline_ns = Io.Timestamp.now(t.io, .awake).nanoseconds + @as(i96, ms) * std.time.ns_per_ms };
-            c.sqlite3_progress_handler(self.db, 2000, progressCallback, &guard);
-        } else guard = .{ .io = undefined, .deadline_ns = 0 };
         defer if (self.timeout != null) c.sqlite3_progress_handler(self.db, 0, null, null);
         var tier: u8 = 0;
         while (tier < 2) : (tier += 1) {
+            // Each tier has its own short budget: the words with the same first letter may take a while on a very
+            // large index, and looking at every word is only worth a moment.
+            if (self.timeout) |t| {
+                const budget: u32 = if (tier == 0) 1000 else 250;
+                const ms: u32 = @min(t.ms, budget);
+                guard = .{ .io = t.io, .deadline_ns = Io.Timestamp.now(t.io, .awake).nanoseconds + @as(i96, ms) * std.time.ns_per_ms };
+                c.sqlite3_progress_handler(self.db, 500, progressCallback, &guard);
+            } else guard = .{ .io = undefined, .deadline_ns = 0 };
             // Tier 0: words with the same first letter (a range of the vocabulary). Tier 1: all of them.
             const sql = if (tier == 0)
                 "SELECT term, doc, dk_edits(term, ?1, ?2) FROM fts_vocab WHERE term >= ?3 AND term < ?4 AND length(term) BETWEEN ?5 AND ?6 AND dk_edits(term, ?1, ?2) IS NOT NULL"
@@ -890,7 +893,10 @@ pub const SqliteIndex = struct {
             }
             st.int(5, @max(lo_len, 1)) catch |e| return searchError(e);
             st.int(6, hi_len) catch |e| return searchError(e);
-            while (st.step() catch |e| return if (guard.fired) &.{} else searchError(e)) {
+            while (st.step() catch |e| {
+                if (guard.fired) break; // out of time: what was found so far is used
+                return searchError(e);
+            }) {
                 const term = st.colText(0) orelse continue;
                 if (std.mem.eql(u8, term, word)) continue;
                 try found.append(arena, .{ .term = try arena.dupe(u8, term), .edits = @intCast(st.colInt(2)), .docs = st.colInt(1) });
@@ -905,7 +911,17 @@ pub const SqliteIndex = struct {
                 return std.mem.lessThan(u8, a.term, b.term);
             }
         }.lt);
-        const n = @min(found.items.len, queryparse.max_expansions);
+        // Only the closest spellings count when there are enough of them: a rarer word two edits away would
+        // otherwise outscore the word that was meant (rare words weigh more in the ranking).
+        var n = @min(found.items.len, queryparse.max_expansions);
+        if (found.items.len > 0) {
+            const best = found.items[0].edits;
+            var at_best: usize = 0;
+            for (found.items) |f| if (f.edits == best) {
+                at_best += 1;
+            };
+            if (at_best >= 1 and best < max_edits) n = @min(n, at_best);
+        }
         const out = try arena.alloc([]const u8, n);
         for (found.items[0..n], out) |f, *o| o.* = f.term;
         return out;

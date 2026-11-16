@@ -33,7 +33,7 @@ pub const max_terms = 32;
 pub const max_depth = 8;
 /// Fuzzy words must be this long (shorter ones have too many near neighbours).
 pub const fuzzy_min_len = 3;
-pub const fuzzy_max_len = 12;
+pub const fuzzy_max_len = 24;
 /// Words shorter than this are never made fuzzy by `Options.fuzzy_words` (one
 /// edit away from a three-letter word is most of the dictionary); writing
 /// `word~` still works from `fuzzy_min_len`.
@@ -761,6 +761,8 @@ fn emitFuzzy(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, word: []const u8
         try out.append(arena, ')');
         return;
     }
+    // Without a vocabulary every spelling one edit away is generated, which is only sensible for shorter words.
+    if (lower.len > 12) return quoted(arena, out, lower);
     try out.append(arena, '(');
     try quoted(arena, out, lower);
     var buf: [fuzzy_max_len + 1]u8 = undefined;
