@@ -208,3 +208,10 @@ pre { background: var(--card); border: 1px solid var(--border); border-radius: 0
   .stat-n { font-size: 1.3rem; }
   .card { padding: 0.8rem; }
 }
+
+/* The document viewer */
+.doctitle { font-size: 1.25rem; margin: 0 0 0.8rem; overflow-wrap: anywhere; }
+dl.meta { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 1rem; margin: 0 0 1.2rem; font-size: 0.92rem; }
+dl.meta dt { color: var(--muted); }
+dl.meta dd { margin: 0; overflow-wrap: anywhere; }
+.doctext { white-space: pre-wrap; overflow-wrap: anywhere; font: 0.85rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--card); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.8rem 1rem; max-height: 70vh; overflow: auto; }

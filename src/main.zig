@@ -628,25 +628,25 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     index.setSimpleSyntax(!cfg.search.advanced_syntax);
     const searcher = if (pool) |*p| p.searcher() else index.searcher();
 
-    // Regular-expression filtering reads the stored texts through its own
-    // read-only connections. Without a content.db (nothing imported yet) or
-    // with `[search] regex = false` the filter is simply not offered.
+    // The document viewer and regular-expression filtering read the stored texts through
+    // their own read-only connections. Without a content.db (nothing imported yet) neither is
+    // offered; with `[search] regex = false` only the viewer is.
     var content_pool: ?dk.content_sqlite.ContentPool = null;
     defer if (content_pool) |*p| p.close();
     var regex_service: ?dk.regexsearch.Service = null;
     var admin_regex_service: ?dk.regexsearch.Service = null;
-    if (cfg.search.regex) {
-        if (Io.Dir.cwd().access(io, paths.content, .{})) |_| {
-            if (dk.content_sqlite.ContentPool.open(gpa, io, paths.content, @max(cfg.search.regex_concurrency, 2))) |p| {
-                content_pool = p;
+    if (Io.Dir.cwd().access(io, paths.content, .{})) |_| {
+        if (dk.content_sqlite.ContentPool.open(gpa, io, paths.content, @max(cfg.search.regex_concurrency, 2))) |p| {
+            content_pool = p;
+            if (cfg.search.regex) {
                 regex_service = dk.regexsearch.Service.init(io, content_pool.?.store(), publicRegexLimits(cfg.search));
                 admin_regex_service = dk.regexsearch.Service.init(io, content_pool.?.store(), adminRegexLimits(cfg.search));
-            } else |e| {
-                err(io, "note: the regex filter is off: cannot open {s} for reading ({t})", .{ paths.content, e });
             }
-        } else |_| {
-            err(io, "note: the regex filter is off until something has been imported ({s} does not exist yet); restart after the first import", .{paths.content});
+        } else |e| {
+            err(io, "note: the document viewer and the regex filter are off: cannot open {s} for reading ({t})", .{ paths.content, e });
         }
+    } else |_| {
+        err(io, "note: the document viewer and the regex filter are off until something has been imported ({s} does not exist yet); restart after the first import", .{paths.content});
     }
 
     // Validated as a literal at load time, so this cannot fail.
@@ -773,7 +773,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
 
     installSignalHandlers(onServeSignal);
     var result: u8 = exit_ok;
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, if (regex_service) |*r| r else null, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, if (regex_service) |*r| r else null, if (content_pool) |*p| p.store() else null, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

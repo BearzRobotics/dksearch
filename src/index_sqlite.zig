@@ -302,7 +302,7 @@ pub const SqliteIndex = struct {
     }
 
     pub fn searcher(self: *SqliteIndex) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = searchImpl } };
+        return .{ .ptr = self, .vtable = &.{ .search = searchImpl, .info = infoImpl } };
     }
 
     pub fn imageSearcher(self: *SqliteIndex) search.ImageSearcher {
@@ -533,6 +533,48 @@ pub const SqliteIndex = struct {
     }
 
     // ------------------------------------------------------------ search
+
+    /// What the index records about one document.
+    pub fn infoImpl(ptr: *anyopaque, arena: Allocator, id: doc.Id) search.Error!?search.Hit {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
+        const columns = if (self.has_meta)
+            "d.language, d.content_type, d.modified_at, d.size, d.author, d.kind, d.domain, d.published_at, d.indexed_at"
+        else
+            "d.language, d.content_type, NULL, NULL, NULL, NULL, NULL, d.published_at, NULL";
+        const sql = try std.fmt.allocPrint(arena, "SELECT d.id, d.connector, d.url, d.title, NULL, 0.0, {s} FROM docs d WHERE d.id = ?1", .{columns});
+        const st = Stmt.prepare(self.db, try arena.dupeSentinel(u8, sql, 0)) catch |e| return searchError(e);
+        defer st.deinit();
+        st.blob(1, &id) catch |e| return searchError(e);
+        if (!(st.step() catch |e| return searchError(e))) return null;
+        var hit = try hitFromRow(arena, st);
+        hit.published_at = colOptInt(st, 13);
+        hit.indexed_at = colOptInt(st, 14);
+        return hit;
+    }
+
+    /// The `Hit` in the current row of a SELECT whose columns are: id, connector, url, title,
+    /// snippet, score, language, content_type, modified_at, size, author, kind, domain.
+    fn hitFromRow(arena: Allocator, st: Stmt) search.Error!search.Hit {
+        const idb = c.sqlite3_column_blob(st.s, 0) orelse return error.Io;
+        if (c.sqlite3_column_bytes(st.s, 0) != @sizeOf(doc.Id)) return error.Io;
+        var id: doc.Id = undefined;
+        @memcpy(&id, @as([*]const u8, @ptrCast(idb))[0..@sizeOf(doc.Id)]);
+        return .{
+            .id = id,
+            .connector = try arena.dupe(u8, st.colText(1) orelse ""),
+            .url = try dupeOpt(arena, st.colText(2)),
+            .title = try dupeOpt(arena, st.colText(3)),
+            .snippet = try dupeOpt(arena, st.colText(4)),
+            .score = st.colFloat(5),
+            .language = try dupeOpt(arena, st.colText(6)),
+            .content_type = try dupeOpt(arena, st.colText(7)),
+            .modified_at = colOptInt(st, 8),
+            .size = if (colOptInt(st, 9)) |v| @intCast(@max(v, 0)) else null,
+            .author = try dupeOpt(arena, st.colText(10)),
+            .kind = try dupeOpt(arena, st.colText(11)),
+            .domain = try dupeOpt(arena, st.colText(12)),
+        };
+    }
 
     pub fn searchImpl(ptr: *anyopaque, arena: Allocator, q: search.Query) search.Error!search.Page {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
@@ -784,25 +826,7 @@ pub const SqliteIndex = struct {
                 more = true;
                 break;
             }
-            const idb = c.sqlite3_column_blob(st.s, 0) orelse return error.Io;
-            if (c.sqlite3_column_bytes(st.s, 0) != @sizeOf(doc.Id)) return error.Io;
-            var id: doc.Id = undefined;
-            @memcpy(&id, @as([*]const u8, @ptrCast(idb))[0..@sizeOf(doc.Id)]);
-            try hits.append(arena, .{
-                .id = id,
-                .connector = try arena.dupe(u8, st.colText(1) orelse ""),
-                .url = try dupeOpt(arena, st.colText(2)),
-                .title = try dupeOpt(arena, st.colText(3)),
-                .snippet = try dupeOpt(arena, st.colText(4)),
-                .score = st.colFloat(5),
-                .language = try dupeOpt(arena, st.colText(6)),
-                .content_type = try dupeOpt(arena, st.colText(7)),
-                .modified_at = colOptInt(st, 8),
-                .size = if (colOptInt(st, 9)) |v| @intCast(@max(v, 0)) else null,
-                .author = try dupeOpt(arena, st.colText(10)),
-                .kind = try dupeOpt(arena, st.colText(11)),
-                .domain = try dupeOpt(arena, st.colText(12)),
-            });
+            try hits.append(arena, try hitFromRow(arena, st));
         }
         return .{ .hits = hits.items, .has_more = more, .interpreted = interpreted, .fuzzy = fuzzy };
     }
@@ -882,7 +906,7 @@ pub const SearchPool = struct {
     }
 
     pub fn searcher(self: *SearchPool) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = poolSearch } };
+        return .{ .ptr = self, .vtable = &.{ .search = poolSearch, .info = poolInfo } };
     }
 
     pub fn imageSearcher(self: *SearchPool) search.ImageSearcher {
@@ -897,6 +921,19 @@ pub const SearchPool = struct {
             if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
                 defer slot.busy.store(false, .release);
                 return SqliteIndex.nearImpl(&slot.index, arena, hash, max_distance, limit);
+            }
+        }
+        unreachable;
+    }
+
+    fn poolInfo(ptr: *anyopaque, arena: Allocator, id: doc.Id) search.Error!?search.Hit {
+        const self: *SearchPool = @ptrCast(@alignCast(ptr));
+        self.idle.waitUncancelable(self.io);
+        defer self.idle.post(self.io);
+        for (self.slots) |*slot| {
+            if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                defer slot.busy.store(false, .release);
+                return SqliteIndex.infoImpl(&slot.index, arena, id);
             }
         }
         unreachable;

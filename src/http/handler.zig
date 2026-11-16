@@ -48,7 +48,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, api_search, api_health, style, other };
+const Route = enum { help_search, help_regex, home, search_page, api_search, api_health, style, document, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -58,6 +58,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/api/v1/search")) return .api_search;
     if (std.mem.eql(u8, path, "/api/v1/health")) return .api_health;
     if (std.mem.eql(u8, path, "/assets/style.css")) return .style;
+    if (std.mem.startsWith(u8, path, "/doc/")) return .document;
     return .other;
 }
 
@@ -69,12 +70,25 @@ pub fn handle(arena: Allocator, searcher: dk.search.Searcher, method: http.Metho
 
 /// Like `handle`, with the regex filter available when `regex` is set.
 pub fn handleWith(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, method: http.Method, target: []const u8) Response {
-    return handleInner(arena, searcher, regex, method, target) catch |e| switch (e) {
+    return handleServices(arena, searcher, .{ .regex = regex }, method, target);
+}
+
+/// What the public pages can use besides the index.
+pub const Services = struct {
+    /// The regular-expression filter, if the server offers it.
+    regex: ?*dk.regexsearch.Service = null,
+    /// Stored document texts, for the document viewer.
+    content: ?dk.storage.ContentStore = null,
+};
+
+pub fn handleServices(arena: Allocator, searcher: dk.search.Searcher, services: Services, method: http.Method, target: []const u8) Response {
+    return handleInner(arena, searcher, services, method, target) catch |e| switch (e) {
         error.OutOfMemory => plain(.service_unavailable, "temporarily out of memory\n"),
     };
 }
 
-fn handleInner(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, method: http.Method, target: []const u8) error{OutOfMemory}!Response {
+fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Services, method: http.Method, target: []const u8) error{OutOfMemory}!Response {
+    const regex = services.regex;
     const t = query.parseTarget(arena, target) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         // Cannot tell whether the client wants JSON or HTML; use plain text.
@@ -116,6 +130,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regex
         },
         .api_search => try apiSearch(arena, searcher, regex, t.params),
         .search_page => try pageSearch(arena, searcher, regex, t.params),
+        .document => try documentPage(arena, searcher, services, t.path),
         .other => unreachable,
     };
 }
@@ -312,6 +327,37 @@ pub fn jsonResponse(arena: Allocator, status: http.Status, value: anytype) error
 
 pub fn apiError(arena: Allocator, status: http.Status, code: []const u8, message: []const u8) error{OutOfMemory}!Response {
     return jsonResponse(arena, status, .{ .@"error" = .{ .code = code, .message = message } });
+}
+
+// ------------------------------------------------------------ document viewer
+
+/// Longest stored text shown on the viewer page, in bytes.
+const max_view_bytes = 512 * 1024;
+
+fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Services, path: []const u8) error{OutOfMemory}!Response {
+    const hex = path["/doc/".len..];
+    var id: dk.document.Id = undefined;
+    if (hex.len != 2 * @sizeOf(dk.document.Id)) return htmlError(arena, .not_found, "Not found", "No such document.");
+    _ = std.fmt.hexToBytes(&id, hex) catch return htmlError(arena, .not_found, "Not found", "No such document.");
+    const info = searcher.info(arena, id) catch |e| return searchFailure(arena, e, false);
+    const hit = info orelse return htmlError(arena, .not_found, "Not found", "No such document.");
+
+    var text: ?[]const u8 = null;
+    var cut = false;
+    if (services.content) |store| {
+        if (store.get(arena, id)) |bytes| {
+            if (bytes.len > max_view_bytes) {
+                // Cut at a character boundary.
+                var end: usize = max_view_bytes;
+                while (end > 0 and (bytes[end] & 0xC0) == 0x80) end -= 1;
+                text = bytes[0..end];
+                cut = true;
+            } else text = bytes;
+        } else |_| {}
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    html.writeDocument(&aw.writer, hit, text, cut, services.regex != null) catch return error.OutOfMemory;
+    return htmlResponse(arena, .ok, aw.written());
 }
 
 // ------------------------------------------------------------ HTML pages
@@ -610,6 +656,45 @@ test "end to end against the real index" {
     for ([_][]const u8{ "/api/v1/search?q=%22", "/api/v1/search?q=title%3Ax+OR+*", "/api/v1/search?q=%00", "/api/v1/search?q=NEAR(" }) |t| {
         const r = handle(ar.allocator(), idx.searcher(), .GET, t);
         try testing.expect(r.status == .ok or r.status == .bad_request);
+    }
+}
+
+test "the document viewer shows what is known and the stored text, escaped; unknown ids are 404" {
+    var idx = try dk.index_sqlite.SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    var store = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer store.deinit();
+    const d: dk.document.Document = .{ .connector = "notes", .source_id = "a", .title = "Trip <plan>", .text = "Packing list & <b>route</b>", .canonical_url = "file:///home/me/notes/trip.md", .content_type = "text/markdown", .author = "Jo", .modified_at = 1_700_000_000, .language = "en" };
+    try idx.indexer().add(d.id(), d);
+    try store.store().put(d.id(), d.text.?);
+
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const hex = std.fmt.bytesToHex(d.id(), .lower);
+    const target = try std.fmt.allocPrint(ar.allocator(), "/doc/{s}", .{hex});
+    const r = handleServices(ar.allocator(), idx.searcher(), .{ .content = store.store() }, .GET, target);
+    try testing.expectEqual(http.Status.ok, r.status);
+    for ([_][]const u8{ "Trip &lt;plan&gt;", "Packing list &amp; &lt;b&gt;route&lt;/b&gt;", "file:///home/me/notes/trip.md", "markdown", "2023-11-14", "Jo", "notes" }) |needle| {
+        errdefer std.debug.print("missing: {s}\n{s}\n", .{ needle, r.body });
+        try testing.expect(std.mem.indexOf(u8, r.body, needle) != null);
+    }
+    // The file address is shown as text, never as a link a browser cannot follow.
+    try testing.expect(std.mem.indexOf(u8, r.body, "href=\"file:") == null);
+    try testing.expect(std.mem.indexOf(u8, r.body, "<b>route</b>") == null);
+
+    // Without the content store only the metadata is shown.
+    const bare = handleServices(ar.allocator(), idx.searcher(), .{}, .GET, target);
+    try testing.expectEqual(http.Status.ok, bare.status);
+    try testing.expect(std.mem.indexOf(u8, bare.body, "not stored on this server") != null);
+
+    // Results link to the viewer when the address cannot be opened.
+    const found = handleServices(ar.allocator(), idx.searcher(), .{}, .GET, "/search?q=packing");
+    try testing.expect(std.mem.indexOf(u8, found.body, target) != null);
+
+    for ([_][]const u8{ "/doc/", "/doc/zz", "/doc/00112233445566778899aabbccddeeff", "/doc/0011223344556677889900aabbccddeeffaa", "/doc/../etc/passwd" }) |t| {
+        const nf = handleServices(ar.allocator(), idx.searcher(), .{}, .GET, t);
+        errdefer std.debug.print("target: {s}\n", .{t});
+        try testing.expectEqual(http.Status.not_found, nf.status);
     }
 }
 

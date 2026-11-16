@@ -216,9 +216,12 @@ fn writeHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
         try w.writeAll("</div>");
         return finishHit(w, h);
     };
-    try w.writeAll("<span class=\"title\">");
+    // An address a browser cannot open (a file on the server, for instance): the title opens the viewer.
+    try w.writeAll("<a class=\"title\" href=\"/doc/");
+    try writeIdHex(w, h.id);
+    try w.writeAll("\">");
     try writeEscaped(w, label);
-    try w.writeAll("</span>");
+    try w.writeAll("</a>");
     if (h.url) |u| {
         try w.writeAll("<div class=\"url\">");
         try writeEscaped(w, u);
@@ -235,7 +238,106 @@ fn finishHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
     };
     try w.writeAll("<div class=\"source\">");
     try writeEscaped(w, h.connector);
-    try w.writeAll("</div></li>\n");
+    if (h.kind) |k| {
+        try w.writeAll(" &middot; ");
+        try writeEscaped(w, k);
+    }
+    if (h.size) |n| {
+        try w.writeAll(" &middot; ");
+        try writeSize(w, n);
+    }
+    if (h.modified_at) |t| {
+        try w.writeAll(" &middot; ");
+        try writeDate(w, t);
+    }
+    try w.writeAll(" &middot; <a href=\"/doc/");
+    try writeIdHex(w, h.id);
+    try w.writeAll("\">Stored text</a></div></li>\n");
+}
+
+fn writeIdHex(w: *Writer, id: dk.document.Id) Writer.Error!void {
+    const hex = std.fmt.bytesToHex(id, .lower);
+    try w.writeAll(&hex);
+}
+
+/// `1.5 MB`, `300 B`: sizes people read.
+fn writeSize(w: *Writer, n: u64) Writer.Error!void {
+    if (n < 1024) return w.print("{d} B", .{n});
+    const units = [_][]const u8{ "KB", "MB", "GB", "TB" };
+    var v: f64 = @floatFromInt(n);
+    var i: usize = 0;
+    v /= 1024;
+    while (v >= 1024 and i + 1 < units.len) : (i += 1) v /= 1024;
+    try w.print("{d:.1} {s}", .{ v, units[i] });
+}
+
+/// A Unix time as `2026-11-16` (UTC).
+fn writeDate(w: *Writer, secs: i64) Writer.Error!void {
+    const days = @divFloor(secs, 86400);
+    // Civil-from-days (Howard Hinnant's algorithm).
+    const z = days + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    const y = yoe + era * 400 + @as(i64, if (m <= 2) 1 else 0);
+    try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u64, @intCast(@max(y, 0))), @as(u64, @intCast(m)), @as(u64, @intCast(d)) }); // unsigned, so no "+" is printed
+}
+
+/// The viewer page for one document: what is known about it and its stored text.
+pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, regex_enabled: bool) Writer.Error!void {
+    _ = regex_enabled;
+    try writeHead(w, h.title orelse h.url orelse "Document");
+    try w.writeAll("<body><main class=\"docpage\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n<h2 class=\"doctitle\">");
+    try writeEscaped(w, h.title orelse h.url orelse "(untitled)");
+    try w.writeAll("</h2>\n<dl class=\"meta\">");
+    try metaRow(w, "Source", h.connector);
+    if (h.url) |u| {
+        try w.writeAll("<dt>Address</dt><dd>");
+        if (isLinkable(u)) {
+            try w.writeAll("<a href=\"");
+            try writeEscaped(w, u);
+            try w.writeAll("\" rel=\"noopener noreferrer\">");
+            try writeEscaped(w, u);
+            try w.writeAll("</a>");
+        } else try writeEscaped(w, u);
+        try w.writeAll("</dd>");
+    }
+    if (h.kind) |k| try metaRow(w, "Kind", k);
+    if (h.content_type) |ct| try metaRow(w, "Type", ct);
+    if (h.language) |l| try metaRow(w, "Language", l);
+    if (h.author) |a| try metaRow(w, "Author", a);
+    if (h.size) |n| {
+        try w.writeAll("<dt>Size</dt><dd>");
+        try writeSize(w, n);
+        try w.writeAll("</dd>");
+    }
+    inline for (.{ .{ "Modified", h.modified_at }, .{ "Published", h.published_at }, .{ "Added", h.indexed_at } }) |row| {
+        if (row[1]) |t| {
+            try w.print("<dt>{s}</dt><dd>", .{row[0]});
+            try writeDate(w, t);
+            try w.writeAll("</dd>");
+        }
+    }
+    try w.writeAll("</dl>\n");
+    if (text) |t| {
+        try w.writeAll("<h3>Stored text</h3>\n<pre class=\"doctext\">");
+        try writeEscaped(w, t);
+        try w.writeAll("</pre>\n");
+        if (cut) try w.writeAll("<p class=\"muted small\">Only the beginning is shown.</p>\n");
+    } else {
+        try w.writeAll("<p class=\"notice\">The text of this document is not stored on this server (the source may be set to keep only what it needs for searching), so only what is known about it is shown.</p>\n");
+    }
+    try w.writeAll("<p><a href=\"/\">&larr; New search</a></p></main></body></html>\n");
+}
+
+fn metaRow(w: *Writer, name: []const u8, value: []const u8) Writer.Error!void {
+    try w.print("<dt>{s}</dt><dd>", .{name});
+    try writeEscaped(w, value);
+    try w.writeAll("</dd>");
 }
 
 fn writePagerLink(w: *Writer, f: Form, offset: u32, label_html: []const u8) Writer.Error!void {

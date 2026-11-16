@@ -113,6 +113,10 @@ pub const Hit = struct {
     author: ?[]const u8 = null,
     kind: ?[]const u8 = null,
     domain: ?[]const u8 = null,
+    /// When the source says it was created or published, and when it was added here.
+    /// Filled by `Searcher.info`, not by `search`.
+    published_at: ?i64 = null,
+    indexed_at: ?i64 = null,
 };
 
 pub const Page = struct {
@@ -148,7 +152,15 @@ pub const Searcher = struct {
         /// Ordering is by descending score, ties broken by document id, so
         /// pages are stable for an unchanged index.
         search: *const fn (ptr: *anyopaque, arena: Allocator, q: Query) Error!Page,
+        /// What the index knows about one document (null if it is not there). Optional.
+        info: ?*const fn (ptr: *anyopaque, arena: Allocator, id: doc.Id) Error!?Hit = null,
     };
+
+    /// What the index records about document `id`, or null if it has none (or cannot say).
+    pub fn info(self: Searcher, arena: Allocator, id: doc.Id) Error!?Hit {
+        const f = self.vtable.info orelse return null;
+        return f(self.ptr, arena, id);
+    }
 
     pub fn search(self: Searcher, arena: Allocator, q: Query) Error!Page {
         return self.vtable.search(self.ptr, arena, q);
