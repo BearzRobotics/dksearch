@@ -122,6 +122,9 @@ pub const SqliteIndex = struct {
     recency_days: u32 = 365,
     /// Stop words and synonyms applied to searches (must outlive the index); null for none.
     lexicon: ?*const lexicon_mod.Lexicon = null,
+    /// What is left of the search's time limit for its second attempt (the typo-tolerant repeat), so that
+    /// the two together never exceed the limit.
+    retry_budget_ms: ?u32 = null,
     /// A time limit for each search, if set (`setQueryTimeout`).
     timeout: ?struct { io: Io, ms: u32 } = null,
     /// True if the `docs` table has the metadata columns filters use (an index
@@ -640,11 +643,26 @@ pub const SqliteIndex = struct {
             return e;
         };
         const all = try mergeFilters(arena, base_filters, first.filters);
+        const t0: i96 = if (self.timeout) |t| Io.Timestamp.now(t.io, .awake).nanoseconds else 0;
         const page = try self.runMatch(arena, q, all, limit, first.fts, interpretedOf(first), first.fuzzy_applied);
         if (forced == null and page.hits.len < auto_fuzzy_below and q.offset == 0 and first.fts.len > 0) {
+            // The repeat gets what is left of the time limit, and is skipped if the first attempt used half of it:
+            // two full attempts would outlast the connection's own deadline.
+            var budget: ?u32 = null;
+            if (self.timeout) |t| {
+                const used_ms: i96 = @divTrunc(Io.Timestamp.now(t.io, .awake).nanoseconds - t0, std.time.ns_per_ms);
+                if (used_ms * 2 >= t.ms) return page;
+                budget = t.ms - @as(u32, @intCast(used_ms));
+            }
             if (self.parseQuery(arena, q.text, true, now)) |second| {
                 if (second.fuzzy_applied) {
-                    const again = try self.runMatch(arena, q, all, limit, second.fts, interpretedOf(second), true);
+                    self.retry_budget_ms = budget;
+                    defer self.retry_budget_ms = null;
+                    // A repeat that runs out of time leaves the first answer standing.
+                    const again = self.runMatch(arena, q, all, limit, second.fts, interpretedOf(second), true) catch |e| switch (e) {
+                        error.Timeout => return page,
+                        else => return e,
+                    };
                     if (again.hits.len > page.hits.len) return again;
                 }
             } else |_| {}
@@ -893,7 +911,7 @@ pub const SqliteIndex = struct {
 
         var guard: Deadline = undefined;
         if (self.timeout) |t| {
-            guard = .{ .io = t.io, .deadline_ns = Io.Timestamp.now(t.io, .awake).nanoseconds + @as(i96, t.ms) * std.time.ns_per_ms };
+            guard = .{ .io = t.io, .deadline_ns = Io.Timestamp.now(t.io, .awake).nanoseconds + @as(i96, self.retry_budget_ms orelse t.ms) * std.time.ns_per_ms };
             c.sqlite3_progress_handler(self.db, 2000, progressCallback, &guard);
         } else guard = .{ .io = undefined, .deadline_ns = 0 };
         defer if (self.timeout != null) c.sqlite3_progress_handler(self.db, 0, null, null);

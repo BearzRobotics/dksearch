@@ -53,6 +53,13 @@ fn isDataImage(block: []const u8) bool {
     return std.mem.startsWith(u8, t, "![") and std.mem.indexOf(u8, t, "](data:") != null;
 }
 
+fn withoutFormFeeds(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, s, 0x0c) == null) return s;
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |b| if (b != 0x0c) try out.append(arena, b);
+    return std.mem.trim(u8, out.items, " \t\r\n");
+}
+
 /// Removes `![alt](data:...)` images from text (returns `s` itself when there are none).
 pub fn withoutInlineImages(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
     if (std.mem.indexOf(u8, s, "](data:") == null) return s;
@@ -133,7 +140,7 @@ fn blocks(arena: Allocator, text: []const u8) Allocator.Error![]Block {
             b.level = h.level;
             b.text = h.text;
         } else {
-            b.text = try withoutInlineImages(arena, trimmed);
+            b.text = try withoutFormFeeds(arena, try withoutInlineImages(arena, trimmed));
         }
         b.page = if (saw_pages) page else null;
         const path = try arena.alloc([]const u8, stack.items.len);
@@ -372,12 +379,99 @@ pub fn rank(arena: Allocator, terms: []const []const u8, texts: []const []const 
     return out.items;
 }
 
+/// Common English words that carry no meaning for finding a passage; used only to shape a question into a search.
+const question_stop_words = [_][]const u8{
+    "a", "about", "after", "all", "also", "am", "an", "and", "any", "are", "as", "at", "be", "been", "before", "being", "but", "by", "can", "could", "did", "do", "does", "doing", "done", "each", "for", "from", "had", "has", "have", "he", "her", "him", "his", "how", "i", "if", "in", "into", "is", "it", "its", "me", "my", "no", "not", "of", "on", "or", "our", "she", "should", "so", "some", "such", "than", "that", "the", "their", "them", "then", "there", "these", "they", "this", "those", "to", "us", "was", "we", "were", "what", "when", "where", "which", "who", "whom", "why", "will", "with", "would", "you", "your",
+};
+
+pub fn isQuestionStopWord(word: []const u8) bool {
+    return isQuestionStop(word);
+}
+
+fn isQuestionStop(word: []const u8) bool {
+    var buf: [16]u8 = undefined;
+    if (word.len > buf.len) return false;
+    const low = std.ascii.lowerString(&buf, word);
+    for (question_stop_words) |s| if (std.mem.eql(u8, s, low)) return true;
+    return false;
+}
+
+/// The search used to find candidate documents for a question. A question in plain words ("What did the ravens of
+/// Odin do each day?") is turned into its meaningful words joined by OR, so that a document need not contain every
+/// word of the question; ranking then favours those with more of the rarer ones. A query that already uses the
+/// query language (quotes, OR, NOT, a minus, parentheses, a `field:`) is left as written, and so is one that would
+/// be left with no words.
+pub fn candidateQuery(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    if (std.mem.indexOfAny(u8, text, "\"():-*~+") != null) return text;
+    var out: std.ArrayList(u8) = .empty;
+    var seen_words: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n,.;!?'`[]{}<>=/\\|&^%$#@_");
+    while (it.next()) |w| {
+        if (std.mem.eql(u8, w, "OR") or std.mem.eql(u8, w, "AND") or std.mem.eql(u8, w, "NOT")) return text;
+        if (w.len < 2 or isQuestionStop(w)) continue;
+        var dup = false;
+        for (seen_words.items) |x| if (std.ascii.eqlIgnoreCase(x, w)) {
+            dup = true;
+        };
+        if (dup) continue;
+        if (seen_words.items.len >= 16) break;
+        try seen_words.append(arena, w);
+        if (out.items.len > 0) try out.appendSlice(arena, " OR ");
+        try out.appendSlice(arena, w);
+    }
+    if (out.items.len == 0) return text;
+    return out.items;
+}
+
+/// A document address without its extension: the same work in several file formats has the same stem.
+pub fn stemOf(url: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, url, '/') orelse 0;
+    const dot = std.mem.lastIndexOfScalar(u8, url, '.') orelse return url;
+    return if (dot > slash) url[0..dot] else url;
+}
+
+/// How well a format keeps a work's structure; lower is better. Used to keep one copy of a work that exists in
+/// several formats.
+pub fn formatRank(url: []const u8) u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, url, '.') orelse return 9;
+    const ext = url[dot + 1 ..];
+    const order = [_][]const u8{ "md", "html", "htm", "epub", "docx", "odt", "txt", "pdf" };
+    for (order, 0..) |o, i| if (std.ascii.eqlIgnoreCase(ext, o)) return @intCast(i);
+    return 8;
+}
+
 const testing = std.testing;
 
 fn textsOf(arena: Allocator, cs: []const Chunk) ![]const []const u8 {
     const out = try arena.alloc([]const u8, cs.len);
     for (cs, out) |c, *o| o.* = c.text;
     return out;
+}
+
+test "a question becomes its meaningful words joined by OR; query-language queries are left alone" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("ravens OR Odin OR day", try candidateQuery(a, "What did the ravens of Odin do each day?"));
+    try testing.expectEqualStrings("ravens", try candidateQuery(a, "ravens ravens the"));
+    try testing.expectEqualStrings("\"two words\" more", try candidateQuery(a, "\"two words\" more"));
+    try testing.expectEqualStrings("a OR b", try candidateQuery(a, "a OR b"));
+    try testing.expectEqualStrings("odin -thor", try candidateQuery(a, "odin -thor"));
+    try testing.expectEqualStrings("title:odin ravens", try candidateQuery(a, "title:odin ravens"));
+    try testing.expectEqualStrings("the of", try candidateQuery(a, "the of")); // nothing meaningful: as typed
+    try testing.expectEqualStrings("file:///b/Book", stemOf("file:///b/Book.pdf"));
+    try testing.expectEqualStrings("https://x.org/a.b/c", stemOf("https://x.org/a.b/c"));
+    try testing.expect(formatRank("x.md") < formatRank("x.epub") and formatRank("x.epub") < formatRank("x.pdf") and formatRank("x.pdf") < formatRank("x.zzz"));
+}
+
+test "form feeds count pages and are not part of the chunk text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cs = try chunk(a, "Page one text.\n\n\x0c\n\nPage two text.\n\n\x0c\n\nPage three.", .{ .chunk_chars = 200, .overlap = 0 });
+    try testing.expect(cs.len >= 1);
+    for (cs) |c| try testing.expect(std.mem.indexOfScalar(u8, c.text, 0x0c) == null);
+    try testing.expectEqual(@as(?u32, 1), cs[0].page);
 }
 
 test "inline data images are removed from the middle of text, other images and links are kept" {

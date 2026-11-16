@@ -610,13 +610,42 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
     const context = bounded.get(params, "context", 0, 0, 3) catch return apiError(arena, .bad_request, "invalid_parameter", "context: must be 0 to 3");
     const chunk_chars = bounded.get(params, "chunk_chars", 1200, dk.retrieve.min_chunk_chars, dk.retrieve.max_chunk_chars) catch return apiError(arena, .bad_request, "invalid_parameter", "chunk_chars: must be 200 to 8000");
     const overlap = bounded.get(params, "overlap", 150, 0, 2000) catch return apiError(arena, .bad_request, "invalid_parameter", "overlap: must be 0 to 2000");
-    const terms = try dk.retrieve.queryTerms(arena, q.text);
-    if (terms.len == 0) return apiError(arena, .bad_request, "empty_query", "retrieval needs at least one word to look for");
+    const all_terms = try dk.retrieve.queryTerms(arena, q.text);
+    if (all_terms.len == 0) return apiError(arena, .bad_request, "empty_query", "retrieval needs at least one word to look for");
+    // Words like "what" and "the" say nothing about which passage answers; leave them out unless that is everything.
+    var meaningful: std.ArrayList([]const u8) = .empty;
+    for (all_terms) |w| if (!dk.retrieve.isQuestionStopWord(w)) try meaningful.append(arena, w);
+    const terms = if (meaningful.items.len > 0) meaningful.items else all_terms;
+    const dedupe = if (params.get("dedupe")) |v| !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) else true;
+    // The candidates: a plain-words question matches documents with any of its meaningful words.
+    q.text = try dk.retrieve.candidateQuery(arena, q.text);
 
     q.limit = candidates;
     q.offset = 0;
     q.sort = .relevance;
     const page = searcher.search(arena, q) catch |e| return searchFailure(arena, e, true);
+
+    // The same work in several formats (book.md, book.pdf, book.epub in one folder) is one candidate: the
+    // format that keeps the most structure wins.
+    var kept: std.ArrayList(dk.search.Hit) = .empty;
+    var duplicates: u32 = 0;
+    for (page.hits) |h| {
+        if (dedupe) if (h.url) |u| {
+            const stem = dk.retrieve.stemOf(u);
+            var merged = false;
+            for (kept.items) |*have| {
+                const ku = have.url orelse continue;
+                if (std.mem.eql(u8, have.connector, h.connector) and std.mem.eql(u8, dk.retrieve.stemOf(ku), stem)) {
+                    if (dk.retrieve.formatRank(u) < dk.retrieve.formatRank(ku)) have.* = h;
+                    merged = true;
+                    duplicates += 1;
+                    break;
+                }
+            }
+            if (merged) continue;
+        };
+        try kept.append(arena, h);
+    }
 
     // Chunk the candidates' stored texts.
     const Doc = struct { hit: dk.search.Hit, chunks: []const dk.retrieve.Chunk };
@@ -626,7 +655,7 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
     var owner: std.ArrayList(struct { doc: u32, chunk: u32 }) = .empty;
     var total: usize = 0;
     var skipped: u32 = 0;
-    for (page.hits) |h| {
+    for (kept.items) |h| {
         if (total >= max_retrieve_total_bytes) {
             skipped += 1;
             continue;
@@ -683,7 +712,7 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
             .after = after,
         };
     }
-    return jsonResponse(arena, .ok, .{ .chunks = out, .candidates = @as(u32, @intCast(page.hits.len)), .without_text = skipped });
+    return jsonResponse(arena, .ok, .{ .chunks = out, .candidates = @as(u32, @intCast(kept.items.len)), .duplicates_merged = duplicates, .without_text = skipped });
 }
 
 fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
@@ -1068,6 +1097,27 @@ test "retrieval: the best passages of the candidate documents, with headings, sp
     _ = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/api/v1/retrieve?q=odin&source=books&candidates=5");
     try testing.expectEqual(@as(u32, 5), fake.last.?.limit);
     try testing.expectEqualStrings("books", fake.last.?.filters[0].text);
+    // A question is searched by its meaningful words, joined by OR.
+    _ = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/api/v1/retrieve?q=What+did+the+ravens+of+Odin+do");
+    try testing.expectEqualStrings("ravens OR Odin", fake.last.?.text);
+    // The same work in two formats is one candidate (the Markdown one); dedupe=0 keeps both.
+    const id_c: dk.document.Id = .{ 0xcc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try mem.store().put(id_c, "Odin had two ravens (the PDF copy).");
+    const dup_hits = [_]dk.search.Hit{
+        .{ .id = id_c, .connector = "books", .url = "file:///x/myth.pdf", .title = "Myths", .snippet = null, .score = 3 },
+        hits[0],
+    };
+    fake.result = .{ .hits = &dup_hits, .has_more = false };
+    const merged = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/api/v1/retrieve?q=odin+ravens");
+    var mp = try std.json.parseFromSlice(std.json.Value, testing.allocator, merged.body, .{});
+    defer mp.deinit();
+    try testing.expectEqual(@as(i64, 1), mp.value.object.get("candidates").?.integer);
+    try testing.expectEqual(@as(i64, 1), mp.value.object.get("duplicates_merged").?.integer);
+    for (mp.value.object.get("chunks").?.array.items) |c| try testing.expect(std.mem.startsWith(u8, c.object.get("view_url").?.string, "/doc/aa"));
+    const both = handleServices(ar.allocator(), fake.searcher(), services, .GET, "/api/v1/retrieve?q=odin+ravens&dedupe=0");
+    var bp = try std.json.parseFromSlice(std.json.Value, testing.allocator, both.body, .{});
+    defer bp.deinit();
+    try testing.expectEqual(@as(i64, 2), bp.value.object.get("candidates").?.integer);
     // Bad parameters and a query with no words are refused, and so is a server with no stored texts.
     try testing.expectEqual(http.Status.bad_request, handleServices(ar.allocator(), fake.searcher(), services, .GET, "/api/v1/retrieve?q=odin&k=0").status);
     try testing.expectEqual(http.Status.bad_request, handleServices(ar.allocator(), fake.searcher(), services, .GET, "/api/v1/retrieve?q=ext%3Amd").status);

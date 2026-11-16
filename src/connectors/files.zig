@@ -684,15 +684,17 @@ fn readPdfImpl(self: *FilesConnector, arena: Allocator, io: Io, st: Io.File.Stat
     }
     defer if (owned_by_page_allocator) std.heap.page_allocator.free(@constCast(stdout));
     // The text is copied below, so the buffer can be released as soon as this function returns.
-    // Page breaks (form feeds) become blank lines; anything else that is not text is dropped.
+    // Page breaks (form feeds) are kept, set off by blank lines, so that a passage can be traced to its page
+    // (`/api/v1/retrieve` counts them); anything else that is not text is dropped.
     var text: std.ArrayList(u8) = .empty;
     for (stdout) |b| switch (b) {
-        0x0C => text.appendSlice(arena, "\n\n") catch return .out_of_memory,
+        0x0C => text.appendSlice(arena, "\n\n\x0c\n\n") catch return .out_of_memory,
         0 => {},
         else => text.append(arena, b) catch return .out_of_memory,
     };
-    const trimmed = std.mem.trim(u8, text.items, " \t\r\n");
-    if (trimmed.len == 0) return .no_text;
+    // Trailing breaks and white space go; leading page breaks stay, so that the first page keeps its number.
+    const trimmed = std.mem.trimEnd(u8, std.mem.trimStart(u8, text.items, " \t\r\n"), " \t\r\n\x0c");
+    if (std.mem.trim(u8, trimmed, " \t\r\n\x0c").len == 0) return .no_text;
     if (!std.unicode.utf8ValidateSlice(trimmed)) return .refused;
     const url = fileUrl(arena, base_abs, rel) catch return .out_of_memory;
     const mtime_s: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s));
