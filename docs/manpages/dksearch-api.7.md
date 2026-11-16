@@ -10,7 +10,7 @@ GET /api/v1/search?q=TEXT[&language=L][&content_type=T][&connector=C][&filter=F]
 
 GET /api/v1/health
 
-GET /, GET /search?q=TEXT[&language=L][&connector=C][&offset=N]
+GET /, GET /search?q=TEXT[&language=L][&source=S]...[&connector=C][&offset=N]
 
 GET /help/search and GET /help/regex\nHTML pages that explain the query language (with typo tolerance) and, when the server offers it, the regular-expression filter with the limits this server applies. `/help` is the same as `/help/search`. The search form links to both.\n\nGET /assets/style.css
 
@@ -86,7 +86,7 @@ GET /api/v1/health
 Returns 200 and `{"status":"ok"}`. It reports that the process is serving requests and nothing about the index.
 
 GET /search and GET /
-HTML pages. `/` is the search form. `/search` takes `q`, `language`, `connector`, `sort`, `offset`, `fuzzy` and, when the server offers it, `regex` and `regex_flags` (on the page a pattern is written in the search box as `re:/pattern/` or `re:/pattern/i`, with a minus in front to keep only documents that do not match; the same form works in the `q` parameter of the API and cannot be combined with `regex`); the page size is fixed at 10 and any `limit` is ignored. Result URLs are links only if they begin with `http://` or `https://`; otherwise they are shown as text. An empty `q` shows the form again.
+HTML pages. `/` is the search form. `/search` takes `q`, `language`, `source` (repeatable: one per ticked source, a source name or `kind:NAME` for all sources of a kind; the Source list on the page is a set of tick boxes, none ticked means all), `connector` (one source, as before), `sort`, `offset`, `fuzzy` and, when the server offers it, `regex` and `regex_flags` (on the page a pattern is written in the search box as `re:/pattern/` or `re:/pattern/i`, with a minus in front to keep only documents that do not match; the same form works in the `q` parameter of the API and cannot be combined with `regex`); the page size is fixed at 10 and any `limit` is ignored. Result URLs are links only if they begin with `http://` or `https://`; otherwise they are shown as text. An empty `q` shows the form again.
 
 GET /assets/style.css
 The stylesheet, cacheable for one hour. All other responses are `Cache-Control: no-store`.
