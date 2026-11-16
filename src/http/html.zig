@@ -182,8 +182,9 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     try writeHead(w, if (f.q.len > 0) f.q else "dksearch");
     try w.writeAll("<body>");
     try writeSidePanel(w, f.regex_enabled);
-    try w.writeAll("<main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
+    try w.writeAll("<main class=\"results-page\"><div class=\"head\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>");
     try writeForm(w, f);
+    try w.writeAll("</div>\n");
     try writeInterpretation(w, f, page, offset);
 
     if (page.hits.len == 0) {
@@ -336,10 +337,20 @@ fn writeDate(w: *Writer, secs: i64) Writer.Error!void {
 /// The viewer page for one document: what is known about it and its stored text.
 pub const OpenLink = struct { href: []const u8, label: []const u8 };
 
+/// One line at the top of the viewer pages: the name and a search box.
+fn writeTopBar(w: *Writer) Writer.Error!void {
+    try w.writeAll("<header class=\"topbar\"><a class=\"brand\" href=\"/\">dksearch</a>" ++
+        "<form class=\"search\" action=\"/search\" method=\"get\" role=\"search\">" ++
+        "<input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Search\" placeholder=\"Search\">" ++
+        "<button type=\"submit\">Search</button></form></header>\n");
+}
+
 /// A page from a ZIM file. `body` was made safe by the sanitizer.
 pub fn writeArticle(w: *Writer, title: []const u8, source: []const u8, body: []const u8) Writer.Error!void {
     try writeHead(w, title);
-    try w.writeAll("<body><main class=\"docpage\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n<h2 class=\"doctitle\">");
+    try w.writeAll("<body>");
+    try writeTopBar(w);
+    try w.writeAll("<main class=\"docpage\"><h2 class=\"doctitle\">");
     try writeEscaped(w, title);
     try w.writeAll("</h2>\n<p class=\"muted small\">From the ZIM source <a href=\"/search?q=*&amp;connector=");
     try query.writeEncoded(w, source);
@@ -352,7 +363,9 @@ pub fn writeArticle(w: *Writer, title: []const u8, source: []const u8, body: []c
 
 pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, open_link: ?OpenLink, rendered: ?[]const u8, is_markdown: bool) Writer.Error!void {
     try writeHead(w, h.title orelse h.url orelse "Document");
-    try w.writeAll("<body><main class=\"docpage\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n<h2 class=\"doctitle\">");
+    try w.writeAll("<body>");
+    try writeTopBar(w);
+    try w.writeAll("<main class=\"docpage\"><h2 class=\"doctitle\">");
     try writeEscaped(w, h.title orelse h.url orelse "(untitled)");
     try w.writeAll("</h2>\n<dl class=\"meta\">");
     try metaRow(w, "Source", h.connector);

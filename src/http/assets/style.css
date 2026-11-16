@@ -226,3 +226,24 @@ dl.meta dd { margin: 0; overflow-wrap: anywhere; }
 .rendered th, .rendered td { border: 1px solid var(--border); padding: 0.25rem 0.6rem; }
 .article img { max-width: 100%; height: auto; }
 .article a { overflow-wrap: anywhere; }
+
+/* One-line header: the name and the search box side by side. */
+.head { display: flex; align-items: flex-start; gap: 1rem; }
+.head .brand { margin: 0.35rem 0 0; font-size: 1.25rem; flex: none; }
+.head form.search { flex: 1 1 auto; }
+.topbar { display: flex; align-items: center; gap: 1rem; padding: 0.5rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--bg); position: sticky; top: 0; z-index: 5; }
+.topbar .brand { font-size: 1.2rem; font-weight: 700; color: inherit; text-decoration: none; flex: none; }
+.topbar form.search { flex: 0 1 36rem; flex-wrap: nowrap; }
+.topbar form.search input[type="search"] { padding: 0.35rem 0.7rem; flex: 1 1 auto; min-width: 0; }
+.topbar form.search button { padding: 0.35rem 0.9rem; }
+/* The viewer uses the window, not a narrow column. */
+main.docpage { max-width: none; padding: 1rem 1.5rem 3rem; }
+.docpage .doctitle { font-size: 1.5rem; }
+.docpage .doctext { max-height: none; }
+.docpage .doctext.rendered { max-width: none; }
+.docpage dl.meta { max-width: 60rem; }
+@media (max-width: 40rem) { .topbar { flex-wrap: wrap; } .topbar form.search { flex: 1 1 100%; } }
+/* Tables of articles keep their natural layout (the Markdown ones scroll instead). */
+.article table { display: table; max-width: 100%; }
+.article th { white-space: nowrap; vertical-align: top; text-align: left; }
+.article td { vertical-align: top; }

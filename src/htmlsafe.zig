@@ -32,13 +32,13 @@ pub const Options = struct {
 pub const Error = error{ OutOfMemory, WriteFailed };
 
 const allowed_tags = [_][]const u8{
-    "a",          "abbr",   "article",  "aside", "b",   "bdi",     "bdo",     "blockquote", "br",   "caption", "cite",
-    "code",       "col",    "colgroup", "dd",    "del", "details", "dfn",     "div",        "dl",   "dt",      "em",
-    "figcaption", "figure", "footer",   "h1",    "h2",  "h3",      "h4",      "h5",         "h6",   "header",  "hr",
-    "i",          "img",    "ins",      "kbd",   "li",  "main",    "mark",    "nav",        "ol",   "p",       "pre",
-    "q",          "rp",     "rt",       "ruby",  "s",   "samp",    "section", "small",      "span", "strong",  "sub",
-    "summary",    "sup",    "table",    "tbody", "td",  "tfoot",   "th",      "thead",      "time", "tr",      "u",
-    "ul",         "var",    "wbr",
+    "a",          "abbr",   "article",  "aside", "b",     "bdi",     "bdo",   "blockquote", "br",     "caption", "cite",
+    "code",       "col",    "colgroup", "dd",    "del",   "details", "dfn",   "div",        "dl",     "dt",      "em",
+    "figcaption", "figure", "footer",   "h1",    "h2",    "h3",      "h4",    "h5",         "h6",     "header",  "hr",
+    "i",          "img",    "ins",      "kbd",   "li",    "mark",    "nav",   "ol",         "p",      "pre",     "q",
+    "rp",         "rt",     "ruby",     "s",     "samp",  "section", "small", "span",       "strong", "sub",     "summary",
+    "sup",        "table",  "tbody",    "td",    "tfoot", "th",      "thead", "time",       "tr",     "u",       "ul",
+    "var",        "wbr",
 };
 
 const void_tags = [_][]const u8{ "br", "col", "hr", "img", "wbr" };
@@ -463,6 +463,10 @@ test "formatting passes, scripts and handlers do not" {
     try expectClean("<form action=\"/x\"><input name=a><button>go</button></form>", "go");
     try expectClean("<svg onload=\"alert(1)\"><text>hi</text></svg>ok", "ok");
     try expectClean("<object data=\"x\"></object><embed src=\"x\">z", "z");
+}
+
+test "main is not allowed: the page styles its own main element, and an article must not pick that up" {
+    try expectClean("<main><p>x</p></main><header>h</header>", "<p>x</p><header>h</header>");
 }
 
 test "links: only http, https, mailto and relative survive; script schemes in any disguise do not" {
