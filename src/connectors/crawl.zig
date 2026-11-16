@@ -61,6 +61,9 @@ const max_seeds_file_bytes = 4 * 1024 * 1024;
 /// A site's `crawl-delay` is honored up to this many seconds.
 const max_crawl_delay_s = 60;
 const checkpoint_every = 10;
+/// While one address is still being crawled, the work so far is committed every this many pages
+/// (with the position of the last finished address), so a crash loses a few pages, not the whole crawl.
+const save_every_pages = 25;
 const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
@@ -272,6 +275,7 @@ pub const CrawlConnector = struct {
         }
 
         var done: ?[]const u8 = if (start > 0) seeds[start - 1].line else null;
+        r.last_done = done;
         var since: u32 = 0;
         for (seeds[start..], start..) |seed, seed_index| {
             // With no link following the seeds are the whole job; otherwise the
@@ -284,6 +288,8 @@ pub const CrawlConnector = struct {
             }
             if (r.exhausted) break; // the page budget for this run is spent
             done = seed.line;
+            r.last_done = done;
+            r.unsaved = 0;
             since += 1;
             if (since >= checkpoint_every) {
                 since = 0;
@@ -481,6 +487,10 @@ const Run = struct {
     fetched: u64 = 0,
     exhausted: bool = false,
     stored: u64 = 0,
+    /// The last address that was crawled completely: a safe place to resume from.
+    last_done: ?[]const u8 = null,
+    /// Pages stored since the work was last committed.
+    unsaved: u32 = 0,
     network_failures: u64 = 0,
 
     const Result = enum { stored, skipped, stopped };
@@ -808,6 +818,15 @@ const Run = struct {
         };
         _ = self.control.submitted.fetchAdd(1, .monotonic);
         self.stored += 1;
+        self.unsaved += 1;
+        if (self.unsaved >= save_every_pages) {
+            self.unsaved = 0;
+            // Restarting from the last finished address re-reads the current one: nothing is skipped.
+            if (self.last_done) |safe_pos| self.sink.checkpoint(safe_pos) catch |e| switch (e) {
+                error.Stopped => return .{ .result = .stopped },
+                else => {}, // not fatal: the next page tries again
+            };
+        }
         return .{ .result = .stored, .links = scanned.links };
     }
 };
