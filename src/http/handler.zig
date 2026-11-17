@@ -87,6 +87,8 @@ pub const Services = struct {
     originals: ?*const dk.originals.Service = null,
     /// ZIM files whose articles can be shown from the file itself.
     zims: ?*const dk.zimserve.Service = null,
+    /// The embedding server and the vectors, when `[embeddings]` is set (semantic=1 on search).
+    embed: ?*const dk.embed.Service = null,
     /// Documents per source, counted now and then, for the source list and the page that lists the sources.
     source_stats: ?*dk.sourcestats.Cache = null,
     /// The collection the search page searches when nothing is picked (`search.default_collection`).
@@ -477,8 +479,11 @@ const ApiHit = struct {
     /// With `group=1`: other sources that hold the same text, folded into this result.
     same_in: []const []const u8 = &.{},
 };
+/// What `semantic=1` did: whether the order was changed by meaning, and why not when it was not.
+const SemanticNote = struct { used: bool, model: ?[]const u8 = null, compared: u32 = 0, reason: ?[]const u8 = null };
+
 const PeerNote = struct { peer: []const u8, status: []const u8, ms: u32, results: u32, http_status: ?u16 = null, cached: bool = false };
-const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null };
+const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null, semantic: ?SemanticNote = null };
 
 const Federated = struct { hits: []const dk.search.Hit, notes: []const PeerNote };
 
@@ -493,6 +498,41 @@ fn peerNames(arena: Allocator, services: Services) error{OutOfMemory}![]const []
         n += 1;
     };
     return names[0..n];
+}
+
+const SemanticResult = struct { page: dk.search.Page, note: SemanticNote };
+
+fn wantsSemantic(params: query.Params) bool {
+    const v = params.get("semantic") orelse return false;
+    return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+}
+
+/// With `semantic=1`: the lexical results (a wider pool than asked for) re-ordered by meaning. Falls back to the
+/// plain lexical page, with the reason, when there is no embedding server, no vectors yet, the query cannot be
+/// embedded, or the request pages past the first page.
+fn semanticSearch(arena: Allocator, searcher: dk.search.Searcher, services: Services, params: query.Params, q: dk.search.Query) error{ OutOfMemory, Search }!SemanticResult {
+    const lexical = struct {
+        fn run(a: Allocator, s: dk.search.Searcher, query_: dk.search.Query, why: []const u8) error{ OutOfMemory, Search }!SemanticResult {
+            const page = s.search(a, query_) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Search;
+            return .{ .page = page, .note = .{ .used = false, .reason = why } };
+        }
+    }.run;
+    const svc = services.embed orelse return lexical(arena, searcher, q, "this server has no embedding model configured");
+    const text = params.get("q") orelse "";
+    if (text.len == 0 or q.offset != 0) return lexical(arena, searcher, q, "semantic ordering applies to the first page of a search with words");
+    var store = dk.embed.Store.openReadOnly(svc.vectors_path) orelse return lexical(arena, searcher, q, "no vectors yet (run `dksearch embed`)");
+    defer store.close();
+    const model = svc.client.settings.model;
+    const vecs = svc.client.embed(arena, &.{text}) catch return lexical(arena, searcher, q, "the embedding server could not be reached or refused the query");
+    var wide = q;
+    const want: u32 = if (q.limit == 0) 10 else q.limit;
+    wide.limit = @min(@max(want * 3, 30), 100);
+    const page = searcher.search(arena, wide) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Search;
+    const fused = try dk.embed.fuse(arena, &store, model, vecs[0], page.hits);
+    var out = page;
+    out.hits = fused.hits[0..@min(fused.hits.len, want)];
+    out.has_more = page.has_more or fused.hits.len > want;
+    return .{ .page = out, .note = .{ .used = fused.compared > 0, .model = model, .compared = @intCast(fused.compared), .reason = if (fused.compared == 0) "none of these documents has a vector yet" else null } };
 }
 
 fn wantsPeers(params: query.Params) bool {
@@ -574,7 +614,18 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
         for (r.page.hits, hits) |h, *out| out.* = try apiHit(arena, try withIdent(arena, services, h));
         return jsonResponse(arena, .ok, .{ .hits = hits, .has_more = r.page.has_more, .interpreted = r.page.interpreted, .fuzzy = r.page.fuzzy, .regex = .{ .examined = r.examined, .truncated = r.truncated } });
     }
-    const page = searcher.search(arena, q) catch |e| return searchFailure(arena, e, true);
+    var semantic: ?SemanticNote = null;
+    const page = blk: {
+        if (wantsSemantic(params)) {
+            const r = semanticSearch(arena, searcher, services, params, q) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Search => return searchFailure(arena, error.Io, true),
+            };
+            semantic = r.note;
+            break :blk r.page;
+        }
+        break :blk searcher.search(arena, q) catch |e| return searchFailure(arena, e, true);
+    };
 
     const local = try arena.alloc(dk.search.Hit, page.hits.len);
     for (page.hits, local) |h, *dst| dst.* = try withIdent(arena, services, h);
@@ -583,7 +634,7 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
     const shown = if (fed) |f| f.hits else grouped;
     const hits = try arena.alloc(ApiHit, shown.len);
     for (shown, hits) |h, *out| out.* = try apiHit(arena, h);
-    return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null });
+    return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null, .semantic = semantic });
 }
 
 /// `h` with its node-independent identity filled in (from its address, or the hash of its stored text).
@@ -2324,6 +2375,40 @@ test "source list with counts, the sources page, a default collection with the w
     const limited: Services = .{ .sources = &store, .source_stats = &stats, .content = mem.store(), .collections = &partial, .default_collection = "reading", .anonymous = &.{"bk"} };
     const lim = handleServices(a, idx.searcher(), limited, .GET, "/search?q=ravens");
     try testing.expect(std.mem.indexOf(u8, lim.body, "Searching only") == null);
+}
+
+test "semantic=1 says why when it cannot reorder, and the plain results are still returned" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const hits = [_]dk.search.Hit{.{ .id = .{ 0x21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .connector = "n", .url = null, .title = "Lamp", .snippet = null, .score = 1 }};
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
+    // Not configured.
+    const none = handleServices(a, fake.searcher(), .{}, .GET, "/api/v1/search?q=lamp&semantic=1");
+    try testing.expectEqual(http.Status.ok, none.status);
+    try testing.expect(std.mem.indexOf(u8, none.body, "no embedding model configured") != null);
+    try testing.expect(std.mem.indexOf(u8, none.body, "\"title\":\"Lamp\"") != null);
+    // Not asked for: no note at all.
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), .{}, .GET, "/api/v1/search?q=lamp").body, "\"semantic\":null") != null);
+    // Configured, but no vectors made yet.
+    const client = try dk.embed.Client.init(testing.allocator, testing.io, .{ .url = "http://127.0.0.1:1", .model = "m", .timeout_ms = 300 });
+    defer client.deinit();
+    const svc: dk.embed.Service = .{ .client = client, .vectors_path = "/nonexistent-dksearch/vectors.db" };
+    const nov = handleServices(a, fake.searcher(), .{ .embed = &svc }, .GET, "/api/v1/search?q=lamp&semantic=1");
+    try testing.expect(std.mem.indexOf(u8, nov.body, "no vectors yet") != null);
+    // Vectors exist, the model server is down: the query cannot be embedded.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const vp = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/vectors.db", .{tmp.sub_path}, 0);
+    var store = try dk.embed.Store.open(vp);
+    try store.put(hits[0].id, "m", &.{ 1.0, 0.0 });
+    store.close();
+    const svc2: dk.embed.Service = .{ .client = client, .vectors_path = vp };
+    const down = handleServices(a, fake.searcher(), .{ .embed = &svc2 }, .GET, "/api/v1/search?q=lamp&semantic=1");
+    try testing.expectEqual(http.Status.ok, down.status);
+    try testing.expect(std.mem.indexOf(u8, down.body, "could not be reached") != null);
+    // Paging past the first page is not reordered.
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), .{ .embed = &svc2 }, .GET, "/api/v1/search?q=lamp&semantic=1&offset=10").body, "first page") != null);
 }
 
 test "retrieval cache: the same answer twice, served from the cache, and a changed document is read again" {

@@ -53,3 +53,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0035 | Opening office files in a document server |
 | 0036 | Conditional requests when crawling again |
 | 0037 | One connector for archives and dumps |
+| 0038 | Semantic search, opt-in |

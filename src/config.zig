@@ -304,6 +304,17 @@ pub const Peer = struct {
 
 pub const max_peers = 50;
 
+/// An embedding model server for semantic search (`[embeddings]`), opt-in.
+pub const Embeddings = struct {
+    url: []const u8,
+    /// `ollama` or `openai` (the shape of the server's API).
+    api: []const u8 = "ollama",
+    model: []const u8,
+    timeout_ms: u32 = 30000,
+    max_chars: u32 = 2000,
+    batch: u32 = 16,
+};
+
 /// A document server (OnlyOffice or Collabora) that office files can be opened in from the viewer.
 pub const DocServer = struct {
     /// `onlyoffice` or `collabora`.
@@ -342,6 +353,7 @@ pub const Config = struct {
     node_name: []const u8 = "",
     peers: []const Peer = &.{},
     docserver: ?DocServer = null,
+    embeddings: ?Embeddings = null,
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -360,7 +372,7 @@ const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_m
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
 const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
-const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver" };
+const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings" };
 
 /// Parses and validates configuration text. `source_name` is only used in
 /// diagnostics (normally the file path).
@@ -529,6 +541,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
         }
     }
     cfg.docserver = try readDocServer(a, src, root, diag);
+    cfg.embeddings = try readEmbeddings(a, src, root, diag);
     cfg.peers = try readPeers(a, src, root, diag);
     if (cfg.peers.len > 0 and cfg.node_name.len == 0) {
         diag.set(src, "node.name", "is required when peers are configured (peers show this name beside the results they get from here)", .{});
@@ -597,6 +610,30 @@ fn baseAddress(a: Allocator, src: []const u8, key: []const u8, text: []const u8,
         return error.InvalidValue;
     }
     return a.dupe(u8, url);
+}
+
+fn readEmbeddings(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!?Embeddings {
+    const t = (try subTable(src, root, "embeddings", diag)) orelse return null;
+    try checkKeys(src, "embeddings", t, &[_][]const u8{ "url", "api", "model", "timeout_ms", "max_chars", "batch" }, diag);
+    var e: Embeddings = .{
+        .url = try baseAddress(a, src, "embeddings.url", try reqStr(src, "embeddings", t, "url", diag), diag),
+        .model = try a.dupe(u8, try reqStr(src, "embeddings", t, "model", diag)),
+    };
+    if (e.model.len > 200 or std.mem.indexOfAny(u8, e.model, "\"\\\x00\r\n") != null) {
+        diag.set(src, "embeddings.model", "must be at most 200 characters without quotes or line breaks", .{});
+        return error.InvalidValue;
+    }
+    if (try str(src, "embeddings", t, "api", diag)) |v| {
+        if (!std.mem.eql(u8, v, "ollama") and !std.mem.eql(u8, v, "openai")) {
+            diag.set(src, "embeddings.api", "must be \"ollama\" or \"openai\", got \"{s}\"", .{v});
+            return error.InvalidValue;
+        }
+        e.api = try a.dupe(u8, v);
+    }
+    if (try intIn(src, "embeddings", t, "timeout_ms", 100, 300000, diag)) |n| e.timeout_ms = @intCast(n);
+    if (try intIn(src, "embeddings", t, "max_chars", 100, 20000, diag)) |n| e.max_chars = @intCast(n);
+    if (try intIn(src, "embeddings", t, "batch", 1, 256, diag)) |n| e.batch = @intCast(n);
+    return e;
 }
 
 fn readDocServer(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!?DocServer {
@@ -1190,6 +1227,21 @@ test "collections and the anonymous access setting are read and checked" {
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = [\"a\"]\n[[collection]]\nname = \"x\"\nsources = [\"b\"]\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[access]\nanonymous_collections = [\"ghost\"]\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = []\n", &d));
+}
+
+test "embeddings are read and checked" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "[embeddings]\nurl = \"http://127.0.0.1:11434/\"\nmodel = \"nomic-embed-text\"\nbatch = 8\n", &d);
+    defer c.deinit();
+    try testing.expectEqualStrings("http://127.0.0.1:11434", c.embeddings.?.url);
+    try testing.expectEqualStrings("ollama", c.embeddings.?.api);
+    try testing.expectEqual(@as(u32, 8), c.embeddings.?.batch);
+    var none = try loadFromSlice(testing.allocator, "t.toml", "", &d);
+    defer none.deinit();
+    try testing.expect(none.embeddings == null);
+    for ([_][]const u8{ "[embeddings]\nurl = \"http://h\"\n", "[embeddings]\nmodel = \"m\"\n", "[embeddings]\nurl = \"ftp://h\"\nmodel = \"m\"\n", "[embeddings]\nurl = \"http://h\"\nmodel = \"m\"\napi = \"grpc\"\n", "[embeddings]\nurl = \"http://h\"\nmodel = \"m\"\nbatch = 0\n" }) |text| {
+        try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", text, &d));
+    }
 }
 
 test "the default collection must be defined" {

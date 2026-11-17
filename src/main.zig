@@ -205,7 +205,7 @@ fn run(init: std.process.Init) u8 {
         return restoreCmd(io, gpa, config_path, dir orelse return usageError(io, "restore needs the backup DIR"), rebuild_index);
     }
 
-    if (eq(first, "serve") or eq(first, "rebuild")) {
+    if (eq(first, "serve") or eq(first, "rebuild") or eq(first, "embed")) {
         var config_path: ?[]const u8 = null;
         while (args.next()) |a| {
             if (eq(a, "--config")) {
@@ -217,7 +217,7 @@ fn run(init: std.process.Init) u8 {
                 return exit_usage;
             }
         }
-        return if (eq(first, "serve")) serve(io, gpa, config_path) else rebuildCmd(io, gpa, config_path);
+        return if (eq(first, "serve")) serve(io, gpa, config_path) else if (eq(first, "embed")) embedCmd(io, gpa, config_path) else rebuildCmd(io, gpa, config_path);
     }
 
     if (eq(first, "remove")) {
@@ -996,11 +996,26 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             return 1;
         };
     }
+    var embed_client: ?*dk.embed.Client = null;
+    var embed_service: dk.embed.Service = undefined;
+    if (cfg.embeddings) |ec| {
+        const vec_path = std.fmt.allocPrintSentinel(arena_state.allocator(), "{s}/vectors.db", .{cfg.data_dir}, 0) catch return exit_io;
+        embed_client = dk.embed.Client.init(gpa, io, .{
+            .url = ec.url,
+            .api = if (std.mem.eql(u8, ec.api, "openai")) .openai else .ollama,
+            .model = ec.model,
+            .timeout_ms = ec.timeout_ms,
+            .max_chars = ec.max_chars,
+            .batch = ec.batch,
+        }) catch return exit_io;
+        embed_service = .{ .client = embed_client.?, .vectors_path = vec_path };
+    }
+    defer if (embed_client) |c| c.deinit();
     var source_stats = dk.sourcestats.Cache.init(gpa, io);
     defer source_stats.deinit();
     var retrieve_cache = dk.retrievecache.Cache.init(gpa, io, @as(usize, cfg.search.retrieve_cache_mb) * 1024 * 1024);
     defer retrieve_cache.deinit();
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };
@@ -1026,6 +1041,109 @@ fn lockWriters(io: Io, data_dir: []const u8, what: []const u8) ?dk.maintenance.W
         return null;
     };
 }
+
+/// `dksearch embed`: makes the vectors for semantic search from the retained texts, asking the embedding server of
+/// `[embeddings]`. Documents that have a vector for the model are skipped, so it can be stopped and run again.
+fn embedCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    const ec = cfg.embeddings orelse {
+        err(io, "there is no [embeddings] table in the configuration; add url and model (see `man dksearch`, SEMANTIC SEARCH)", .{});
+        return exit_usage;
+    };
+    if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = Paths.make(arena, cfg.data_dir) catch return exit_io;
+    const vec_path = std.fmt.allocPrintSentinel(arena, "{s}/vectors.db", .{cfg.data_dir}, 0) catch return exit_io;
+
+    var state = openState(io, gpa, paths.state) orelse return exit_io;
+    defer state.close();
+    var content = openContent(io, gpa, paths.content) orelse return exit_io;
+    defer content.close();
+    var store = dk.embed.Store.open(vec_path) catch |e| {
+        err(io, "cannot open {s}: {t}", .{ vec_path, e });
+        return exit_io;
+    };
+    defer store.close();
+    const settings: dk.embed.Settings = .{
+        .url = ec.url,
+        .api = if (std.mem.eql(u8, ec.api, "openai")) .openai else .ollama,
+        .model = ec.model,
+        .timeout_ms = ec.timeout_ms,
+        .max_chars = ec.max_chars,
+        .batch = ec.batch,
+    };
+    const client = dk.embed.Client.init(gpa, io, settings) catch return exit_io;
+    defer client.deinit();
+
+    const Work = struct {
+        gpa: std.mem.Allocator,
+        io: Io,
+        client: *dk.embed.Client,
+        store: *dk.embed.Store,
+        content: dk.storage.ContentStore,
+        settings: dk.embed.Settings,
+        batch_arena: std.heap.ArenaAllocator,
+        ids: std.ArrayList(dk.document.Id) = .empty,
+        texts: std.ArrayList([]const u8) = .empty,
+        made: u64 = 0,
+        skipped: u64 = 0,
+        failed: ?dk.embed.Error = null,
+
+        fn visit(ptr: *anyopaque, rec: dk.storage.Record) dk.storage.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.store.has(rec.id, self.settings.model)) {
+                self.skipped += 1;
+                return;
+            }
+            const a = self.batch_arena.allocator();
+            const text = self.content.get(self.gpa, rec.id) catch {
+                self.skipped += 1; // no retained text
+                return;
+            };
+            defer self.gpa.free(text);
+            const t = dk.embed.textFor(a, rec.meta.title, text, self.settings.max_chars) catch return error.OutOfMemory;
+            if (std.mem.trim(u8, t, " \t\r\n").len == 0) return;
+            self.ids.append(a, rec.id) catch return error.OutOfMemory;
+            self.texts.append(a, t) catch return error.OutOfMemory;
+            if (self.ids.items.len >= self.settings.batch) self.flush() catch return error.Io;
+        }
+
+        fn flush(self: *@This()) !void {
+            if (self.ids.items.len == 0) return;
+            const a = self.batch_arena.allocator();
+            const vecs = self.client.embed(a, self.texts.items) catch |e| {
+                self.failed = e;
+                return error.EmbedFailed;
+            };
+            for (self.ids.items, vecs) |id, v| self.store.put(id, self.settings.model, v) catch return error.EmbedFailed;
+            self.made += self.ids.items.len;
+            out(io_global.?, "  {d} vectors made\n", .{self.made});
+            _ = self.batch_arena.reset(.retain_capacity);
+            self.ids = .empty;
+            self.texts = .empty;
+        }
+    };
+    io_global = io;
+    var work: Work = .{ .gpa = gpa, .io = io, .client = client, .store = &store, .content = content.store(), .settings = settings, .batch_arena = .init(gpa) };
+    defer work.batch_arena.deinit();
+    out(io, "making vectors with {s} at {s}\n", .{ settings.model, settings.url });
+    state.documents().forEach(.{ .ptr = &work, .visit = Work.visit }) catch {
+        if (work.failed) |f| err(io, "the embedding server failed ({t}); {d} vectors were saved, run `embed` again to continue", .{ f, work.made });
+        return exit_failure;
+    };
+    work.flush() catch {
+        if (work.failed) |f| err(io, "the embedding server failed ({t}); {d} vectors were saved, run `embed` again to continue", .{ f, work.made });
+        return exit_failure;
+    };
+    out(io, "done: {d} vectors made, {d} documents skipped (already done, or no retained text); {d} in the store for this model\n", .{ work.made, work.skipped, store.count(settings.model) });
+    return exit_ok;
+}
+
+var io_global: ?Io = null;
 
 fn rebuildCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     var diag: dk.config.Diagnostic = .{};

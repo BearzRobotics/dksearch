@@ -470,6 +470,17 @@ Example:
 Regular-expression search (the `[search]` table): in a query on the public page or API, a regular expression keeps only the candidate documents whose stored text matches it. The words of the query choose the candidates through the index, in ranking order, so at least one word is required; the expression is then checked against the first 1 MiB of each candidate's text (8 MiB on the administration page). It is meant for finding patterns that words cannot express (product codes, dates, phone numbers, `colou?r`), not for scanning the corpus: with the default limits at most 200 candidates are checked in at most half a second, and when a limit stops the search the response says so. Because anyone who can reach the public page can type a pattern, everything is bounded: pattern length, nesting, repeat counts, matching steps per document, candidates, time and the number of simultaneous regex queries; the administration interface uses ten times the limits. The matcher works on bytes, not characters (so `.` matches one byte of a multi-byte character) and has no Unicode properties (`\p{L}`); it is regex-zig (vendor/regex-zig, docs/decisions/0020). Set `regex = false` to switch the feature off.
 
 
+SEMANTIC SEARCH
+Semantic search is opt-in and uses a model server that you run (nothing in dksearch starts a model):
+
+    [embeddings]
+    url = "http://127.0.0.1:11434"    # Ollama, or any server with an OpenAI-style /v1/embeddings
+    model = "nomic-embed-text"        # the model name the server knows
+    api = "ollama"                    # or "openai"
+    # timeout_ms = 30000   max_chars = 2000 (title and start of the text that is embedded)   batch = 16
+
+**dksearch embed** asks that server for a vector for each stored document (its title and the first *max_chars* of its text) and keeps them in `data_dir/vectors.db`, one per document and model. Documents that already have one are skipped, so it can be stopped, run again, and run again after an import. Then `semantic=1` on `/api/v1/search` re-orders the lexical results: the search finds its candidates by words as usual (a wider pool than the page), the query is embedded, and the order is the reciprocal-rank fusion (k = 60) of the lexical order and the order of similarity to the query, so a result that both lists like rises and one that only one likes is not dropped. Documents without a vector keep their lexical share only. It cannot bring up a document the words did not match (that needs a vector index over everything, a later step), applies to the first page only, and the answer says (`semantic`) whether it was used and, if not, why (no embedding model configured, no vectors yet, the model server not reachable). Without `[embeddings]` nothing changes: dksearch stays purely lexical. The retrieval API (`/api/v1/retrieve`) is not changed by this.
+
 SOURCE LIST AND DUPLICATES
 The search page's source list shows how many documents each source holds, and `/sources` lists the sources the visitor may search with their kind, document count, when a document was last added, and the collections each is in, with a link that searches just that source. The numbers are counted at most every five minutes (counting groups the whole index). On the search page the same text found in several sources (or the same web page by its address) is shown once, naming the others ("same text in ..."); `group=0` shows every copy. The API folds them only with `group=1` (`same_in` lists the other sources).
 

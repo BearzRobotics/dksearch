@@ -61,6 +61,19 @@ pub const commands = [_]Command{
         ,
     },
     .{
+        .name = "embed",
+        .synopsis = "embed [--config FILE]",
+        .summary = "Make the vectors for semantic search (needs [embeddings])",
+        .detail =
+        \\Asks the embedding model server named in [embeddings] (Ollama, or any server with
+        \\an OpenAI-style /v1/embeddings) for a vector for each stored document and keeps
+        \\them in data_dir/vectors.db. Documents that already have one for the model are
+        \\skipped, so it can be stopped and run again, and run again after an import. Nothing
+        \\here starts a model: run the server yourself. Search then takes `semantic=1`.
+        \\
+        ,
+    },
+    .{
         .name = "rebuild",
         .synopsis = "rebuild [--config FILE]",
         .summary = "Recreate the search index from the stored text",

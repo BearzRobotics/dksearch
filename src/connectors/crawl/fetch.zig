@@ -45,6 +45,9 @@ pub const Request = struct {
     /// Validators from an earlier answer: the server may answer 304 (nothing changed) without a body.
     if_none_match: ?[]const u8 = null,
     if_modified_since: ?[]const u8 = null,
+    /// A request body (the request is then a POST) and its media type.
+    body: ?[]const u8 = null,
+    content_type: []const u8 = "application/json",
 };
 
 /// Fetches `req.url`. Everything returned is allocated from `arena`; on
@@ -97,15 +100,18 @@ fn run(client: *http.Client, arena: Allocator, req: Request) Failure!Response {
         headers[n_headers] = .{ .name = "if-modified-since", .value = v };
         n_headers += 1;
     }
-    var request = client.request(.GET, uri, .{
+    var request = client.request(if (req.body != null) .POST else .GET, uri, .{
         .redirect_behavior = .unhandled,
         .keep_alive = false,
-        .headers = .{ .user_agent = .{ .override = req.user_agent } },
+        .headers = .{ .user_agent = .{ .override = req.user_agent }, .content_type = if (req.body != null) .{ .override = req.content_type } else .default },
         .extra_headers = headers[0..n_headers],
     }) catch |e| return mapRequestError(e);
     defer request.deinit();
 
-    request.sendBodiless() catch return error.Network;
+    if (req.body) |b| {
+        const copy = try arena.dupe(u8, b);
+        request.sendBodyComplete(copy) catch return error.Network;
+    } else request.sendBodiless() catch return error.Network;
     var redirect_buffer: [0]u8 = undefined;
     var response = request.receiveHead(&redirect_buffer) catch |e| return switch (e) {
         error.Canceled => error.Canceled,
