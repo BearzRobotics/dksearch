@@ -995,9 +995,11 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             return 1;
         };
     }
+    var source_stats = dk.sourcestats.Cache.init(gpa, io);
+    defer source_stats.deinit();
     var retrieve_cache = dk.retrievecache.Cache.init(gpa, io, @as(usize, cfg.search.retrieve_cache_mb) * 1024 * 1024);
     defer retrieve_cache.deinit();
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

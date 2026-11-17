@@ -250,6 +250,9 @@ pub const SearchSettings = struct {
     retrieve_cache_mb: u32 = 128,
     /// How long a peer's good answer is reused for the same question (seconds). 0 turns it off.
     peer_cache_seconds: u32 = 30,
+    /// A collection the search page searches when the visitor has not picked any source (the page offers "search
+    /// everything"). Null: everything.
+    default_collection: ?[]const u8 = null,
     stop_words_file: ?[]const u8 = null,
     synonyms_file: ?[]const u8 = null,
     /// "advanced": the query language (OR, NOT, grouping, prefix*, word~, "a b"~5, +, -);
@@ -356,7 +359,7 @@ const server_keys = [_][]const u8{
 const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions", "backup_dir", "zim_dir" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
-const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "peer_cache_seconds", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
+const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
 const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver" };
 
 /// Parses and validates configuration text. `source_name` is only used in
@@ -488,6 +491,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
                 @field(cfg.search, key) = try a.dupe(u8, v);
             }
         }
+        if (try str(src, "search", t, "default_collection", diag)) |v| cfg.search.default_collection = try a.dupe(u8, v);
         if (try intIn(src, "search", t, "chunk_index_min_kb", 0, 1024 * 1024, diag)) |n| cfg.search.chunk_index_min_kb = @intCast(n);
         if (try intIn(src, "search", t, "retrieve_cache_mb", 0, 65536, diag)) |n| cfg.search.retrieve_cache_mb = @intCast(n);
         if (try intIn(src, "search", t, "peer_cache_seconds", 0, 3600, diag)) |n| cfg.search.peer_cache_seconds = @intCast(n);
@@ -512,6 +516,16 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
                 return error.InvalidValue;
             }
             cfg.node_name = try a.dupe(u8, n);
+        }
+    }
+    if (cfg.search.default_collection) |dc| {
+        var known = false;
+        for (cfg.collections) |col| if (std.mem.eql(u8, col.name, dc)) {
+            known = true;
+        };
+        if (!known) {
+            diag.set(src, "search.default_collection", "names a collection that is not defined: \"{s}\"", .{dc});
+            return error.InvalidValue;
         }
     }
     cfg.docserver = try readDocServer(a, src, root, diag);
@@ -1176,6 +1190,16 @@ test "collections and the anonymous access setting are read and checked" {
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = [\"a\"]\n[[collection]]\nname = \"x\"\nsources = [\"b\"]\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[access]\nanonymous_collections = [\"ghost\"]\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = []\n", &d));
+}
+
+test "the default collection must be defined" {
+    var d: Diagnostic = .{};
+    const base = "[[source]]\nname = \"a\"\nkind = \"files\"\n[[collection]]\nname = \"books\"\nsources = [\"a\"]\n";
+    var c = try loadFromSlice(testing.allocator, "t.toml", base ++ "[search]\ndefault_collection = \"books\"\n", &d);
+    defer c.deinit();
+    try testing.expectEqualStrings("books", c.search.default_collection.?);
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[search]\ndefault_collection = \"nope\"\n", &d));
+    try testing.expectEqualStrings("search.default_collection", d.key());
 }
 
 test "a document server is read and checked" {

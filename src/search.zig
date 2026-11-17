@@ -173,6 +173,8 @@ pub const Hit = struct {
     /// A node-independent identity (32 hex digits): the same page or the same text has the same one on every node.
     /// Filled by the HTTP layer, not by `search`.
     ident: ?[]const u8 = null,
+    /// Sources (other than this result's) that hold the same text, when results are grouped.
+    same_in: []const []const u8 = &.{},
 };
 
 /// A passage found in the chunk index: the document, the position of the chunk among that document's chunks (as
@@ -203,6 +205,9 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// What the index holds for one source.
+pub const SourceStat = struct { name: []const u8, docs: u64, last_added: ?i64 = null };
+
 pub const Searcher = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -216,7 +221,15 @@ pub const Searcher = struct {
         info: ?*const fn (ptr: *anyopaque, arena: Allocator, id: doc.Id) Error!?Hit = null,
         /// The best passages of large documents, from the chunk index (see `ChunkHit`). Optional.
         search_chunks: ?*const fn (ptr: *anyopaque, arena: Allocator, q: Query, limit: u32) Error![]const ChunkHit = null,
+        /// How many documents each source has and when the last one was added. Optional.
+        source_stats: ?*const fn (ptr: *anyopaque, arena: Allocator) Error![]const SourceStat = null,
     };
+
+    /// Documents per source (empty if the index cannot say).
+    pub fn sourceStats(self: Searcher, arena: Allocator) Error![]const SourceStat {
+        const f = self.vtable.source_stats orelse return &.{};
+        return f(self.ptr, arena);
+    }
 
     /// Passages of large documents that match `q` (its words, conditions and source choice), best first. Empty
     /// when the index has no chunk index or nothing matches.

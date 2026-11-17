@@ -48,11 +48,12 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, api_search, api_retrieve, api_health, style, document, zim, wopi, other };
+const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
     if (std.mem.eql(u8, path, "/search")) return .search_page;
+    if (std.mem.eql(u8, path, "/sources")) return .sources_page;
     if (std.mem.eql(u8, path, "/help") or std.mem.eql(u8, path, "/help/search")) return .help_search;
     if (std.mem.eql(u8, path, "/help/regex")) return .help_regex;
     if (std.mem.eql(u8, path, "/api/v1/search")) return .api_search;
@@ -86,6 +87,10 @@ pub const Services = struct {
     originals: ?*const dk.originals.Service = null,
     /// ZIM files whose articles can be shown from the file itself.
     zims: ?*const dk.zimserve.Service = null,
+    /// Documents per source, counted now and then, for the source list and the page that lists the sources.
+    source_stats: ?*dk.sourcestats.Cache = null,
+    /// The collection the search page searches when nothing is picked (`search.default_collection`).
+    default_collection: ?[]const u8 = null,
     /// A document server that office files can be opened in (`[docserver]`).
     docserver: ?*const dk.docserver.Service = null,
     /// Other nodes this one can ask (`peers=1`), if any are configured.
@@ -137,6 +142,79 @@ fn collectionChoices(arena: Allocator, services: Services) error{OutOfMemory}![]
 }
 
 /// The enabled sources, sorted by kind and then name, for the Source drop-down.
+/// `sourceChoices` with the number of documents of each (for the pages that show the list).
+fn sourceChoicesFor(arena: Allocator, services: Services, searcher: dk.search.Searcher) error{OutOfMemory}![]const html.SourceChoice {
+    const choices = try sourceChoices(arena, services);
+    const cache = services.source_stats orelse return choices;
+    const stats = try cache.get(arena, searcher);
+    const out = try arena.alloc(html.SourceChoice, choices.len);
+    for (choices, out) |c, *o| {
+        o.* = c;
+        for (stats) |s| if (std.mem.eql(u8, s.name, c.name)) {
+            o.docs = s.docs;
+        };
+    }
+    return out;
+}
+
+/// `/sources`: the sources the caller may search, with what each holds and which collections it is in.
+fn sourcesPage(arena: Allocator, searcher: dk.search.Searcher, services: Services) error{OutOfMemory}!Response {
+    const choices = try sourceChoicesFor(arena, services, searcher);
+    const stats: []const dk.search.SourceStat = if (services.source_stats) |c| try c.get(arena, searcher) else &.{};
+    const rows = try arena.alloc(html.SourceRow, choices.len);
+    for (choices, rows) |c, *r| {
+        var last: ?i64 = null;
+        for (stats) |s| if (std.mem.eql(u8, s.name, c.name)) {
+            last = s.last_added;
+        };
+        var colls: std.ArrayList([]const u8) = .empty;
+        for (services.collections) |col| {
+            if (services.scope.sources != null and !collectionVisible(services, col)) continue;
+            for (col.sources) |m| if (std.mem.eql(u8, m, c.name)) {
+                try colls.append(arena, col.name);
+                break;
+            };
+        }
+        r.* = .{ .name = c.name, .kind = c.kind, .docs = c.docs, .last_added = last, .collections = colls.items };
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    html.writeSourcesPage(&aw.writer, rows, 0) catch return error.OutOfMemory;
+    return htmlResponse(arena, .ok, aw.written());
+}
+
+/// True if the caller's scope covers every source of `col` (so naming it reveals nothing).
+fn collectionVisible(services: Services, col: dk.config.Collection) bool {
+    for (col.sources) |m| if (!services.scope.allows(m)) return false;
+    return true;
+}
+
+/// Results that hold the same text or are the same page, folded into the first (the best), which lists where else
+/// they are in `same_in`. Results without an identity are never folded.
+fn groupDuplicates(arena: Allocator, hits: []const dk.search.Hit) error{OutOfMemory}![]const dk.search.Hit {
+    var out: std.ArrayList(dk.search.Hit) = .empty;
+    var first_of: std.StringHashMapUnmanaged(usize) = .empty;
+    for (hits) |h| {
+        if (h.ident) |ident| {
+            if (first_of.get(ident)) |at| {
+                var names: std.ArrayList([]const u8) = .empty;
+                try names.appendSlice(arena, out.items[at].same_in);
+                if (!std.mem.eql(u8, out.items[at].connector, h.connector)) {
+                    var have = false;
+                    for (names.items) |n| if (std.mem.eql(u8, n, h.connector)) {
+                        have = true;
+                    };
+                    if (!have) try names.append(arena, h.connector);
+                }
+                out.items[at].same_in = names.items;
+                continue;
+            }
+            try first_of.put(arena, ident, out.items.len);
+        }
+        try out.append(arena, h);
+    }
+    return out.items;
+}
+
 fn sourceChoices(arena: Allocator, services: Services) error{OutOfMemory}![]const html.SourceChoice {
     const store = services.sources orelse return &.{};
     var out: std.ArrayList(html.SourceChoice) = .empty;
@@ -236,7 +314,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
     return switch (r) {
         .home => blk: {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHomeForm(&aw.writer, null, .{ .regex_enabled = regex != null, .sources = try sourceChoices(arena, services), .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, null, .{ .regex_enabled = regex != null, .sources = try sourceChoicesFor(arena, services, searcher), .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
@@ -253,7 +331,8 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         },
         .api_search => try apiSearch(arena, searcher, regex, services, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
         .api_retrieve => try apiRetrieve(arena, searcher, services, t.params),
-        .search_page => try pageSearch(arena, searcher, regex, services, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
+        .search_page => try pageSearch(arena, searcher, regex, services, try sourceChoicesFor(arena, services, searcher), try sourceBoosts(arena, services), t.params),
+        .sources_page => try sourcesPage(arena, searcher, services),
         .document => try documentPage(arena, searcher, services, t.path, t.params),
         .zim => try zimPage(arena, services, t.path),
         .wopi => unreachable, // answered above
@@ -395,6 +474,8 @@ const ApiHit = struct {
     /// The document's identity that does not depend on the node (the same page or the same text on another node
     /// has the same one); null when there is neither an address nor stored text to make it from.
     ident: ?[]const u8 = null,
+    /// With `group=1`: other sources that hold the same text, folded into this result.
+    same_in: []const []const u8 = &.{},
 };
 const PeerNote = struct { peer: []const u8, status: []const u8, ms: u32, results: u32, http_status: ?u16 = null, cached: bool = false };
 const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null };
@@ -475,7 +556,7 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
     var q = parsed.q;
     q.boosts = boosts;
     try limitQuery(arena, &q, services);
-    switch (try applySources(arena, &q, sources, services.collections, params)) {
+    switch (try applySources(arena, &q, sources, services.collections, params, null)) {
         .ok => {},
         .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     }
@@ -498,7 +579,8 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
     const local = try arena.alloc(dk.search.Hit, page.hits.len);
     for (page.hits, local) |h, *dst| dst.* = try withIdent(arena, services, h);
     const fed = try federate(arena, services, params, q, local);
-    const shown = if (fed) |f| f.hits else local;
+    const grouped = if (fed == null and (if (params.get("group")) |g| std.mem.eql(u8, g, "1") else false)) try groupDuplicates(arena, local) else local;
+    const shown = if (fed) |f| f.hits else grouped;
     const hits = try arena.alloc(ApiHit, shown.len);
     for (shown, hits) |h, *out| out.* = try apiHit(arena, h);
     return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null });
@@ -525,6 +607,7 @@ fn apiHit(arena: Allocator, h: dk.search.Hit) error{OutOfMemory}!ApiHit {
         .node = h.node,
         .also_on = h.also_on,
         .ident = h.ident,
+        .same_in = h.same_in,
         .language = h.language,
         .content_type = h.content_type,
         .kind = h.kind,
@@ -805,13 +888,15 @@ fn documentImage(arena: Allocator, svc: *const dk.originals.Service, hit: dk.sea
 
 /// Turns the ticked sources (`source`, repeatable) and the single `connector` into source conditions on `q`: each is
 /// a source name or `kind:NAME` for every source of a kind, and they are alternatives. Returns what was picked.
-fn applySources(arena: Allocator, q: *dk.search.Query, sources: []const html.SourceChoice, colls: []const dk.config.Collection, params: query.Params) error{OutOfMemory}!union(enum) { ok: []const []const u8, bad: ParamError } {
+fn applySources(arena: Allocator, q: *dk.search.Query, sources: []const html.SourceChoice, colls: []const dk.config.Collection, params: query.Params, default: ?[]const u8) error{OutOfMemory}!union(enum) { ok: []const []const u8, bad: ParamError } {
     var picked: std.ArrayList([]const u8) = .empty;
     for (try params.all(arena, "source")) |v| {
         if (!validFilter(v)) return .{ .bad = .{ .name = "source", .message = "invalid value" } };
         if (picked.items.len >= 64) return .{ .bad = .{ .name = "source", .message = "at most 64 sources" } };
         try picked.append(arena, v);
     }
+    // Nothing picked: the server's default collection, when it has one.
+    if (picked.items.len == 0 and q.connector == null) if (default) |name| try picked.append(arena, try std.fmt.allocPrint(arena, "collection:{s}", .{name}));
     // The single `connector` is an exact match unless it names a kind or is combined with ticked sources.
     const connector_is_kind = if (q.connector) |c| std.mem.startsWith(u8, c, "kind:") else false;
     const fold = picked.items.len > 0 or connector_is_kind;
@@ -978,7 +1063,7 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
     var q = parsed.q;
     q.boosts = try sourceBoosts(arena, services);
     try limitQuery(arena, &q, services);
-    switch (try applySources(arena, &q, try sourceChoices(arena, services), services.collections, params)) {
+    switch (try applySources(arena, &q, try sourceChoices(arena, services), services.collections, params, null)) {
         .ok => {},
         .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     }
@@ -1231,11 +1316,19 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
     try limitQuery(arena, &q, services);
     // The ticked sources (`source`, repeatable) and the older single `connector`: each is a source name or
     // `kind:NAME` for every source of a kind. They are alternatives (`kind:zim` is all its sources).
-    const picked = switch (try applySources(arena, &q, sources, services.collections, params)) {
+    // The default collection applies when nothing is picked, the visitor did not ask for everything, and the
+    // caller can see all of it.
+    const all_asked = if (params.get("sources")) |v| std.mem.eql(u8, v, "all") else false;
+    var default: ?[]const u8 = null;
+    if (services.default_collection) |name| if (!all_asked) for (services.collections) |col| if (std.mem.eql(u8, col.name, name) and collectionVisible(services, col)) {
+        default = name;
+    };
+    const picked = switch (try applySources(arena, &q, sources, services.collections, params, default)) {
         .ok => |p| p,
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
-    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .picked = picked, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .collections = try collectionChoices(arena, services), .sort = params.get("sort") orelse "" };
+    const defaulted = if (default) |d| (picked.len == 1 and std.mem.startsWith(u8, picked[0], "collection:") and std.mem.eql(u8, picked[0]["collection:".len..], d) and (try params.all(arena, "source")).len == 0) else false;
+    var form: html.Form = .{ .default_note = if (defaulted) default else null, .all_sources = all_asked, .q = parsed.typed, .language = q.language orelse "", .picked = picked, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .collections = try collectionChoices(arena, services), .sort = params.get("sort") orelse "" };
     if (parsed.re) |req| {
         // A pattern typed in the box is already part of `q` and travels with it; only one given
         // as a parameter has to be carried separately (the pager and the exact-spelling link).
@@ -1271,6 +1364,12 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
     };
 
     var shown = page;
+    // The same text in several sources is one result, naming the others (`group=0` shows them all).
+    if (!(if (params.get("group")) |g| std.mem.eql(u8, g, "0") else false)) {
+        const with_ident = try arena.alloc(dk.search.Hit, page.hits.len);
+        for (page.hits, with_ident) |h, *dst| dst.* = try withIdent(arena, services, h);
+        shown.hits = try groupDuplicates(arena, with_ident);
+    }
     form.peer_names = try peerNames(arena, services);
     if (try federate(arena, services, params, q, page.hits)) |f| {
         shown.hits = f.hits;
@@ -2158,6 +2257,73 @@ test "a key with a limit gets 429 and retry-after once it is over it; other call
     try testing.expectEqual(http.Status.too_many_requests, handleAuthorized(a, fake.searcher(), services, .GET, "/search?q=x", slow).status);
     for (0..5) |_| try testing.expectEqual(http.Status.ok, handleAuthorized(a, fake.searcher(), services, .GET, "/api/v1/search?q=x", try bearer(a, &tok_free)).status);
     try testing.expectEqual(http.Status.ok, handleServices(a, fake.searcher(), services, .GET, "/api/v1/search?q=x").status);
+}
+
+test "source list with counts, the sources page, a default collection with the way out, and duplicates folded" {
+    var idx = try dk.index_sqlite.SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    const docs = [_]dk.document.Document{
+        .{ .connector = "books", .source_id = "1", .title = "Edda", .text = "ravens of the north", .canonical_url = "file:///b/edda.txt", .acquired_at = 1700000000 },
+        .{ .connector = "backup", .source_id = "1", .title = "Edda copy", .text = "ravens of the north", .canonical_url = "file:///bk/edda.txt", .acquired_at = 1700000500 },
+        .{ .connector = "notes", .source_id = "1", .title = "Note", .text = "ravens in my notes", .canonical_url = "file:///n/note.txt", .acquired_at = 1600000000 },
+    };
+    for (docs) |d| {
+        try idx.indexer().add(d.id(), d);
+        try mem.store().put(d.id(), d.text.?);
+    }
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const cfgs = [_]dk.config.Source{
+        .{ .name = "books", .kind = "files", .options = &.{} },
+        .{ .name = "backup", .kind = "files", .options = &.{} },
+        .{ .name = "notes", .kind = "files", .options = &.{} },
+    };
+    var store = dk.sourcestore.Store.init(testing.allocator, testing.io, &cfgs);
+    defer store.deinit();
+    var stats = dk.sourcestats.Cache.init(testing.allocator, testing.io);
+    defer stats.deinit();
+    const colls = [_]dk.config.Collection{.{ .name = "reading", .sources = &.{ "books", "backup" } }};
+    const services: Services = .{ .sources = &store, .source_stats = &stats, .content = mem.store(), .collections = &colls, .default_collection = "reading" };
+
+    // The picker shows how many documents each source has; the sources page lists them with their collections.
+    const home = handleServices(a, idx.searcher(), services, .GET, "/");
+    try testing.expect(std.mem.indexOf(u8, home.body, "books <small class=\"muted\">(1)</small>") != null);
+    const sp = handleServices(a, idx.searcher(), services, .GET, "/sources");
+    try testing.expectEqual(http.Status.ok, sp.status);
+    try testing.expect(std.mem.indexOf(u8, sp.body, "<strong>notes</strong>") != null);
+    try testing.expect(std.mem.indexOf(u8, sp.body, "reading") != null);
+    try testing.expect(std.mem.indexOf(u8, sp.body, "href=\"/search?q=source%3Abooks\"") != null);
+
+    // Nothing picked: the default collection, with a note and the link to everything; the notes source is left out.
+    const def = handleServices(a, idx.searcher(), services, .GET, "/search?q=ravens");
+    try testing.expect(std.mem.indexOf(u8, def.body, "Searching only <strong>reading</strong>") != null);
+    try testing.expect(std.mem.indexOf(u8, def.body, "Note") == null);
+    try testing.expect(std.mem.indexOf(u8, def.body, "sources=all") != null);
+    // The same text in two sources is one result naming the other.
+    try testing.expect(std.mem.indexOf(u8, def.body, "same text in ") != null);
+    try testing.expect(std.mem.indexOf(u8, def.body, "Edda copy") == null);
+    // Everything on request; the pager keeps that; a pick or group=0 changes it.
+    const all = handleServices(a, idx.searcher(), services, .GET, "/search?q=ravens&sources=all");
+    try testing.expect(std.mem.indexOf(u8, all.body, "Note") != null);
+    try testing.expect(std.mem.indexOf(u8, all.body, "Searching only") == null);
+    const picked = handleServices(a, idx.searcher(), services, .GET, "/search?q=ravens&source=notes");
+    try testing.expect(std.mem.indexOf(u8, picked.body, "Searching only") == null and std.mem.indexOf(u8, picked.body, "Note") != null);
+    const ungrouped = handleServices(a, idx.searcher(), services, .GET, "/search?q=ravens&sources=all&group=0");
+    try testing.expect(std.mem.indexOf(u8, ungrouped.body, "Edda copy") != null);
+    // The API is not limited by the default, and folds duplicates only when asked.
+    const api = handleServices(a, idx.searcher(), services, .GET, "/api/v1/search?q=ravens");
+    try testing.expect(std.mem.indexOf(u8, api.body, "\"Note\"") != null and std.mem.indexOf(u8, api.body, "Edda copy") != null);
+    const grouped = handleServices(a, idx.searcher(), services, .GET, "/api/v1/search?q=ravens&group=1");
+    try testing.expect(std.mem.indexOf(u8, grouped.body, "Edda copy") == null);
+    try testing.expect(std.mem.indexOf(u8, grouped.body, "\"same_in\":[\"backup\"]") != null or std.mem.indexOf(u8, grouped.body, "\"same_in\":[\"books\"]") != null);
+    // A caller who cannot see all of the default collection is not given the default.
+    const partial = [_]dk.config.Collection{ .{ .name = "reading", .sources = &.{ "books", "backup" } }, .{ .name = "bk", .sources = &.{"books"} } };
+    const limited: Services = .{ .sources = &store, .source_stats = &stats, .content = mem.store(), .collections = &partial, .default_collection = "reading", .anonymous = &.{"bk"} };
+    const lim = handleServices(a, idx.searcher(), limited, .GET, "/search?q=ravens");
+    try testing.expect(std.mem.indexOf(u8, lim.body, "Searching only") == null);
 }
 
 test "retrieval cache: the same answer twice, served from the cache, and a changed document is read again" {

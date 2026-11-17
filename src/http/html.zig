@@ -67,7 +67,7 @@ pub fn writeSnippet(w: *Writer, snippet: []const u8) Writer.Error!void {
 }
 
 /// A source offered in the Source drop-down.
-pub const SourceChoice = struct { name: []const u8, kind: []const u8 };
+pub const SourceChoice = struct { name: []const u8, kind: []const u8, docs: ?u64 = null };
 
 /// A collection offered next to the sources.
 pub const CollectionChoice = struct { name: []const u8, description: []const u8 = "" };
@@ -112,7 +112,64 @@ pub const Form = struct {
     peers_on: bool = false,
     /// What each peer did for this search, shown above the results.
     peer_notes: []const PeerNote = &.{},
+    /// The default collection that this search was limited to (the visitor picked nothing), with the link back to everything.
+    default_note: ?[]const u8 = null,
+    /// The visitor asked for every source although a default collection is set (`sources=all`); kept when paging.
+    all_sources: bool = false,
 };
+
+/// `12345` as `12,345`.
+pub fn writeCount(w: *Writer, n: u64) Writer.Error!void {
+    var buf: [24]u8 = undefined;
+    const digits = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return;
+    for (digits, 0..) |c, i| {
+        if (i > 0 and (digits.len - i) % 3 == 0) try w.writeByte(',');
+        try w.writeByte(c);
+    }
+}
+
+pub const SourceRow = struct { name: []const u8, kind: []const u8, docs: ?u64, last_added: ?i64, collections: []const []const u8 };
+
+/// The page that lists the sources the visitor may search, with what each holds. No script.
+pub fn writeSourcesPage(w: *Writer, rows: []const SourceRow, now: i64) Writer.Error!void {
+    try writeHead(w, "Sources");
+    try w.writeAll("<body>");
+    try writeSidePanel(w, false);
+    try w.writeAll("<main class=\"results-page\"><div class=\"head\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1></div><h2>Sources</h2>");
+    if (rows.len == 0) {
+        try w.writeAll("<p class=\"notice\">No sources are available here.</p>");
+    } else {
+        try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Source</th><th>Kind</th><th>Documents</th><th>Last added</th><th>In collections</th><th></th></tr></thead><tbody>");
+        for (rows) |r| {
+            try w.writeAll("<tr><td><strong>");
+            try writeEscaped(w, r.name);
+            try w.writeAll("</strong></td><td>");
+            try writeEscaped(w, kindLabel(r.kind));
+            try w.writeAll("</td><td>");
+            if (r.docs) |n| try writeCount(w, n) else try w.writeAll("<span class=\"muted\">?</span>");
+            try w.writeAll("</td><td>");
+            if (r.last_added) |t| {
+                try writeDate(w, t);
+                if (now > t) {
+                    try w.writeAll(" <small class=\"muted\">(");
+                    const days = @divFloor(now - t, 86400);
+                    if (days == 0) try w.writeAll("today") else try w.print("{d} d ago", .{days});
+                    try w.writeAll(")</small>");
+                }
+            } else try w.writeAll("<span class=\"muted\">&ndash;</span>");
+            try w.writeAll("</td><td>");
+            for (r.collections, 0..) |c, i| {
+                if (i > 0) try w.writeAll(", ");
+                try writeEscaped(w, c);
+            }
+            try w.writeAll("</td><td><a href=\"/search?q=source%3A");
+            try query.writeEncoded(w, r.name);
+            try w.writeAll("\">Search it</a></td></tr>");
+        }
+        try w.writeAll("</tbody></table></div>");
+    }
+    try w.writeAll("</main></body></html>\n");
+}
 
 pub const PeerNote = struct { name: []const u8, text: []const u8, ok: bool };
 
@@ -174,6 +231,11 @@ fn writeSourcePicker(w: *Writer, f: Form) Writer.Error!void {
             try writeEscaped(w, src.name);
             try w.writeAll(if (whole_kind or isPicked(f.picked, src.name)) "\" checked> " else "\"> ");
             try writeEscaped(w, src.name);
+            if (src.docs) |n| {
+                try w.writeAll(" <small class=\"muted\">(");
+                try writeCount(w, n);
+                try w.writeAll(")</small>");
+            }
             try w.writeAll("</label>");
         }
         try w.writeAll("</div>");
@@ -264,7 +326,7 @@ fn writeSidePanel(w: *Writer, regex_enabled: bool) Writer.Error!void {
     if (regex_enabled) try w.writeAll("<h3>Regular expressions</h3><dl><dt><code>re:/\\d{3}-\\d{4}/</code></dt><dd>keep results whose text matches the pattern</dd>" ++
         "<dt><code>re:/colou?r/i</code></dt><dd>the <code>i</code> ignores case</dd>" ++
         "<dt><code>-re:/draft/</code></dt><dd>leave out those that match</dd></dl><p class=\"small\">Use it together with at least one word.</p>");
-    try w.writeAll("<p class=\"small\"><a href=\"/help/search\">Full guide</a>");
+    try w.writeAll("<p class=\"small\"><a href=\"/sources\">Sources</a> &middot; <a href=\"/help/search\">Full guide</a>");
     if (regex_enabled) try w.writeAll(" &middot; <a href=\"/help/regex\">Regex guide</a>");
     try w.writeAll("</p></aside>\n");
 }
@@ -302,6 +364,13 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     try writeForm(w, f);
     try w.writeAll("</div>\n");
     try writeInterpretation(w, f, page, offset);
+    if (f.default_note) |name| {
+        try w.writeAll("<p class=\"muted small\">Searching only <strong>");
+        try writeEscaped(w, name);
+        try w.writeAll("</strong> (the default). <a href=\"/search?q=");
+        try query.writeEncoded(w, f.q);
+        try w.writeAll("&amp;sources=all\">Search all sources</a></p>\n");
+    }
     if (f.peer_notes.len > 0) {
         try w.writeAll("<p class=\"muted small\">Peers: ");
         for (f.peer_notes, 0..) |n, i| {
@@ -433,6 +502,13 @@ fn finishHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
     try w.writeAll(" &middot; <a href=\"");
     try writeViewHref(w, h);
     try w.writeAll("\">Stored text</a>");
+    if (h.same_in.len > 0) {
+        try w.writeAll(" &middot; same text in ");
+        for (h.same_in, 0..) |n, i| {
+            if (i > 0) try w.writeAll(", ");
+            try writeEscaped(w, n);
+        }
+    }
     if (h.also_on.len > 0) {
         try w.writeAll(" &middot; also on ");
         for (h.also_on, 0..) |n, i| {
@@ -599,6 +675,7 @@ fn writePagerLink(w: *Writer, f: Form, offset: u32, label_html: []const u8) Writ
         try query.writeEncoded(w, f.language);
     }
     try writeSourceParams(w, f.picked);
+    if (f.all_sources) try w.writeAll("&amp;sources=all");
     if (f.regex.len > 0) {
         try w.writeAll("&amp;regex=");
         try query.writeEncoded(w, f.regex);

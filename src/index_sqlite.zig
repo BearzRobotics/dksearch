@@ -374,7 +374,7 @@ pub const SqliteIndex = struct {
     }
 
     pub fn searcher(self: *SqliteIndex) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = searchImpl, .info = infoImpl, .search_chunks = searchChunksImpl } };
+        return .{ .ptr = self, .vtable = &.{ .search = searchImpl, .info = infoImpl, .search_chunks = searchChunksImpl, .source_stats = sourceStatsImpl } };
     }
 
     pub fn imageSearcher(self: *SqliteIndex) search.ImageSearcher {
@@ -660,6 +660,19 @@ pub const SqliteIndex = struct {
     // ------------------------------------------------------------ search
 
     /// What the index records about one document.
+    pub fn sourceStatsImpl(ptr: *anyopaque, arena: Allocator) search.Error![]const search.SourceStat {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
+        const sql = if (self.has_meta) "SELECT connector, COUNT(*), MAX(indexed_at) FROM docs GROUP BY connector" else "SELECT connector, COUNT(*), NULL FROM docs GROUP BY connector";
+        const st = Stmt.prepare(self.db, sql) catch |e| return searchError(e);
+        defer st.deinit();
+        var out: std.ArrayList(search.SourceStat) = .empty;
+        while (st.step() catch |e| return searchError(e)) {
+            const name = st.colText(0) orelse continue;
+            const n = st.colInt(1);
+            try out.append(arena, .{ .name = try arena.dupe(u8, name), .docs = if (n < 0) 0 else @intCast(n), .last_added = colOptInt(st, 2) });
+        }
+        return out.items;
+    }
     pub fn infoImpl(ptr: *anyopaque, arena: Allocator, id: doc.Id) search.Error!?search.Hit {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
         const columns = if (self.has_meta)
@@ -1299,7 +1312,7 @@ pub const SearchPool = struct {
     }
 
     pub fn searcher(self: *SearchPool) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = poolSearch, .info = poolInfo, .search_chunks = poolSearchChunks } };
+        return .{ .ptr = self, .vtable = &.{ .search = poolSearch, .info = poolInfo, .search_chunks = poolSearchChunks, .source_stats = poolSourceStats } };
     }
 
     pub fn imageSearcher(self: *SearchPool) search.ImageSearcher {
@@ -1319,6 +1332,18 @@ pub const SearchPool = struct {
         unreachable;
     }
 
+    fn poolSourceStats(ptr: *anyopaque, arena: Allocator) search.Error![]const search.SourceStat {
+        const self: *SearchPool = @ptrCast(@alignCast(ptr));
+        self.idle.waitUncancelable(self.io);
+        defer self.idle.post(self.io);
+        for (self.slots) |*slot| {
+            if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                defer slot.busy.store(false, .release);
+                return SqliteIndex.sourceStatsImpl(&slot.index, arena);
+            }
+        }
+        unreachable;
+    }
     fn poolInfo(ptr: *anyopaque, arena: Allocator, id: doc.Id) search.Error!?search.Hit {
         const self: *SearchPool = @ptrCast(@alignCast(ptr));
         self.idle.waitUncancelable(self.io);
