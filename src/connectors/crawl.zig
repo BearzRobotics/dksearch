@@ -345,6 +345,7 @@ pub const CrawlConnector = struct {
             while (level.items.len > 0) : (depth += 1) {
                 if (self.max_depth == 0) control.setProgress(first, seeds.len) else control.setProgress(sh.fetched.load(.monotonic), self.max_pages);
                 var ctx: LevelContext = .{ .conn = self, .items = level.items, .runs = runs, .outs = outs };
+                defer ctx.deferred.deinit(self.gpa);
                 var group: Io.Group = .init;
                 var started: usize = 0;
                 while (started + 1 < n_workers) : (started += 1) {
@@ -399,6 +400,9 @@ pub const CrawlConnector = struct {
         runs: []Run,
         outs: []std.ArrayList(Task),
         next: std.atomic.Value(usize) = .init(0),
+        /// Pages set aside because their site was busy; fetched when the level's queue is empty.
+        deferred: std.ArrayList(Task) = .empty,
+        deferred_mutex: Io.Mutex = .init,
     };
 
     /// A worker of one level: takes the next page of the level until there are none, fetching, storing and
@@ -409,9 +413,31 @@ pub const CrawlConnector = struct {
         const sh = r.sh;
         while (true) {
             if (r.control.isCancelled() or sh.stop.load(.monotonic) or sh.exhausted.load(.monotonic)) return;
+            var task: ?Task = null;
             const index = ctx.next.fetchAdd(1, .monotonic);
-            if (index >= ctx.items.len) return;
-            const result = r.fetchOne(ctx.items[index], &ctx.outs[w]) catch {
+            if (index < ctx.items.len) {
+                const t = ctx.items[index];
+                // A site that is being asked right now would keep this worker waiting while other sites' pages wait
+                // in the queue: set it aside for later (once the queue is empty everything left is simply fetched).
+                if (r.hostBusy(t.url)) {
+                    ctx.deferred_mutex.lockUncancelable(self.io);
+                    ctx.deferred.append(self.gpa, t) catch {
+                        ctx.deferred_mutex.unlock(self.io);
+                        sh.out_of_memory.store(true, .monotonic);
+                        sh.stop.store(true, .monotonic);
+                        return;
+                    };
+                    ctx.deferred_mutex.unlock(self.io);
+                    continue;
+                }
+                task = t;
+            } else {
+                ctx.deferred_mutex.lockUncancelable(self.io);
+                task = ctx.deferred.pop();
+                ctx.deferred_mutex.unlock(self.io);
+                if (task == null) return;
+            }
+            const result = r.fetchOne(task.?, &ctx.outs[w]) catch {
                 sh.out_of_memory.store(true, .monotonic);
                 sh.stop.store(true, .monotonic);
                 return;
@@ -421,7 +447,6 @@ pub const CrawlConnector = struct {
                 return;
             }
         }
-        _ = self;
     }
 
     /// Merges the workers' found links into the next level, round-robin over the seeds of the window `first..end`.
@@ -652,6 +677,8 @@ const Host = struct {
     /// Held while this origin is being asked, so only one worker talks to it at a time (and, from creation
     /// until its `robots.txt` is read, so nobody uses rules that are not there yet).
     lock: Io.Mutex = .init,
+    /// True while a worker holds `lock` for a request, so others can look for other work instead of waiting.
+    busy: std.atomic.Value(bool) = .init(false),
 };
 
 /// What the workers of one run share. `mutex` guards the host table, the visited set and the position
@@ -755,6 +782,23 @@ const Run = struct {
         return .fromSeconds(self.conn.timeout_s);
     }
 
+    /// True if the origin of `url` is known and a worker is asking it right now.
+    fn hostBusy(self: *Run, url: []const u8) bool {
+        const u = parseUrl(url) orelse return false;
+        var buf: [300]u8 = undefined;
+        const scheme: []const u8 = if (u.https) "https" else "http";
+        const origin = (if (u.uri.port) |pt|
+            std.fmt.bufPrint(&buf, "{s}://{s}:{d}", .{ scheme, u.host, pt })
+        else
+            std.fmt.bufPrint(&buf, "{s}://{s}", .{ scheme, u.host })) catch return false;
+        for (origin) |*ch| ch.* = std.ascii.toLower(ch.*);
+        const io = self.conn.io;
+        self.sh.mutex.lockUncancelable(io);
+        defer self.sh.mutex.unlock(io);
+        const h = self.sh.hosts.get(origin) orelse return false;
+        return h.busy.load(.monotonic);
+    }
+
     /// The (cached) robots rules for the origin of `u`.
     /// `listed` is true for a page the administrator named (a seed or a sitemap
     /// entry): such a site is always allowed; `max_hosts` bounds only sites
@@ -854,7 +898,11 @@ const Run = struct {
             };
             // One worker at a time asks a host: the lock is held through the wait for its turn and the request.
             host.lock.lockUncancelable(self.conn.io);
-            defer host.lock.unlock(self.conn.io);
+            host.busy.store(true, .monotonic);
+            defer {
+                host.busy.store(false, .monotonic);
+                host.lock.unlock(self.conn.io);
+            }
             if (!host.rules.allowed(try targetOf(a, u))) return self.skip(.robots);
             if (!self.waitTurn(host)) return .stopped;
 
