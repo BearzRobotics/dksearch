@@ -452,18 +452,23 @@ fn readOfficeImpl(self: *FilesConnector, arena: Allocator, io: Io, dir: Io.Dir, 
     if (!std.unicode.utf8ValidateSlice(got.text)) return .refused;
     const url = fileUrl(arena, base_abs, rel) catch return .out_of_memory;
     const mtime_s: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s));
+    var extras: std.ArrayList(doc.Extra) = .empty;
+    extras.appendSlice(arena, fileSizeExtra(arena, st.size) catch return .out_of_memory) catch return .out_of_memory;
+    officetext.metadataExtras(arena, got, &extras) catch return .out_of_memory;
+    const full_text = officetext.withMetadataText(arena, got) catch return .out_of_memory;
+    if (!std.unicode.utf8ValidateSlice(full_text)) return .refused;
     return .{ .document = .{
         .connector = self.name,
         .source_id = rel,
         .canonical_url = url,
         .title = got.title orelse titleOf(got.text, rel, false),
-        .text = got.text,
+        .text = full_text,
         .language = got.language orelse self.language,
         .content_type = office_kind.contentType(),
         .author = got.author,
         .published_at = if (got.date) |d| avmeta.yearStart(d) else null,
         .modified_at = mtime_s,
-        .extra = fileSizeExtra(arena, st.size) catch return .out_of_memory,
+        .extra = extras.items,
     } };
 }
 
@@ -699,17 +704,63 @@ fn readPdfImpl(self: *FilesConnector, arena: Allocator, io: Io, st: Io.File.Stat
     if (!std.unicode.utf8ValidateSlice(trimmed)) return .refused;
     const url = fileUrl(arena, base_abs, rel) catch return .out_of_memory;
     const mtime_s: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s));
+    // The document information the PDF carries (title, author, subject, keywords, program), if `pdfinfo` is there.
+    var info: officetext.Extracted = .{ .text = trimmed };
+    if (std.fmt.allocPrint(arena, "{s}/{s}", .{ base_abs, rel })) |path| {
+        if (std.process.run(arena, io, .{
+            .argv = &.{ "pdfinfo", "-enc", "UTF-8", path },
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(16 * 1024),
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+        })) |r| {
+            if (r.term.success()) info = parsePdfInfo(arena, r.stdout, trimmed) catch info;
+        } else |_| {}
+    } else |_| return .out_of_memory;
+    var extras: std.ArrayList(doc.Extra) = .empty;
+    extras.appendSlice(arena, fileSizeExtra(arena, st.size) catch return .out_of_memory) catch return .out_of_memory;
+    officetext.metadataExtras(arena, info, &extras) catch return .out_of_memory;
+    const full_text = officetext.withMetadataText(arena, info) catch return .out_of_memory;
+    if (!std.unicode.utf8ValidateSlice(full_text)) return .refused;
     return .{ .document = .{
         .connector = self.name,
         .source_id = rel,
         .canonical_url = url,
-        .title = titleOf(trimmed, rel, false),
-        .text = trimmed,
+        .title = info.title orelse titleOf(trimmed, rel, false),
+        .text = full_text,
         .language = self.language,
         .content_type = "application/pdf",
+        .author = info.author,
         .modified_at = mtime_s,
-        .extra = fileSizeExtra(arena, st.size) catch return .out_of_memory,
+        .extra = extras.items,
     } };
+}
+
+/// What `pdfinfo` prints (`Title:          Harbour Report`, one field a line) as document properties. Empty values and
+/// text that is not valid UTF-8 are left out.
+pub fn parsePdfInfo(arena: Allocator, out: []const u8, text: []const u8) Allocator.Error!officetext.Extracted {
+    var info: officetext.Extracted = .{ .text = text };
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = line[0..colon];
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
+        if (value.len == 0 or !std.unicode.utf8ValidateSlice(value)) continue;
+        const v = try arena.dupe(u8, value[0..@min(value.len, 1000)]);
+        if (std.mem.eql(u8, key, "Title")) info.title = v else if (std.mem.eql(u8, key, "Author")) info.author = v else if (std.mem.eql(u8, key, "Subject")) info.subject = v else if (std.mem.eql(u8, key, "Keywords")) {
+            var kw: std.ArrayList([]const u8) = .empty;
+            var it = std.mem.tokenizeAny(u8, v, ",;");
+            while (it.next()) |k| {
+                const t = std.mem.trim(u8, k, " \t");
+                if (t.len > 0 and t.len <= 200 and kw.items.len < 50) try kw.append(arena, t);
+            }
+            info.keywords = kw.items;
+        } else if (std.mem.eql(u8, key, "Creator")) info.application = v else if (std.mem.eql(u8, key, "Producer")) {
+            const one = try arena.alloc(officetext.Extracted.Pair, 1);
+            one[0] = .{ .name = "producer", .value = v };
+            info.custom = one;
+        }
+    }
+    return info;
 }
 
 /// Paths (relative, '/'-separated) of every eligible file under `dir`.
@@ -1414,4 +1465,20 @@ test "pdf_workers is a number from 1 to 32" {
     try testing.expectError(error.InvalidValue, validate(src(&.{ .{ .key = "path", .value = .{ .string = "/x" } }, .{ .key = "pdf_workers", .value = .{ .integer = 0 } } }), &d));
     try testing.expectError(error.InvalidValue, validate(src(&.{ .{ .key = "path", .value = .{ .string = "/x" } }, .{ .key = "pdf_workers", .value = .{ .integer = 99 } } }), &d));
     try testing.expectError(error.WrongType, validate(src(&.{ .{ .key = "path", .value = .{ .string = "/x" } }, .{ .key = "pdf_workers", .value = .{ .string = "4" } } }), &d));
+}
+
+test "pdfinfo output becomes document properties" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const out = "Title:           Harbour Report\nSubject:         Tide tables\nKeywords:        harbour, tides; boats\nAuthor:          Ada Quill\nCreator:         Imaginary Writer\nProducer:        Imaginary PDF 2\nCreationDate:    Mon Jan  1 10:00:00 2026 CET\nTagged:          no\nPages:           3\nEmpty:           \n";
+    const info = try parsePdfInfo(a, out, "body");
+    try testing.expectEqualStrings("Harbour Report", info.title.?);
+    try testing.expectEqualStrings("Ada Quill", info.author.?);
+    try testing.expectEqualStrings("Tide tables", info.subject.?);
+    try testing.expectEqual(@as(usize, 3), info.keywords.len);
+    try testing.expectEqualStrings("Imaginary Writer", info.application.?);
+    try testing.expectEqualStrings("Imaginary PDF 2", info.custom[0].value);
+    const none = try parsePdfInfo(a, "Pages: 2\nTitle:\n", "body");
+    try testing.expect(none.title == null and none.keywords.len == 0);
 }

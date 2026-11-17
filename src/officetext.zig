@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const xml = @import("xmlzig");
 const ziparchive = @import("ziparchive.zig");
 const htmltext = @import("htmltext.zig");
+const doc = @import("document.zig");
 
 pub const Kind = enum {
     docx,
@@ -52,7 +53,52 @@ pub const Extracted = struct {
     language: ?[]const u8 = null,
     /// The date the document gives for itself, as written.
     date: ?[]const u8 = null,
+    // The rest of what document programs and document management systems put in a file's properties.
+    subject: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    category: ?[]const u8 = null,
+    last_modified_by: ?[]const u8 = null,
+    /// The program that made the file, and the company and manager its properties name.
+    application: ?[]const u8 = null,
+    company: ?[]const u8 = null,
+    manager: ?[]const u8 = null,
+    /// Keywords or tags (split at commas and semicolons).
+    keywords: []const []const u8 = &.{},
+    /// Properties a person or a system added (SharePoint columns, DMS fields), as name and text.
+    custom: []const Pair = &.{},
+
+    pub const Pair = struct { name: []const u8, value: []const u8 };
 };
+
+const max_keywords = 50;
+const max_custom = 100;
+
+/// Adds the words of `list` (comma or semicolon separated) to `out.keywords`.
+fn addKeywords(arena: Allocator, out: *Extracted, list: []const u8) Allocator.Error!void {
+    var kw: std.ArrayList([]const u8) = .empty;
+    try kw.appendSlice(arena, out.keywords);
+    var it = std.mem.tokenizeAny(u8, list, ",;\n");
+    while (it.next()) |raw| {
+        const k = std.mem.trim(u8, raw, " \t\r");
+        if (k.len == 0 or k.len > 200 or kw.items.len >= max_keywords) continue;
+        try kw.append(arena, try arena.dupe(u8, k));
+    }
+    out.keywords = kw.items;
+}
+
+fn addCustom(arena: Allocator, out: *Extracted, name: []const u8, value: []const u8) Allocator.Error!void {
+    const n = std.mem.trim(u8, name, " \t\r\n");
+    const v = std.mem.trim(u8, value, " \t\r\n");
+    if (n.len == 0 or v.len == 0 or out.custom.len >= max_custom) return;
+    var c: std.ArrayList(Extracted.Pair) = .empty;
+    try c.appendSlice(arena, out.custom);
+    try c.append(arena, .{ .name = try arena.dupe(u8, n), .value = try arena.dupe(u8, v[0..@min(v.len, 1000)]) });
+    out.custom = c.items;
+}
+
+fn setOnce(arena: Allocator, slot: *?[]const u8, v: []const u8) Allocator.Error!void {
+    if (slot.* == null) slot.* = try arena.dupe(u8, v[0..@min(v.len, 2000)]);
+}
 
 /// Largest XML part read.
 const max_part_bytes = 64 * 1024 * 1024;
@@ -66,6 +112,9 @@ const ns_ss = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const ns_a = "http://schemas.openxmlformats.org/drawingml/2006/main";
 const max_sheets = 500;
 const max_shared_strings = 4 * 1024 * 1024;
+const ns_cp = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties";
+const ns_extended = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties";
+const ns_custom = "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties";
 const ns_dc = "http://purl.org/dc/elements/1.1/";
 const ns_dcterms = "http://purl.org/dc/terms/";
 const ns_meta = "urn:oasis:names:tc:opendocument:xmlns:meta:1.0";
@@ -86,7 +135,7 @@ pub fn extract(arena: Allocator, archive: *ziparchive.Archive, kind: Kind, max_t
             for ([_][]const u8{ "word/footnotes.xml", "word/endnotes.xml" }) |part| {
                 if (archive.has(part)) docxBody(arena, archive, part, &text, max_text_bytes) catch |e| if (e == error.TooLarge) return e;
             }
-            if (archive.has("docProps/core.xml")) readCoreProps(arena, archive, &out) catch {};
+            readPackageProps(arena, archive, &out);
         },
         .odt, .ods, .odp => {
             try odtBody(arena, archive, &text, max_text_bytes, switch (kind) {
@@ -98,11 +147,11 @@ pub fn extract(arena: Allocator, archive: *ziparchive.Archive, kind: Kind, max_t
         },
         .xlsx => {
             try xlsxBody(arena, archive, &text, max_text_bytes);
-            if (archive.has("docProps/core.xml")) readCoreProps(arena, archive, &out) catch {};
+            readPackageProps(arena, archive, &out);
         },
         .pptx => {
             try pptxBody(arena, archive, &text, max_text_bytes);
-            if (archive.has("docProps/core.xml")) readCoreProps(arena, archive, &out) catch {};
+            readPackageProps(arena, archive, &out);
         },
         .epub => try epub(arena, archive, &text, &out, max_text_bytes),
     }
@@ -110,7 +159,60 @@ pub fn extract(arena: Allocator, archive: *ziparchive.Archive, kind: Kind, max_t
     return out;
 }
 
+/// The properties as tags and fields the index can filter on: each keyword a `tag` (`tag:budget`), and `subject`,
+/// `category`, `description`, `last_modified_by`, `application`, `company`, `manager` and the custom properties
+/// (name lower-cased, spaces as `_`) as fields.
+pub fn metadataExtras(arena: Allocator, got: Extracted, out: *std.ArrayList(doc.Extra)) Allocator.Error!void {
+    for (got.keywords) |k| try out.append(arena, .{ .key = "tag", .value = k });
+    const fixed = [_]struct { []const u8, ?[]const u8 }{
+        .{ "subject", got.subject },
+        .{ "category", got.category },
+        .{ "description", got.description },
+        .{ "last_modified_by", got.last_modified_by },
+        .{ "application", got.application },
+        .{ "company", got.company },
+        .{ "manager", got.manager },
+    };
+    for (fixed) |f| if (f[1]) |v| try out.append(arena, .{ .key = f[0], .value = v[0..@min(v.len, 256)] });
+    for (got.custom) |c| {
+        const key = try arena.alloc(u8, @min(c.name.len, 32));
+        for (key, c.name[0..key.len]) |*d, ch| d.* = if (std.ascii.isAlphanumeric(ch) or ch == '-') std.ascii.toLower(ch) else '_';
+        try out.append(arena, .{ .key = key, .value = c.value[0..@min(c.value.len, 256)] });
+    }
+}
+
+/// The text with the words of the properties that describe the content (subject, keywords, description, category)
+/// added at the end as short lines, so that a search for them finds the file even when its body does not say them.
+pub fn withMetadataText(arena: Allocator, got: Extracted) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, got.text);
+    var wrote = false;
+    const lines = [_]struct { []const u8, ?[]const u8 }{ .{ "Subject", got.subject }, .{ "Category", got.category }, .{ "Description", got.description } };
+    for (lines) |l| if (l[1]) |v| {
+        if (!wrote) try out.appendSlice(arena, "\n\n");
+        wrote = true;
+        try out.print(arena, "{s}: {s}\n", .{ l[0], v });
+    };
+    if (got.keywords.len > 0) {
+        if (!wrote) try out.appendSlice(arena, "\n\n");
+        try out.appendSlice(arena, "Keywords: ");
+        for (got.keywords, 0..) |k, i| {
+            if (i > 0) try out.appendSlice(arena, ", ");
+            try out.appendSlice(arena, k);
+        }
+        try out.append(arena, '\n');
+    }
+    return out.items;
+}
+
 // ------------------------------------------------------------------- shared
+
+/// Core, application and custom properties of an Office Open XML package; a part that cannot be read is left out.
+fn readPackageProps(arena: Allocator, archive: *ziparchive.Archive, out: *Extracted) void {
+    if (archive.has("docProps/core.xml")) readCoreProps(arena, archive, out) catch {};
+    if (archive.has("docProps/app.xml")) readAppProps(arena, archive, out) catch {};
+    if (archive.has("docProps/custom.xml")) readCustomProps(arena, archive, out) catch {};
+}
 
 fn append(arena: Allocator, text: *std.ArrayList(u8), max: usize, bytes: []const u8) Error!void {
     if (text.items.len + bytes.len > max) return error.TooLarge;
@@ -190,13 +292,13 @@ fn readCoreProps(arena: Allocator, archive: *ziparchive.Archive, out: *Extracted
     var src: std.Io.Reader = undefined;
     var rd = xmlReader(arena, bytes, &src);
     defer rd.deinit();
-    var field: enum { none, title, creator, modified, created } = .none;
+    var field: enum { none, title, creator, modified, created, subject, description, keywords, category, last_modified_by } = .none;
     while (true) {
         const ev = rd.next() catch return error.Unreadable;
         switch (ev) {
             .start_element => |s| {
                 field = .none;
-                if (s.name.is(ns_dc, "title")) field = .title else if (s.name.is(ns_dc, "creator")) field = .creator else if (s.name.is(ns_dcterms, "modified")) field = .modified else if (s.name.is(ns_dcterms, "created")) field = .created;
+                if (s.name.is(ns_dc, "title")) field = .title else if (s.name.is(ns_dc, "creator")) field = .creator else if (s.name.is(ns_dcterms, "modified")) field = .modified else if (s.name.is(ns_dcterms, "created")) field = .created else if (s.name.is(ns_dc, "subject")) field = .subject else if (s.name.is(ns_dc, "description")) field = .description else if (s.name.is(ns_cp, "keywords")) field = .keywords else if (s.name.is(ns_cp, "category")) field = .category else if (s.name.is(ns_cp, "lastModifiedBy")) field = .last_modified_by;
             },
             .end_element => field = .none,
             .text => |t| {
@@ -213,9 +315,73 @@ fn readCoreProps(arena: Allocator, archive: *ziparchive.Archive, out: *Extracted
                     .created => if (out.date == null) {
                         out.date = try arena.dupe(u8, v);
                     },
+                    .subject => try setOnce(arena, &out.subject, v),
+                    .description => try setOnce(arena, &out.description, v),
+                    .keywords => try addKeywords(arena, out, v),
+                    .category => try setOnce(arena, &out.category, v),
+                    .last_modified_by => try setOnce(arena, &out.last_modified_by, v),
                     .none => {},
                 }
             },
+            .end_of_document => break,
+            else => {},
+        }
+    }
+}
+
+/// `Application`, `Company` and `Manager` from `docProps/app.xml`.
+fn readAppProps(arena: Allocator, archive: *ziparchive.Archive, out: *Extracted) Error!void {
+    const bytes = try readPart(arena, archive, "docProps/app.xml");
+    var src: std.Io.Reader = undefined;
+    var rd = xmlReader(arena, bytes, &src);
+    defer rd.deinit();
+    var field: enum { none, application, company, manager } = .none;
+    while (true) {
+        const ev = rd.next() catch return error.Unreadable;
+        switch (ev) {
+            .start_element => |s| {
+                field = .none;
+                if (s.name.is(ns_extended, "Application")) field = .application else if (s.name.is(ns_extended, "Company")) field = .company else if (s.name.is(ns_extended, "Manager")) field = .manager;
+            },
+            .end_element => field = .none,
+            .text => |t| {
+                const v = std.mem.trim(u8, t, " \t\r\n");
+                if (v.len == 0) continue;
+                switch (field) {
+                    .application => try setOnce(arena, &out.application, v),
+                    .company => try setOnce(arena, &out.company, v),
+                    .manager => try setOnce(arena, &out.manager, v),
+                    .none => {},
+                }
+            },
+            .end_of_document => break,
+            else => {},
+        }
+    }
+}
+
+/// Properties added by people and systems: `docProps/custom.xml`, one `property` per field with a typed value.
+fn readCustomProps(arena: Allocator, archive: *ziparchive.Archive, out: *Extracted) Error!void {
+    const bytes = try readPart(arena, archive, "docProps/custom.xml");
+    var src: std.Io.Reader = undefined;
+    var rd = xmlReader(arena, bytes, &src);
+    defer rd.deinit();
+    var name: ?[]const u8 = null;
+    var depth: u32 = 0; // inside a property
+    while (true) {
+        const ev = rd.next() catch return error.Unreadable;
+        switch (ev) {
+            .start_element => |s| {
+                if (depth == 0 and s.name.is(ns_custom, "property")) {
+                    name = if (attr(s.attributes, "", "name")) |n| try arena.dupe(u8, n) else null;
+                    depth = 1;
+                } else if (depth > 0) depth += 1;
+            },
+            .end_element => if (depth > 0) {
+                depth -= 1;
+                if (depth == 0) name = null;
+            },
+            .text => |t| if (depth > 1) if (name) |n| try addCustom(arena, out, n, t),
             .end_of_document => break,
             else => {},
         }
@@ -466,7 +632,8 @@ fn readOdtMeta(arena: Allocator, archive: *ziparchive.Archive, out: *Extracted) 
     var src: std.Io.Reader = undefined;
     var rd = xmlReader(arena, bytes, &src);
     defer rd.deinit();
-    var field: enum { none, title, creator, initial, date, created } = .none;
+    var field: enum { none, title, creator, initial, date, created, subject, description, keyword, generator, user } = .none;
+    var user_name: ?[]const u8 = null;
     var initial: ?[]const u8 = null;
     var created: ?[]const u8 = null;
     while (true) {
@@ -474,7 +641,10 @@ fn readOdtMeta(arena: Allocator, archive: *ziparchive.Archive, out: *Extracted) 
         switch (ev) {
             .start_element => |s| {
                 field = .none;
-                if (s.name.is(ns_dc, "title")) field = .title else if (s.name.is(ns_dc, "creator")) field = .creator else if (s.name.is(ns_meta, "initial-creator")) field = .initial else if (s.name.is(ns_dc, "date")) field = .date else if (s.name.is(ns_meta, "creation-date")) field = .created;
+                if (s.name.is(ns_dc, "title")) field = .title else if (s.name.is(ns_dc, "creator")) field = .creator else if (s.name.is(ns_meta, "initial-creator")) field = .initial else if (s.name.is(ns_dc, "date")) field = .date else if (s.name.is(ns_meta, "creation-date")) field = .created else if (s.name.is(ns_dc, "subject")) field = .subject else if (s.name.is(ns_dc, "description")) field = .description else if (s.name.is(ns_meta, "keyword")) field = .keyword else if (s.name.is(ns_meta, "generator")) field = .generator else if (s.name.is(ns_meta, "user-defined")) {
+                    field = .user;
+                    user_name = if (attr(s.attributes, ns_meta, "name")) |n| try arena.dupe(u8, n) else null;
+                }
             },
             .end_element => field = .none,
             .text => |t| {
@@ -490,6 +660,11 @@ fn readOdtMeta(arena: Allocator, archive: *ziparchive.Archive, out: *Extracted) 
                     .initial => initial = try arena.dupe(u8, v),
                     .date => out.date = try arena.dupe(u8, v),
                     .created => created = try arena.dupe(u8, v),
+                    .subject => try setOnce(arena, &out.subject, v),
+                    .description => try setOnce(arena, &out.description, v),
+                    .keyword => try addKeywords(arena, out, v),
+                    .generator => try setOnce(arena, &out.application, v),
+                    .user => if (user_name) |n| try addCustom(arena, out, n, v),
                     .none => {},
                 }
             },
@@ -753,4 +928,57 @@ test "presentations: slides in order, paragraphs on lines (pptx and odp made by 
     const odp = try extract(a, &ar2, .odp, 1 << 20);
     try testing.expect(std.mem.indexOf(u8, odp.text, "narwhals").? < std.mem.indexOf(u8, odp.text, "platypus").?);
     try testing.expect(std.mem.indexOf(u8, odp.text, "platypus\nand a second paragraph") != null);
+}
+
+test "document properties: subject, keywords, description, category, who, which program, custom fields (docx and odt)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ar: ziparchive.Archive = undefined;
+    const file = try openFixture(&tmp, "s.docx", @embedFile("testdata/office/sample.docx"), &ar, a);
+    defer file.close(testing.io);
+    const got = try extract(a, &ar, .docx, 1 << 20);
+    try testing.expectEqualStrings("Tide tables", got.subject.?);
+    try testing.expectEqualStrings("Notes on spring tides", got.description.?);
+    try testing.expectEqualStrings("Reports", got.category.?);
+    try testing.expectEqualStrings("Cy Marsh", got.last_modified_by.?);
+    try testing.expectEqualStrings("Imaginary Writer", got.application.?);
+    try testing.expectEqualStrings("Harbour Board", got.company.?);
+    try testing.expectEqualStrings("Di Park", got.manager.?);
+    try testing.expectEqual(@as(usize, 3), got.keywords.len);
+    try testing.expectEqualStrings("boats", got.keywords[2]);
+    try testing.expectEqual(@as(usize, 2), got.custom.len);
+    try testing.expectEqualStrings("Project Code", got.custom[0].name);
+    try testing.expectEqualStrings("HB-7", got.custom[0].value);
+    try testing.expectEqualStrings("12", got.custom[1].value);
+
+    var extras: std.ArrayList(doc.Extra) = .empty;
+    try metadataExtras(a, got, &extras);
+    var tags: usize = 0;
+    var project: ?[]const u8 = null;
+    for (extras.items) |e| {
+        if (std.mem.eql(u8, e.key, "tag")) tags += 1;
+        if (std.mem.eql(u8, e.key, "project_code")) project = e.value;
+    }
+    try testing.expectEqual(@as(usize, 3), tags);
+    try testing.expectEqualStrings("HB-7", project.?);
+    const full = try withMetadataText(a, got);
+    try testing.expect(std.mem.startsWith(u8, full, got.text));
+    try testing.expect(std.mem.indexOf(u8, full, "Subject: Tide tables\n") != null);
+    try testing.expect(std.mem.indexOf(u8, full, "Keywords: harbour, tides, boats\n") != null);
+
+    var ar2: ziparchive.Archive = undefined;
+    const file2 = try openFixture(&tmp, "s.odt", @embedFile("testdata/office/sample.odt"), &ar2, a);
+    defer file2.close(testing.io);
+    const odt = try extract(a, &ar2, .odt, 1 << 20);
+    try testing.expectEqualStrings("Lamps", odt.subject.?);
+    try testing.expectEqualStrings("How to keep a lantern", odt.description.?);
+    try testing.expectEqual(@as(usize, 2), odt.keywords.len);
+    try testing.expectEqualStrings("Imaginary Writer/1.0", odt.application.?);
+    try testing.expectEqualStrings("LN-3", odt.custom[0].value);
+    // A document without properties has none of this and its text is unchanged.
+    const plain: Extracted = .{ .text = "just text" };
+    try testing.expectEqualStrings("just text", try withMetadataText(a, plain));
 }
