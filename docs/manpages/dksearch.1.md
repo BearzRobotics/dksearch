@@ -472,6 +472,21 @@ Visitors without a key then see only the members of those collections everywhere
 
 An API key (made with **api-key add**) replaces the anonymous scope by the union of its collections' sources (or all of them with `--all`). It is sent as `Authorization: Bearer dkk_...`; a key that is not valid is refused with 401 `invalid_key` and is never treated as anonymous. The scope comes from the key or the setting, never from the request: nothing in a query, a parameter or a source name widens it. Keys are shown once and kept only as hashes. The administration interface and its token are separate and unaffected.
 
+PEERS AND FEDERATED SEARCH
+A *peer* is another dksearch node you may ask. Peers are configured by hand, never discovered:
+
+    [node]
+    name = "home"                         # shown on other nodes beside what comes from here
+
+    [[peer]]
+    name = "office"                       # letters, digits, - and _
+    url = "https://search.example.org"    # no path, no credentials
+    key_file = "/etc/dksearch/office.key" # a key the peer made with `dksearch api-key add`; or `key = "dkk_..."`
+    timeout_ms = 1500                     # 100 to 30000
+    enabled = true
+
+A node name is required once there are peers. The key limits what the peer shows you to the collections it chose for you; give the key file mode 0600 (the key inside the configuration file also works but is easier to leak). With peers configured the search page has an *Also ask peers* box and the API takes `peers=1` (see **dksearch-api**(7)): the peers are asked in parallel and results are merged and labelled with the node they came from, with a note above the results saying which peers answered, were slow, down or refused. A peer that fails is left alone for 5 seconds, doubling after each further failure up to 5 minutes. Everything a peer sends is treated as untrusted text (bounded, escaped, never as markup), and its document links are built from the ids it returns. A visitor whose view is limited (by `[access]` or a key) is never offered peers. Links to a peer's documents work in a browser only if that peer shows them without a key. Peers are asked over the existing API; nothing is copied between nodes.
+
 SEARCH SYNTAX
 The search box understands: `"kernel module"` (phrase), `linux wayland` (both words), `linux AND wayland`, `linux OR bsd`, `linux NOT android` or `linux -android` (exclude), `+linux` (required, which is the default anyway), `(linux OR bsd) AND kernel` (grouping), `comp*` (words starting with comp), `compositor~` (the word or any word one typo away) and `"window manager"~5` (within five positions of each other). AND binds tighter than OR, so `a b OR c` is `(a AND b) OR c`. `AND`, `OR` and `NOT` are operators only in capitals. Everything typed is quoted before it reaches the index, so no index syntax can be injected. A query with only excluded words has nothing to search for and is an error.
 

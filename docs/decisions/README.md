@@ -49,3 +49,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0031 | Typo tolerance from the index's vocabulary (edit distance 2) |
 | 0032 | Crawler concurrency and breadth-first order |
 | 0033 | Collections and API keys |
+| 0034 | Peers and federated search |

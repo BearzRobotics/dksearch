@@ -284,6 +284,21 @@ pub const Access = struct {
     anonymous_collections: ?[]const []const u8 = null,
 };
 
+/// Another dksearch node this one may ask (federated search). Configured by the operator, never discovered.
+pub const Peer = struct {
+    name: []const u8,
+    /// Base address, `http://host:port` or `https://host`, without a path.
+    url: []const u8,
+    /// An API key issued by the peer (`dksearch api-key add`): inline, or read from `key_file` at start.
+    key: ?[]const u8 = null,
+    key_file: ?[]const u8 = null,
+    enabled: bool = true,
+    /// How long to wait for this peer's answer.
+    timeout_ms: u32 = 1500,
+};
+
+pub const max_peers = 50;
+
 pub const max_collections = 200;
 pub const max_collection_sources = 1000;
 
@@ -308,6 +323,9 @@ pub const Config = struct {
     /// Named groups of sources (`[[collection]]`): what a search can be limited to, and what an API key can see.
     collections: []const Collection = &.{},
     access: Access = .{},
+    /// This node's name, shown beside results that come from it on another node.
+    node_name: []const u8 = "",
+    peers: []const Peer = &.{},
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -326,7 +344,7 @@ const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_m
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
 const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
-const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access" };
+const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer" };
 
 /// Parses and validates configuration text. `source_name` is only used in
 /// diagnostics (normally the file path).
@@ -472,6 +490,21 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
 
     cfg.sources = try readSources(a, src, root, diag);
     cfg.collections = try readCollections(a, src, root, cfg.sources, diag);
+    if (try subTable(src, root, "node", diag)) |t| {
+        try checkKeys(src, "node", t, &[_][]const u8{"name"}, diag);
+        if (try str(src, "node", t, "name", diag)) |n| {
+            if (n.len == 0 or n.len > 64 or std.mem.indexOfAny(u8, n, "<>&\"'\x00\r\n") != null) {
+                diag.set(src, "node.name", "must be 1 to 64 characters without quotes, angle brackets or line breaks", .{});
+                return error.InvalidValue;
+            }
+            cfg.node_name = try a.dupe(u8, n);
+        }
+    }
+    cfg.peers = try readPeers(a, src, root, diag);
+    if (cfg.peers.len > 0 and cfg.node_name.len == 0) {
+        diag.set(src, "node.name", "is required when peers are configured (peers show this name beside the results they get from here)", .{});
+        return error.InvalidValue;
+    }
     if (try subTable(src, root, "access", diag)) |t| {
         try checkKeys(src, "access", t, &[_][]const u8{"anonymous_collections"}, diag);
         if (t.get("anonymous_collections")) |v| {
@@ -522,6 +555,63 @@ fn stringList(a: Allocator, src: []const u8, key: []const u8, v: toml.Value, dia
             return error.WrongType;
         },
     };
+    return out;
+}
+
+fn readPeers(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error![]const Peer {
+    const v = root.get("peer") orelse return &.{};
+    const arr = switch (v) {
+        .array => |x| x,
+        else => {
+            diag.set(src, "peer", "expected an array of tables ([[peer]]), got {s}", .{v.typeName()});
+            return error.WrongType;
+        },
+    };
+    if (arr.items.items.len > max_peers) {
+        diag.set(src, "peer", "at most {d} peers", .{max_peers});
+        return error.InvalidValue;
+    }
+    var out = try a.alloc(Peer, arr.items.items.len);
+    var kbuf: [96]u8 = undefined;
+    var nbuf: [128]u8 = undefined;
+    for (arr.items.items, 0..) |item, i| {
+        const where = std.fmt.bufPrint(&kbuf, "peer[{d}]", .{i}) catch "peer";
+        const t = switch (item) {
+            .table => |x| x,
+            else => {
+                diag.set(src, where, "expected a table, got {s}", .{item.typeName()});
+                return error.WrongType;
+            },
+        };
+        try checkKeys(src, where, t, &[_][]const u8{ "name", "url", "key", "key_file", "enabled", "timeout_ms" }, diag);
+        const name = try reqStr(src, where, t, "name", diag);
+        if (!validSourceName(name)) {
+            diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.name", .{where}) catch "peer.name", "must be 1-64 characters of a-z, 0-9, '_' or '-', starting with a letter or digit, got \"{s}\"", .{name});
+            return error.InvalidValue;
+        }
+        for (out[0..i]) |prev| if (std.mem.eql(u8, prev.name, name)) {
+            diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.name", .{where}) catch "peer.name", "duplicate peer name \"{s}\"", .{name});
+            return error.InvalidValue;
+        };
+        var url = std.mem.trimEnd(u8, try reqStr(src, where, t, "url", diag), "/");
+        const has_scheme = std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
+        const rest = if (has_scheme) url[std.mem.indexOf(u8, url, "://").? + 3 ..] else "";
+        if (!has_scheme or rest.len == 0 or std.mem.indexOfAny(u8, rest, "/?#@ ") != null) {
+            diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.url", .{where}) catch "peer.url", "must look like http://host:port or https://host (no path, no credentials), got \"{s}\"", .{url});
+            return error.InvalidValue;
+        }
+        url = try a.dupe(u8, url);
+        var p: Peer = .{ .name = try a.dupe(u8, name), .url = url };
+        if (try str(src, where, t, "key", diag)) |k| p.key = try a.dupe(u8, k);
+        if (try str(src, where, t, "key_file", diag)) |k| p.key_file = try a.dupe(u8, k);
+        if (p.key != null and p.key_file != null) {
+            diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.key", .{where}) catch "peer.key", "give either key or key_file, not both", .{});
+            return error.InvalidValue;
+        }
+        if (try optBool(src, where, t, "enabled", diag)) |b| p.enabled = b;
+        if (try intIn(src, where, t, "timeout_ms", 100, 30000, diag)) |n| p.timeout_ms = @intCast(n);
+        out[i] = p;
+    }
     return out;
 }
 
@@ -1033,6 +1123,33 @@ test "collections and the anonymous access setting are read and checked" {
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = [\"a\"]\n[[collection]]\nname = \"x\"\nsources = [\"b\"]\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[access]\nanonymous_collections = [\"ghost\"]\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = []\n", &d));
+}
+
+test "the node name and peers are read and checked" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "[node]\nname = \"home\"\n[[peer]]\nname = \"office\"\nurl = \"https://search.example.org/\"\nkey_file = \"office.key\"\ntimeout_ms = 800\n[[peer]]\nname = \"lan\"\nurl = \"http://192.168.1.5:8080\"\nkey = \"dkk_x\"\nenabled = false\n", &d);
+    defer c.deinit();
+    try testing.expectEqualStrings("home", c.node_name);
+    try testing.expectEqual(@as(usize, 2), c.peers.len);
+    try testing.expectEqualStrings("https://search.example.org", c.peers[0].url);
+    try testing.expectEqualStrings("office.key", c.peers[0].key_file.?);
+    try testing.expectEqual(@as(u32, 800), c.peers[0].timeout_ms);
+    try testing.expect(!c.peers[1].enabled);
+    try testing.expectEqual(@as(u32, 1500), c.peers[1].timeout_ms);
+    var none = try loadFromSlice(testing.allocator, "t.toml", "", &d);
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.peers.len);
+    const bad = [_][]const u8{
+        "[[peer]]\nname = \"a\"\nurl = \"http://h:1\"\n", // no node name
+        "[node]\nname = \"n\"\n[[peer]]\nname = \"a\"\nurl = \"ftp://h\"\n",
+        "[node]\nname = \"n\"\n[[peer]]\nname = \"a\"\nurl = \"http://u:p@h\"\n",
+        "[node]\nname = \"n\"\n[[peer]]\nname = \"a\"\nurl = \"http://h/path\"\n",
+        "[node]\nname = \"n\"\n[[peer]]\nname = \"a\"\nurl = \"http://h\"\nkey = \"x\"\nkey_file = \"y\"\n",
+        "[node]\nname = \"n\"\n[[peer]]\nname = \"a\"\nurl = \"http://h\"\n[[peer]]\nname = \"a\"\nurl = \"http://i\"\n",
+        "[node]\nname = \"<b>\"\n",
+        "[node]\nname = \"n\"\n[[peer]]\nname = \"a\"\nurl = \"http://h\"\ntimeout_ms = 5\n",
+    };
+    for (bad) |text| try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", text, &d));
 }
 
 test "ranking settings and a source's boost are read and checked" {

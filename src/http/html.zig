@@ -106,7 +106,15 @@ pub const Form = struct {
     collections: []const CollectionChoice = &.{},
     /// The chosen order (`newest`, ...); empty for best match first.
     sort: []const u8 = "",
+    /// Peers (other nodes) this server can ask: names, for the "Also ask peers" box. Empty: no box.
+    peer_names: []const []const u8 = &.{},
+    /// The box was ticked.
+    peers_on: bool = false,
+    /// What each peer did for this search, shown above the results.
+    peer_notes: []const PeerNote = &.{},
 };
+
+pub const PeerNote = struct { name: []const u8, text: []const u8, ok: bool };
 
 pub fn writeHead(w: *Writer, title: []const u8) Writer.Error!void {
     try w.writeAll("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">" ++
@@ -207,11 +215,19 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
         "<input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Search\" autofocus value=\"");
     try writeEscaped(w, f.q);
     try w.writeAll("\"><button type=\"submit\">Search</button>");
-    const open = if (f.language.len > 0 or f.picked.len > 0 or f.sort.len > 0) " open" else "";
+    const open = if (f.language.len > 0 or f.picked.len > 0 or f.sort.len > 0 or f.peers_on) " open" else "";
     try w.print("<details{s}><summary><span>Filters</span><a class=\"tips\" href=\"/help/search\">Search tips</a></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
     try writeEscaped(w, f.language);
     try w.writeAll("\"></label>");
     try writeSourcePicker(w, f);
+    if (f.peer_names.len > 0) {
+        try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"peers\" value=\"1\"{s}> Also ask peers (", .{if (f.peers_on) " checked" else ""});
+        for (f.peer_names, 0..) |n, i| {
+            if (i > 0) try w.writeAll(", ");
+            try writeEscaped(w, n);
+        }
+        try w.writeAll(")</label>");
+    }
     try w.writeAll("<label>Order <select name=\"sort\">");
     const orders = [_][2][]const u8{ .{ "", "Best match" }, .{ "newest", "Newest" }, .{ "oldest", "Oldest" }, .{ "largest", "Largest" }, .{ "smallest", "Smallest" }, .{ "title", "Title" } };
     for (orders) |o| {
@@ -286,6 +302,17 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     try writeForm(w, f);
     try w.writeAll("</div>\n");
     try writeInterpretation(w, f, page, offset);
+    if (f.peer_notes.len > 0) {
+        try w.writeAll("<p class=\"muted small\">Peers: ");
+        for (f.peer_notes, 0..) |n, i| {
+            if (i > 0) try w.writeAll("; ");
+            try w.writeAll("<strong>");
+            try writeEscaped(w, n.name);
+            try w.writeAll("</strong> ");
+            try writeEscaped(w, n.text);
+        }
+        try w.writeAll("</p>\n");
+    }
 
     if (page.hits.len == 0) {
         try w.writeAll("<p class=\"notice\">No results for &ldquo;");
@@ -342,7 +369,7 @@ fn writeInterpretation(w: *Writer, f: Form, page: dk.search.Page, offset: u32) W
 fn writeHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
     try w.writeAll("<li>");
     const label = h.title orelse h.url orelse "(untitled)";
-    if (h.url) |u| if (std.mem.startsWith(u8, u, "zim://")) {
+    if (h.url) |u| if (h.remote_view == null and std.mem.startsWith(u8, u, "zim://")) {
         // An article of a ZIM file: it opens from the file (see handler.zimPage).
         try w.writeAll("<a class=\"title\" href=\"/zim/");
         try writeEscaped(w, u["zim://".len..]);
@@ -365,8 +392,8 @@ fn writeHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
         return finishHit(w, h);
     };
     // An address a browser cannot open (a file on the server, for instance): the title opens the viewer.
-    try w.writeAll("<a class=\"title\" href=\"/doc/");
-    try writeIdHex(w, h.id);
+    try w.writeAll("<a class=\"title\" href=\"");
+    try writeViewHref(w, h);
     try w.writeAll("\">");
     try writeEscaped(w, label);
     try w.writeAll("</a>");
@@ -385,6 +412,11 @@ fn finishHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
         try w.writeAll("</p>");
     };
     try w.writeAll("<div class=\"source\">");
+    if (h.node) |n| {
+        try w.writeAll("<strong>");
+        try writeEscaped(w, n);
+        try w.writeAll("</strong> &middot; ");
+    }
     try writeEscaped(w, h.connector);
     if (h.kind) |k| {
         try w.writeAll(" &middot; ");
@@ -398,9 +430,24 @@ fn finishHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
         try w.writeAll(" &middot; ");
         try writeDate(w, t);
     }
-    try w.writeAll(" &middot; <a href=\"/doc/");
+    try w.writeAll(" &middot; <a href=\"");
+    try writeViewHref(w, h);
+    try w.writeAll("\">Stored text</a>");
+    if (h.also_on.len > 0) {
+        try w.writeAll(" &middot; also on ");
+        for (h.also_on, 0..) |n, i| {
+            if (i > 0) try w.writeAll(", ");
+            try writeEscaped(w, n);
+        }
+    }
+    try w.writeAll("</div></li>\n");
+}
+
+/// The page of the stored document: here, or on the peer that has it.
+fn writeViewHref(w: *Writer, h: dk.search.Hit) Writer.Error!void {
+    if (h.remote_view) |v| return writeEscaped(w, v);
+    try w.writeAll("/doc/");
     try writeIdHex(w, h.id);
-    try w.writeAll("\">Stored text</a></div></li>\n");
 }
 
 fn writeIdHex(w: *Writer, id: dk.document.Id) Writer.Error!void {

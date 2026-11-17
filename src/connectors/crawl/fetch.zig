@@ -37,6 +37,8 @@ pub const Request = struct {
     user_agent: []const u8,
     accept: []const u8,
     max_body_bytes: usize,
+    /// The value of an `Authorization` header, if one is to be sent (API keys of peers).
+    authorization: ?[]const u8 = null,
 };
 
 /// Fetches `req.url`. Everything returned is allocated from `arena`; on
@@ -77,7 +79,7 @@ fn run(client: *http.Client, arena: Allocator, req: Request) Failure!Response {
         .redirect_behavior = .unhandled,
         .keep_alive = false,
         .headers = .{ .user_agent = .{ .override = req.user_agent } },
-        .extra_headers = &.{.{ .name = "accept", .value = req.accept }},
+        .extra_headers = if (req.authorization) |a| &.{ .{ .name = "accept", .value = req.accept }, .{ .name = "authorization", .value = a } } else &.{.{ .name = "accept", .value = req.accept }},
     }) catch |e| return mapRequestError(e);
     defer request.deinit();
 

@@ -51,6 +51,9 @@ source
 language, content_type, connector
 : Optional exact-match filters on the document's language tag, media type and source connector. At most 64 bytes, no control characters. An empty value means no filter.
 
+peers
+: Optional. `1` also asks the configured peers (other dksearch nodes, `[[peer]]` in the configuration) the same `q` and merges their results with this node's by reciprocal-rank fusion (the sum of 1/(60 + rank) over the lists a page is in; scores are not comparable between indexes). Only `q` and the page size are sent on, with this node's key for that peer; `source`, `filter` and the other parameters apply here only, and a peer never asks its own peers. Each result of a peer has `node` (the peer's name, null for this node's own), a `view_url` that is an absolute address on that peer, and `also_on`, the other nodes that have the same page (pages are the same when their web addresses are the same apart from scheme, host case, fragment and trailing slash). The response gains `peers`: one entry per asked peer with `peer`, `status` (`ok`, `timeout`, `down`, `refused`, `bad_answer`, `backoff` after recent failures, `unavailable`), `ms`, `results` and, for a refusal, `http_status`. A slow or failing peer never delays the local results beyond its own time limit (`timeout_ms`, default 1500), and `peers` is null when it was not asked for. Ignored (with `peers` null) when the caller's view is limited by a key or the anonymous setting, when `offset` is not 0, and when no peer is configured. The pager of the page does not carry peers to later pages.
+
 explain
 : Optional. `1` adds the parts of each hit's score (`explain` object), to see why a result ranks where it does.
 

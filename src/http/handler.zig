@@ -85,6 +85,8 @@ pub const Services = struct {
     originals: ?*const dk.originals.Service = null,
     /// ZIM files whose articles can be shown from the file itself.
     zims: ?*const dk.zimserve.Service = null,
+    /// Other nodes this one can ask (`peers=1`), if any are configured.
+    peers: ?*dk.peers.Service = null,
     /// What retrieval derives from stored texts (chunks, PDF page indexes), kept between requests.
     retrieve_cache: ?*dk.retrievecache.Cache = null,
     /// The configured sources, for the Source drop-down (follows edits made in the admin panel).
@@ -219,7 +221,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
     return switch (r) {
         .home => blk: {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHomeForm(&aw.writer, null, .{ .regex_enabled = regex != null, .sources = try sourceChoices(arena, services), .collections = try collectionChoices(arena, services) }) catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, null, .{ .regex_enabled = regex != null, .sources = try sourceChoices(arena, services), .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
@@ -370,8 +372,61 @@ const ApiHit = struct {
     /// With `explain=1`: the parts of the score (text match in the title and in the body, the source's
     /// boost, the recency factor).
     explain: ?dk.search.Explain = null,
+    /// The peer node the result came from; null for this node.
+    node: ?[]const u8 = null,
+    /// Other nodes that have the same page.
+    also_on: []const []const u8 = &.{},
 };
-const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false };
+const PeerNote = struct { peer: []const u8, status: []const u8, ms: u32, results: u32, http_status: ?u16 = null };
+const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null };
+
+const Federated = struct { hits: []const dk.search.Hit, notes: []const PeerNote };
+
+/// The enabled peers' names for the "Also ask peers" box; none when the caller's view is limited.
+fn peerNames(arena: Allocator, services: Services) error{OutOfMemory}![]const []const u8 {
+    const svc = services.peers orelse return &.{};
+    if (svc.enabledCount() == 0 or services.scope.sources != null) return &.{};
+    const names = try arena.alloc([]const u8, svc.peers.len);
+    var n: usize = 0;
+    for (svc.peers) |p| if (p.cfg.enabled) {
+        names[n] = p.cfg.name;
+        n += 1;
+    };
+    return names[0..n];
+}
+
+fn wantsPeers(params: query.Params) bool {
+    const v = params.get("peers") orelse return false;
+    return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "on");
+}
+
+fn statusText(s: dk.peers.Status) []const u8 {
+    return switch (s) {
+        .ok => "answered",
+        .timeout => "was too slow",
+        .down => "could not be reached",
+        .refused => "refused the request (check the key)",
+        .bad_answer => "sent an answer that could not be used",
+        .backoff => "was skipped for a moment after failing",
+        .unavailable => "cannot be asked (this build has no network support)",
+    };
+}
+
+/// With `peers=1`: asks the peers the same question and merges their results with `local`. Null when the caller did
+/// not ask, there are no peers, or the caller's view is limited (a restricted caller is never given other nodes'
+/// results, and a restricted node's answers are not for sale to peers with a wider key), or this is not the first page.
+fn federate(arena: Allocator, services: Services, params: query.Params, q: dk.search.Query, local: []const dk.search.Hit) error{OutOfMemory}!?Federated {
+    if (!wantsPeers(params)) return null;
+    const svc = services.peers orelse return null;
+    if (svc.enabledCount() == 0 or services.scope.sources != null or q.offset != 0) return null;
+    const text = params.get("q") orelse return null;
+    if (text.len == 0) return null;
+    const limit: u32 = if (q.limit == 0) 10 else q.limit;
+    const replies = try svc.ask(arena, text, limit);
+    const notes = try arena.alloc(PeerNote, replies.len);
+    for (replies, notes) |r, *n| n.* = .{ .peer = r.peer, .status = @tagName(r.status), .ms = r.ms, .results = @intCast(r.hits.len), .http_status = if (r.http_status != 0) r.http_status else null };
+    return .{ .hits = try dk.peers.fuse(arena, local, replies, limit), .notes = notes };
+}
 
 pub const RegexNote = struct { status: http.Status, code: []const u8, message: []const u8 };
 
@@ -420,9 +475,11 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
     }
     const page = searcher.search(arena, q) catch |e| return searchFailure(arena, e, true);
 
-    const hits = try arena.alloc(ApiHit, page.hits.len);
-    for (page.hits, hits) |h, *out| out.* = try apiHit(arena, h);
-    return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy });
+    const fed = try federate(arena, services, params, q, page.hits);
+    const shown = if (fed) |f| f.hits else page.hits;
+    const hits = try arena.alloc(ApiHit, shown.len);
+    for (shown, hits) |h, *out| out.* = try apiHit(arena, h);
+    return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null });
 }
 
 fn apiHit(arena: Allocator, h: dk.search.Hit) error{OutOfMemory}!ApiHit {
@@ -433,7 +490,9 @@ fn apiHit(arena: Allocator, h: dk.search.Hit) error{OutOfMemory}!ApiHit {
         .title = h.title,
         .snippet = h.snippet,
         .score = h.score,
-        .view_url = try std.fmt.allocPrint(arena, "/doc/{s}", .{std.fmt.bytesToHex(h.id, .lower)}),
+        .view_url = h.remote_view orelse try std.fmt.allocPrint(arena, "/doc/{s}", .{std.fmt.bytesToHex(h.id, .lower)}),
+        .node = h.node,
+        .also_on = h.also_on,
         .language = h.language,
         .content_type = h.content_type,
         .kind = h.kind,
@@ -992,14 +1051,26 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         // An empty box just shows the form again.
         error.EmptyQuery => {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHomeForm(&aw.writer, "Enter something to search for.", .{ .regex_enabled = regex != null, .sources = sources, .collections = try collectionChoices(arena, services) }) catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, "Enter something to search for.", .{ .regex_enabled = regex != null, .sources = sources, .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
             return htmlResponse(arena, .ok, aw.written());
         },
         else => return searchFailure(arena, e, false),
     };
 
+    var shown = page;
+    form.peer_names = try peerNames(arena, services);
+    if (try federate(arena, services, params, q, page.hits)) |f| {
+        shown.hits = f.hits;
+        form.peers_on = true;
+        const notes = try arena.alloc(html.PeerNote, f.notes.len);
+        for (f.notes, notes) |src, *dst| {
+            const status: dk.peers.Status = std.meta.stringToEnum(dk.peers.Status, src.status).?;
+            dst.* = .{ .name = src.peer, .ok = status == .ok, .text = if (status == .ok) try std.fmt.allocPrint(arena, "{d} {s} in {d} ms", .{ src.results, if (src.results == 1) "result" else "results", src.ms }) else statusText(status) };
+        }
+        form.peer_notes = notes;
+    } else if (wantsPeers(params)) form.peers_on = true;
     var aw: std.Io.Writer.Allocating = .init(arena);
-    html.writeResults(&aw.writer, form, page, q.offset, html_page_size) catch return error.OutOfMemory;
+    html.writeResults(&aw.writer, form, shown, q.offset, html_page_size) catch return error.OutOfMemory;
     return htmlResponse(arena, .ok, aw.written());
 }
 
@@ -1669,6 +1740,39 @@ test "original files are served only for sources that allow it, from inside thei
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, other, "/file")).status);
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, outside, "/file")).status);
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, pdf, "/file/x")).status);
+}
+
+test "peers: asked only on request, reported when they fail, never for a limited caller, and the page offers the box" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const hits = [_]dk.search.Hit{.{ .id = .{ 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .connector = "notes", .url = "https://e.org/a", .title = "Note", .snippet = null, .score = 1 }};
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
+    const peers_cfg = [_]dk.config.Peer{.{ .name = "office", .url = "http://127.0.0.1:1", .timeout_ms = 500 }};
+    const svc = try dk.peers.Service.init(testing.allocator, testing.io, "home", &peers_cfg);
+    defer svc.deinit();
+    const colls = [_]dk.config.Collection{.{ .name = "public", .sources = &.{"notes"} }};
+    const open: Services = .{ .peers = svc };
+    // Not asked unless the request says so.
+    const unasked = handleServices(a, fake.searcher(), open, .GET, "/api/v1/search?q=note");
+    try testing.expect(std.mem.indexOf(u8, unasked.body, "\"peers\":null") != null);
+    // Asked: the peer is down, the local result is still there and the peer is named in the report.
+    const asked = handleServices(a, fake.searcher(), open, .GET, "/api/v1/search?q=note&peers=1");
+    try testing.expectEqual(http.Status.ok, asked.status);
+    try testing.expect(std.mem.indexOf(u8, asked.body, "\"peer\":\"office\"") != null);
+    try testing.expect(std.mem.indexOf(u8, asked.body, "\"status\":\"down\"") != null);
+    try testing.expect(std.mem.indexOf(u8, asked.body, "\"title\":\"Note\"") != null);
+    // The page: the box on the home page and the results page, the note above the results.
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), open, .GET, "/").body, "Also ask peers (office)") != null);
+    const page = handleServices(a, fake.searcher(), open, .GET, "/search?q=note&peers=1");
+    // (The peer failed a moment ago, so it is skipped now; either way the page says so.)
+    try testing.expect(std.mem.indexOf(u8, page.body, "<strong>office</strong> was skipped") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "checked") != null);
+    // A caller whose view is limited gets neither the box nor the peers.
+    const limited: Services = .{ .peers = svc, .collections = &colls, .anonymous = &.{"public"} };
+    const lim = handleServices(a, fake.searcher(), limited, .GET, "/api/v1/search?q=note&peers=1");
+    try testing.expect(std.mem.indexOf(u8, lim.body, "\"peers\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), limited, .GET, "/").body, "Also ask peers") == null);
 }
 
 test "retrieval cache: the same answer twice, served from the cache, and a changed document is read again" {

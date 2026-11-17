@@ -164,6 +164,12 @@ pub const Hit = struct {
     published_at: ?i64 = null,
     indexed_at: ?i64 = null,
     explain: ?Explain = null,
+    /// The name of the peer node this result came from; null for this node's own results.
+    node: ?[]const u8 = null,
+    /// Where the document's page is, on the node that has it (an absolute address; only for results of peers).
+    remote_view: ?[]const u8 = null,
+    /// Other nodes that returned the same document (merged into this one result).
+    also_on: []const []const u8 = &.{},
 };
 
 /// A passage found in the chunk index: the document, the position of the chunk among that document's chunks (as
