@@ -48,6 +48,8 @@ pub const Kind = enum { search, retrieve };
 /// A passage a peer returned for `/api/v1/retrieve`, bounded and with its link built here.
 pub const RemoteChunk = struct {
     node: []const u8,
+    /// The document's node-independent identity, if the peer gave a well formed one.
+    ident: ?[]const u8 = null,
     doc_id: []const u8,
     view_url: []const u8,
     source: []const u8,
@@ -375,6 +377,7 @@ fn copyHit(a: Allocator, h: search.Hit) Allocator.Error!search.Hit {
     if (h.domain) |v| o.domain = try a.dupe(u8, v);
     if (h.node) |v| o.node = try a.dupe(u8, v);
     if (h.remote_view) |v| o.remote_view = try a.dupe(u8, v);
+    if (h.ident) |v| o.ident = try a.dupe(u8, v);
     return o;
 }
 
@@ -387,6 +390,7 @@ fn dupeAll(a: Allocator, list: []const []const u8) Allocator.Error![]const []con
 fn copyChunk(a: Allocator, c: RemoteChunk) Allocator.Error!RemoteChunk {
     var o = c;
     o.node = try a.dupe(u8, c.node);
+    if (c.ident) |v| o.ident = try a.dupe(u8, v);
     o.doc_id = try a.dupe(u8, c.doc_id);
     o.view_url = try a.dupe(u8, c.view_url);
     o.source = try a.dupe(u8, c.source);
@@ -463,6 +467,7 @@ pub fn parseRetrieveAnswer(a: Allocator, body: []const u8, node: []const u8, bas
         };
         try out.append(a, .{
             .node = node,
+            .ident = try validIdent(a, c.get("ident")),
             .doc_id = try a.dupe(u8, id_hex),
             .view_url = try std.fmt.allocPrint(a, "{s}/doc/{s}", .{ base, id_hex }),
             .source = source,
@@ -566,6 +571,7 @@ pub fn parseAnswer(a: Allocator, body: []const u8, node: []const u8, base: []con
             .size = smallInt(h.get("size"), u64),
             .modified_at = smallInt(h.get("modified_at"), i64),
             .node = node,
+            .ident = try validIdent(a, h.get("ident")),
             // The page is built from the id, never taken from the answer: a peer cannot point us elsewhere.
             .remote_view = try std.fmt.allocPrint(a, "{s}/doc/{s}", .{ base, id_hex }),
         });
@@ -575,6 +581,37 @@ pub fn parseAnswer(a: Allocator, body: []const u8, node: []const u8, base: []con
 }
 
 // ------------------------------------------------------------------ merging
+
+/// The identity of a document that does not depend on the node: for a web page the hash of its address as `identity`
+/// makes it (so http and https, fragments and trailing slashes do not matter), otherwise the hash of the stored text
+/// (`stamp`, the content store's hash of it). Null when neither is known. 32 hex digits.
+pub fn identHex(arena: Allocator, url: ?[]const u8, stamp: ?[32]u8) Allocator.Error!?[]const u8 {
+    var digest: [32]u8 = undefined;
+    if (try identity(arena, url)) |ident| {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update("u\x00");
+        h.update(ident);
+        h.final(&digest);
+    } else if (stamp) |s| {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update("t\x00");
+        h.update(&s);
+        h.final(&digest);
+    } else return null;
+    const hex = std.fmt.bytesToHex(digest[0..16].*, .lower);
+    return try arena.dupe(u8, &hex);
+}
+
+/// `v` if it is exactly 32 lower-case hex digits (copied), else null: a peer's claimed identity is only used as a key.
+fn validIdent(a: Allocator, v: ?std.json.Value) Allocator.Error!?[]const u8 {
+    const s = switch (v orelse return null) {
+        .string => |x| x,
+        else => return null,
+    };
+    if (s.len != 32) return null;
+    for (s) |c| if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return null;
+    return try a.dupe(u8, s);
+}
 
 /// The address with what does not identify a page removed: scheme and host in lower case, no fragment, no trailing
 /// slash. Null for addresses that mean something only on one machine (files).
@@ -607,7 +644,8 @@ pub fn fuse(a: Allocator, local: []const search.Hit, replies: []const Reply, lim
     for (replies) |r| if (r.status == .ok) try lists.append(a, .{ .hits = r.hits, .node = r.peer });
     for (lists.items) |l| for (l.hits, 0..) |h, rank| {
         const contribution = 1.0 / (rrf_k + @as(f64, @floatFromInt(rank + 1)));
-        const ident = try identity(a, h.url);
+        // The node-independent identity decides when there is one (the same file on two nodes); else the address.
+        const ident: ?[]const u8 = if (h.ident) |i| try std.fmt.allocPrint(a, "i:{s}", .{i}) else try identity(a, h.url);
         const alt = try std.fmt.allocPrint(a, "{s}/{x}", .{ h.node orelse "", &h.id });
         const found: ?usize = if (ident) |k| by_identity.get(k) else by_node_id.get(alt);
         if (found) |at| {
@@ -822,4 +860,40 @@ test "the pairing test says whether the peer answers and accepts the key, and th
     try testing.expect(infos[0].has_key and infos[0].last_ok_unix > 0);
     try testing.expectEqual(Status.refused, infos[1].last_status.?);
     try testing.expect(!infos[1].has_key and infos[1].last_ok_unix == 0 and infos[1].failures == 2 and infos[1].quiet_secs > 0);
+}
+
+test "identity: the same page or the same text is the same on every node, and a different one differs" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const t1: [32]u8 = @splat(1);
+    const t2: [32]u8 = @splat(2);
+    // A web page: the address decides (http/https, fragment, slash do not matter); the text does not.
+    const w1 = (try identHex(a, "https://Example.org/a/", t1)).?;
+    try testing.expectEqual(@as(usize, 32), w1.len);
+    try testing.expectEqualStrings(w1, (try identHex(a, "http://example.org/a#x", t2)).?);
+    try testing.expect(!std.mem.eql(u8, w1, (try identHex(a, "https://example.org/b", t1)).?));
+    // A file: the text decides, wherever it lives.
+    const f1 = (try identHex(a, "file:///home/a/x.txt", t1)).?;
+    try testing.expectEqualStrings(f1, (try identHex(a, "file:///mnt/other/y.txt", t1)).?);
+    try testing.expect(!std.mem.eql(u8, f1, (try identHex(a, "file:///home/a/x.txt", t2)).?));
+    // A file's identity is not a web page's.
+    try testing.expect(!std.mem.eql(u8, f1, w1));
+    try testing.expect((try identHex(a, "file:///x", null)) == null);
+    // The same file on two nodes merges although their addresses differ; a claimed identity must be well formed.
+    var h1 = hitOf(1, "file:///home/a/x.txt", null);
+    h1.ident = f1;
+    var h2 = hitOf(2, "file:///mnt/other/y.txt", "p");
+    h2.ident = f1;
+    var h3 = hitOf(3, "file:///z", "p");
+    h3.ident = (try identHex(a, "file:///z", t2)).?;
+    const local = [_]search.Hit{h1};
+    const remote = [_]search.Hit{ h2, h3 };
+    const merged = try fuse(a, &local, &[_]Reply{.{ .peer = "p", .status = .ok, .hits = &remote }}, 10);
+    try testing.expectEqual(@as(usize, 2), merged.len);
+    try testing.expectEqualStrings("p", merged[0].also_on[0]);
+    const body = "{\"hits\":[{\"id\":\"0102030405060708090a0b0c0d0e0f10\",\"connector\":\"b\",\"ident\":\"ABC\"},{\"id\":\"0102030405060708090a0b0c0d0e0f11\",\"connector\":\"b\",\"ident\":\"00112233445566778899aabbccddeeff\"}]}";
+    const parsed = try parseAnswer(a, body, "n", "http://h");
+    try testing.expect(parsed.hits[0].ident == null);
+    try testing.expectEqualStrings("00112233445566778899aabbccddeeff", parsed.hits[1].ident.?);
 }

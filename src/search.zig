@@ -170,6 +170,9 @@ pub const Hit = struct {
     remote_view: ?[]const u8 = null,
     /// Other nodes that returned the same document (merged into this one result).
     also_on: []const []const u8 = &.{},
+    /// A node-independent identity (32 hex digits): the same page or the same text has the same one on every node.
+    /// Filled by the HTTP layer, not by `search`.
+    ident: ?[]const u8 = null,
 };
 
 /// A passage found in the chunk index: the document, the position of the chunk among that document's chunks (as

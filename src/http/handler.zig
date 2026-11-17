@@ -384,6 +384,9 @@ const ApiHit = struct {
     node: ?[]const u8 = null,
     /// Other nodes that have the same page.
     also_on: []const []const u8 = &.{},
+    /// The document's identity that does not depend on the node (the same page or the same text on another node
+    /// has the same one); null when there is neither an address nor stored text to make it from.
+    ident: ?[]const u8 = null,
 };
 const PeerNote = struct { peer: []const u8, status: []const u8, ms: u32, results: u32, http_status: ?u16 = null };
 const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null };
@@ -479,16 +482,27 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
             },
         };
         const hits = try arena.alloc(ApiHit, r.page.hits.len);
-        for (r.page.hits, hits) |h, *out| out.* = try apiHit(arena, h);
+        for (r.page.hits, hits) |h, *out| out.* = try apiHit(arena, try withIdent(arena, services, h));
         return jsonResponse(arena, .ok, .{ .hits = hits, .has_more = r.page.has_more, .interpreted = r.page.interpreted, .fuzzy = r.page.fuzzy, .regex = .{ .examined = r.examined, .truncated = r.truncated } });
     }
     const page = searcher.search(arena, q) catch |e| return searchFailure(arena, e, true);
 
-    const fed = try federate(arena, services, params, q, page.hits);
-    const shown = if (fed) |f| f.hits else page.hits;
+    const local = try arena.alloc(dk.search.Hit, page.hits.len);
+    for (page.hits, local) |h, *dst| dst.* = try withIdent(arena, services, h);
+    const fed = try federate(arena, services, params, q, local);
+    const shown = if (fed) |f| f.hits else local;
     const hits = try arena.alloc(ApiHit, shown.len);
     for (shown, hits) |h, *out| out.* = try apiHit(arena, h);
     return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null });
+}
+
+/// `h` with its node-independent identity filled in (from its address, or the hash of its stored text).
+fn withIdent(arena: Allocator, services: Services, h_in: dk.search.Hit) error{OutOfMemory}!dk.search.Hit {
+    var h = h_in;
+    if (h.ident != null) return h;
+    const stamp: ?[32]u8 = if (services.content) |store| store.stamp(h.id) else null;
+    h.ident = try dk.peers.identHex(arena, h.url, stamp);
+    return h;
 }
 
 fn apiHit(arena: Allocator, h: dk.search.Hit) error{OutOfMemory}!ApiHit {
@@ -502,6 +516,7 @@ fn apiHit(arena: Allocator, h: dk.search.Hit) error{OutOfMemory}!ApiHit {
         .view_url = h.remote_view orelse try std.fmt.allocPrint(arena, "/doc/{s}", .{std.fmt.bytesToHex(h.id, .lower)}),
         .node = h.node,
         .also_on = h.also_on,
+        .ident = h.ident,
         .language = h.language,
         .content_type = h.content_type,
         .kind = h.kind,
@@ -848,6 +863,8 @@ const RetrievedChunk = struct {
     node: ?[]const u8 = null,
     /// Other nodes that returned the same passage.
     also_on: []const []const u8 = &.{},
+    /// The document's identity that does not depend on the node (see `ApiHit.ident`).
+    ident: ?[]const u8 = null,
 };
 
 /// With `peers=1`: asks the peers for their best passages and merges them with `local` by reciprocal-rank fusion
@@ -869,7 +886,7 @@ fn federateRetrieval(arena: Allocator, services: Services, params: query.Params,
     var entries: std.ArrayList(Entry) = .empty;
     var seen: std.StringHashMapUnmanaged(usize) = .empty;
     for (local, 0..) |c, rank| {
-        const key = try retrievalKey(arena, c.url, c.start, null, c.doc_id, c.index);
+        const key = try retrievalKey(arena, c.ident, c.url, c.start, null, c.doc_id, c.index);
         try seen.put(arena, key, entries.items.len);
         try entries.append(arena, .{ .chunk = c, .score = 1.0 / (dk.peers.rrf_k + @as(f64, @floatFromInt(rank + 1))), .order = entries.items.len });
     }
@@ -877,7 +894,7 @@ fn federateRetrieval(arena: Allocator, services: Services, params: query.Params,
         if (r.status != .ok) continue;
         for (r.chunks, 0..) |c, rank| {
             const contribution = 1.0 / (dk.peers.rrf_k + @as(f64, @floatFromInt(rank + 1)));
-            const key = try retrievalKey(arena, c.url, c.start, c.node, c.doc_id, c.index);
+            const key = try retrievalKey(arena, c.ident, c.url, c.start, c.node, c.doc_id, c.index);
             if (seen.get(key)) |at| {
                 entries.items[at].score += contribution;
                 var have = false;
@@ -911,6 +928,7 @@ fn federateRetrieval(arena: Allocator, services: Services, params: query.Params,
                 .after = c.after,
                 .images = &.{},
                 .node = c.node,
+                .ident = c.ident,
             }, .score = contribution, .order = entries.items.len });
         }
     }
@@ -932,8 +950,9 @@ fn federateRetrieval(arena: Allocator, services: Services, params: query.Params,
 
 /// What makes two passages the same across nodes: the same web page and start in it; passages of documents without a
 /// shared address (files) are only the same as themselves.
-fn retrievalKey(arena: Allocator, url: ?[]const u8, start: usize, node: ?[]const u8, doc_id: []const u8, index: u32) error{OutOfMemory}![]const u8 {
-    if (try dk.peers.identity(arena, url)) |ident| return std.fmt.allocPrint(arena, "{s}#{d}", .{ ident, start });
+fn retrievalKey(arena: Allocator, ident: ?[]const u8, url: ?[]const u8, start: usize, node: ?[]const u8, doc_id: []const u8, index: u32) error{OutOfMemory}![]const u8 {
+    if (ident) |i| return std.fmt.allocPrint(arena, "i:{s}#{d}", .{ i, start });
+    if (try dk.peers.identity(arena, url)) |ident_url| return std.fmt.allocPrint(arena, "{s}#{d}", .{ ident_url, start });
     return std.fmt.allocPrint(arena, "{s}/{s}#{d}", .{ node orelse "", doc_id, index });
 }
 
@@ -1128,6 +1147,7 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
             .before = before,
             .after = after,
             .images = images,
+            .ident = (try withIdent(arena, services, d.hit)).ident,
         };
     }
     const fed = try federateRetrieval(arena, services, params, params.get("q") orelse "", k, context, out);
@@ -2063,6 +2083,37 @@ test "peers: asked only on request, reported when they fail, never for a limited
     const lim = handleServices(a, fake.searcher(), limited, .GET, "/api/v1/search?q=note&peers=1");
     try testing.expect(std.mem.indexOf(u8, lim.body, "\"peers\":null") != null);
     try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), limited, .GET, "/").body, "Also ask peers") == null);
+}
+
+test "results carry an identity that does not depend on the node: the address for web pages, the text for files" {
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    const id_a: dk.document.Id = .{ 0xa1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const id_b: dk.document.Id = .{ 0xb1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const id_c: dk.document.Id = .{ 0xc1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try mem.store().put(id_a, "the very same text");
+    try mem.store().put(id_b, "the very same text");
+    try mem.store().put(id_c, "another text");
+    const hits = [_]dk.search.Hit{
+        .{ .id = id_a, .connector = "disk1", .url = "file:///home/a/x.txt", .title = "A", .snippet = null, .score = 3 },
+        .{ .id = id_b, .connector = "disk2", .url = "file:///mnt/b/y.txt", .title = "B", .snippet = null, .score = 2 },
+        .{ .id = id_c, .connector = "disk2", .url = "file:///mnt/b/z.txt", .title = "C", .snippet = null, .score = 1 },
+    };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
+    const r = handleServices(a, fake.searcher(), .{ .content = mem.store() }, .GET, "/api/v1/search?q=text");
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, r.body, .{});
+    defer parsed.deinit();
+    const items = parsed.value.object.get("hits").?.array.items;
+    const ia = items[0].object.get("ident").?.string;
+    try testing.expectEqual(@as(usize, 32), ia.len);
+    try testing.expectEqualStrings(ia, items[1].object.get("ident").?.string); // the same text elsewhere
+    try testing.expect(!std.mem.eql(u8, ia, items[2].object.get("ident").?.string));
+    // Without stored text a file has no identity; a web page always does.
+    const none = handleServices(a, fake.searcher(), .{}, .GET, "/api/v1/search?q=text");
+    try testing.expect(std.mem.indexOf(u8, none.body, "\"ident\":null") != null);
 }
 
 test "retrieval cache: the same answer twice, served from the cache, and a changed document is read again" {
