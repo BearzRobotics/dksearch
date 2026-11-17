@@ -85,6 +85,8 @@ pub const Services = struct {
     originals: ?*const dk.originals.Service = null,
     /// ZIM files whose articles can be shown from the file itself.
     zims: ?*const dk.zimserve.Service = null,
+    /// What retrieval derives from stored texts (chunks, PDF page indexes), kept between requests.
+    retrieve_cache: ?*dk.retrievecache.Cache = null,
     /// The configured sources, for the Source drop-down (follows edits made in the admin panel).
     sources: ?*dk.sourcestore.Store = null,
     /// Named groups of sources, for the `collection:` filter and the Collections choice.
@@ -785,7 +787,9 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
         try kept.append(arena, h);
     }
 
-    // Chunk the candidates' stored texts.
+    // Chunk the candidates' stored texts (cached between requests; entries are held until the response is made).
+    var held: std.ArrayList(*dk.retrievecache.Entry) = .empty;
+    defer if (services.retrieve_cache) |c| for (held.items) |e| c.release(e);
     const Doc = struct { hit: dk.search.Hit, chunks: []const dk.retrieve.Chunk, from_index: bool };
     var docs: std.ArrayList(Doc) = .empty;
     var all_text: std.ArrayList([]const u8) = .empty;
@@ -798,23 +802,18 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
             skipped += 1;
             continue;
         }
-        const bytes = store.get(arena, h.id) catch {
-            skipped += 1; // no stored text (the source does not keep it, or it is gone)
-            continue;
-        };
-        var text = bytes;
-        if (text.len > max_retrieve_text_bytes) {
-            var end: usize = max_retrieve_text_bytes;
-            while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
-            text = text[0..end];
-        }
-        total += text.len;
         // A document with passages in the chunk index is chunked as the index was (so the numbers agree) and only
         // those passages compete; any other is chunked as asked and all its passages compete.
         var wanted: std.ArrayList(u32) = .empty;
         for (chunk_hits) |ch| if (std.mem.eql(u8, &ch.id, &h.id)) try wanted.append(arena, ch.index);
         const from_index = wanted.items.len > 0;
-        const cs = dk.retrieve.chunk(arena, text, if (from_index) dk.retrieve.index_chunk_options else .{ .chunk_chars = chunk_chars, .overlap = overlap }) catch return error.OutOfMemory;
+        const opts: dk.retrieve.Options = if (from_index) dk.retrieve.index_chunk_options else .{ .chunk_chars = chunk_chars, .overlap = overlap };
+        const got = (try cachedChunks(arena, services.retrieve_cache, store, h.id, opts, &held)) orelse {
+            skipped += 1; // no stored text (the source does not keep it, or it is gone)
+            continue;
+        };
+        total += got.text_bytes;
+        const cs = got.chunks;
         const di: u32 = @intCast(docs.items.len);
         try docs.append(arena, .{ .hit = h, .chunks = cs, .from_index = from_index });
         for (cs) |c| {
@@ -853,9 +852,7 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
                 if (page_indexes.items.len <= ti) try page_indexes.resize(arena, twins.items.len);
                 if (!page_built.items[ti]) {
                     page_built.items[ti] = true;
-                    if (store.get(arena, tw.id)) |t| {
-                        page_indexes.items[ti] = dk.retrieve.PageIndex.build(arena, t) catch null;
-                    } else |_| {}
+                    page_indexes.items[ti] = try cachedPages(arena, services.retrieve_cache, store, tw.id, &held);
                 }
                 if (page_indexes.items[ti]) |*pi| {
                     if (try pi.pageOf(arena, c.text)) |pg| {
@@ -891,6 +888,65 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
         };
     }
     return jsonResponse(arena, .ok, .{ .chunks = out, .candidates = @as(u32, @intCast(kept.items.len)), .duplicates_merged = duplicates, .without_text = skipped });
+}
+
+const CachedChunks = struct { chunks: []const dk.retrieve.Chunk, text_bytes: usize };
+
+/// The text of `id` cut to the size retrieval works on (on a character boundary).
+fn limitedText(text: []const u8) []const u8 {
+    if (text.len <= max_retrieve_text_bytes) return text;
+    var end: usize = max_retrieve_text_bytes;
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
+/// The chunks of a document's stored text, from the cache when it holds them for this version of the content, made
+/// (and kept) otherwise. Null if there is no stored text. A held cache entry is added to `held`; the caller releases
+/// them once it no longer uses the chunks. Without a cache or a version stamp the chunks live in `arena`.
+fn cachedChunks(arena: Allocator, cache: ?*dk.retrievecache.Cache, store: dk.storage.ContentStore, id: dk.document.Id, opts: dk.retrieve.Options, held: *std.ArrayList(*dk.retrievecache.Entry)) error{OutOfMemory}!?CachedChunks {
+    if (cache) |c| if (store.stamp(id)) |st| {
+        const key = dk.retrievecache.Cache.keyOf(id, st, .chunks, @intCast(opts.chunk_chars), @intCast(opts.overlap));
+        if (c.acquire(key)) |e| {
+            try held.append(arena, e);
+            return .{ .chunks = e.chunks, .text_bytes = e.text_bytes };
+        }
+        // The text is read into the entry's own memory: chunks (headings especially) may point into it.
+        const e = try c.begin(key);
+        const bytes = store.get(e.arena.allocator(), id) catch |err| {
+            c.discard(e);
+            return if (err == error.OutOfMemory) error.OutOfMemory else null;
+        };
+        const text = limitedText(bytes);
+        e.chunks = dk.retrieve.chunk(e.arena.allocator(), text, opts) catch {
+            c.discard(e);
+            return error.OutOfMemory;
+        };
+        const kept = c.publish(e, text.len);
+        try held.append(arena, kept);
+        return .{ .chunks = kept.chunks, .text_bytes = kept.text_bytes };
+    };
+    const bytes = store.get(arena, id) catch return null;
+    const text = limitedText(bytes);
+    return .{ .chunks = dk.retrieve.chunk(arena, text, opts) catch return error.OutOfMemory, .text_bytes = text.len };
+}
+
+/// The page index of a PDF's text, cached like the chunks. Null if there is no text or no page breaks.
+fn cachedPages(arena: Allocator, cache: ?*dk.retrievecache.Cache, store: dk.storage.ContentStore, id: dk.document.Id, held: *std.ArrayList(*dk.retrievecache.Entry)) error{OutOfMemory}!?dk.retrieve.PageIndex {
+    if (cache) |c| if (store.stamp(id)) |st| {
+        const key = dk.retrievecache.Cache.keyOf(id, st, .pages, 0, 0);
+        if (c.acquire(key)) |e| {
+            try held.append(arena, e);
+            return e.pages;
+        }
+        const t = store.get(arena, id) catch return null;
+        const e = try c.begin(key);
+        e.pages = dk.retrieve.PageIndex.build(e.arena.allocator(), t) catch null;
+        const kept = c.publish(e, t.len);
+        try held.append(arena, kept);
+        return kept.pages;
+    };
+    const t = store.get(arena, id) catch return null;
+    return dk.retrieve.PageIndex.build(arena, t) catch null;
 }
 
 fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, services: Services, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
@@ -1613,6 +1669,33 @@ test "original files are served only for sources that allow it, from inside thei
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, other, "/file")).status);
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, outside, "/file")).status);
     try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, pdf, "/file/x")).status);
+}
+
+test "retrieval cache: the same answer twice, served from the cache, and a changed document is read again" {
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    const id_a: dk.document.Id = .{ 0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try mem.store().put(id_a, "# Mythology\n\nOdin had two ravens, Huginn and Muninn, who flew over the world.");
+    const hits = [_]dk.search.Hit{.{ .id = id_a, .connector = "books", .url = "file:///x/myth.md", .title = "Myths", .snippet = null, .score = 2 }};
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
+    var cache = dk.retrievecache.Cache.init(testing.allocator, testing.io, 1024 * 1024);
+    defer cache.deinit();
+    const services: Services = .{ .content = mem.store(), .retrieve_cache = &cache };
+    const target = "/api/v1/retrieve?q=odin+ravens";
+    const first = handleServices(ar.allocator(), fake.searcher(), services, .GET, target);
+    try testing.expectEqual(http.Status.ok, first.status);
+    try testing.expectEqual(@as(u64, 0), cache.hits.load(.monotonic));
+    const second = handleServices(ar.allocator(), fake.searcher(), services, .GET, target);
+    try testing.expectEqual(@as(u64, 1), cache.hits.load(.monotonic));
+    try testing.expectEqualStrings(first.body, second.body);
+    // The document changes: its stored hash differs, so the cached chunks are not used.
+    try mem.store().put(id_a, "# Mythology\n\nOdin had two ravens and a spear called Gungnir.");
+    const third = handleServices(ar.allocator(), fake.searcher(), services, .GET, target);
+    try testing.expectEqual(@as(u64, 1), cache.hits.load(.monotonic));
+    try testing.expect(std.mem.indexOf(u8, third.body, "Gungnir") != null);
+    try testing.expect(std.mem.indexOf(u8, third.body, "Huginn") == null);
 }
 
 test "retrieval: a Markdown work without page breaks gets pages from its PDF twin; entry names are listed" {

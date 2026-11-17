@@ -46,7 +46,16 @@ pub const ContentStore = struct {
         begin: ?*const fn (ptr: *anyopaque) Error!void = null,
         commit: ?*const fn (ptr: *anyopaque) Error!void = null,
         rollback: ?*const fn (ptr: *anyopaque) Error!void = null,
+        /// Optional. A short value that changes whenever the content of `id` does (the stored hash), without
+        /// reading the content: lets a cache of things derived from it know when they are out of date.
+        stamp: ?*const fn (ptr: *anyopaque, id: doc.Id) Error![32]u8 = null,
     };
+
+    /// The content version of `id`, or null if the store cannot say (callers then do not cache).
+    pub fn stamp(self: ContentStore, id: doc.Id) ?[32]u8 {
+        const f = self.vtable.stamp orelse return null;
+        return f(self.ptr, id) catch null;
+    }
 
     pub fn begin(self: ContentStore) Error!void {
         if (self.vtable.begin) |f| return f(self.ptr);

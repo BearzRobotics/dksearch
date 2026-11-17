@@ -23,6 +23,7 @@ pub const scheduler = @import("scheduler.zig");
 pub const retrieve = @import("retrieve.zig");
 pub const editdistance = @import("editdistance.zig");
 pub const access = @import("access.zig");
+pub const retrievecache = @import("retrievecache.zig");
 pub const optioninfo = @import("optioninfo.zig");
 pub const settinginfo = @import("settinginfo.zig");
 pub const officetext = @import("officetext.zig");
@@ -69,6 +70,7 @@ test {
     _ = retrieve;
     _ = editdistance;
     _ = access;
+    _ = retrievecache;
     _ = optioninfo;
     _ = settinginfo;
     _ = officetext;

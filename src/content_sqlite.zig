@@ -66,7 +66,7 @@ pub const SqliteContentStore = struct {
     }
 
     pub fn store(self: *SqliteContentStore) storage.ContentStore {
-        return .{ .ptr = self, .vtable = &.{ .put = put, .get = get, .delete = delete, .begin = begin, .commit = commit, .rollback = rollback } };
+        return .{ .ptr = self, .vtable = &.{ .put = put, .get = get, .delete = delete, .begin = begin, .commit = commit, .rollback = rollback, .stamp = stamp } };
     }
 
     fn begin(ptr: *anyopaque) storage.Error!void {
@@ -106,6 +106,18 @@ pub const SqliteContentStore = struct {
         try st.int(3, @intCast(bytes.len));
         try st.blob(4, packed_bytes);
         _ = try st.step();
+    }
+
+    /// The stored hash of the text, read without the text.
+    fn stamp(ptr: *anyopaque, id: doc.Id) storage.Error![32]u8 {
+        const self: *SqliteContentStore = @ptrCast(@alignCast(ptr));
+        const st = try Stmt.prepare(self.db, "SELECT hash FROM content WHERE id = ?1");
+        defer st.deinit();
+        try st.blob(1, &id);
+        if (!try st.step()) return error.NotFound;
+        const h = st.colBlob(0) orelse return error.Corrupt;
+        if (h.len != 32) return error.Corrupt;
+        return h[0..32].*;
     }
 
     fn get(ptr: *anyopaque, gpa: Allocator, id: doc.Id) storage.Error![]u8 {
@@ -205,7 +217,7 @@ pub const ContentPool = struct {
     }
 
     pub fn store(self: *ContentPool) storage.ContentStore {
-        return .{ .ptr = self, .vtable = &.{ .put = refusePut, .get = poolGet, .delete = refuseDelete } };
+        return .{ .ptr = self, .vtable = &.{ .put = refusePut, .get = poolGet, .delete = refuseDelete, .stamp = poolStamp } };
     }
 
     fn poolGet(ptr: *anyopaque, gpa: Allocator, id: doc.Id) storage.Error![]u8 {
@@ -219,6 +231,19 @@ pub const ContentPool = struct {
             }
         }
         unreachable; // permits never exceed the number of idle slots
+    }
+
+    fn poolStamp(ptr: *anyopaque, id: doc.Id) storage.Error![32]u8 {
+        const self: *ContentPool = @ptrCast(@alignCast(ptr));
+        self.idle.waitUncancelable(self.io);
+        defer self.idle.post(self.io);
+        for (self.slots) |*slot| {
+            if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                defer slot.busy.store(false, .release);
+                return SqliteContentStore.stamp(@ptrCast(&slot.store), id);
+            }
+        }
+        unreachable;
     }
 
     fn refusePut(_: *anyopaque, _: doc.Id, _: []const u8) storage.Error!void {

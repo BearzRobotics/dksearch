@@ -28,7 +28,7 @@ pub const MemoryContentStore = struct {
     }
 
     pub fn store(self: *MemoryContentStore) storage.ContentStore {
-        return .{ .ptr = self, .vtable = &.{ .put = put, .get = get, .delete = delete } };
+        return .{ .ptr = self, .vtable = &.{ .put = put, .get = get, .delete = delete, .stamp = stamp } };
     }
 
     fn put(ptr: *anyopaque, id: doc.Id, bytes: []const u8) storage.Error!void {
@@ -44,6 +44,12 @@ pub const MemoryContentStore = struct {
         const self: *MemoryContentStore = @ptrCast(@alignCast(ptr));
         const v = self.map.get(id) orelse return error.NotFound;
         return gpa.dupe(u8, v);
+    }
+
+    fn stamp(ptr: *anyopaque, id: doc.Id) storage.Error![32]u8 {
+        const self: *MemoryContentStore = @ptrCast(@alignCast(ptr));
+        const v = self.map.get(id) orelse return error.NotFound;
+        return doc.hashContent(v);
     }
 
     fn delete(ptr: *anyopaque, id: doc.Id) storage.Error!void {
