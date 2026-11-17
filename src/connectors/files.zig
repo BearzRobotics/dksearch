@@ -34,7 +34,7 @@ pub const kind = "files";
 pub const default_max_file_bytes: u32 = 4 * 1024 * 1024;
 pub const hard_max_file_bytes: u32 = 64 * 1024 * 1024;
 const checkpoint_every = 100;
-const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text", "pdf_workers", "max_pdf_bytes", "pdf_timeout_seconds", "media", "office", "html" };
+const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text", "pdf_workers", "max_pdf_bytes", "pdf_timeout_seconds", "media", "office", "html", "code" };
 
 /// Checks a source's options without touching the filesystem.
 pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!void {
@@ -77,7 +77,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
             },
         }
     }
-    inline for (.{ "serve_originals", "pdf_text", "media", "office", "html" }) |bool_key| {
+    inline for (.{ "serve_originals", "pdf_text", "media", "office", "html", "code" }) |bool_key| {
         if (source.option(bool_key)) |v| switch (v) {
             .boolean => {},
             else => {
@@ -159,6 +159,8 @@ pub const FilesConnector = struct {
     office: bool,
     /// Index `.html` and `.htm` files as web pages (`html = true`).
     html: bool,
+    /// Index source code and configuration files as text (`code = true`).
+    code: bool,
     /// Subtitle and lyrics files of this run, found next to their media (set by `run`).
     sidecars: SidecarMap = .empty,
     /// Backs the checkpoint handed back in an `Outcome`.
@@ -185,6 +187,7 @@ pub const FilesConnector = struct {
             .pdf_timeout_s = @intCast(source.optionInt("pdf_timeout_seconds") orelse default_pdf_timeout_seconds),
             .office = source.optionBool("office") orelse false,
             .html = source.optionBool("html") orelse false,
+            .code = source.optionBool("code") orelse false,
         };
     }
 
@@ -240,7 +243,7 @@ pub const FilesConnector = struct {
         const base_abs = Io.Dir.cwd().realPathFileAlloc(io, self.root, arena) catch return error.InvalidSource;
         self.sidecars = .empty;
         var sidecar_paths: std.ArrayList([]const u8) = .empty;
-        const paths = collect(arena, io, dir, .{ .pdf = self.pdf_text, .media = self.media, .office = self.office, .html = self.html }, &sidecar_paths) catch |e| switch (e) {
+        const paths = collect(arena, io, dir, .{ .pdf = self.pdf_text, .media = self.media, .office = self.office, .html = self.html, .code = self.code }, &sidecar_paths) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SourceFailed,
         };
@@ -410,6 +413,27 @@ pub const FilesConnector = struct {
 
         const url = fileUrl(arena, base_abs, rel) catch return .out_of_memory;
         const mtime_s: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s));
+        // Source code: the file's name is its title, and its language and a `code` tag make it findable.
+        const code_lang: ?[]const u8 = if (self.code and !is_md and !hasExtension(rel, ".txt")) codeLanguage(rel) else null;
+        if (code_lang) |lang| {
+            const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |i| rel[i + 1 ..] else rel;
+            var extras: std.ArrayList(doc.Extra) = .empty;
+            extras.appendSlice(arena, fileSizeExtra(arena, st.size) catch return .out_of_memory) catch return .out_of_memory;
+            extras.append(arena, .{ .key = "tag", .value = "code" }) catch return .out_of_memory;
+            extras.append(arena, .{ .key = "tag", .value = lang }) catch return .out_of_memory;
+            extras.append(arena, .{ .key = "code_language", .value = lang }) catch return .out_of_memory;
+            return .{ .document = .{
+                .connector = self.name,
+                .source_id = rel,
+                .canonical_url = url,
+                .title = base,
+                .text = text,
+                .language = null,
+                .content_type = "text/plain",
+                .modified_at = mtime_s,
+                .extra = extras.items,
+            } };
+        }
         return .{ .document = .{
             .connector = self.name,
             .source_id = rel,
@@ -764,7 +788,39 @@ pub fn parsePdfInfo(arena: Allocator, out: []const u8, text: []const u8) Allocat
 }
 
 /// Paths (relative, '/'-separated) of every eligible file under `dir`.
-const Wanted = struct { pdf: bool, media: bool, office: bool, html: bool };
+const Wanted = struct { pdf: bool, media: bool, office: bool, html: bool, code: bool = false };
+
+/// The language of a source or configuration file, by its name or extension (case-insensitive), or null if it is not
+/// one that `code = true` indexes.
+pub fn codeLanguage(path: []const u8) ?[]const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+    const base = if (slash) |i| path[i + 1 ..] else path;
+    const names = [_][2][]const u8{ .{ "makefile", "make" }, .{ "dockerfile", "docker" }, .{ "cmakelists.txt", "cmake" }, .{ "build.zig.zon", "zig" } };
+    for (names) |n| if (std.ascii.eqlIgnoreCase(base, n[0])) return n[1];
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return null;
+    if (dot == 0) return null;
+    const ext = base[dot + 1 ..];
+    const table = [_][2][]const u8{
+        .{ "zig", "zig" },        .{ "c", "c" },           .{ "h", "c" },            .{ "cc", "cpp" },         .{ "cpp", "cpp" },    .{ "hpp", "cpp" },
+        .{ "cxx", "cpp" },        .{ "rs", "rust" },       .{ "go", "go" },          .{ "py", "python" },      .{ "rb", "ruby" },    .{ "js", "javascript" },
+        .{ "mjs", "javascript" }, .{ "ts", "typescript" }, .{ "tsx", "typescript" }, .{ "jsx", "javascript" }, .{ "java", "java" },  .{ "kt", "kotlin" },
+        .{ "swift", "swift" },    .{ "cs", "csharp" },     .{ "php", "php" },        .{ "pl", "perl" },        .{ "lua", "lua" },    .{ "sh", "shell" },
+        .{ "bash", "shell" },     .{ "zsh", "shell" },     .{ "fish", "shell" },     .{ "sql", "sql" },        .{ "r", "r" },        .{ "scala", "scala" },
+        .{ "hs", "haskell" },     .{ "ml", "ocaml" },      .{ "ex", "elixir" },      .{ "exs", "elixir" },     .{ "erl", "erlang" }, .{ "clj", "clojure" },
+        .{ "nim", "nim" },        .{ "dart", "dart" },     .{ "vue", "vue" },        .{ "svelte", "svelte" },  .{ "css", "css" },    .{ "scss", "css" },
+        .{ "toml", "toml" },      .{ "yaml", "yaml" },     .{ "yml", "yaml" },       .{ "json", "json" },      .{ "ini", "ini" },    .{ "cfg", "ini" },
+        .{ "conf", "conf" },      .{ "cmake", "cmake" },   .{ "mk", "make" },        .{ "asm", "asm" },        .{ "s", "asm" },      .{ "tex", "latex" },
+        .{ "rst", "rst" },        .{ "org", "org" },       .{ "adoc", "asciidoc" },
+    };
+    for (table) |t| if (std.ascii.eqlIgnoreCase(ext, t[0])) return t[1];
+    return null;
+}
+
+/// Directories of generated or downloaded code that `code = true` does not enter.
+fn skipCodeDir(name: []const u8) bool {
+    for ([_][]const u8{ "node_modules", "__pycache__", "zig-out", "target", "vendor", "dist", "build" }) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
 
 fn collect(arena: Allocator, io: Io, dir: Io.Dir, want: Wanted, sidecars: *std.ArrayList([]const u8)) !([][]const u8) {
     const pdf = want.pdf;
@@ -775,11 +831,15 @@ fn collect(arena: Allocator, io: Io, dir: Io.Dir, want: Wanted, sidecars: *std.A
     while (try walker.next(io)) |entry| {
         if (entry.basename.len == 0 or entry.basename[0] == '.') continue; // hidden: skipped, not entered
         switch (entry.kind) {
-            .directory => try walker.enter(io, entry),
+            .directory => {
+                if (want.code and skipCodeDir(entry.basename)) continue;
+                try walker.enter(io, entry);
+            },
             .file => {
                 const wanted = hasExtension(entry.path, ".txt") or hasExtension(entry.path, ".md") or
                     (pdf and hasExtension(entry.path, ".pdf")) or (media and avmeta.formatOf(entry.path) != null) or
                     (want.office and officetext.kindOf(entry.path) != null) or
+                    (want.code and codeLanguage(entry.path) != null) or
                     (want.html and (hasExtension(entry.path, ".html") or hasExtension(entry.path, ".htm")));
                 if (wanted) {
                     try list.append(arena, try arena.dupe(u8, entry.path));
@@ -1332,6 +1392,52 @@ test "media = true: audio is found by its name, with its subtitle or lyrics text
     try testing.expectEqualStrings("audio", page.hits[0].kind.?);
     try testing.expectEqualStrings("audio/wav", page.hits[0].content_type.?);
     try testing.expectEqual(@as(?u64, wav.len), page.hits[0].size); // the file's size, not the text's
+}
+
+test "code = true: source and configuration files are indexed with their language, generated directories are not" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "src");
+    try tmp.dir.createDirPath(testing.io, "node_modules/dep");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "src/tool.py", .data = "def frobnicate(x):\n    return x * 2\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "src/Makefile", .data = "all:\n\tcc -o frobnicator main.c\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "node_modules/dep/index.js", .data = "module.exports = 'wombat';\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "readme.txt", .data = "plain notes about frobnicate" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "image.png", .data = "not code" });
+    try testing.expectEqualStrings("python", codeLanguage("a/b/tool.PY").?);
+    try testing.expectEqualStrings("make", codeLanguage("src/Makefile").?);
+    try testing.expect(codeLanguage("photo.png") == null and codeLanguage(".py") == null and codeLanguage("noext") == null);
+    var pb: [200]u8 = undefined;
+    const source = try treeSource(&tmp, &pb, &.{.{ .key = "code", .value = .{ .boolean = true } }});
+    defer testing.allocator.free(source.options);
+    var fc = try FilesConnector.init(testing.allocator, testing.io, source);
+    defer fc.deinit();
+    var e: E2e = undefined;
+    try e.init();
+    defer e.deinit();
+    var ctl: api.Control = .{};
+    const r = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc.connector(), "notes", &ctl, E2e.now);
+    try testing.expectEqual(@as(u64, 3), r.submitted); // tool.py, Makefile, readme.txt
+    try testing.expectEqual(@as(usize, 2), try e.hits("frobnicate")); // the script and the notes
+    try testing.expectEqual(@as(usize, 0), try e.hits("wombat")); // node_modules is not entered
+    const page = try e.idx.searcher().search(e.arena.allocator(), .{ .text = "frobnicate", .filters = &.{.{ .field = .tag, .text = "python" }} });
+    try testing.expectEqual(@as(usize, 1), page.hits.len);
+    try testing.expectEqualStrings("tool.py", page.hits[0].title.?);
+    // Off by default: only the text file.
+    var tmp2 = testing.tmpDir(.{ .iterate = true });
+    defer tmp2.cleanup();
+    try tmp2.dir.writeFile(testing.io, .{ .sub_path = "tool.py", .data = "def frobnicate(x): pass\n" });
+    var pb2: [200]u8 = undefined;
+    const off = try treeSource(&tmp2, &pb2, &.{});
+    defer testing.allocator.free(off.options);
+    var fc2 = try FilesConnector.init(testing.allocator, testing.io, off);
+    defer fc2.deinit();
+    var e2: E2e = undefined;
+    try e2.init();
+    defer e2.deinit();
+    var ctl2: api.Control = .{};
+    const r2 = try runner.runImport(e2.arena.allocator(), &e2.state, &e2.pipe, fc2.connector(), "notes", &ctl2, E2e.now);
+    try testing.expectEqual(@as(u64, 0), r2.submitted);
 }
 
 test "office = true and html = true: Word, OpenDocument, EPUB and HTML files are found by their text" {
