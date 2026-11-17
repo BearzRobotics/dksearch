@@ -189,6 +189,8 @@ pub const PeerEdit = union(enum) {
     save: struct { original: ?[]const u8, spec: PeerSpec },
     delete: []const u8,
     set_enabled: struct { name: []const u8, enabled: bool },
+    /// Whether this node tells the peers it asks about this peer.
+    set_introduce: struct { name: []const u8, introduce: bool },
 };
 
 /// Applies `edit` to the `[[peer]]` tables of the configuration text, like `apply` does for sources: the result is
@@ -229,6 +231,15 @@ pub fn applyPeer(gpa: Allocator, text: []const u8, edit: PeerEdit, problem: *Pro
                 try t.entries.put(a, try doc.dupe("enabled"), .{ .boolean = false });
             }
         },
+        .set_introduce => |si| {
+            const i = indexOf(array, si.name) orelse return problem.set("there is no peer named \"{s}\"", .{si.name});
+            const t = array.items.items[i].table;
+            if (si.introduce) {
+                try t.entries.put(a, try doc.dupe("introduce"), .{ .boolean = true });
+            } else {
+                _ = t.entries.orderedRemove("introduce");
+            }
+        },
         .save => |sv| {
             const spec = sv.spec;
             if (!config.validSourceName(spec.name)) return problem.set("the name must be 1-64 characters of a-z, 0-9, '-' and '_', starting with a letter or digit", .{});
@@ -239,10 +250,12 @@ pub fn applyPeer(gpa: Allocator, text: []const u8, edit: PeerEdit, problem: *Pro
             // What a saved peer keeps from before: an inline key and a key file (unless a new key file is given).
             var keep_key: ?toml.Value = null;
             var keep_key_file: ?toml.Value = null;
+            var keep_introduce: ?toml.Value = null;
             const t: *toml.Table = if (existing) |i| blk: {
                 const old = array.items.items[i].table;
                 keep_key = old.get("key");
                 keep_key_file = old.get("key_file");
+                keep_introduce = old.get("introduce");
                 old.entries.clearRetainingCapacity();
                 old.key_comments.clearRetainingCapacity();
                 break :blk old;
@@ -260,6 +273,7 @@ pub fn applyPeer(gpa: Allocator, text: []const u8, edit: PeerEdit, problem: *Pro
                 if (keep_key) |k| try t.entries.put(a, try doc.dupe("key"), k);
                 if (keep_key_file) |k| try t.entries.put(a, try doc.dupe("key_file"), k);
             }
+            if (keep_introduce) |v| try t.entries.put(a, try doc.dupe("introduce"), v);
             if (spec.timeout_ms != 1500) try t.entries.put(a, try doc.dupe("timeout_ms"), .{ .integer = @intCast(spec.timeout_ms) });
             if (!spec.enabled) try t.entries.put(a, try doc.dupe("enabled"), .{ .boolean = false });
         },
@@ -732,4 +746,20 @@ test "collections are added, replaced, removed, and refused with the reason" {
     const gone = try applyCollection(a, one, .{ .delete = "mine" }, &problem);
     defer a.free(gone);
     try testing.expect(std.mem.indexOf(u8, gone, "collection") == null);
+}
+
+test "introduce can be switched on and off for a peer, and is kept when the peer is saved again" {
+    var problem: Problem = .{};
+    const a = testing.allocator;
+    const cfg = "[node]\nname = \"h\"\n[[peer]]\nname = \"p\"\nurl = \"http://h:1\"\n";
+    const on = try applyPeer(a, cfg, .{ .set_introduce = .{ .name = "p", .introduce = true } }, &problem);
+    defer a.free(on);
+    try testing.expect(std.mem.indexOf(u8, on, "introduce = true") != null);
+    const saved = try applyPeer(a, on, .{ .save = .{ .original = "p", .spec = .{ .name = "p", .url = "http://h:2" } } }, &problem);
+    defer a.free(saved);
+    try testing.expect(std.mem.indexOf(u8, saved, "introduce = true") != null and std.mem.indexOf(u8, saved, "h:2") != null);
+    const off = try applyPeer(a, saved, .{ .set_introduce = .{ .name = "p", .introduce = false } }, &problem);
+    defer a.free(off);
+    try testing.expect(std.mem.indexOf(u8, off, "introduce") == null);
+    try testing.expectError(error.Invalid, applyPeer(a, cfg, .{ .set_introduce = .{ .name = "nobody", .introduce = true } }, &problem));
 }

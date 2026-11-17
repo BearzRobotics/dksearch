@@ -29,6 +29,9 @@ limit
 
 Needs an API key (`Authorization: Bearer dkk_...`) whose collections include the source, whatever the anonymous setting of the server: 401 `key_required` without one. A source that does not exist, is off, is not shared, has `rights = "forbidden"` or is outside the key's collections answers 404 `not_shared`. The answer is `{"source": NAME, "documents": [...], "next": CURSOR or null}`. Each document has `id`, `ident` (see `/api/v1/search`), `source`, `url`, `title`, `text` (the full stored text; documents with no retained text or over 4 MiB are left out), `language`, `content_type`, `modified_at`, `published_at`, `author` and `redistribution` (what the source's owner says may be done with the text: `unknown`, `allowed` or `restricted`). Pages are in a stable order, so a replica can continue from a cursor.
 
+GET /api/v1/peers
+The peers this node is willing to introduce to the nodes it answers (`introduce = true` on the `[[peer]]`, and enabled). Needs an API key, like `/api/v1/export`. The answer is `{"node": NAME, "peers": [{"name": ..., "url": ...}]}`: names and addresses only, never keys. They are suggestions: the asking node's operator decides whether to add any, and needs a key from that peer's own node.
+
 GET /api/v1/health
 
 GET /, GET /search?q=TEXT[&language=L][&source=S]...[&connector=C][&offset=N]

@@ -48,7 +48,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_export, api_health, style, document, zim, wopi, other };
+const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_export, api_peers, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -59,6 +59,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/api/v1/search")) return .api_search;
     if (std.mem.eql(u8, path, "/api/v1/retrieve")) return .api_retrieve;
     if (std.mem.eql(u8, path, "/api/v1/export")) return .api_export;
+    if (std.mem.eql(u8, path, "/api/v1/peers")) return .api_peers;
     if (std.mem.eql(u8, path, "/api/v1/health")) return .api_health;
     if (std.mem.eql(u8, path, "/assets/style.css")) return .style;
     if (std.mem.startsWith(u8, path, "/doc/")) return .document;
@@ -309,7 +310,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         },
     }
     // Copying documents needs a key, however open the server is to anonymous searches.
-    if (r == .api_export and !services.keyed) {
+    if ((r == .api_export or r == .api_peers) and !services.keyed) {
         var resp = try apiError(arena, .unauthorized, "key_required", "exporting documents needs an API key (Authorization: Bearer ...)");
         resp.headers = headersWith(arena, &.{ .{ .name = "www-authenticate", .value = "Bearer" }, no_store });
         return resp;
@@ -341,6 +342,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         .api_search => try apiSearch(arena, searcher, regex, services, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
         .api_retrieve => try apiRetrieve(arena, searcher, services, t.params),
         .api_export => try apiExport(arena, searcher, services, t.params),
+        .api_peers => try apiPeers(arena, services),
         .search_page => try pageSearch(arena, searcher, regex, services, try sourceChoicesFor(arena, services, searcher), try sourceBoosts(arena, services), t.params),
         .sources_page => try sourcesPage(arena, searcher, services),
         .document => try documentPage(arena, searcher, services, t.path, t.params),
@@ -676,6 +678,21 @@ fn apiExport(arena: Allocator, searcher: dk.search.Searcher, services: Services,
     // Another page may follow when this one was full or was cut for size.
     const more = rows.len >= limit or cut;
     var resp = try jsonResponse(arena, .ok, .{ .source = src.name, .documents = out.items, .next = if (more and last != null) try std.fmt.allocPrint(arena, "{d}", .{last.?}) else null });
+    resp.headers = headersWith(arena, &.{no_store});
+    return resp;
+}
+
+/// `GET /api/v1/peers`: the peers this node is willing to introduce (`introduce = true`), by name and address only.
+/// For a caller with a key; they are suggestions the caller's operator may accept, nothing is added by asking.
+fn apiPeers(arena: Allocator, services: Services) error{OutOfMemory}!Response {
+    const Entry = struct { name: []const u8, url: []const u8 };
+    var list: std.ArrayList(Entry) = .empty;
+    var node: []const u8 = "";
+    if (services.peers) |svc| {
+        node = svc.node;
+        for (svc.peers) |p| if (p.cfg.enabled and p.cfg.introduce) try list.append(arena, .{ .name = p.cfg.name, .url = p.cfg.url });
+    }
+    var resp = try jsonResponse(arena, .ok, .{ .node = node, .peers = list.items });
     resp.headers = headersWith(arena, &.{no_store});
     return resp;
 }
@@ -2575,6 +2592,35 @@ test "export: only shared sources, only with a key that covers them, paged with 
     try testing.expectEqual(http.Status.bad_request, (try get(a, idx.searcher(), services, "/api/v1/export", &tok_all)).status);
     try testing.expectEqual(http.Status.bad_request, (try get(a, idx.searcher(), services, "/api/v1/export?source=books&limit=1000", &tok_all)).status);
     try testing.expectEqual(http.Status.bad_request, (try get(a, idx.searcher(), services, "/api/v1/export?source=books&after=-1", &tok_all)).status);
+}
+
+test "peers offered for introduction: only with a key, only those marked, with name and address and nothing else" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var keys_store = dk.access.KeyStore.init(testing.allocator, testing.io, try tmp.dir.realPathFileAlloc(testing.io, ".", a));
+    defer keys_store.deinit();
+    var tok: [dk.access.token_len]u8 = undefined;
+    const keys = try dk.access.add(a, testing.io, &.{}, "k", &.{"*"}, 1, &tok);
+    try dk.access.save(a, testing.io, tmp.dir, dk.access.file_name, keys);
+    const cfgs = [_]dk.config.Peer{
+        .{ .name = "lab", .url = "https://lab.example.org", .key = "dkk_secretsecret", .introduce = true },
+        .{ .name = "hidden", .url = "https://hidden.example.org", .key = "dkk_other" },
+        .{ .name = "off", .url = "https://off.example.org", .introduce = true, .enabled = false },
+    };
+    const svc = try dk.peers.Service.init(testing.allocator, testing.io, "home", &cfgs);
+    defer svc.deinit();
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    const services: Services = .{ .peers = svc, .keys = &keys_store };
+    try testing.expectEqual(http.Status.unauthorized, handleServices(a, fake.searcher(), services, .GET, "/api/v1/peers").status);
+    const r = handleAuthorized(a, fake.searcher(), services, .GET, "/api/v1/peers", try std.fmt.allocPrint(a, "Bearer {s}", .{&tok}));
+    try testing.expectEqual(http.Status.ok, r.status);
+    try testing.expect(std.mem.indexOf(u8, r.body, "\"name\":\"lab\"") != null and std.mem.indexOf(u8, r.body, "https://lab.example.org") != null);
+    try testing.expect(std.mem.indexOf(u8, r.body, "hidden") == null and std.mem.indexOf(u8, r.body, "off.example") == null);
+    try testing.expect(std.mem.indexOf(u8, r.body, "secret") == null and std.mem.indexOf(u8, r.body, "dkk_") == null); // no key ever leaves
+    try testing.expect(std.mem.indexOf(u8, r.body, "\"node\":\"home\"") != null);
 }
 
 test "retrieval cache: the same answer twice, served from the cache, and a changed document is read again" {

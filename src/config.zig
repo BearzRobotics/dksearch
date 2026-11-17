@@ -301,6 +301,8 @@ pub const Peer = struct {
     key: ?[]const u8 = null,
     key_file: ?[]const u8 = null,
     enabled: bool = true,
+    /// This node may tell the peers it asks about this peer (`GET /api/v1/peers`), as a suggestion they accept or not.
+    introduce: bool = false,
     /// How long to wait for this peer's answer.
     timeout_ms: u32 = 1500,
 };
@@ -690,7 +692,7 @@ fn readPeers(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic
                 return error.WrongType;
             },
         };
-        try checkKeys(src, where, t, &[_][]const u8{ "name", "url", "key", "key_file", "enabled", "timeout_ms" }, diag);
+        try checkKeys(src, where, t, &[_][]const u8{ "name", "url", "key", "key_file", "enabled", "introduce", "timeout_ms" }, diag);
         const name = try reqStr(src, where, t, "name", diag);
         if (!validSourceName(name)) {
             diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.name", .{where}) catch "peer.name", "must be 1-64 characters of a-z, 0-9, '_' or '-', starting with a letter or digit, got \"{s}\"", .{name});
@@ -716,6 +718,7 @@ fn readPeers(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic
             return error.InvalidValue;
         }
         if (try optBool(src, where, t, "enabled", diag)) |b| p.enabled = b;
+        if (try optBool(src, where, t, "introduce", diag)) |b| p.introduce = b;
         if (try intIn(src, where, t, "timeout_ms", 100, 30000, diag)) |n| p.timeout_ms = @intCast(n);
         out[i] = p;
     }
@@ -1283,6 +1286,13 @@ test "a document server is read and checked" {
     for (bad) |text| try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", text, &d));
 }
 
+test "a peer can be marked to be introduced" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "[node]\nname = \"h\"\n[[peer]]\nname = \"a\"\nurl = \"http://h:1\"\nintroduce = true\n[[peer]]\nname = \"b\"\nurl = \"http://h:2\"\n", &d);
+    defer c.deinit();
+    try testing.expect(c.peers[0].introduce and !c.peers[1].introduce);
+}
+
 test "the node name and peers are read and checked" {
     var d: Diagnostic = .{};
     var c = try loadFromSlice(testing.allocator, "t.toml", "[node]\nname = \"home\"\n[[peer]]\nname = \"office\"\nurl = \"https://search.example.org/\"\nkey_file = \"office.key\"\ntimeout_ms = 800\n[[peer]]\nname = \"lan\"\nurl = \"http://192.168.1.5:8080\"\nkey = \"dkk_x\"\nenabled = false\n", &d);
@@ -1293,6 +1303,7 @@ test "the node name and peers are read and checked" {
     try testing.expectEqualStrings("office.key", c.peers[0].key_file.?);
     try testing.expectEqual(@as(u32, 800), c.peers[0].timeout_ms);
     try testing.expect(!c.peers[1].enabled);
+    try testing.expect(!c.peers[0].introduce);
     try testing.expectEqual(@as(u32, 1500), c.peers[1].timeout_ms);
     var none = try loadFromSlice(testing.allocator, "t.toml", "", &d);
     defer none.deinit();

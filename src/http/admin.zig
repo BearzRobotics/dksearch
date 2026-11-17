@@ -247,7 +247,7 @@ pub const App = struct {
             .maintenance => self.pageMaintenance(arena, csrf),
             .action_maintenance => self.startOperation(arena, req, auth, false),
             .zim_page => self.pageZim(arena, csrf, t.params),
-            .access_page => self.pageAccess(arena, csrf, null, null),
+            .access_page => self.pageAccessFull(arena, csrf, null, null, t.params.get("suggest") != null),
             .action_peer_test => self.testPeer(arena, req, auth),
             .action_peer_edit => self.editPeer(arena, req, auth),
             .action_collection_edit => self.editCollection(arena, req, auth),
@@ -1084,6 +1084,10 @@ pub const App = struct {
     }
 
     fn pageAccess(self: *App, arena: Allocator, csrf: ?[]const u8, fresh: ?NewKey, notice: ?[]const u8) error{OutOfMemory}!Response {
+        return self.pageAccessFull(arena, csrf, fresh, notice, false);
+    }
+
+    fn pageAccessFull(self: *App, arena: Allocator, csrf: ?[]const u8, fresh: ?NewKey, notice: ?[]const u8, suggest: bool) error{OutOfMemory}!Response {
         var aw: Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         writePage(w, "Access", csrf, "access") catch return error.OutOfMemory;
@@ -1092,14 +1096,14 @@ pub const App = struct {
             html.writeEscaped(w, n) catch return error.OutOfMemory;
             w.writeAll("</p>") catch return error.OutOfMemory;
         }
-        self.writeAccess(arena, w, csrf, fresh) catch return error.OutOfMemory;
+        self.writeAccess(arena, w, csrf, fresh, suggest) catch return error.OutOfMemory;
         w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
         var r = handler.htmlResponse(arena, .ok, aw.written());
         r.headers = handler.headersWith(arena, &.{handler.no_store}); // a page that may show a new key is never cached
         return r;
     }
 
-    fn writeAccess(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, fresh: ?NewKey) !void {
+    fn writeAccess(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, fresh: ?NewKey, suggest: bool) !void {
         try w.writeAll("<p class=\"muted\">Who may see what. A <em>collection</em> is a named group of sources (written as <code>[[collection]]</code> in the configuration file); an <em>API key</em> lets a program see only the collections it was made for. Without keys, everyone can search everything unless <code>[access] anonymous_collections</code> says otherwise.</p>");
         if (fresh) |f| {
             try w.writeAll("<section class=\"card\"><h2>New key made</h2><p>Copy it now: it is shown only this once, and only its hash is kept. Key <strong>");
@@ -1125,7 +1129,7 @@ pub const App = struct {
         } else try w.writeAll("May see <strong>every source</strong> (no limit is set).");
         try w.writeAll(" Change this with <code>[access]</code> in the configuration file (read at start).</p></section>");
 
-        try self.writePeers(arena, w, csrf);
+        try self.writePeers(arena, w, csrf, suggest);
         try w.writeAll("<section class=\"card\"><h2>Collections</h2>");
         if (self.opts.collections.len == 0) {
             try w.writeAll("<p class=\"muted\">None defined. Add <code>[[collection]]</code> tables with <code>name</code>, an optional <code>description</code> and <code>sources = [...]</code> to the configuration file.</p>");
@@ -1206,7 +1210,7 @@ pub const App = struct {
         try w.writeAll("</section>");
     }
 
-    fn writePeers(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8) !void {
+    fn writePeers(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, suggest: bool) !void {
         try w.writeAll("<section class=\"card\"><h2>Peers</h2>");
         const svc = self.opts.peers orelse {
             try w.writeAll("<p class=\"muted\">No peers yet. Peers are other dksearch nodes you may ask (see the manual, <em>Peers and federated search</em>). They are saved in the configuration file and start working after a restart.</p>");
@@ -1247,7 +1251,7 @@ pub const App = struct {
                 try html.writeEscaped(w, p.name);
                 try w.writeAll("\"><button type=\"submit\" class=\"btn\">Test</button></form>");
                 if (self.canEditConfig()) {
-                    for ([_][3][]const u8{ .{ "toggle", if (p.enabled) "Turn off" else "Turn on", if (p.enabled) "0" else "1" }, .{ "delete", "Remove", "" } }) |b| {
+                    for ([_][3][]const u8{ .{ "toggle", if (p.enabled) "Turn off" else "Turn on", if (p.enabled) "0" else "1" }, .{ "introduce", if (p.introduce) "Stop introducing" else "Introduce", if (p.introduce) "0" else "1" }, .{ "delete", "Remove", "" } }) |b| {
                         try w.writeAll(" <form class=\"inline\" action=\"/actions/peer-edit\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
                         try html.writeEscaped(w, token);
                         try w.print("\"><input type=\"hidden\" name=\"op\" value=\"{s}\"><input type=\"hidden\" name=\"enabled\" value=\"{s}\"><input type=\"hidden\" name=\"name\" value=\"", .{ b[0], b[2] });
@@ -1259,8 +1263,55 @@ pub const App = struct {
             try w.writeAll("</td></tr>");
         }
         try w.writeAll("</tbody></table></div>");
+        try self.writeSuggestions(arena, w, csrf, svc, infos, suggest);
         try self.writePeerForm(w, csrf);
         try w.writeAll("</section>");
+    }
+
+    /// What the peers offer to introduce: shown only on request (it asks them, over the network), never added by itself.
+    fn writeSuggestions(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, svc: *dk.peers.Service, infos: []const dk.peers.Info, suggest: bool) !void {
+        if (!suggest) {
+            try w.writeAll("<p><a class=\"btn secondary\" href=\"/access?suggest=1\">Ask my peers for suggestions</a> <span class=\"muted\">Peers marked <em>Introduce</em> on their own node list the peers they are willing to introduce. Nothing is added unless you add it.</span></p>");
+            return;
+        }
+        const replies = try svc.ask(arena, .peers, "", "");
+        try w.writeAll("<h3>Suggested by your peers</h3>");
+        var shown: usize = 0;
+        for (replies) |r| {
+            if (r.status != .ok) {
+                try w.writeAll("<p class=\"muted\"><strong>");
+                try html.writeEscaped(w, r.peer);
+                try w.print("</strong> did not answer ({t}).</p>", .{r.status});
+                continue;
+            }
+            for (r.intros) |intro| {
+                // Not one you already have (same address).
+                var have = false;
+                for (infos) |inf| if (std.ascii.eqlIgnoreCase(std.mem.trimEnd(u8, inf.url, "/"), intro.url)) {
+                    have = true;
+                };
+                if (have) continue;
+                shown += 1;
+                try w.writeAll("<form class=\"stack card\" action=\"/actions/peer-edit\" method=\"post\"><p><strong>");
+                try html.writeEscaped(w, intro.name);
+                try w.writeAll("</strong> <code>");
+                try html.writeEscaped(w, intro.url);
+                try w.writeAll("</code> <span class=\"muted\">suggested by ");
+                try html.writeEscaped(w, intro.from);
+                try w.writeAll("</span></p>");
+                if (csrf) |token| if (self.canEditConfig()) {
+                    try w.writeAll("<input type=\"hidden\" name=\"op\" value=\"save\"><input type=\"hidden\" name=\"csrf\" value=\"");
+                    try html.writeEscaped(w, token);
+                    try w.writeAll("\"><input type=\"hidden\" name=\"name\" value=\"");
+                    try html.writeEscaped(w, intro.name);
+                    try w.writeAll("\"><input type=\"hidden\" name=\"url\" value=\"");
+                    try html.writeEscaped(w, intro.url);
+                    try w.writeAll("\"><label>Key file <input name=\"key_file\" maxlength=\"300\" placeholder=\"/etc/dksearch/new-peer.key\"><small>You need a key from that node to ask it anything; ask its owner, then put it in a file.</small></label><button type=\"submit\" class=\"btn\">Add this peer</button>");
+                };
+                try w.writeAll("</form>");
+            }
+        }
+        if (shown == 0) try w.writeAll("<p class=\"muted\">No suggestions: none of your peers offers a peer you do not have.</p>");
     }
 
     fn writeCollectionForm(self: *App, w: *Io.Writer, csrf: ?[]const u8) !void {
@@ -1351,8 +1402,10 @@ pub const App = struct {
             .{ .delete = name }
         else if (std.mem.eql(u8, op, "toggle"))
             .{ .set_enabled = .{ .name = name, .enabled = if (params.get("enabled")) |v| std.mem.eql(u8, v, "1") else false } }
+        else if (std.mem.eql(u8, op, "introduce"))
+            .{ .set_introduce = .{ .name = name, .introduce = if (params.get("enabled")) |v| std.mem.eql(u8, v, "1") else false } }
         else
-            return actionFailure(arena, false, .{ .status = .bad_request, .code = "unknown_operation", .message = "op must be save, delete or toggle" });
+            return actionFailure(arena, false, .{ .status = .bad_request, .code = "unknown_operation", .message = "op must be save, delete, toggle or introduce" });
 
         self.edit_mutex.lockUncancelable(self.io);
         defer self.edit_mutex.unlock(self.io);
@@ -3689,6 +3742,28 @@ test "Access: peers are added to the configuration file, switched and removed fr
     _ = try post(&f, a, cookie, csrf, "op=delete&name=office");
     try testing.expect(std.mem.indexOf(u8, try tmp.dir.readFileAlloc(testing.io, "c.toml", a, .limited(4096)), "office") == null);
     try testing.expectEqual(http.Status.bad_request, (try post(&f, a, cookie, csrf, "op=delete&name=nobody")).status);
+}
+
+test "Access: suggestions are asked for only on request, and a peer that cannot answer is named" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const cfgs = [_]dk.config.Peer{.{ .name = "office", .url = "http://127.0.0.1:1", .timeout_ms = 400 }};
+    const svc = try dk.peers.Service.init(testing.allocator, testing.io, "home", &cfgs);
+    defer svc.deinit();
+    f.app.opts.peers = svc;
+    f.app.opts.node_name = "home";
+    const plain = try f.call(a, .GET, "/access", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, plain.body, "Ask my peers for suggestions") != null);
+    try testing.expect(std.mem.indexOf(u8, plain.body, "Suggested by your peers") == null);
+    const asked = try f.call(a, .GET, "/access?suggest=1", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, asked.body, "Suggested by your peers") != null);
+    try testing.expect(std.mem.indexOf(u8, asked.body, "<strong>office</strong> did not answer") != null);
 }
 
 test "Access: collections are added and removed from the page, written to the configuration file" {

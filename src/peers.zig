@@ -43,7 +43,11 @@ pub const Status = enum {
     unavailable,
 };
 
-pub const Kind = enum { search, retrieve };
+pub const Kind = enum { search, retrieve, peers };
+
+/// A peer that a peer offers to introduce.
+pub const Intro = struct { from: []const u8, name: []const u8, url: []const u8 };
+pub const max_intros_per_peer = 50;
 
 /// A passage a peer returned for `/api/v1/retrieve`, bounded and with its link built here.
 pub const RemoteChunk = struct {
@@ -80,6 +84,8 @@ pub const Reply = struct {
     hits: []const search.Hit = &.{},
     /// Passages (for `Kind.retrieve`), owned by the request arena.
     chunks: []const RemoteChunk = &.{},
+    /// Peers this peer offers to introduce (for `Kind.peers`).
+    intros: []const Intro = &.{},
     /// Entries of the answer that were skipped for being malformed.
     skipped: u32 = 0,
     /// The status code of a refusal.
@@ -118,6 +124,7 @@ pub const Info = struct {
     name: []const u8,
     url: []const u8,
     enabled: bool,
+    introduce: bool,
     has_key: bool,
     last_status: ?Status,
     last_unix: i64,
@@ -365,6 +372,7 @@ pub const Service = struct {
                 .name = try arena.dupe(u8, p.cfg.name),
                 .url = try arena.dupe(u8, p.cfg.url),
                 .enabled = p.cfg.enabled,
+                .introduce = p.cfg.introduce,
                 .has_key = p.auth != null,
                 .last_status = if (ls < 0) null else @fromBackingInt(@intCast(ls)),
                 .last_unix = p.last_unix.load(.monotonic),
@@ -419,6 +427,13 @@ pub const Service = struct {
                 r.hits = parsed.hits;
                 r.skipped = parsed.skipped;
             },
+            .peers => {
+                r.intros = parseIntroductions(a, resp.body, p.cfg.name) catch {
+                    r.status = .bad_answer;
+                    self.penalise(p);
+                    return r;
+                };
+            },
             .retrieve => {
                 const parsed = parseRetrieveAnswer(a, resp.body, p.cfg.name, p.base) catch {
                     r.status = .bad_answer;
@@ -464,7 +479,55 @@ fn cloneReply(a: Allocator, r: Reply) Allocator.Error!Reply {
     const chunks = try a.alloc(RemoteChunk, r.chunks.len);
     for (r.chunks, chunks) |c, *dst| dst.* = try copyChunk(a, c);
     o.chunks = chunks;
+    const intros = try a.alloc(Intro, r.intros.len);
+    for (r.intros, intros) |i, *dst| dst.* = .{ .from = try a.dupe(u8, i.from), .name = try a.dupe(u8, i.name), .url = try a.dupe(u8, i.url) };
+    o.intros = intros;
     return o;
+}
+
+/// A base address that is safe to offer as a peer: http or https, a host, no path, credentials, spaces or quotes.
+pub fn validBase(url: []const u8) bool {
+    const rest = if (std.mem.startsWith(u8, url, "https://")) url[8..] else if (std.mem.startsWith(u8, url, "http://")) url[7..] else return false;
+    return rest.len > 0 and rest.len <= 200 and std.mem.indexOfAny(u8, rest, "/?#@ \"'<>\\") == null;
+}
+
+/// Reads `{"node":...,"peers":[{"name":...,"url":...}]}`: the peers a peer is willing to introduce. Entries with an
+/// address that is not a plain base address are left out; names are cut to what a peer name may be.
+pub fn parseIntroductions(a: Allocator, body: []const u8, from: []const u8) AnswerError![]const Intro {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.BadAnswer;
+    const obj = switch (root) {
+        .object => |o| o,
+        else => return error.BadAnswer,
+    };
+    const arr = switch (obj.get("peers") orelse return error.BadAnswer) {
+        .array => |x| x,
+        else => return error.BadAnswer,
+    };
+    var out: std.ArrayList(Intro) = .empty;
+    for (arr.items) |item| {
+        if (out.items.len >= max_intros_per_peer) break;
+        const o = switch (item) {
+            .object => |x| x,
+            else => continue,
+        };
+        const url_raw = (try bounded(a, o.get("url"), 220)) orelse continue;
+        const url = std.mem.trimEnd(u8, url_raw, "/");
+        if (!validBase(url)) continue;
+        const name_raw = (try bounded(a, o.get("name"), 64)) orelse "";
+        // A name made only of what a peer name may hold, from the offered one or the host.
+        var nb: std.ArrayList(u8) = .empty;
+        const basis = if (name_raw.len > 0) name_raw else url[(std.mem.indexOf(u8, url, "://").? + 3)..];
+        for (basis) |c| {
+            const ch: u8 = if (std.ascii.isAlphanumeric(c)) std.ascii.toLower(c) else '-';
+            if (ch == '-' and (nb.items.len == 0 or nb.items[nb.items.len - 1] == '-')) continue;
+            if (nb.items.len >= 40) break;
+            try nb.append(a, ch);
+        }
+        while (nb.items.len > 0 and nb.items[nb.items.len - 1] == '-') _ = nb.pop();
+        if (nb.items.len == 0) continue;
+        try out.append(a, .{ .from = from, .name = nb.items, .url = url });
+    }
+    return out.items;
 }
 
 fn copyHit(a: Allocator, h: search.Hit) Allocator.Error!search.Hit {
@@ -1030,4 +1093,19 @@ test "a good answer is reused for the same question for a while, a different que
     // With the cache off every question goes to the peer.
     svc.cache_ttl_seconds = 0;
     try testing.expect(!(try svc.ask(a, .search, "odin", "&limit=10"))[0].cached);
+}
+
+test "introductions: plain addresses only, names made safe, and nonsense refused" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const body = "{\"node\":\"b\",\"peers\":[{\"name\":\"Our Lab!\",\"url\":\"https://lab.example.org/\"},{\"name\":\"x\",\"url\":\"http://u:p@h\"},{\"name\":\"y\",\"url\":\"https://h/path\"},{\"url\":\"http://192.168.1.5:8080\"},{\"name\":\"z\",\"url\":\"javascript:alert(1)\"},5]}";
+    const got = try parseIntroductions(a, body, "b");
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqualStrings("our-lab", got[0].name);
+    try testing.expectEqualStrings("https://lab.example.org", got[0].url);
+    try testing.expectEqualStrings("192-168-1-5-8080", got[1].name);
+    try testing.expectEqualStrings("b", got[1].from);
+    for ([_][]const u8{ "", "[]", "{}", "{\"peers\":5}" }) |bad| try testing.expectError(error.BadAnswer, parseIntroductions(a, bad, "b"));
+    try testing.expect(validBase("http://h:1") and !validBase("ftp://h") and !validBase("https://") and !validBase("https://h/x"));
 }
