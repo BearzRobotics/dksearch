@@ -48,12 +48,15 @@ pub const default_max_hosts: u32 = 100;
 pub const hard_max_hosts: u32 = 100_000;
 pub const default_timeout_s: u32 = 30;
 pub const default_workers: u32 = 8;
+pub const default_window: u32 = 100;
+pub const max_window: u32 = 10_000;
 pub const max_workers: u32 = 64;
 pub const max_timeout_s: u32 = 300;
 const max_redirects = 5;
 /// Links taken from one page, pending URLs per tree, and URLs remembered per run.
 const max_links_per_page = 2000;
-const max_queue = 50_000;
+/// Pages found per level by one worker are kept up to this many (bounds the memory of a level).
+const max_level_items = 100_000;
 const max_visited = 2_000_000;
 const max_sitemap_urls = 50_000;
 const max_sitemap_bytes = 10 * 1024 * 1024;
@@ -71,7 +74,7 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window" };
 
 // ------------------------------------------------------------ validation
 
@@ -164,6 +167,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     try boolOption(source, "allow_private_addresses", diag);
     try intOption(source, "timeout_seconds", 1, max_timeout_s, diag);
     try intOption(source, "workers", 1, max_workers, diag);
+    try intOption(source, "window", 0, max_window, diag);
     _ = try needString(source, "ca_bundle", false, diag);
     if (try needString(source, "language", false, diag)) |l| if (!files.validLanguageTag(l)) {
         diag.set("", key(&kbuf, source, "language"), "must be a language tag such as \"en\" (letters, digits and '-', at most 35 characters)", .{});
@@ -189,6 +193,8 @@ pub const CrawlConnector = struct {
     timeout_s: u32,
     /// How many seeds are crawled at once (each in its own task, with its own connection).
     workers: u32,
+    /// How many seeds are crawled together, breadth-first (0: all of them); the resume position moves per window.
+    window: u32,
     ca: cabundle.Choice,
     language: ?[]const u8,
     checkpoint_buf: std.ArrayList(u8) = .empty,
@@ -228,6 +234,7 @@ pub const CrawlConnector = struct {
             .allow_private = source.optionBool("allow_private_addresses") orelse false,
             .timeout_s = @intCast(source.optionInt("timeout_seconds") orelse default_timeout_s),
             .workers = @intCast(source.optionInt("workers") orelse default_workers),
+            .window = @intCast(source.optionInt("window") orelse default_window),
             .ca = ca,
             .language = language,
         };
@@ -274,24 +281,99 @@ pub const CrawlConnector = struct {
 
         var locked: LockedSink = .{ .inner = sink, .io = self.io };
         var sh: Shared = .{ .first_seed = start };
-        sh.next_seed.store(start, .monotonic);
         sh.finished = try run_arena.allocator().alloc(bool, seeds.len - start);
         @memset(sh.finished, false);
         sh.last_done = if (start > 0) seeds[start - 1].line else null;
 
-        const n_workers: usize = @min(self.workers, seeds.len - start);
-        var ctx: WorkerContext = .{ .conn = self, .arena = run_arena.allocator(), .sink = locked.sink(), .control = control, .sh = &sh, .seeds = seeds };
-        var group: Io.Group = .init;
-        var started: usize = 0;
-        while (started + 1 < n_workers) : (started += 1) {
-            // If no more tasks can be started, the ones that were do the work.
-            group.concurrent(self.io, workerTask, .{&ctx}) catch break;
+        // One client and one `Run` per worker, kept for the whole crawl.
+        const n_workers: usize = @max(1, @min(self.workers, seeds.len - start));
+        const clients = try self.gpa.alloc(http.Client, n_workers);
+        defer self.gpa.free(clients);
+        const runs = try self.gpa.alloc(Run, n_workers);
+        defer self.gpa.free(runs);
+        var made: usize = 0;
+        defer for (clients[0..made]) |*cl| cl.deinit();
+        for (clients, runs) |*cl, *rn| {
+            cl.* = .{ .allocator = self.gpa, .io = self.io };
+            made += 1;
+            cabundle.load(&cl.ca_bundle, self.gpa, self.io, self.ca) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidSource,
+            };
+            cl.now = Io.Clock.real.now(self.io);
+            rn.* = .{ .conn = self, .arena = run_arena.allocator(), .client = cl, .sink = locked.sink(), .control = control, .sh = &sh };
         }
-        workerTask(&ctx) catch {}; // this thread works too
-        group.await(self.io) catch {};
+        const outs = try self.gpa.alloc(std.ArrayList(Task), n_workers);
+        defer {
+            for (outs) |*o| o.deinit(self.gpa);
+            self.gpa.free(outs);
+        }
+        @memset(outs, .empty);
+
+        // The seeds are taken in windows. Inside a window the crawl is breadth-first: every seed's first page, then
+        // every page one link away, and so on, so a window covers many sites early instead of one site deeply.
+        // The resume position moves forward a window at a time.
+        var first = start;
+        windows: while (first < seeds.len) {
+            const end = if (self.window == 0) seeds.len else @min(first + self.window, seeds.len);
+            // Level 0: the seeds themselves (a sitemap seed contributes its pages, which follow no links).
+            var level: std.ArrayList(Task) = .empty;
+            defer level.deinit(self.gpa);
+            for (seeds[first..end], first..) |seed, index| {
+                if (control.isCancelled() or sh.stop.load(.monotonic)) break :windows;
+                const u = parseUrl(seed.url) orelse {
+                    _ = runs[0].reject(.limit);
+                    continue;
+                };
+                if (!seed.sitemap) {
+                    const keep = (runs[0].firstVisit(seed.url) catch return error.OutOfMemory) orelse continue;
+                    try level.append(self.gpa, .{ .url = keep, .depth = 0, .seed = @intCast(index), .root = true, .site = u.host });
+                } else {
+                    var arena = std.heap.ArenaAllocator.init(self.gpa);
+                    defer arena.deinit();
+                    const a = arena.allocator();
+                    var pages: std.ArrayList([]const u8) = .empty;
+                    var n_files: u32 = 0;
+                    if (runs[0].sitemapPages(a, seed.url, u.host, 0, &n_files, &pages) catch return error.OutOfMemory) break :windows;
+                    for (pages.items) |page| {
+                        const keep = (runs[0].firstVisit(page) catch return error.OutOfMemory) orelse continue;
+                        try level.append(self.gpa, .{ .url = keep, .depth = self.max_depth, .seed = @intCast(index), .root = true, .site = u.host });
+                    }
+                }
+            }
+            var depth: u32 = 0;
+            while (level.items.len > 0) : (depth += 1) {
+                if (self.max_depth == 0) control.setProgress(first, seeds.len) else control.setProgress(sh.fetched.load(.monotonic), self.max_pages);
+                var ctx: LevelContext = .{ .conn = self, .items = level.items, .runs = runs, .outs = outs };
+                var group: Io.Group = .init;
+                var started: usize = 0;
+                while (started + 1 < n_workers) : (started += 1) {
+                    group.concurrent(self.io, levelWorker, .{ &ctx, started + 1 }) catch break;
+                }
+                levelWorker(&ctx, 0) catch {};
+                group.await(self.io) catch {};
+                const all_taken = ctx.next.load(.monotonic) >= level.items.len and !sh.stop.load(.monotonic) and !sh.exhausted.load(.monotonic);
+                // The next level: what the workers found, taken a seed at a time so that consecutive pages are on
+                // different sites (a site is asked by one worker at a time, so a run of one site's pages would
+                // leave the others idle).
+                const next = try self.nextLevel(outs, first, end);
+                // Stopped part-way through the window: it is not finished (unless this was its last level and every
+                // page of it was fetched, in which case there is nothing left to repeat).
+                if ((control.isCancelled() or sh.stop.load(.monotonic) or sh.exhausted.load(.monotonic)) and !(all_taken and next.len == 0)) {
+                    self.gpa.free(next);
+                    break :windows;
+                }
+                level.clearRetainingCapacity();
+                try level.appendSlice(self.gpa, next);
+                self.gpa.free(next);
+            }
+            // The window is done: its seeds are finished, in order.
+            for (first..end) |index| self.finishSeed(&sh, seeds, index, locked.sink());
+            if (sh.stop.load(.monotonic) or control.isCancelled()) break;
+            first = end;
+        }
 
         if (sh.out_of_memory.load(.monotonic)) return error.OutOfMemory;
-        if (ctx.load_failed.load(.monotonic)) return error.InvalidSource;
         sh.mutex.lockUncancelable(self.io);
         const done = sh.last_done;
         sh.mutex.unlock(self.io);
@@ -301,56 +383,76 @@ pub const CrawlConnector = struct {
         return .{};
     }
 
-    /// What every worker task of a run is given.
-    const WorkerContext = struct {
-        conn: *CrawlConnector,
-        arena: Allocator,
-        sink: api.Sink,
-        control: *api.Control,
-        sh: *Shared,
-        seeds: []const Seed,
-        load_failed: std.atomic.Value(bool) = .init(false),
+    /// One page of the crawl: the address, how many links from its seed it is, which seed it belongs to (and so its
+    /// site, which decides which links may be followed), and whether the administrator named it.
+    const Task = struct {
+        url: []const u8,
+        depth: u32,
+        seed: u32,
+        root: bool = false,
+        site: []const u8,
     };
 
-    /// One worker: takes the next seed, crawls it, records it as finished, until there are none left, the page
-    /// budget is spent, or the run is stopped.
-    fn workerTask(ctx: *WorkerContext) Io.Cancelable!void {
-        const self = ctx.conn;
-        const sh = ctx.sh;
-        var client: http.Client = .{ .allocator = self.gpa, .io = self.io };
-        defer client.deinit();
-        cabundle.load(&client.ca_bundle, self.gpa, self.io, self.ca) catch |e| {
-            if (e == error.OutOfMemory) sh.out_of_memory.store(true, .monotonic) else ctx.load_failed.store(true, .monotonic);
-            sh.stop.store(true, .monotonic);
-            return;
-        };
-        client.now = Io.Clock.real.now(self.io);
-        var r: Run = .{ .conn = self, .arena = ctx.arena, .client = &client, .sink = ctx.sink, .control = ctx.control, .sh = sh };
+    const LevelContext = struct {
+        conn: *CrawlConnector,
+        items: []const Task,
+        runs: []Run,
+        outs: []std.ArrayList(Task),
+        next: std.atomic.Value(usize) = .init(0),
+    };
 
+    /// A worker of one level: takes the next page of the level until there are none, fetching, storing and
+    /// collecting the links of each into its own list.
+    fn levelWorker(ctx: *LevelContext, w: usize) Io.Cancelable!void {
+        const self = ctx.conn;
+        const r = &ctx.runs[w];
+        const sh = r.sh;
         while (true) {
-            if (ctx.control.isCancelled() or sh.stop.load(.monotonic) or sh.exhausted.load(.monotonic)) return;
-            const index = sh.next_seed.fetchAdd(1, .monotonic);
-            if (index >= ctx.seeds.len) return;
-            const seed = ctx.seeds[index];
-            // With no link following the seeds are the whole job; otherwise the number of pages is open-ended
-            // and only the page budget bounds it.
-            if (self.max_depth == 0) ctx.control.setProgress(index, ctx.seeds.len) else ctx.control.setProgress(sh.fetched.load(.monotonic), self.max_pages);
-            const result = r.crawlSeed(seed) catch {
+            if (r.control.isCancelled() or sh.stop.load(.monotonic) or sh.exhausted.load(.monotonic)) return;
+            const index = ctx.next.fetchAdd(1, .monotonic);
+            if (index >= ctx.items.len) return;
+            const result = r.fetchOne(ctx.items[index], &ctx.outs[w]) catch {
                 sh.out_of_memory.store(true, .monotonic);
                 sh.stop.store(true, .monotonic);
                 return;
             };
-            switch (result) {
-                .stopped => {
-                    sh.stop.store(true, .monotonic);
-                    return;
-                },
-                .stored, .skipped => {},
+            if (result == .stopped) {
+                sh.stop.store(true, .monotonic);
+                return;
             }
-            // A seed cut short by the page budget is not finished: it will be visited again on a resume.
-            if (sh.exhausted.load(.monotonic)) return;
-            self.finishSeed(sh, ctx.seeds, index, ctx.sink);
         }
+        _ = self;
+    }
+
+    /// Merges the workers' found links into the next level, round-robin over the seeds of the window `first..end`.
+    fn nextLevel(self: *CrawlConnector, outs: []std.ArrayList(Task), first: usize, end: usize) Allocator.Error![]Task {
+        const n = end - first;
+        const buckets = try self.gpa.alloc(std.ArrayList(Task), n);
+        defer {
+            for (buckets) |*b| b.deinit(self.gpa);
+            self.gpa.free(buckets);
+        }
+        @memset(buckets, .empty);
+        var total: usize = 0;
+        for (outs) |*o| {
+            for (o.items) |t| {
+                try buckets[t.seed - first].append(self.gpa, t);
+                total += 1;
+            }
+            o.clearRetainingCapacity();
+        }
+        const merged = try self.gpa.alloc(Task, total);
+        var at: usize = 0;
+        var round: usize = 0;
+        while (at < total) : (round += 1) {
+            for (buckets) |*b| {
+                if (round < b.items.len) {
+                    merged[at] = b.items[round];
+                    at += 1;
+                }
+            }
+        }
+        return merged;
     }
 
     /// Records that seed `index` is finished and moves the resume position forward over every seed that is now
@@ -818,27 +920,6 @@ const Run = struct {
         return gop.key_ptr.*;
     }
 
-    fn crawlSeed(self: *Run, seed: Seed) error{OutOfMemory}!Result {
-        const u = parseUrl(seed.url) orelse return self.reject(.limit);
-        if (!seed.sitemap) return self.crawlTree(seed.url, 0, u.host);
-
-        // A sitemap lists pages: fetch each of them, and follow no links from
-        // them (the sitemap already says what the site wants indexed).
-        var arena = std.heap.ArenaAllocator.init(self.conn.gpa);
-        defer arena.deinit();
-        const a = arena.allocator();
-        var pages: std.ArrayList([]const u8) = .empty;
-        var n_files: u32 = 0;
-        if (try self.sitemapPages(a, seed.url, u.host, 0, &n_files, &pages)) return .stopped;
-        var last: Result = .skipped;
-        for (pages.items) |page| {
-            last = try self.crawlTree(page, self.conn.max_depth, u.host);
-            if (last == .stopped) return .stopped;
-            if (self.sh.exhausted.load(.monotonic)) break;
-        }
-        return last;
-    }
-
     /// Expands the sitemap (or sitemap index) at `url` into page URLs on the
     /// sitemap's own site. Returns true if the run was stopped.
     fn sitemapPages(self: *Run, a: Allocator, url: []const u8, site: []const u8, level: u32, n_files: *u32, out: *std.ArrayList([]const u8)) error{OutOfMemory}!bool {
@@ -887,57 +968,40 @@ const Run = struct {
         return false;
     }
 
-    /// Breadth-first from `root`, following same-site links down to
-    /// `max_depth`. `depth0` is the depth of `root` itself.
-    fn crawlTree(self: *Run, root: []const u8, depth0: u32, site: []const u8) error{OutOfMemory}!Result {
+    /// Fetches and stores one page of the crawl and appends the links worth following (to `out`).
+    fn fetchOne(self: *Run, t: CrawlConnector.Task, out: *std.ArrayList(CrawlConnector.Task)) error{OutOfMemory}!Result {
         const gpa = self.conn.gpa;
-        var queue: std.ArrayList(Item) = .empty;
-        defer queue.deinit(gpa);
-        const first = (try self.firstVisit(root)) orelse return .skipped;
-        try queue.append(gpa, .{ .url = first, .depth = depth0 });
-        var any = false;
-        var head: usize = 0;
-        while (head < queue.items.len) {
-            if (self.control.isCancelled()) return .stopped;
-            if (self.sh.fetched.load(.monotonic) >= self.conn.max_pages) {
-                self.sh.exhausted.store(true, .monotonic);
-                break;
-            }
-            if (self.sh.stop.load(.monotonic)) return .stopped;
-            const item = queue.items[head];
-            head += 1;
-
-            var page = std.heap.ArenaAllocator.init(gpa);
-            defer page.deinit();
-            const a = page.allocator();
-            const got = switch (try self.get(a, item.url, site, accept_pages, self.conn.max_page_bytes, head == 1)) {
-                .stopped => return .stopped,
-                .skipped => continue,
-                .page => |p| p,
-            };
-            // A redirect target counts as seen too.
-            if (!std.mem.eql(u8, got.url, item.url)) _ = try self.firstVisit(got.url);
-
-            const stored = try self.store(a, got.url, got.resp);
-            switch (stored.result) {
-                .stopped => return .stopped,
-                .stored => any = true,
-                .skipped => {},
-            }
-            if (item.depth >= self.conn.max_depth) continue;
-            for (stored.links) |link| {
-                if (queue.items.len - head >= max_queue) break;
-                const target = (try resolveRedirect(a, got.url, link)) orelse continue;
-                const tu = parseUrl(target) orelse continue;
-                if (!self.mayVisit(site, tu.host) or looksBinary(tu.uri.path)) continue;
-                const keep = (try self.firstVisit(target)) orelse continue;
-                try queue.append(gpa, .{ .url = keep, .depth = item.depth + 1 });
-            }
+        if (self.sh.fetched.load(.monotonic) >= self.conn.max_pages) {
+            self.sh.exhausted.store(true, .monotonic);
+            return .skipped;
         }
-        return if (any) .stored else .skipped;
-    }
+        var page = std.heap.ArenaAllocator.init(gpa);
+        defer page.deinit();
+        const a = page.allocator();
+        const got = switch (try self.get(a, t.url, t.site, accept_pages, self.conn.max_page_bytes, t.root)) {
+            .stopped => return .stopped,
+            .skipped => return .skipped,
+            .page => |p| p,
+        };
+        // A redirect target counts as seen too.
+        if (!std.mem.eql(u8, got.url, t.url)) _ = try self.firstVisit(got.url);
 
-    const Item = struct { url: []const u8, depth: u32 };
+        const stored = try self.store(a, got.url, got.resp);
+        switch (stored.result) {
+            .stopped => return .stopped,
+            .stored, .skipped => {},
+        }
+        if (t.depth >= self.conn.max_depth) return stored.result;
+        for (stored.links) |link| {
+            if (out.items.len >= max_level_items) break;
+            const target = (try resolveRedirect(a, got.url, link)) orelse continue;
+            const tu = parseUrl(target) orelse continue;
+            if (!self.mayVisit(t.site, tu.host) or looksBinary(tu.uri.path)) continue;
+            const keep = (try self.firstVisit(target)) orelse continue;
+            try out.append(gpa, .{ .url = keep, .depth = t.depth + 1, .seed = t.seed, .site = t.site });
+        }
+        return stored.result;
+    }
 
     const Stored = struct { result: Result, links: []const []const u8 = &.{} };
 
@@ -1396,6 +1460,39 @@ test "seeds on different hosts are crawled at the same time, and the resume posi
     try testing.expect(cut.checkpoint == null);
 }
 
+test "a window is crawled breadth-first: every seed's first page before any seed's second" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/robots.txt", .status = 404 },
+        .{ .path = "/a", .body = "<p>seed a</p><a href=\"/a1\">x</a>" },
+        .{ .path = "/a1", .body = "<p>a one</p>" },
+        .{ .path = "/b", .body = "<p>seed b</p><a href=\"/b1\">x</a>" },
+        .{ .path = "/b1", .body = "<p>b one</p>" },
+        .{ .path = "/c", .body = "<p>seed c</p>" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [3][96]u8 = undefined;
+    var seeds: std.ArrayList(u8) = .empty;
+    defer seeds.deinit(testing.allocator);
+    for ([_][]const u8{ "/a", "/b", "/c" }, 0..) |p, i| try seeds.print(testing.allocator, "{s}\n", .{srv.url(&b[i], p)});
+    var conn = try testConnector(&tmp, seeds.items, "t/1");
+    defer conn.deinit();
+    conn.max_depth = 1;
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    _ = try conn.connector().run(got.sink(), &ctl, null);
+    try testing.expectEqual(@as(usize, 5), got.texts.items.len);
+    // The three seeds first, then what they link to: not seed a and its page before seed b.
+    try testing.expect(std.mem.startsWith(u8, got.texts.items[0], "seed a"));
+    try testing.expect(std.mem.startsWith(u8, got.texts.items[1], "seed b"));
+    try testing.expect(std.mem.startsWith(u8, got.texts.items[2], "seed c"));
+    try testing.expect(std.mem.startsWith(u8, got.texts.items[3], "a one"));
+    try testing.expect(std.mem.startsWith(u8, got.texts.items[4], "b one"));
+}
+
 test "requests to one host are spaced by the delay" {
     var srv: TestServer = undefined;
     try srv.start(&.{
@@ -1443,6 +1540,7 @@ test "cancelling stops the run and reports where to resume" {
     for ([_][]const u8{ "/1", "/2", "/3" }, 0..) |p, i| try seeds.print(testing.allocator, "{s}\n", .{srv.url(&b[i], p)});
     var conn = try testConnector(&tmp, seeds.items, "t/1");
     defer conn.deinit();
+    conn.window = 1; // each seed is its own window, so the resume position moves after every seed
 
     // Cancel from inside the sink after the first page.
     const Stopper = struct {

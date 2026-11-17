@@ -84,6 +84,7 @@ const crawl = [_]Option{
     .{ .key = "max_hosts", .label = "Most other sites per run", .type = .number, .min = 1, .max = 100000, .default = "100", .help = "Sites found by following links; sites you list are not counted." },
     .{ .key = "max_page_bytes", .label = "Largest page (bytes)", .type = .number, .min = 1, .max = 33554432, .default = "2097152", .help = "Larger pages are skipped." },
     .{ .key = "workers", .label = "Seeds crawled at once", .type = .number, .min = 1, .max = 64, .default = "8", .help = "How many addresses are crawled at the same time. A site is still asked by one at a time, with the delay above between requests, so this changes how fast the crawl moves across many sites, not how hard any one site is hit." },
+    .{ .key = "window", .label = "Seeds crawled together", .type = .number, .min = 0, .max = 10000, .default = "100", .help = "Seeds are crawled in groups, breadth-first inside a group: every address's first page, then every page one link away, and so on. 0 means all seeds in one group. An interrupted crawl repeats at most its current group." },
     timeout,
     ca,
     lang,
