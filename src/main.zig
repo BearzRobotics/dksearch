@@ -969,9 +969,29 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
 
     installSignalHandlers(onServeSignal);
     var result: u8 = exit_ok;
+    var doc_service: ?dk.docserver.Service = null;
+    if (cfg.docserver) |d| {
+        var secret: ?[]const u8 = d.jwt_secret;
+        if (d.jwt_secret_file) |path| {
+            const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4096)) catch |e| {
+                std.debug.print("dksearch: docserver.jwt_secret_file {s} cannot be read: {t}\n", .{ path, e });
+                return 1;
+            };
+            secret = std.mem.trim(u8, text, " \t\r\n"); // kept for the life of the server
+        }
+        doc_service = dk.docserver.Service.init(io, .{
+            .kind = if (std.mem.eql(u8, d.kind, "collabora")) .collabora else .onlyoffice,
+            .url = d.url,
+            .public_url = d.public_url,
+            .jwt_secret = secret,
+        }) catch |e| {
+            std.debug.print("dksearch: cannot set up the document server links: {t}\n", .{e});
+            return 1;
+        };
+    }
     var retrieve_cache = dk.retrievecache.Cache.init(gpa, io, @as(usize, cfg.search.retrieve_cache_mb) * 1024 * 1024);
     defer retrieve_cache.deinit();
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

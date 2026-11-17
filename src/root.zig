@@ -25,6 +25,7 @@ pub const editdistance = @import("editdistance.zig");
 pub const access = @import("access.zig");
 pub const retrievecache = @import("retrievecache.zig");
 pub const peers = @import("peers.zig");
+pub const docserver = @import("docserver.zig");
 pub const optioninfo = @import("optioninfo.zig");
 pub const settinginfo = @import("settinginfo.zig");
 pub const officetext = @import("officetext.zig");
@@ -73,6 +74,7 @@ test {
     _ = access;
     _ = retrievecache;
     _ = peers;
+    _ = docserver;
     _ = optioninfo;
     _ = settinginfo;
     _ = officetext;

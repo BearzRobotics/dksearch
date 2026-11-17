@@ -299,6 +299,16 @@ pub const Peer = struct {
 
 pub const max_peers = 50;
 
+/// A document server (OnlyOffice or Collabora) that office files can be opened in from the viewer.
+pub const DocServer = struct {
+    /// `onlyoffice` or `collabora`.
+    kind: []const u8,
+    url: []const u8,
+    public_url: []const u8,
+    jwt_secret: ?[]const u8 = null,
+    jwt_secret_file: ?[]const u8 = null,
+};
+
 pub const max_collections = 200;
 pub const max_collection_sources = 1000;
 
@@ -326,6 +336,7 @@ pub const Config = struct {
     /// This node's name, shown beside results that come from it on another node.
     node_name: []const u8 = "",
     peers: []const Peer = &.{},
+    docserver: ?DocServer = null,
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -344,7 +355,7 @@ const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_m
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
 const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
-const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer" };
+const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver" };
 
 /// Parses and validates configuration text. `source_name` is only used in
 /// diagnostics (normally the file path).
@@ -500,6 +511,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
             cfg.node_name = try a.dupe(u8, n);
         }
     }
+    cfg.docserver = try readDocServer(a, src, root, diag);
     cfg.peers = try readPeers(a, src, root, diag);
     if (cfg.peers.len > 0 and cfg.node_name.len == 0) {
         diag.set(src, "node.name", "is required when peers are configured (peers show this name beside the results they get from here)", .{});
@@ -556,6 +568,44 @@ fn stringList(a: Allocator, src: []const u8, key: []const u8, v: toml.Value, dia
         },
     };
     return out;
+}
+
+/// A base address `http://host[:port]` or `https://host[:port]` without a path or credentials, trailing slashes removed.
+fn baseAddress(a: Allocator, src: []const u8, key: []const u8, text: []const u8, diag: *Diagnostic) Error![]const u8 {
+    const url = std.mem.trimEnd(u8, text, "/");
+    const has_scheme = std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
+    const rest = if (has_scheme) url[std.mem.indexOf(u8, url, "://").? + 3 ..] else "";
+    if (!has_scheme or rest.len == 0 or std.mem.indexOfAny(u8, rest, "/?#@ \"'<>") != null) {
+        diag.set(src, key, "must look like http://host:port or https://host (no path, no credentials), got \"{s}\"", .{text});
+        return error.InvalidValue;
+    }
+    return a.dupe(u8, url);
+}
+
+fn readDocServer(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!?DocServer {
+    const t = (try subTable(src, root, "docserver", diag)) orelse return null;
+    try checkKeys(src, "docserver", t, &[_][]const u8{ "kind", "url", "public_url", "jwt_secret", "jwt_secret_file" }, diag);
+    const kind = try reqStr(src, "docserver", t, "kind", diag);
+    if (!std.mem.eql(u8, kind, "onlyoffice") and !std.mem.eql(u8, kind, "collabora")) {
+        diag.set(src, "docserver.kind", "must be \"onlyoffice\" or \"collabora\", got \"{s}\"", .{kind});
+        return error.InvalidValue;
+    }
+    var d: DocServer = .{
+        .kind = try a.dupe(u8, kind),
+        .url = try baseAddress(a, src, "docserver.url", try reqStr(src, "docserver", t, "url", diag), diag),
+        .public_url = try baseAddress(a, src, "docserver.public_url", try reqStr(src, "docserver", t, "public_url", diag), diag),
+    };
+    if (try str(src, "docserver", t, "jwt_secret", diag)) |s| d.jwt_secret = try a.dupe(u8, s);
+    if (try str(src, "docserver", t, "jwt_secret_file", diag)) |s| d.jwt_secret_file = try a.dupe(u8, s);
+    if (d.jwt_secret != null and d.jwt_secret_file != null) {
+        diag.set(src, "docserver.jwt_secret", "give either jwt_secret or jwt_secret_file, not both", .{});
+        return error.InvalidValue;
+    }
+    if (d.jwt_secret != null or d.jwt_secret_file != null) if (std.mem.eql(u8, kind, "collabora")) {
+        diag.set(src, "docserver.jwt_secret", "only applies to OnlyOffice (Collabora is given a token in the address)", .{});
+        return error.InvalidValue;
+    };
+    return d;
 }
 
 fn readPeers(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error![]const Peer {
@@ -1123,6 +1173,26 @@ test "collections and the anonymous access setting are read and checked" {
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = [\"a\"]\n[[collection]]\nname = \"x\"\nsources = [\"b\"]\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[access]\nanonymous_collections = [\"ghost\"]\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = []\n", &d));
+}
+
+test "a document server is read and checked" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "[docserver]\nkind = \"onlyoffice\"\nurl = \"http://127.0.0.1:8090/\"\npublic_url = \"http://172.17.0.1:8080\"\njwt_secret = \"s\"\n", &d);
+    defer c.deinit();
+    try testing.expectEqualStrings("onlyoffice", c.docserver.?.kind);
+    try testing.expectEqualStrings("http://127.0.0.1:8090", c.docserver.?.url);
+    try testing.expectEqualStrings("s", c.docserver.?.jwt_secret.?);
+    var none = try loadFromSlice(testing.allocator, "t.toml", "", &d);
+    defer none.deinit();
+    try testing.expect(none.docserver == null);
+    const bad = [_][]const u8{
+        "[docserver]\nkind = \"word\"\nurl = \"http://h\"\npublic_url = \"http://p\"\n",
+        "[docserver]\nkind = \"collabora\"\nurl = \"http://h/path\"\npublic_url = \"http://p\"\n",
+        "[docserver]\nkind = \"collabora\"\nurl = \"http://h\"\n",
+        "[docserver]\nkind = \"collabora\"\nurl = \"http://h\"\npublic_url = \"http://p\"\njwt_secret = \"x\"\n",
+        "[docserver]\nkind = \"onlyoffice\"\nurl = \"http://h\"\npublic_url = \"http://p\"\njwt_secret = \"x\"\njwt_secret_file = \"y\"\n",
+    };
+    for (bad) |text| try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", text, &d));
 }
 
 test "the node name and peers are read and checked" {

@@ -474,6 +474,19 @@ Visitors without a key then see only the members of those collections everywhere
 
 An API key (made with **api-key add**) replaces the anonymous scope by the union of its collections' sources (or all of them with `--all`). It is sent as `Authorization: Bearer dkk_...`; a key that is not valid is refused with 401 `invalid_key` and is never treated as anonymous. The scope comes from the key or the setting, never from the request: nothing in a query, a parameter or a source name widens it. Keys are shown once and kept only as hashes. The administration interface and its token are separate and unaffected.
 
+OPENING OFFICE FILES IN A DOCUMENT SERVER
+With a document server (OnlyOffice Docs, or Collabora Online / LibreOffice Online) the viewer page of an office file (`docx`, `xlsx`, `pptx`, `odt`, `ods`, `odp`, and the older `doc`, `xls`, `ppt`, `rtf`, `csv`) gets an *Open in the document viewer* button next to *Open the original file*, which shows the file formatted, read-only, in the document server. It needs a source with `serve_originals = true` (the file is fetched from there), and a server you run yourself, for example from Docker:
+
+    [docserver]
+    kind = "collabora"                     # or "onlyoffice"
+    url = "http://127.0.0.1:9980"          # the document server as your browser reaches it
+    public_url = "http://172.17.0.1:8080"  # this dksearch as the document server reaches it
+    jwt_secret_file = "/etc/dksearch/onlyoffice.jwt"   # OnlyOffice only, if its JWT is on (its default); or jwt_secret
+
+`/doc/ID/open` checks that the caller may see the document, then sends the browser to Collabora, or serves a small page that starts OnlyOffice's viewer. The document server has no cookie or key, so it is given a token: an HMAC over the document's id and an expiry, valid for that one document for one hour, usable only to read that file through `/wopi/files/ID` and `/wopi/files/ID/contents` (the WOPI protocol; both servers read the file this way). The tokens are signed with a secret made when the server starts, so links stop working after a restart. A token lets its holder read that file but gives no access to anything else, search included. Nothing is written back: the viewer is read-only (`permission=readonly`, `mode: view`).
+
+For Collabora, allow dksearch as a WOPI host (`storage.wopi.host`, in Docker `-e 'extra_params=--o:ssl.enable=false --o:storage.wopi.host[0]=.+'`; use a precise pattern in real use). OnlyOffice by default refuses to fetch from private addresses (`services.CoAuthoring.request-filtering-agent.allowPrivateIPAddress`); set it for a dksearch on your LAN. `public_url` must be an address the document server can reach: from a Docker container `127.0.0.1` is the container itself, so use the host's address (`172.17.0.1` on the default bridge) and have dksearch listen there (`server.address`). OnlyOffice's page uses a policy that allows only its own script (by hash), the document server's script and frame; the rest of dksearch stays script-free.
+
 PEERS AND FEDERATED SEARCH
 A *peer* is another dksearch node you may ask. Peers are configured by hand, never discovered:
 

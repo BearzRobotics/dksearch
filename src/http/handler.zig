@@ -48,7 +48,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, api_search, api_retrieve, api_health, style, document, zim, other };
+const Route = enum { help_search, help_regex, home, search_page, api_search, api_retrieve, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -61,6 +61,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/assets/style.css")) return .style;
     if (std.mem.startsWith(u8, path, "/doc/")) return .document;
     if (std.mem.startsWith(u8, path, "/zim/")) return .zim;
+    if (std.mem.startsWith(u8, path, "/wopi/files/")) return .wopi;
     return .other;
 }
 
@@ -85,6 +86,8 @@ pub const Services = struct {
     originals: ?*const dk.originals.Service = null,
     /// ZIM files whose articles can be shown from the file itself.
     zims: ?*const dk.zimserve.Service = null,
+    /// A document server that office files can be opened in (`[docserver]`).
+    docserver: ?*const dk.docserver.Service = null,
     /// Other nodes this one can ask (`peers=1`), if any are configured.
     peers: ?*dk.peers.Service = null,
     /// What retrieval derives from stored texts (chunks, PDF page indexes), kept between requests.
@@ -200,6 +203,10 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         return resp;
     }
 
+    // A document server's requests carry their own token (in the address, and Collabora also in an Authorization
+    // header, which is not an API key): that token alone decides.
+    if (r == .wopi) return wopiPage(arena, searcher, services, t.path, t.params);
+
     // Who is asking, and what they may see. Pages that show no documents need no key.
     switch (try scopeFor(arena, services_in, authorization)) {
         .ok => |c| {
@@ -241,6 +248,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         .search_page => try pageSearch(arena, searcher, regex, services, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
         .document => try documentPage(arena, searcher, services, t.path, t.params),
         .zim => try zimPage(arena, services, t.path),
+        .wopi => unreachable, // answered above
         .other => unreachable,
     };
 }
@@ -594,8 +602,12 @@ const max_view_bytes = 512 * 1024;
 fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Services, path: []const u8, params: query.Params) error{OutOfMemory}!Response {
     var hex = path["/doc/".len..];
     var want_file = false;
+    var want_open = false;
     var want_image: ?usize = null;
-    if (std.mem.endsWith(u8, hex, "/file")) {
+    if (std.mem.endsWith(u8, hex, "/open")) {
+        want_open = true;
+        hex = hex[0 .. hex.len - "/open".len];
+    } else if (std.mem.endsWith(u8, hex, "/file")) {
         want_file = true;
         hex = hex[0 .. hex.len - "/file".len];
     } else if (std.mem.indexOf(u8, hex, "/image/")) |at| {
@@ -612,12 +624,16 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     const can_open = if (services.originals) |o| (if (hit.url) |u| o.serves(hit.connector, u) else false) else false;
     if (want_file) return if (can_open) originalFile(arena, services.originals.?, hit) else htmlError(arena, .not_found, "Not found", "The original file of this document is not available here.");
     if (want_image) |n| return if (can_open) documentImage(arena, services.originals.?, hit, n) else htmlError(arena, .not_found, "Not found", "The pictures of this document are not available here.");
+    // The document server shows office files read-only; the caller was checked above.
+    const doc_format: ?dk.docserver.Format = if (services.docserver != null and can_open) (if (hit.url) |u| dk.docserver.formatOf(u) else null) else null;
+    if (want_open) return if (doc_format) |f| openInDocServer(arena, services.docserver.?, hex, hit, f) else htmlError(arena, .not_found, "Not found", "This document cannot be opened in a document server here.");
     // A ZIM article can be read from the file itself.
-    var open_link: ?html.OpenLink = null;
+    var open_links: std.ArrayList(html.OpenLink) = .empty;
     if (can_open) {
-        open_link = .{ .href = try std.fmt.allocPrint(arena, "/doc/{s}/file", .{hex}), .label = "Open the original file" };
+        try open_links.append(arena, .{ .href = try std.fmt.allocPrint(arena, "/doc/{s}/file", .{hex}), .label = "Open the original file" });
+        if (doc_format != null) try open_links.append(arena, .{ .href = try std.fmt.allocPrint(arena, "/doc/{s}/open", .{hex}), .label = "Open in the document viewer" });
     } else if (services.zims) |z| if (hit.url) |u| if (zimAddress(u)) |za| if (z.has(za.name)) {
-        open_link = .{ .href = try std.fmt.allocPrint(arena, "/zim/{s}/{s}", .{ za.name, za.path }), .label = "Read the article" };
+        try open_links.append(arena, .{ .href = try std.fmt.allocPrint(arena, "/zim/{s}/{s}", .{ za.name, za.path }), .label = "Read the article" });
     };
 
     var text: ?[]const u8 = null;
@@ -646,8 +662,84 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
         };
     };
     var aw: std.Io.Writer.Allocating = .init(arena);
-    html.writeDocument(&aw.writer, hit, text, cut, open_link, rendered, is_markdown) catch return error.OutOfMemory;
+    html.writeDocument(&aw.writer, hit, text, cut, open_links.items, rendered, is_markdown) catch return error.OutOfMemory;
     return htmlResponse(arena, .ok, aw.written());
+}
+
+/// Sends the browser to the document server to view `hit`'s file: Collabora by redirect, OnlyOffice by a small page
+/// that starts its viewer. The token lets the server fetch just this file for an hour.
+fn openInDocServer(arena: Allocator, svc: *const dk.docserver.Service, hex: []const u8, hit: dk.search.Hit, format: dk.docserver.Format) error{OutOfMemory}!Response {
+    var id: dk.document.Id = undefined;
+    _ = std.fmt.hexToBytes(&id, hex) catch return htmlError(arena, .not_found, "Not found", "No such document.");
+    var buf: [dk.docserver.token_len]u8 = undefined;
+    const token = try arena.dupe(u8, dk.docserver.makeToken(&svc.secret, id, svc.now() + dk.docserver.token_ttl_seconds, &buf));
+    switch (svc.settings.kind) {
+        .collabora => {
+            const to = try dk.docserver.collaboraUrl(arena, svc.settings, hex, token);
+            return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = to }, no_store }) };
+        },
+        .onlyoffice => {
+            const name = baseName(hit.url orelse "");
+            const version = try std.fmt.allocPrint(arena, "{d}", .{hit.modified_at orelse 0});
+            const cfg = try dk.docserver.onlyofficeConfig(arena, svc.settings, hex, token, name, format, version);
+            const page = try dk.docserver.onlyofficePage(arena, svc.settings, cfg, if (hit.title) |t| t else name);
+            var r = htmlResponse(arena, .ok, page.html);
+            // Its own policy instead of the usual one (two policies would both apply, and the stricter wins).
+            const headers = try arena.alloc(Header, 4);
+            headers[0] = .{ .name = "content-security-policy", .value = page.csp };
+            headers[1] = no_store;
+            headers[2] = .{ .name = "referrer-policy", .value = "no-referrer" };
+            headers[3] = .{ .name = "x-content-type-options", .value = "nosniff" };
+            r.headers = headers;
+            return r;
+        },
+    }
+}
+
+fn baseName(url: []const u8) []const u8 {
+    const no_query = url[0 .. std.mem.indexOfAny(u8, url, "?#") orelse url.len];
+    return no_query[(std.mem.lastIndexOfScalar(u8, no_query, '/') orelse return no_query) + 1 ..];
+}
+
+/// What a document server asks of dksearch (WOPI): `/wopi/files/ID` (the file's details) and
+/// `/wopi/files/ID/contents` (the file). Only with a token made for that document and still valid; the token is
+/// the whole authorization, since the server has no key.
+fn wopiPage(arena: Allocator, searcher: dk.search.Searcher, services: Services, path: []const u8, params: query.Params) error{OutOfMemory}!Response {
+    const svc = services.docserver orelse return htmlError(arena, .not_found, "Not found", "That page does not exist.");
+    var hex = path["/wopi/files/".len..];
+    var contents = false;
+    if (std.mem.endsWith(u8, hex, "/contents")) {
+        contents = true;
+        hex = hex[0 .. hex.len - "/contents".len];
+    }
+    const refused = struct {
+        fn at(a: Allocator) error{OutOfMemory}!Response {
+            return apiError(a, .unauthorized, "invalid_token", "the access token is missing, expired or for another document");
+        }
+    }.at;
+    var id: dk.document.Id = undefined;
+    if (hex.len != 2 * @sizeOf(dk.document.Id)) return refused(arena);
+    _ = std.fmt.hexToBytes(&id, hex) catch return refused(arena);
+    const token = params.get("access_token") orelse return refused(arena);
+    const for_id = dk.docserver.checkToken(&svc.secret, token, svc.now()) orelse return refused(arena);
+    if (!std.mem.eql(u8, &for_id, &id)) return refused(arena);
+    const hit = (searcher.info(arena, id) catch |e| return searchFailure(arena, e, true)) orelse return apiError(arena, .not_found, "not_found", "no such document");
+    const origin = services.originals orelse return apiError(arena, .not_found, "not_found", "the original file is not available");
+    const url = hit.url orelse return apiError(arena, .not_found, "not_found", "the original file is not available");
+    if (!origin.serves(hit.connector, url) or dk.docserver.formatOf(url) == null) return apiError(arena, .not_found, "not_found", "the original file is not available");
+    const served = origin.read(arena, hit.connector, url) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.NotServed, error.NotFound, error.Forbidden => apiError(arena, .not_found, "not_found", "the original file is not available"),
+        error.TooLarge => apiError(arena, .payload_too_large, "too_large", "the file is too large"),
+        error.Io => apiError(arena, .internal_server_error, "internal_error", "the file could not be read"),
+    };
+    if (contents) {
+        return .{ .status = .ok, .content_type = "application/octet-stream", .body = served.bytes, .headers = headersWith(arena, &.{ .{ .name = "x-content-type-options", .value = "nosniff" }, .{ .name = "cache-control", .value = "private, no-store" }, .{ .name = "x-wopi-itemversion", .value = try std.fmt.allocPrint(arena, "{d}", .{hit.modified_at orelse 0}) } }) };
+    }
+    const info: dk.docserver.CheckFileInfo = .{ .BaseFileName = served.filename, .Size = served.bytes.len, .Version = try std.fmt.allocPrint(arena, "{d}", .{hit.modified_at orelse 0}) };
+    var r = try jsonResponse(arena, .ok, info);
+    r.headers = headersWith(arena, &.{no_store});
+    return r;
 }
 
 /// The original file of a document, for the browser to show or download.
@@ -1769,6 +1861,100 @@ test "ZIM articles are served from the file: sanitized, links and images through
     }
     // Not configured: nothing is served.
     try testing.expectEqual(http.Status.not_found, get(a, &fake, .{}, "/zim/sea/Lighthouse").status);
+}
+
+test "office files open in the document server: the viewer link, Collabora's redirect, OnlyOffice's page, and WOPI with a token" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "notes");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "notes/report.docx", .data = "PK fake docx bytes" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "notes/a.pdf", .data = "%PDF-1.4 fake" });
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = try std.fmt.allocPrint(a, "{s}/notes", .{try tmp.dir.realPathFileAlloc(testing.io, ".", a)});
+    var idx = try dk.index_sqlite.SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const docx: dk.document.Document = .{ .connector = "notes", .source_id = "d", .title = "Report", .text = "text", .canonical_url = try std.fmt.allocPrint(a, "file://{s}/report.docx", .{base}), .modified_at = 1700000000 };
+    const pdf: dk.document.Document = .{ .connector = "notes", .source_id = "p", .title = "P", .text = "text", .canonical_url = try std.fmt.allocPrint(a, "file://{s}/a.pdf", .{base}) };
+    const hidden: dk.document.Document = .{ .connector = "other", .source_id = "h", .title = "H", .text = "text", .canonical_url = try std.fmt.allocPrint(a, "file://{s}/report.docx", .{base}) };
+    for ([_]dk.document.Document{ docx, pdf, hidden }) |d| try idx.indexer().add(d.id(), d);
+    const roots = [_]dk.originals.Root{ .{ .connector = "notes", .base = base }, .{ .connector = "other", .base = base } };
+    const originals: dk.originals.Service = .{ .io = testing.io, .roots = &roots };
+    var collabora = try dk.docserver.Service.init(testing.io, .{ .kind = .collabora, .url = "http://127.0.0.1:9980", .public_url = "http://172.17.0.1:8080" });
+    var onlyoffice = try dk.docserver.Service.init(testing.io, .{ .kind = .onlyoffice, .url = "http://127.0.0.1:8090", .public_url = "http://172.17.0.1:8080", .jwt_secret = "s3cret" });
+    const hex = std.fmt.bytesToHex(docx.id(), .lower);
+    const pdf_hex = std.fmt.bytesToHex(pdf.id(), .lower);
+    const hidden_hex = std.fmt.bytesToHex(hidden.id(), .lower);
+    const with_c: Services = .{ .originals = &originals, .docserver = &collabora };
+    const with_o: Services = .{ .originals = &originals, .docserver = &onlyoffice };
+    const get = struct {
+        fn at(arena: Allocator, searcher: dk.search.Searcher, sv: Services, target: []const u8) Response {
+            return handleServices(arena, searcher, sv, .GET, target);
+        }
+    }.at;
+
+    // The viewer offers the link for an office file only, and only when a document server is set up.
+    try testing.expect(std.mem.indexOf(u8, get(a, idx.searcher(), with_c, try std.fmt.allocPrint(a, "/doc/{s}", .{hex})).body, "/open\">Open in the document viewer") != null);
+    try testing.expect(std.mem.indexOf(u8, get(a, idx.searcher(), with_c, try std.fmt.allocPrint(a, "/doc/{s}", .{pdf_hex})).body, "document viewer") == null);
+    try testing.expect(std.mem.indexOf(u8, get(a, idx.searcher(), .{ .originals = &originals }, try std.fmt.allocPrint(a, "/doc/{s}", .{hex})).body, "document viewer") == null);
+    try testing.expectEqual(http.Status.not_found, get(a, idx.searcher(), with_c, try std.fmt.allocPrint(a, "/doc/{s}/open", .{pdf_hex})).status);
+    try testing.expectEqual(http.Status.not_found, get(a, idx.searcher(), .{ .originals = &originals }, try std.fmt.allocPrint(a, "/doc/{s}/open", .{hex})).status);
+
+    // Collabora: a redirect to its editor with the WOPI address and a token.
+    const red = get(a, idx.searcher(), with_c, try std.fmt.allocPrint(a, "/doc/{s}/open", .{hex}));
+    try testing.expectEqual(http.Status.see_other, red.status);
+    var location: []const u8 = "";
+    for (red.headers) |h| if (std.mem.eql(u8, h.name, "location")) {
+        location = h.value;
+    };
+    try testing.expect(std.mem.startsWith(u8, location, "http://127.0.0.1:9980/browser/dist/cool.html?WOPISrc=http%3A%2F%2F172.17.0.1%3A8080%2Fwopi%2Ffiles%2F"));
+    const token = location[std.mem.indexOf(u8, location, "access_token=").? + "access_token=".len ..];
+
+    // WOPI with that token: the details and the file; with another document's id, a wrong token or none: refused.
+    const info = get(a, idx.searcher(), with_c, try std.fmt.allocPrint(a, "/wopi/files/{s}?access_token={s}", .{ hex, token }));
+    try testing.expectEqual(http.Status.ok, info.status);
+    try testing.expect(std.mem.indexOf(u8, info.body, "\"BaseFileName\":\"report.docx\"") != null);
+    try testing.expect(std.mem.indexOf(u8, info.body, "\"UserCanWrite\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, info.body, "\"Size\":18") != null);
+    const body = get(a, idx.searcher(), with_c, try std.fmt.allocPrint(a, "/wopi/files/{s}/contents?access_token={s}", .{ hex, token }));
+    try testing.expectEqual(http.Status.ok, body.status);
+    try testing.expectEqualStrings("PK fake docx bytes", body.body);
+    try testing.expectEqual(http.Status.unauthorized, get(a, idx.searcher(), with_c, try std.fmt.allocPrint(a, "/wopi/files/{s}/contents?access_token={s}", .{ hidden_hex, token })).status);
+    try testing.expectEqual(http.Status.unauthorized, get(a, idx.searcher(), with_c, try std.fmt.allocPrint(a, "/wopi/files/{s}/contents", .{hex})).status);
+    try testing.expectEqual(http.Status.unauthorized, get(a, idx.searcher(), with_c, try std.fmt.allocPrint(a, "/wopi/files/{s}/contents?access_token=nonsense", .{hex})).status);
+    // Collabora also sends the token as an Authorization header; that must not be taken for an API key.
+    const with_header = handleAuthorized(a, idx.searcher(), with_c, .GET, try std.fmt.allocPrint(a, "/wopi/files/{s}?access_token={s}", .{ hex, token }), try std.fmt.allocPrint(a, "Bearer {s}", .{token}));
+    try testing.expectEqual(http.Status.ok, with_header.status);
+    // A token from another server (another secret) is no good, and without a document server the paths do not exist.
+    try testing.expectEqual(http.Status.unauthorized, get(a, idx.searcher(), with_o, try std.fmt.allocPrint(a, "/wopi/files/{s}/contents?access_token={s}", .{ hex, token })).status);
+    try testing.expectEqual(http.Status.not_found, get(a, idx.searcher(), .{ .originals = &originals }, try std.fmt.allocPrint(a, "/wopi/files/{s}/contents?access_token={s}", .{ hex, token })).status);
+
+    // A document the caller may not see cannot be opened, even though the document server could fetch it.
+    const colls = [_]dk.config.Collection{.{ .name = "mine", .sources = &.{"notes"} }};
+    const limited: Services = .{ .originals = &originals, .docserver = &collabora, .collections = &colls, .anonymous = &.{"mine"} };
+    try testing.expectEqual(http.Status.see_other, get(a, idx.searcher(), limited, try std.fmt.allocPrint(a, "/doc/{s}/open", .{hex})).status);
+    try testing.expectEqual(http.Status.not_found, get(a, idx.searcher(), limited, try std.fmt.allocPrint(a, "/doc/{s}/open", .{hidden_hex})).status);
+
+    // OnlyOffice: a page with its viewer script, the file's token address, a JWT, and a policy that allows that script.
+    const page = get(a, idx.searcher(), with_o, try std.fmt.allocPrint(a, "/doc/{s}/open", .{hex}));
+    try testing.expectEqual(http.Status.ok, page.status);
+    try testing.expect(std.mem.indexOf(u8, page.body, "http://127.0.0.1:8090/web-apps/apps/api/documents/api.js") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "DocsAPI.DocEditor") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "\"mode\":\"view\"") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, ",\"token\":\"ey") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "/wopi/files/") != null);
+    var policy: []const u8 = "";
+    for (page.headers) |h| if (std.mem.eql(u8, h.name, "content-security-policy")) {
+        policy = h.value;
+    };
+    try testing.expect(std.mem.indexOf(u8, policy, "'sha256-") != null);
+    var policies: usize = 0;
+    for (page.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "content-security-policy")) {
+        policies += 1;
+    };
+    try testing.expectEqual(@as(usize, 1), policies);
+    try testing.expect(std.mem.indexOf(u8, policy, "frame-src http://127.0.0.1:8090") != null);
 }
 
 test "original files are served only for sources that allow it, from inside their folder" {

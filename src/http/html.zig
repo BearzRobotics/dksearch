@@ -509,7 +509,7 @@ pub fn writeArticle(w: *Writer, title: []const u8, source: []const u8, body: []c
     try w.writeAll("</div>\n<p><a href=\"/\">&larr; New search</a></p></main></body></html>\n");
 }
 
-pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, open_link: ?OpenLink, rendered: ?[]const u8, is_markdown: bool) Writer.Error!void {
+pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, open_links: []const OpenLink, rendered: ?[]const u8, is_markdown: bool) Writer.Error!void {
     try writeHead(w, h.title orelse h.url orelse "Document");
     try w.writeAll("<body>");
     try writeTopBar(w);
@@ -545,12 +545,17 @@ pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool,
         }
     }
     try w.writeAll("</dl>\n");
-    if (open_link) |l| {
-        try w.writeAll("<p><a class=\"button\" href=\"");
-        try writeEscaped(w, l.href);
-        try w.writeAll("\">");
-        try writeEscaped(w, l.label);
-        try w.writeAll("</a></p>\n");
+    if (open_links.len > 0) {
+        try w.writeAll("<p>");
+        for (open_links, 0..) |l, i| {
+            if (i > 0) try w.writeAll(" ");
+            try w.writeAll("<a class=\"button\" href=\"");
+            try writeEscaped(w, l.href);
+            try w.writeAll("\">");
+            try writeEscaped(w, l.label);
+            try w.writeAll("</a>");
+        }
+        try w.writeAll("</p>\n");
     }
     if (rendered) |html_body| {
         // `html_body` was made safe by the sanitizer.

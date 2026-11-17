@@ -50,3 +50,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0032 | Crawler concurrency and breadth-first order |
 | 0033 | Collections and API keys |
 | 0034 | Peers and federated search |
+| 0035 | Opening office files in a document server |
