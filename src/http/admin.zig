@@ -71,6 +71,9 @@ pub const Options = struct {
     data_dir: []const u8 = "",
     collections: []const dk.config.Collection = &.{},
     anonymous_collections: ?[]const []const u8 = null,
+    /// The peers this node can ask, and its own name, for the Access page.
+    peers: ?*dk.peers.Service = null,
+    node_name: []const u8 = "",
     /// The Kiwix library's catalogue (tests point this at a local server).
     kiwix_catalog_url: []const u8 = dk.kiwix.catalog_base,
     kiwix_options: dk.kiwix.Options = .{},
@@ -136,7 +139,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -144,7 +147,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, access_page, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, access_page, action_peer_test, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -162,6 +165,7 @@ pub const App = struct {
             .{ "/actions/maintenance", .action_maintenance },
             .{ "/access", .access_page },
             .{ "/actions/key-add", .action_key_add },
+            .{ "/actions/peer-test", .action_peer_test },
             .{ "/actions/key-remove", .action_key_remove },
             .{ "/zim", .zim_page },
             .{ "/actions/zim", .action_zim },
@@ -215,7 +219,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_peer_test or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -241,7 +245,8 @@ pub const App = struct {
             .maintenance => self.pageMaintenance(arena, csrf),
             .action_maintenance => self.startOperation(arena, req, auth, false),
             .zim_page => self.pageZim(arena, csrf, t.params),
-            .access_page => self.pageAccess(arena, csrf, null),
+            .access_page => self.pageAccess(arena, csrf, null, null),
+            .action_peer_test => self.testPeer(arena, req, auth),
             .action_key_add => self.addKey(arena, req, auth),
             .action_key_remove => self.removeKey(arena, req, auth),
             .action_zim => self.startZimDownload(arena, req, auth),
@@ -1070,10 +1075,15 @@ pub const App = struct {
         return std.fmt.allocPrint(arena, "{s}/{s}", .{ self.opts.data_dir, dk.access.file_name });
     }
 
-    fn pageAccess(self: *App, arena: Allocator, csrf: ?[]const u8, fresh: ?NewKey) error{OutOfMemory}!Response {
+    fn pageAccess(self: *App, arena: Allocator, csrf: ?[]const u8, fresh: ?NewKey, notice: ?[]const u8) error{OutOfMemory}!Response {
         var aw: Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         writePage(w, "Access", csrf, "access") catch return error.OutOfMemory;
+        if (notice) |n| {
+            w.writeAll("<p class=\"notice\" role=\"status\">") catch return error.OutOfMemory;
+            html.writeEscaped(w, n) catch return error.OutOfMemory;
+            w.writeAll("</p>") catch return error.OutOfMemory;
+        }
         self.writeAccess(arena, w, csrf, fresh) catch return error.OutOfMemory;
         w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
         var r = handler.htmlResponse(arena, .ok, aw.written());
@@ -1107,6 +1117,7 @@ pub const App = struct {
         } else try w.writeAll("May see <strong>every source</strong> (no limit is set).");
         try w.writeAll(" Change this with <code>[access]</code> in the configuration file (read at start).</p></section>");
 
+        try self.writePeers(arena, w, csrf);
         try w.writeAll("<section class=\"card\"><h2>Collections</h2>");
         if (self.opts.collections.len == 0) {
             try w.writeAll("<p class=\"muted\">None defined. Add <code>[[collection]]</code> tables with <code>name</code>, an optional <code>description</code> and <code>sources = [...]</code> to the configuration file.</p>");
@@ -1176,6 +1187,73 @@ pub const App = struct {
         try w.writeAll("</section>");
     }
 
+    fn writePeers(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8) !void {
+        try w.writeAll("<section class=\"card\"><h2>Peers</h2>");
+        const svc = self.opts.peers orelse {
+            try w.writeAll("<p class=\"muted\">No peers. Other dksearch nodes you may ask are written as <code>[[peer]]</code> tables (name, url, key or key_file) next to <code>[node] name</code> in the configuration file, and are read at start. See the manual, <em>Peers and federated search</em>.</p></section>");
+            return;
+        };
+        try w.writeAll("<p class=\"muted\">This node is <strong>");
+        try html.writeEscaped(w, self.opts.node_name);
+        try w.writeAll("</strong>. The search page and the API ask the peers when <code>peers=1</code> is given. Peers are set in the configuration file (read at start); <em>Test</em> asks a peer a small question now, which shows whether its address answers and it accepts the key.</p>");
+        const infos = try svc.info(arena);
+        try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Name</th><th>Address</th><th>Key</th><th>Last try</th><th>Last answered</th><th>Trouble</th><th></th></tr></thead><tbody>");
+        const now = unixNow(self.io);
+        for (infos) |p| {
+            try w.writeAll("<tr><td><strong>");
+            try html.writeEscaped(w, p.name);
+            try w.writeAll("</strong>");
+            if (!p.enabled) try w.writeAll(" <span class=\"muted\">(off)</span>");
+            try w.writeAll("</td><td><code>");
+            try html.writeEscaped(w, p.url);
+            try w.print("</code></td><td>{s}</td><td>", .{if (p.has_key) "set" else "<span class=\"muted\">none</span>"});
+            if (p.last_status) |st| {
+                try w.print("{t} in {d} ms, ", .{ st, p.last_ms });
+                try writeAgo(w, now - p.last_unix);
+            } else try w.writeAll("<span class=\"muted\">not yet</span>");
+            try w.writeAll("</td><td>");
+            if (p.last_ok_unix > 0) try writeAgo(w, now - p.last_ok_unix) else try w.writeAll("<span class=\"muted\">never</span>");
+            try w.writeAll("</td><td>");
+            if (p.failures > 0) {
+                try w.print("{d} in a row", .{p.failures});
+                if (p.quiet_secs > 0) try w.print(", skipped for {d} s more", .{p.quiet_secs});
+            } else try w.writeAll("<span class=\"muted\">none</span>");
+            try w.writeAll("</td><td>");
+            if (csrf) |token| {
+                try w.writeAll("<form class=\"inline\" action=\"/actions/peer-test\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+                try html.writeEscaped(w, token);
+                try w.writeAll("\"><input type=\"hidden\" name=\"peer\" value=\"");
+                try html.writeEscaped(w, p.name);
+                try w.writeAll("\"><button type=\"submit\" class=\"btn\">Test</button></form>");
+            }
+            try w.writeAll("</td></tr>");
+        }
+        try w.writeAll("</tbody></table></div></section>");
+    }
+
+    fn testPeer(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const svc = self.opts.peers orelse return actionFailure(arena, false, .{ .status = .not_found, .code = "no_peers", .message = "no peers are configured" });
+        const name = params.get("peer") orelse "";
+        const r = svc.probe(arena, name) orelse return actionFailure(arena, false, .{ .status = .not_found, .code = "no_such_peer", .message = "no such peer" });
+        const text = switch (r.status) {
+            .ok => try std.fmt.allocPrint(arena, "{s}: answered in {d} ms and accepted the key (or needs none).", .{ name, r.ms }),
+            .refused => try std.fmt.allocPrint(arena, "{s}: answered with status {d}: it does not accept this node's key (401 means the key is missing or invalid, 403 that it may not search).", .{ name, r.http_status }),
+            .timeout => try std.fmt.allocPrint(arena, "{s}: no answer within the time limit.", .{name}),
+            .down => try std.fmt.allocPrint(arena, "{s}: could not connect (check the address, the port and that the peer is running; for https, its certificate).", .{name}),
+            .bad_answer => try std.fmt.allocPrint(arena, "{s}: answered, but not like a dksearch node.", .{name}),
+            else => try std.fmt.allocPrint(arena, "{s}: not asked ({t}).", .{ name, r.status }),
+        };
+        const csrf: ?[]const u8 = switch (auth) {
+            .session => |s| try arena.dupe(u8, &s.csrf),
+            else => null,
+        };
+        return self.pageAccess(arena, csrf, null, text);
+    }
+
     fn addKey(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
         const params = switch (try self.checkAction(arena, req, auth, false)) {
             .ok => |p| p,
@@ -1209,7 +1287,7 @@ pub const App = struct {
             .session => |s| try arena.dupe(u8, &s.csrf),
             else => null,
         };
-        return self.pageAccess(arena, csrf, .{ .name = name, .token = try arena.dupe(u8, &tok) });
+        return self.pageAccess(arena, csrf, .{ .name = name, .token = try arena.dupe(u8, &tok) }, null);
     }
 
     fn removeKey(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
@@ -1631,6 +1709,13 @@ fn writeDuration(w: *Io.Writer, seconds: u64) Io.Writer.Error!void {
     if (h > 0) return w.print("{d} h {d} min", .{ h, m });
     if (m > 0) return w.print("{d} min {d} s", .{ m, seconds % 60 });
     try w.print("{d} s", .{seconds});
+}
+
+/// "5 min ago", "just now".
+fn writeAgo(w: *Io.Writer, seconds: i64) Io.Writer.Error!void {
+    if (seconds < 5) return w.writeAll("just now");
+    try writeDuration(w, @intCast(seconds));
+    try w.writeAll(" ago");
 }
 
 fn writeStat(w: *Io.Writer, value: []const u8, label: []const u8) Io.Writer.Error!void {
@@ -2939,6 +3024,38 @@ test "Access: collections are listed, keys are made (shown once), listed and rem
     try testing.expectEqual(http.Status.see_other, removed.status);
     try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/access", .{ .cookie = cookie })).body, "No keys yet") != null);
     try testing.expectEqual(http.Status.not_found, (try f.call(a, .POST, "/actions/key-remove", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&which=ffffffff", .{csrf}) })).status);
+}
+
+test "Access: peers are listed with their status and can be tested" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const none = try f.call(a, .GET, "/access", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, none.body, "No peers") != null);
+
+    const cfgs = [_]dk.config.Peer{.{ .name = "office", .url = "http://127.0.0.1:1", .timeout_ms = 500 }};
+    const svc = try dk.peers.Service.init(testing.allocator, testing.io, "home", &cfgs);
+    defer svc.deinit();
+    f.app.opts.peers = svc;
+    f.app.opts.node_name = "home";
+    const page = try f.call(a, .GET, "/access", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, page.body, "<strong>office</strong>") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "not yet") != null);
+    const csrf = csrfOf(page.body);
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/peer-test", .{ .cookie = cookie, .body = "csrf=wrong&peer=office" })).status);
+    try testing.expectEqual(http.Status.not_found, (try f.call(a, .POST, "/actions/peer-test", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&peer=nobody", .{csrf}) })).status);
+    const tested = try f.call(a, .POST, "/actions/peer-test", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&peer=office", .{csrf}) });
+    try testing.expectEqual(http.Status.ok, tested.status);
+    try testing.expect(std.mem.indexOf(u8, tested.body, "could not connect") != null);
+    // Remembered: the next view shows the failure and the backoff.
+    const after = try f.call(a, .GET, "/access", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, after.body, "down in") != null);
+    try testing.expect(std.mem.indexOf(u8, after.body, "1 in a row") != null);
 }
 
 test "ZIM files: the page explains when no folder is set, confirms before downloading, and only takes kiwix.org addresses" {

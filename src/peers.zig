@@ -92,6 +92,27 @@ const PeerState = struct {
     failures: std.atomic.Value(u32) = .init(0),
     /// Monotonic time (ns) before which the peer is not asked.
     quiet_until: std.atomic.Value(i64) = .init(0),
+    /// What the last real attempt (not a skip) was: status (as an int, -1 for none yet), when (unix seconds), how long.
+    last_status: std.atomic.Value(i32) = .init(-1),
+    last_unix: std.atomic.Value(i64) = .init(0),
+    last_ms: std.atomic.Value(u32) = .init(0),
+    /// When the peer last answered properly (unix seconds), 0 for never.
+    last_ok_unix: std.atomic.Value(i64) = .init(0),
+};
+
+/// What the administration page shows of a peer.
+pub const Info = struct {
+    name: []const u8,
+    url: []const u8,
+    enabled: bool,
+    has_key: bool,
+    last_status: ?Status,
+    last_unix: i64,
+    last_ms: u32,
+    last_ok_unix: i64,
+    failures: u32,
+    /// Seconds until it is asked again, 0 if not in backoff.
+    quiet_secs: u32,
 };
 
 pub const Service = struct {
@@ -207,10 +228,61 @@ pub const Service = struct {
     }
 
     fn runSlot(s: *Slot) void {
-        const t0 = nowNs(s.svc.io);
-        s.reply = s.svc.askOne(s.arena.allocator(), s.peer, s.kind, s.q, s.extra);
-        s.reply.ms = @intCast(@max(0, @divTrunc(nowNs(s.svc.io) - t0, std.time.ns_per_ms)));
+        s.reply = s.svc.timed(s.arena.allocator(), s.peer, s.kind, s.q, s.extra, false);
         s.done = true;
+    }
+
+    /// One attempt, timed and remembered for the administration page. A skip because of backoff is not an attempt.
+    fn timed(self: *Service, a: Allocator, p: *PeerState, kind: Kind, q: []const u8, extra: []const u8, force: bool) Reply {
+        const t0 = nowNs(self.io);
+        if (force) p.quiet_until.store(0, .monotonic);
+        var r = self.askOne(a, p, kind, q, extra);
+        r.ms = @intCast(@max(0, @divTrunc(nowNs(self.io) - t0, std.time.ns_per_ms)));
+        if (r.status != .backoff and r.status != .unavailable) {
+            const now = Io.Clock.real.now(self.io).toSeconds();
+            p.last_status.store(@backingInt(r.status), .monotonic);
+            p.last_unix.store(now, .monotonic);
+            p.last_ms.store(r.ms, .monotonic);
+            if (r.status == .ok) p.last_ok_unix.store(now, .monotonic);
+        }
+        return r;
+    }
+
+    /// Asks the named peer a small question right now (whatever its backoff), for the pairing test: `ok` means the
+    /// address answers and the key is accepted. Null if there is no such peer.
+    pub fn probe(self: *Service, arena: Allocator, name: []const u8) ?Reply {
+        for (self.peers) |*p| if (std.mem.eql(u8, p.cfg.name, name)) {
+            var tmp = std.heap.ArenaAllocator.init(self.gpa);
+            defer tmp.deinit();
+            var r = self.timed(tmp.allocator(), p, .search, "dksearch", "&limit=1", true);
+            r.hits = &.{};
+            r.chunks = &.{};
+            r.peer = arena.dupe(u8, r.peer) catch return null;
+            return r;
+        };
+        return null;
+    }
+
+    pub fn info(self: *Service, arena: Allocator) Allocator.Error![]Info {
+        const out = try arena.alloc(Info, self.peers.len);
+        const now = nowNs(self.io);
+        for (self.peers, out) |*p, *o| {
+            const ls = p.last_status.load(.monotonic);
+            const quiet = p.quiet_until.load(.monotonic) - now;
+            o.* = .{
+                .name = try arena.dupe(u8, p.cfg.name),
+                .url = try arena.dupe(u8, p.cfg.url),
+                .enabled = p.cfg.enabled,
+                .has_key = p.auth != null,
+                .last_status = if (ls < 0) null else @fromBackingInt(@intCast(ls)),
+                .last_unix = p.last_unix.load(.monotonic),
+                .last_ms = p.last_ms.load(.monotonic),
+                .last_ok_unix = p.last_ok_unix.load(.monotonic),
+                .failures = p.failures.load(.monotonic),
+                .quiet_secs = if (quiet > 0) @intCast(@divTrunc(quiet, std.time.ns_per_s)) else 0,
+            };
+        }
+        return out;
     }
 
     fn askOne(self: *Service, a: Allocator, p: *PeerState, kind: Kind, q: []const u8, extra: []const u8) Reply {
@@ -724,4 +796,30 @@ test "passages are asked for with the same limits, and a peer's passages arrive 
     try testing.expectEqual(Status.ok, replies[0].status);
     try testing.expectEqual(@as(usize, 1), replies[0].chunks.len);
     try testing.expectEqualStrings("p", replies[0].chunks[0].node);
+}
+
+test "the pairing test says whether the peer answers and accepts the key, and the status is remembered" {
+    if (!have_http) return error.SkipZigTest;
+    var good: nettest.TestServer = undefined;
+    try good.start(&.{.{ .path = "/api/v1/search?q=dksearch&limit=1", .content_type = "application/json", .body = "{\"hits\":[]}" }});
+    defer good.stop();
+    var bad: nettest.TestServer = undefined;
+    try bad.start(&.{.{ .path = "/api/v1/search?q=dksearch&limit=1", .status = 401, .content_type = "application/json", .body = "{}" }});
+    defer bad.stop();
+    var ub: [2][64]u8 = undefined;
+    const peers = [_]config.Peer{ .{ .name = "good", .url = good.url(&ub[0], ""), .key = "k" }, .{ .name = "bad", .url = bad.url(&ub[1], "") } };
+    const svc = try Service.init(testing.allocator, testing.io, "home", &peers);
+    defer svc.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expect(svc.probe(a, "nope") == null);
+    try testing.expectEqual(Status.ok, svc.probe(a, "good").?.status);
+    try testing.expectEqual(Status.refused, svc.probe(a, "bad").?.status);
+    try testing.expectEqual(Status.refused, svc.probe(a, "bad").?.status); // a test is not held back by backoff
+    const infos = try svc.info(a);
+    try testing.expectEqual(Status.ok, infos[0].last_status.?);
+    try testing.expect(infos[0].has_key and infos[0].last_ok_unix > 0);
+    try testing.expectEqual(Status.refused, infos[1].last_status.?);
+    try testing.expect(!infos[1].has_key and infos[1].last_ok_unix == 0 and infos[1].failures == 2 and infos[1].quiet_secs > 0);
 }
