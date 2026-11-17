@@ -271,6 +271,84 @@ pub fn applyPeer(gpa: Allocator, text: []const u8, edit: PeerEdit, problem: *Pro
     return out;
 }
 
+/// What the Add-a-collection form collects.
+pub const CollectionSpec = struct {
+    name: []const u8,
+    description: []const u8 = "",
+    sources: []const []const u8,
+};
+
+pub const CollectionEdit = union(enum) {
+    /// Add a collection (`original` null) or replace the one named `original`.
+    save: struct { original: ?[]const u8, spec: CollectionSpec },
+    delete: []const u8,
+};
+
+/// Applies `edit` to the `[[collection]]` tables of the configuration text, validated as a whole (unknown sources,
+/// a name that is a source's, a collection still named in `[access]`, ... are refused with the reason).
+pub fn applyCollection(gpa: Allocator, text: []const u8, edit: CollectionEdit, problem: *Problem) Error![]u8 {
+    var tdiag: toml.Diagnostic = .{};
+    var doc = toml.Document.parse(gpa, text, .{}, &tdiag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return problem.set("the configuration file has a syntax error (line {d}: {s}) and cannot be edited here; fix it by hand first", .{ tdiag.line, tdiag.message }),
+    };
+    defer doc.deinit();
+    const a = doc.allocator();
+    const array: *toml.Array = blk: {
+        if (doc.root.getPtr("collection")) |v| switch (v.*) {
+            .array => |arr| {
+                if (!arr.is_table_array) return problem.set("this file defines its collections in a form the editor cannot change (not [[collection]] tables); edit it by hand", .{});
+                break :blk arr;
+            },
+            else => return problem.set("`collection` in this file is not a list of [[collection]] tables; edit it by hand", .{}),
+        };
+        const arr = try a.create(toml.Array);
+        arr.* = .{ .is_table_array = true };
+        try doc.root.entries.put(a, try doc.dupe("collection"), .{ .array = arr });
+        break :blk arr;
+    };
+    switch (edit) {
+        .delete => |name| {
+            const i = indexOf(array, name) orelse return problem.set("there is no collection named \"{s}\"", .{name});
+            _ = array.items.orderedRemove(i);
+        },
+        .save => |sv| {
+            const spec = sv.spec;
+            if (!config.validSourceName(spec.name)) return problem.set("the name must be 1-64 characters of a-z, 0-9, '-' and '_', starting with a letter or digit", .{});
+            if (spec.sources.len == 0) return problem.set("tick at least one source", .{});
+            const existing = if (sv.original) |o| (indexOf(array, o) orelse return problem.set("there is no collection named \"{s}\"", .{o})) else null;
+            if (indexOf(array, spec.name)) |same| {
+                if (existing == null or existing.? != same) return problem.set("a collection named \"{s}\" already exists", .{spec.name});
+            }
+            const t: *toml.Table = if (existing) |i| blk: {
+                const old = array.items.items[i].table;
+                old.entries.clearRetainingCapacity();
+                old.key_comments.clearRetainingCapacity();
+                break :blk old;
+            } else blk: {
+                const nt = try a.create(toml.Table);
+                nt.* = .{ .kind = .explicit };
+                try array.items.append(a, .{ .table = nt });
+                break :blk nt;
+            };
+            try t.entries.put(a, try doc.dupe("name"), .{ .string = try doc.dupe(spec.name) });
+            if (spec.description.len > 0) try t.entries.put(a, try doc.dupe("description"), .{ .string = try doc.dupe(spec.description) });
+            const list = try a.create(toml.Array);
+            list.* = .{};
+            for (spec.sources) |s| try list.items.append(a, .{ .string = try doc.dupe(s) });
+            try t.entries.put(a, try doc.dupe("sources"), .{ .array = list });
+        },
+    }
+    if (array.items.items.len == 0) _ = doc.root.entries.orderedRemove("collection");
+    const out = doc.toOwnedString(gpa) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return problem.set("the new configuration could not be written", .{}),
+    };
+    errdefer gpa.free(out);
+    try validate(gpa, out, problem);
+    return out;
+}
+
 /// Applies changes to settings (outside the `[[source]]` tables) and returns the new configuration
 /// text, validated as a whole like `apply`. Comments elsewhere in the file are kept.
 pub fn applySettings(gpa: Allocator, text: []const u8, changes: []const Setting, problem: *Problem) Error![]u8 {
@@ -623,4 +701,32 @@ test "peers are added, kept when saved again, switched, removed, and refused wit
     defer a.free(gone);
     try testing.expect(std.mem.indexOf(u8, gone, "peer") == null);
     try testing.expectError(error.Invalid, applyPeer(a, one, .{ .delete = "nobody" }, &problem));
+}
+
+test "collections are added, replaced, removed, and refused with the reason" {
+    var problem: Problem = .{};
+    const a = testing.allocator;
+    const cfg = "# c\n[[source]]\nname = \"a\"\nkind = \"files\"\npath = \"/tmp\"\n[[source]]\nname = \"b\"\nkind = \"files\"\npath = \"/tmp\"\n";
+    const one = try applyCollection(a, cfg, .{ .save = .{ .original = null, .spec = .{ .name = "mine", .description = "my stuff", .sources = &.{ "a", "b" } } } }, &problem);
+    defer a.free(one);
+    try testing.expect(std.mem.indexOf(u8, one, "# c") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "description = \"my stuff\"") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "sources = [\"a\", \"b\"]") != null);
+    try testing.expectError(error.Invalid, applyCollection(a, one, .{ .save = .{ .original = null, .spec = .{ .name = "mine", .sources = &.{"a"} } } }, &problem));
+    try testing.expect(std.mem.indexOf(u8, problem.message(), "already exists") != null);
+    try testing.expectError(error.Invalid, applyCollection(a, one, .{ .save = .{ .original = null, .spec = .{ .name = "x", .sources = &.{"ghost"} } } }, &problem));
+    try testing.expect(std.mem.indexOf(u8, problem.message(), "ghost") != null);
+    try testing.expectError(error.Invalid, applyCollection(a, one, .{ .save = .{ .original = null, .spec = .{ .name = "a", .sources = &.{"a"} } } }, &problem)); // a source's name
+    try testing.expectError(error.Invalid, applyCollection(a, one, .{ .save = .{ .original = null, .spec = .{ .name = "none", .sources = &.{} } } }, &problem));
+    const changed = try applyCollection(a, one, .{ .save = .{ .original = "mine", .spec = .{ .name = "mine", .sources = &.{"a"} } } }, &problem);
+    defer a.free(changed);
+    try testing.expect(std.mem.indexOf(u8, changed, "sources = [\"a\"]") != null and std.mem.indexOf(u8, changed, "my stuff") == null);
+    // Still named in [access]: refused, with the reason; free again once that is changed.
+    const guarded = try std.fmt.allocPrint(a, "{s}[access]\nanonymous_collections = [\"mine\"]\n", .{one});
+    defer a.free(guarded);
+    try testing.expectError(error.Invalid, applyCollection(a, guarded, .{ .delete = "mine" }, &problem));
+    try testing.expect(std.mem.indexOf(u8, problem.message(), "anonymous_collections") != null);
+    const gone = try applyCollection(a, one, .{ .delete = "mine" }, &problem);
+    defer a.free(gone);
+    try testing.expect(std.mem.indexOf(u8, gone, "collection") == null);
 }

@@ -139,7 +139,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/actions/collection-edit", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -147,7 +147,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, access_page, action_peer_test, action_peer_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -167,6 +167,7 @@ pub const App = struct {
             .{ "/actions/key-add", .action_key_add },
             .{ "/actions/peer-test", .action_peer_test },
             .{ "/actions/peer-edit", .action_peer_edit },
+            .{ "/actions/collection-edit", .action_collection_edit },
             .{ "/actions/key-remove", .action_key_remove },
             .{ "/zim", .zim_page },
             .{ "/actions/zim", .action_zim },
@@ -220,7 +221,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_peer_test or route == .action_peer_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_peer_test or route == .action_peer_edit or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -249,6 +250,7 @@ pub const App = struct {
             .access_page => self.pageAccess(arena, csrf, null, null),
             .action_peer_test => self.testPeer(arena, req, auth),
             .action_peer_edit => self.editPeer(arena, req, auth),
+            .action_collection_edit => self.editCollection(arena, req, auth),
             .action_key_add => self.addKey(arena, req, auth),
             .action_key_remove => self.removeKey(arena, req, auth),
             .action_zim => self.startZimDownload(arena, req, auth),
@@ -1124,7 +1126,7 @@ pub const App = struct {
         if (self.opts.collections.len == 0) {
             try w.writeAll("<p class=\"muted\">None defined. Add <code>[[collection]]</code> tables with <code>name</code>, an optional <code>description</code> and <code>sources = [...]</code> to the configuration file.</p>");
         } else {
-            try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Name</th><th>Sources</th><th>Description</th></tr></thead><tbody>");
+            try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Name</th><th>Sources</th><th>Description</th><th></th></tr></thead><tbody>");
             for (self.opts.collections) |c| {
                 try w.writeAll("<tr><td><strong>");
                 try html.writeEscaped(w, c.name);
@@ -1135,10 +1137,19 @@ pub const App = struct {
                 }
                 try w.writeAll("</td><td>");
                 try html.writeEscaped(w, c.description);
+                try w.writeAll("</td><td>");
+                if (csrf) |token| if (self.canEditConfig()) {
+                    try w.writeAll("<form class=\"inline\" action=\"/actions/collection-edit\" method=\"post\"><input type=\"hidden\" name=\"op\" value=\"delete\"><input type=\"hidden\" name=\"csrf\" value=\"");
+                    try html.writeEscaped(w, token);
+                    try w.writeAll("\"><input type=\"hidden\" name=\"name\" value=\"");
+                    try html.writeEscaped(w, c.name);
+                    try w.writeAll("\"><button type=\"submit\" class=\"btn danger\">Remove</button></form>");
+                };
                 try w.writeAll("</td></tr>");
             }
             try w.writeAll("</tbody></table></div>");
         }
+        try self.writeCollectionForm(w, csrf);
         try w.writeAll("</section>");
 
         try w.writeAll("<section class=\"card\"><h2>API keys</h2>");
@@ -1246,6 +1257,56 @@ pub const App = struct {
         try w.writeAll("</tbody></table></div>");
         try self.writePeerForm(w, csrf);
         try w.writeAll("</section>");
+    }
+
+    fn writeCollectionForm(self: *App, w: *Io.Writer, csrf: ?[]const u8) !void {
+        if (csrf == null or !self.canEditConfig()) return;
+        const store = self.opts.store orelse return;
+        try w.writeAll("<h3>Add a collection</h3><form class=\"stack\" action=\"/actions/collection-edit\" method=\"post\"><input type=\"hidden\" name=\"op\" value=\"save\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        try html.writeEscaped(w, csrf.?);
+        try w.writeAll("\"><label>Name <input name=\"name\" maxlength=\"64\" required placeholder=\"books\"></label><label>Description <input name=\"description\" maxlength=\"200\"><small>Optional; shown as a hint.</small></label><fieldset><legend>Sources</legend>");
+        for (store.snapshot()) |s| {
+            try w.writeAll("<label class=\"check\"><input type=\"checkbox\" name=\"source\" value=\"");
+            try html.writeEscaped(w, s.name);
+            try w.writeAll("\"> ");
+            try html.writeEscaped(w, s.name);
+            try w.writeAll("</label>");
+        }
+        try w.writeAll("</fieldset><p class=\"muted\">Saved to the configuration file; applies after a restart.</p><p><button type=\"submit\" class=\"btn\">Add the collection</button></p></form>");
+    }
+
+    fn editCollection(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const path = self.opts.config_path orelse return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "the server was started without --config, so there is no configuration file to edit" });
+        if (!self.canEditConfig()) return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "editing collections is not available here" });
+        const op = params.get("op") orelse "save";
+        const name = std.mem.trim(u8, params.get("name") orelse "", " ");
+        const edit: dk.sourceedit.CollectionEdit = if (std.mem.eql(u8, op, "save"))
+            .{ .save = .{ .original = null, .spec = .{ .name = name, .description = std.mem.trim(u8, params.get("description") orelse "", " "), .sources = try params.all(arena, "source") } } }
+        else if (std.mem.eql(u8, op, "delete"))
+            .{ .delete = name }
+        else
+            return actionFailure(arena, false, .{ .status = .bad_request, .code = "unknown_operation", .message = "op must be save or delete" });
+        self.edit_mutex.lockUncancelable(self.io);
+        defer self.edit_mutex.unlock(self.io);
+        const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_unreadable", .message = "cannot read the configuration file" }),
+        };
+        const csrf = try csrfCopy(arena, auth);
+        var problem: dk.sourceedit.Problem = .{};
+        const new_text = dk.sourceedit.applyCollection(arena, text, edit, &problem) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => return self.pageAccessWith(arena, csrf, try arena.dupe(u8, problem.message()), .bad_request),
+        };
+        dk.sourceedit.writeFile(self.io, arena, path, new_text) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Io => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_not_writable", .message = "the configuration file could not be written (check its permissions); nothing was changed" }),
+        };
+        return self.pageAccessWith(arena, csrf, "Saved to the configuration file. Restart dksearch for the change to take effect.", .ok);
     }
 
     fn canEditConfig(self: *App) bool {
@@ -3579,4 +3640,49 @@ test "Access: peers are added to the configuration file, switched and removed fr
     _ = try post(&f, a, cookie, csrf, "op=delete&name=office");
     try testing.expect(std.mem.indexOf(u8, try tmp.dir.readFileAlloc(testing.io, "c.toml", a, .limited(4096)), "office") == null);
     try testing.expectEqual(http.Status.bad_request, (try post(&f, a, cookie, csrf, "op=delete&name=nobody")).status);
+}
+
+test "Access: collections are added and removed from the page, written to the configuration file" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text = "[[source]]\nname = \"a\"\nkind = \"files\"\npath = \"/tmp\"\n[[source]]\nname = \"b\"\nkind = \"files\"\npath = \"/tmp\"\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.toml", .data = text });
+    var pb: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}/c.toml", .{tmp.sub_path});
+    var d: dk.config.Diagnostic = .{};
+    var cfg0 = try dk.config.loadFromSlice(testing.allocator, path, text, &d);
+    defer cfg0.deinit();
+    var store = dk.sourcestore.Store.init(testing.allocator, testing.io, cfg0.sources);
+    defer store.deinit();
+    f.app.opts.store = &store;
+    f.app.opts.config_path = path;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const page = try f.call(a, .GET, "/access", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, page.body, "Add a collection") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "name=\"source\" value=\"a\"") != null);
+    const csrf = csrfOf(page.body);
+    const post = struct {
+        fn go(fx: *Fixture, ar: Allocator, ck: []const u8, token: []const u8, rest: []const u8) !Response {
+            return fx.call(ar, .POST, "/actions/collection-edit", .{ .cookie = ck, .body = try std.fmt.allocPrint(ar, "csrf={s}&{s}", .{ token, rest }) });
+        }
+    }.go;
+    try testing.expectEqual(http.Status.bad_request, (try post(&f, a, cookie, csrf, "op=save&name=empty")).status); // no source ticked
+    const bad = try post(&f, a, cookie, csrf, "op=save&name=x&source=ghost");
+    try testing.expectEqual(http.Status.bad_request, bad.status);
+    try testing.expect(std.mem.indexOf(u8, bad.body, "ghost") != null);
+    const ok = try post(&f, a, cookie, csrf, "op=save&name=mine&description=my+stuff&source=a&source=b");
+    try testing.expectEqual(http.Status.ok, ok.status);
+    try testing.expect(std.mem.indexOf(u8, ok.body, "Restart dksearch") != null);
+    const file = try tmp.dir.readFileAlloc(testing.io, "c.toml", a, .limited(4096));
+    try testing.expect(std.mem.indexOf(u8, file, "[[collection]]") != null and std.mem.indexOf(u8, file, "sources = [\"a\", \"b\"]") != null);
+    _ = try post(&f, a, cookie, csrf, "op=delete&name=mine");
+    try testing.expect(std.mem.indexOf(u8, try tmp.dir.readFileAlloc(testing.io, "c.toml", a, .limited(4096)), "collection") == null);
+    try testing.expectEqual(http.Status.bad_request, (try post(&f, a, cookie, csrf, "op=delete&name=mine")).status);
 }

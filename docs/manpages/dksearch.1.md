@@ -473,6 +473,8 @@ By default everyone can search every source. To limit visitors, name the collect
     [access]
     anonymous_collections = ["public"]    # an empty list means nothing without a key
 
+Collections can also be added and removed on the Access page of the administration interface (when `admin.actions` is on and the server was started with `--config`): a validated edit of the configuration file (a source that does not exist, a name that is a source's, or a collection still named in `[access]` is refused with the reason), applied after a restart.
+
 Visitors without a key then see only the members of those collections everywhere: in results, on the page, in the document viewer (`/doc/ID`, its original file and pictures), in ZIM articles and in retrieval. A document or article outside a caller's scope is answered as if it did not exist. With an empty list the API answers 401 `key_required`, and the search page finds nothing.
 
 An API key (made with **api-key add**) replaces the anonymous scope by the union of its collections' sources (or all of them with `--all`). It is sent as `Authorization: Bearer dkk_...`; a key that is not valid is refused with 401 `invalid_key` and is never treated as anonymous. The scope comes from the key or the setting, never from the request: nothing in a query, a parameter or a source name widens it. Keys are shown once and kept only as hashes. The administration interface and its token are separate and unaffected.
