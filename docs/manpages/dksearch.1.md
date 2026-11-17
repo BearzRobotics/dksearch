@@ -22,6 +22,12 @@ dksearch admin-token [--config FILE]
 
 dksearch admin-password [--config FILE]
 
+dksearch api-key add NAME (--all | --collection NAME ...) [--config FILE]
+
+dksearch api-key list [--config FILE]
+
+dksearch api-key remove NAME_OR_ID [--config FILE]
+
 dksearch backup [--config FILE] DIR
 
 dksearch check-config FILE
@@ -126,6 +132,13 @@ Set the administration password, the fallback for people using a browser. The pa
 
 Usage: dksearch admin-password [--config FILE]
 
+api-key
+Make, list or remove API keys. A key lets a program (or another dksearch) use the search API and see only the collections it was made for (see **COLLECTIONS AND API KEYS** under CONFIGURATION). **add** prints the key (`dkk_` and 43 characters) to standard output, once, and stores only its SHA-256 hash in `data_dir/api-keys.toml` (mode 0600); the key can be limited to named collections (`--collection`, repeatable, each must be defined in the configuration) or made for every source (`--all`). **list** shows each key's number (the first eight hex digits of its hash), name and collections, never the key. **remove** takes the name or the number. Keys are looked at again when the file changes, so a key made or removed with the server running works or stops within a second.
+
+Usage: dksearch api-key add NAME (--all | --collection NAME ...) | list | remove NAME_OR_ID [--config FILE]
+
+Examples: dksearch api-key add laptop --collection books --collection docs
+
 check-config
 Load and validate FILE exactly as **serve** and **import** would, including the options of every source (enabled or not), report the result, and exit without starting anything or touching any data.
 
@@ -188,6 +201,9 @@ dksearch.toml (any name, passed with **--config**)
 
 *data_dir*/index.db
 : The search index (SQLite, written in WAL mode), with companion files `index.db-wal` and `index.db-shm` while open. *data_dir* is `storage.data_dir`, default `data`, created with parents if missing. The index is derived data: delete it freely and run **rebuild**.
+
+*data_dir*/api-keys.toml
+: The hashes of the API keys, with their names and collections. Mode 0600; a file that others can read is refused (no key works until it is fixed). Created by **api-key add**.
 
 *data_dir*/admin-secrets.toml
 : The administration credential hashes (default location; see `admin.secrets_file`). Mode 0600. Created by **admin-token** or **admin-password**. Back it up with your other secrets; losing it just means creating new credentials.
@@ -436,6 +452,25 @@ Example:
 Regular-expression search (the `[search]` table): in a query on the public page or API, a regular expression keeps only the candidate documents whose stored text matches it. The words of the query choose the candidates through the index, in ranking order, so at least one word is required; the expression is then checked against the first 1 MiB of each candidate's text (8 MiB on the administration page). It is meant for finding patterns that words cannot express (product codes, dates, phone numbers, `colou?r`), not for scanning the corpus: with the default limits at most 200 candidates are checked in at most half a second, and when a limit stops the search the response says so. Because anyone who can reach the public page can type a pattern, everything is bounded: pattern length, nesting, repeat counts, matching steps per document, candidates, time and the number of simultaneous regex queries; the administration interface uses ten times the limits. The matcher works on bytes, not characters (so `.` matches one byte of a multi-byte character) and has no Unicode properties (`\p{L}`); it is regex-zig (vendor/regex-zig, docs/decisions/0020). Set `regex = false` to switch the feature off.
 
 
+COLLECTIONS AND API KEYS
+A *collection* is a named group of sources:
+
+    [[collection]]
+    name = "books"
+    description = "Books and papers"      # optional, shown as a hint on the search page
+    sources = ["folklore", "banking"]
+
+The name follows the rules of source names and may not be one; every member must be a configured source. A collection can be searched on the page (the *Collections* choice next to the sources, `source=collection:books` in the address), in the query language (`collection:books`, `-collection:books`; several mean either) and in the API (`source=collection:books`).
+
+By default everyone can search every source. To limit visitors, name the collections they may use:
+
+    [access]
+    anonymous_collections = ["public"]    # an empty list means nothing without a key
+
+Visitors without a key then see only the members of those collections everywhere: in results, on the page, in the document viewer (`/doc/ID`, its original file and pictures), in ZIM articles and in retrieval. A document or article outside a caller's scope is answered as if it did not exist. With an empty list the API answers 401 `key_required`, and the search page finds nothing.
+
+An API key (made with **api-key add**) replaces the anonymous scope by the union of its collections' sources (or all of them with `--all`). It is sent as `Authorization: Bearer dkk_...`; a key that is not valid is refused with 401 `invalid_key` and is never treated as anonymous. The scope comes from the key or the setting, never from the request: nothing in a query, a parameter or a source name widens it. Keys are shown once and kept only as hashes. The administration interface and its token are separate and unaffected.
+
 SEARCH SYNTAX
 The search box understands: `"kernel module"` (phrase), `linux wayland` (both words), `linux AND wayland`, `linux OR bsd`, `linux NOT android` or `linux -android` (exclude), `+linux` (required, which is the default anyway), `(linux OR bsd) AND kernel` (grouping), `comp*` (words starting with comp), `compositor~` (the word or any word one typo away) and `"window manager"~5` (within five positions of each other). AND binds tighter than OR, so `a b OR c` is `(a AND b) OR c`. `AND`, `OR` and `NOT` are operators only in capitals. Everything typed is quoted before it reaches the index, so no index syntax can be injected. A query with only excluded words has nothing to search for and is an error.
 
@@ -509,7 +544,7 @@ dksearch: cannot listen on ADDRESS:PORT: REASON
 : The address is in use, not local, or needs privileges. Exit status 4.
 
 SECURITY CONSIDERATIONS
-The public HTTP listener has no authentication; the search API is read-only and intended to be public if the administrator exposes it. It listens on loopback by default. To expose it, set `server.address` explicitly. Prefer a reverse proxy for TLS (not implemented here) and rate limiting.
+The public HTTP listener has no authentication unless collections and keys are set up (see COLLECTIONS AND API KEYS); the search API is read-only and intended to be public if the administrator exposes it. It listens on loopback by default. To expose it, set `server.address` explicitly. Prefer a reverse proxy for TLS (not implemented here) and rate limiting.
 
 The administration interface is a separate listener (default 127.0.0.1:8081) and separate code; nothing on the public listener reaches it. Everything on it except the sign-in page and the style sheet needs a credential: a bearer token (for scripts) or a session obtained by signing in with the password or the token. Credentials are kept only as hashes (SHA-256 for the token, Argon2id for the password) in `admin.secrets_file`, never in the main configuration, and the file is refused if group or others can read it. The secrets file is read again for every check, so replacing a credential takes effect immediately and ends all sessions. Sessions live only in memory (a restart signs everyone out), use an unguessable 256-bit id in an `HttpOnly`, `SameSite=Strict` cookie, expire after the idle and absolute limits, and every state-changing request is a POST that also carries a per-session form token. Failed attempts are slowed down for the whole process (none for the first three, then 250 ms doubling to 5 s, forgotten after 15 quiet minutes; wrong bearer tokens are not counted), at most four attempts wait at once (more get status 429) and at most two password checks run at once; there is no per-client tracking, because client addresses are not recorded, so an attacker who keeps failing also slows the administrator's own form sign-ins down (the token is not affected). If the `[admin]` table exists but there is no credential, the administration interface does not start and the reason is printed; there is no default password. By default it is read-only. With `admin.actions = true` it can also start an import of a configured, enabled source and cancel the running one (never rebuild, remove, back up or change configuration), under the same authentication, with the form token required for browser sessions. Imports started this way take the same data-directory lock as the command line, so they cannot overlap a command-line import, rebuild or removal. Which paths a source reads comes only from the configuration file, not from the request. It transmits the token or password in clear text unless HTTPS is provided by a reverse proxy, so keep it on loopback or put it behind one (and set `admin.cookie_secure = true`).
 

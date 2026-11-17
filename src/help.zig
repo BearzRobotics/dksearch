@@ -118,6 +118,27 @@ pub const commands = [_]Command{
         ,
     },
     .{
+        .name = "api-key",
+        .synopsis = "api-key add NAME (--all | --collection NAME ...) | list | remove NAME_OR_ID  [--config FILE]",
+        .summary = "Make, list or remove API keys that limit what a caller can see",
+        .detail =
+        \An API key lets a program (or another dksearch) use the search API and see only
+        \the collections it was made for. Collections are groups of sources, written as
+        \[[collection]] tables in the configuration.
+        \
+        \    dksearch api-key add laptop --collection books --collection docs
+        \    dksearch api-key add backup --all
+        \    dksearch api-key list
+        \    dksearch api-key remove laptop
+        \
+        \`add` prints the key ONCE and stores only its hash in data_dir/api-keys.toml. Send
+        \it as `Authorization: Bearer KEY`. A key that is added or removed works or stops
+        \within a second on a running server. To require a key for everything, put
+        \`[access] anonymous_collections = []` in the configuration.
+        \
+        ,
+    },
+    .{
         .name = "admin-password",
         .synopsis = "admin-password [--config FILE]",
         .summary = "Set the admin password for signing in with a browser",
