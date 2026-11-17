@@ -1,6 +1,6 @@
 # YaCy
 
-Status: source read; two-node private experiment in progress. Research order: 2 of 10.
+Status: source read; two-node private experiment partly done (peers paired, crawl and local search work, remote search result unresolved). Research order: 2 of 10.
 
 - Focus: peer-to-peer indexing, discovery and distributed queries.
 - Source: <https://github.com/yacy/yacy_search_server>, shallow clone at `/mnt/scratch/research/yacy_search_server`, commit `eba3f94b4376` (2026-11-03). Experiments use the release `yacy_v1.942_202608150808_f9c4b9700` (downloaded from download.yacy.net, sha256 `2cb3200c951a93db8aa0ece0ea72aaeebce62385b75bff4e690793ec2c32f99f`), unpacked twice under `/mnt/scratch/research/yacy-run`.
@@ -38,10 +38,18 @@ All paths under `source/net/yacy/`.
 
 Environment: two YaCy 1.942 nodes on this machine (`labA` on port 8091, `labB` on 8092), a private network unit `dksearchlab` (copy of `intranet` with DHT on, partition exponent 0, redundancy 1, access whitelist limited to this host), no contact with the public network (no public seed list is configured; the nodes are given only each other's address). A tiny local site (11 pages with invented words) is served on 127.0.0.1:9100 for node A to crawl.
 
-Results so far:
+Results (the experiment is incomplete; what follows is what was observed, and the one result that was wanted, a search on one node finding a document only the other node holds, was **not** obtained):
 
-- (observed) A node starts with defaults from `defaults/yacy.init` and a few lines in `DATA/SETTINGS/yacy.conf`; the start script reads `key=value` without spaces around `=` (with spaces the port and memory settings are silently ignored).
-- (observed) A new node is `virgin`. Node B downloaded A's seed list but did not connect to it: a `virgin` seed is rejected (see Peer types). Loopback addresses do not make a peer `senior`; with the host's own private address configured as `staticIP` the node can progress. (Details in the next section as the experiment proceeds.)
+- (observed) The start script reads `key=value` without spaces around `=`; with spaces the port and memory settings are silently ignored. The node name and `staticIP` settings did not take effect as hoped (the seed showed an empty IP and a random name until edited).
+- (observed) **Cold start of a private two-node network is hard.** A new node is `virgin`. `PeerActions.connectPeer` accepts only `senior` or `principal` seeds, and a node becomes `senior` only when another peer confirms it can reach it (or by the junior path in `Network.java`, which a `virgin` node does not take). With an empty seed list nobody can be the first senior. What worked: node B asked node A directly through the admin page's "add peer" form (`/Network.html?page=4&addPeer=1&peerHash=..&peerIP=..&peerPort=..`), which sends a `hello`; A called B back, found it reachable, told it `yourtype = senior`, and registered it. The reverse direction does not work: A stays `virgin` in B's eyes, so only A knew B. Restarting a node resets its type to `virgin`, so the handshake has to be repeated after every restart.
+- (observed) The crawl works as documented: a node crawled a local site (11 pages, depth 2) and found its pages in a local search; a second node that crawled the same site found the same.
+- (observed) A new peer is not asked for remote searches until it is old enough: seeds younger than `minage` (3 days in `RemoteSearch`) are penalised in selection, so a lab node needed its birth date edited in `DATA/INDEX/<network>/NETWORK/mySeed.txt` before node A chose it ("dhtPeers=1" appeared in the log only then).
+- (observed) With that done, A's global search asked B, and B answered ("remote search: peer labB sent 1 topics ... 0/0 references") but returned no references for a word only B had indexed, although B finds the page in its own local search. The cause was not found in the time spent (candidates: the word-index part of the answer being empty because of how this version splits work between its Solr index and the word index; a request-rate or load check in `htroot/yacy/search.java`; the peers' state after the restarts). It is recorded as unresolved rather than guessed.
+- (read) Membership of a network can be controlled by a shared secret: `network.unit.protocol.control` is `uncontrolled` (anyone speaking the protocol), or a method such as `salted-magic-sim` in which a request proves knowledge of a network-wide secret (`Protocol.authentifyRequest`). Peers also refuse requests carrying a different network name. A private network is therefore a unit file, a name and, optionally, a shared secret.
+
+What this says for dksearch, from the cold-start difficulty alone: the YaCy bootstrap assumes a populated public network; a private two-node network needs an explicit pairing step. A dksearch design should make pairing explicit and persistent (an operator adds a peer by address and a shared key; nothing depends on discovering seniors), and should not lose pairings on restart.
+
+Time used: about three hours, mostly on bootstrap. The nodes are stopped; their directories are kept at `/mnt/scratch/research/yacy-run` (176 MB each) so the experiment can be continued (sites in `site` and `site2`, served on 127.0.0.1:9100 and :9101).
 
 ## Useful patterns
 
