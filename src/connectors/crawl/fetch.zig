@@ -29,6 +29,9 @@ pub const Response = struct {
     /// `Location` of a redirect, if any. Allocated in the caller's arena.
     location: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
+    /// `ETag` and `Last-Modified` of the answer, to ask again conditionally next time.
+    etag: ?[]const u8 = null,
+    last_modified: ?[]const u8 = null,
     body: []const u8 = &.{},
 };
 
@@ -39,6 +42,9 @@ pub const Request = struct {
     max_body_bytes: usize,
     /// The value of an `Authorization` header, if one is to be sent (API keys of peers).
     authorization: ?[]const u8 = null,
+    /// Validators from an earlier answer: the server may answer 304 (nothing changed) without a body.
+    if_none_match: ?[]const u8 = null,
+    if_modified_since: ?[]const u8 = null,
 };
 
 /// Fetches `req.url`. Everything returned is allocated from `arena`; on
@@ -75,11 +81,27 @@ fn sleep(io: Io, d: Io.Duration) void {
 
 fn run(client: *http.Client, arena: Allocator, req: Request) Failure!Response {
     const uri = std.Uri.parse(req.url) catch return error.BadUrl;
+    var headers: [4]http.Header = undefined;
+    var n_headers: usize = 0;
+    headers[n_headers] = .{ .name = "accept", .value = req.accept };
+    n_headers += 1;
+    if (req.authorization) |a| {
+        headers[n_headers] = .{ .name = "authorization", .value = a };
+        n_headers += 1;
+    }
+    if (req.if_none_match) |v| {
+        headers[n_headers] = .{ .name = "if-none-match", .value = v };
+        n_headers += 1;
+    }
+    if (req.if_modified_since) |v| {
+        headers[n_headers] = .{ .name = "if-modified-since", .value = v };
+        n_headers += 1;
+    }
     var request = client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
         .keep_alive = false,
         .headers = .{ .user_agent = .{ .override = req.user_agent } },
-        .extra_headers = if (req.authorization) |a| &.{ .{ .name = "accept", .value = req.accept }, .{ .name = "authorization", .value = a } } else &.{.{ .name = "accept", .value = req.accept }},
+        .extra_headers = headers[0..n_headers],
     }) catch |e| return mapRequestError(e);
     defer request.deinit();
 
@@ -105,6 +127,11 @@ fn run(client: *http.Client, arena: Allocator, req: Request) Failure!Response {
     var out: Response = .{ .status = @backingInt(response.head.status) };
     if (response.head.location) |l| out.location = try arena.dupe(u8, l);
     if (response.head.content_type) |c| out.content_type = try arena.dupe(u8, c);
+    var hit = response.head.iterateHeaders();
+    while (hit.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "etag") and h.value.len <= 300) out.etag = try arena.dupe(u8, h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "last-modified") and h.value.len <= 100) out.last_modified = try arena.dupe(u8, h.value);
+    }
 
     // Only a successful answer's body is wanted; for anything else the
     // connection is simply closed rather than drained.

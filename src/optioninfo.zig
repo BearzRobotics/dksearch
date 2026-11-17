@@ -85,6 +85,7 @@ const crawl = [_]Option{
     .{ .key = "max_page_bytes", .label = "Largest page (bytes)", .type = .number, .min = 1, .max = 33554432, .default = "2097152", .help = "Larger pages are skipped." },
     .{ .key = "workers", .label = "Seeds crawled at once", .type = .number, .min = 1, .max = 64, .default = "8", .help = "How many addresses are crawled at the same time. A site is still asked by one at a time, with the delay above between requests, so this changes how fast the crawl moves across many sites, not how hard any one site is hit." },
     .{ .key = "window", .label = "Seeds crawled together", .type = .number, .min = 0, .max = 10000, .default = "100", .help = "Seeds are crawled in groups, breadth-first inside a group: every address's first page, then every page one link away, and so on. 0 means all seeds in one group. An interrupted crawl repeats at most its current group." },
+    .{ .key = "validators_file", .label = "Validators file (for recrawling)", .type = .text, .help = "A file where the crawler keeps the ETag and Last-Modified of the pages at the depth limit, so the next run can ask the server whether they changed and skip those that did not (a 304 costs no download). Pages with links to follow are always fetched in full. Empty: every page is fetched in full each time." },
     timeout,
     ca,
     lang,

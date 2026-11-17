@@ -74,7 +74,7 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file" };
 
 // ------------------------------------------------------------ validation
 
@@ -169,6 +169,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     try intOption(source, "workers", 1, max_workers, diag);
     try intOption(source, "window", 0, max_window, diag);
     _ = try needString(source, "ca_bundle", false, diag);
+    _ = try needString(source, "validators_file", false, diag);
     if (try needString(source, "language", false, diag)) |l| if (!files.validLanguageTag(l)) {
         diag.set("", key(&kbuf, source, "language"), "must be a language tag such as \"en\" (letters, digits and '-', at most 35 characters)", .{});
         return error.InvalidValue;
@@ -197,6 +198,9 @@ pub const CrawlConnector = struct {
     window: u32,
     ca: cabundle.Choice,
     language: ?[]const u8,
+    /// Where to keep the `ETag` and `Last-Modified` of the pages at the depth limit between runs (none: no
+    /// conditional requests).
+    validators_file: ?[]const u8,
     checkpoint_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(gpa: Allocator, io: Io, source: config.Source) Allocator.Error!CrawlConnector {
@@ -219,6 +223,8 @@ pub const CrawlConnector = struct {
             else => {},
         };
         const language = if (source.optionString("language")) |l| try gpa.dupe(u8, l) else null;
+        errdefer if (language) |l| gpa.free(l);
+        const validators_file = if (source.optionString("validators_file")) |l| try gpa.dupe(u8, l) else null;
         return .{
             .gpa = gpa,
             .io = io,
@@ -237,6 +243,7 @@ pub const CrawlConnector = struct {
             .window = @intCast(source.optionInt("window") orelse default_window),
             .ca = ca,
             .language = language,
+            .validators_file = validators_file,
         };
     }
 
@@ -249,6 +256,7 @@ pub const CrawlConnector = struct {
             else => {},
         }
         if (self.language) |l| self.gpa.free(l);
+        if (self.validators_file) |l| self.gpa.free(l);
         self.checkpoint_buf.deinit(self.gpa);
         self.* = undefined;
     }
@@ -281,6 +289,7 @@ pub const CrawlConnector = struct {
 
         var locked: LockedSink = .{ .inner = sink, .io = self.io };
         var sh: Shared = .{ .first_seed = start };
+        if (self.validators_file) |path| self.loadValidators(run_arena.allocator(), path, &sh.old);
         sh.finished = try run_arena.allocator().alloc(bool, seeds.len - start);
         @memset(sh.finished, false);
         sh.last_done = if (start > 0) seeds[start - 1].line else null;
@@ -375,6 +384,7 @@ pub const CrawlConnector = struct {
         }
 
         if (sh.out_of_memory.load(.monotonic)) return error.OutOfMemory;
+        if (self.validators_file) |path| self.saveValidators(path, &sh);
         sh.mutex.lockUncancelable(self.io);
         const done = sh.last_done;
         sh.mutex.unlock(self.io);
@@ -512,6 +522,47 @@ pub const CrawlConnector = struct {
         self.checkpoint_buf.clearRetainingCapacity();
         self.checkpoint_buf.appendSlice(self.gpa, d) catch return .{ .interrupted = true };
         return .{ .interrupted = true, .checkpoint = self.checkpoint_buf.items };
+    }
+
+    /// The validators of the last run: `URL<TAB>ETag<TAB>Last-Modified` per line (either validator may be empty).
+    /// A file that is missing or damaged is no validators: every page is simply fetched in full.
+    fn loadValidators(self: *CrawlConnector, arena: Allocator, path: []const u8, into: *std.StringHashMapUnmanaged(Validator)) void {
+        const data = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_validators_bytes)) catch return;
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line| {
+            var f = std.mem.splitScalar(u8, line, '\t');
+            const url = f.next() orelse continue;
+            const etag = f.next() orelse continue;
+            const lm = f.next() orelse continue;
+            if (url.len == 0 or (etag.len == 0 and lm.len == 0) or parseUrl(url) == null) continue;
+            if (into.count() >= max_validators) break;
+            into.put(arena, url, .{ .etag = if (etag.len > 0) etag else null, .last_modified = if (lm.len > 0) lm else null }) catch return;
+        }
+    }
+
+    /// Writes the validators back: this run's, and the earlier ones for pages this run did not reach (a partial run
+    /// must not forget the rest). Replaced atomically; a failure only means the next run fetches in full.
+    fn saveValidators(self: *CrawlConnector, path: []const u8, sh: *Shared) void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        const add = struct {
+            fn one(list: *std.ArrayList(u8), gpa: Allocator, url: []const u8, v: Validator) void {
+                list.print(gpa, "{s}\t{s}\t{s}\n", .{ url, v.etag orelse "", v.last_modified orelse "" }) catch {};
+            }
+        }.one;
+        sh.mutex.lockUncancelable(self.io);
+        defer sh.mutex.unlock(self.io);
+        var it = sh.fresh.iterator();
+        while (it.next()) |e| add(&out, self.gpa, e.key_ptr.*, e.value_ptr.*);
+        var old_it = sh.old.iterator();
+        while (old_it.next()) |e| if (!sh.fresh.contains(e.key_ptr.*)) add(&out, self.gpa, e.key_ptr.*, e.value_ptr.*);
+        const tmp = std.fmt.allocPrint(self.gpa, "{s}.tmp", .{path}) catch return;
+        defer self.gpa.free(tmp);
+        const cwd = Io.Dir.cwd();
+        cwd.writeFile(self.io, .{ .sub_path = tmp, .data = out.items }) catch return;
+        cwd.rename(tmp, cwd, path, self.io) catch {
+            cwd.deleteFile(self.io, tmp) catch {};
+        };
     }
 
     /// One entry per line: an absolute http(s) URL, or `sitemap URL`. Blank
@@ -683,8 +734,18 @@ const Host = struct {
 
 /// What the workers of one run share. `mutex` guards the host table, the visited set and the position
 /// bookkeeping; the counters are atomic.
+/// What a server said about a page that lets us ask "has it changed?" next time.
+const Validator = struct { etag: ?[]const u8, last_modified: ?[]const u8 };
+const max_validators = 2_000_000;
+const max_validators_bytes = 512 * 1024 * 1024;
+
 const Shared = struct {
     mutex: Io.Mutex = .init,
+    /// The validators of the last run (read only while crawling) and the ones learned in this run (under `mutex`).
+    old: std.StringHashMapUnmanaged(Validator) = .empty,
+    fresh: std.StringHashMapUnmanaged(Validator) = .empty,
+    /// Pages the server said had not changed (answered 304).
+    not_modified: std.atomic.Value(u64) = .init(0),
     hosts: std.StringHashMapUnmanaged(*Host) = .empty,
     /// Every URL fetched or queued this run, so none is requested twice.
     visited: std.StringHashMapUnmanaged(void) = .empty,
@@ -878,16 +939,20 @@ const Run = struct {
     const Fetched = union(enum) {
         /// `url` is where the answer came from, after redirects.
         page: struct { url: []const u8, resp: fetch.Response },
+        /// The server answered 304 to a conditional request: the stored copy is still current.
+        unchanged,
         skipped,
         stopped,
     };
 
     /// One polite GET of `start`: robots.txt, the host's turn, the request and
     /// same-site redirects. Everything is allocated in `a`.
-    fn get(self: *Run, a: Allocator, start: []const u8, site_host: []const u8, accept: []const u8, max_bytes: usize, listed: bool) error{OutOfMemory}!Fetched {
+    fn get(self: *Run, a: Allocator, start: []const u8, site_host: []const u8, accept: []const u8, max_bytes: usize, listed: bool, cond: ?Validator) error{OutOfMemory}!Fetched {
         var url = try withoutFragment(a, start);
         var hops: u32 = 0;
-        _ = self.sh.fetched.fetchAdd(1, .monotonic);
+        const fetched_now = self.sh.fetched.fetchAdd(1, .monotonic) + 1;
+        // The progress follows every page, not only the start of each breadth-first level (it lagged by a whole level).
+        if (self.conn.max_depth != 0) self.control.setProgress(fetched_now, self.conn.max_pages);
         self.setCurrent(url);
         while (true) {
             const u = parseUrl(url) orelse return self.skip(.limit);
@@ -911,6 +976,9 @@ const Run = struct {
                 .user_agent = self.conn.user_agent,
                 .accept = accept,
                 .max_body_bytes = max_bytes,
+                // Only the first request of the chain: after a redirect the validators are for another address.
+                .if_none_match = if (hops == 0) (if (cond) |c| c.etag else null) else null,
+                .if_modified_since = if (hops == 0) (if (cond) |c| c.last_modified else null) else null,
             }, self.timeout());
             host.last = Io.Timestamp.now(self.conn.io, .awake);
             const got = resp catch |e| switch (e) {
@@ -926,6 +994,7 @@ const Run = struct {
                 else => return self.skip(.http_status),
             };
 
+            if (got.status == 304 and cond != null and hops == 0) return .unchanged;
             if (got.status >= 300 and got.status < 400) {
                 hops += 1;
                 const loc = got.location orelse return self.skip(.redirect);
@@ -976,9 +1045,9 @@ const Run = struct {
         var tmp = std.heap.ArenaAllocator.init(self.conn.gpa);
         defer tmp.deinit();
         const t = tmp.allocator();
-        const got = switch (try self.get(t, url, site, accept_sitemap, max_sitemap_bytes, level == 0)) {
+        const got = switch (try self.get(t, url, site, accept_sitemap, max_sitemap_bytes, level == 0, null)) {
             .stopped => return true,
-            .skipped => return false,
+            .skipped, .unchanged => return false,
             .page => |p| p,
         };
         // A sitemap may be served gzip-compressed as a file (sitemap.xml.gz),
@@ -1026,9 +1095,16 @@ const Run = struct {
         var page = std.heap.ArenaAllocator.init(gpa);
         defer page.deinit();
         const a = page.allocator();
-        const got = switch (try self.get(a, t.url, t.site, accept_pages, self.conn.max_page_bytes, t.root)) {
+        // A page at the depth limit has no links to follow, so a server that says it has not changed lets us skip it.
+        const leaf = t.depth >= self.conn.max_depth;
+        const cond: ?Validator = if (leaf and self.conn.validators_file != null) self.sh.old.get(t.url) else null;
+        const got = switch (try self.get(a, t.url, t.site, accept_pages, self.conn.max_page_bytes, t.root, cond)) {
             .stopped => return .stopped,
             .skipped => return .skipped,
+            .unchanged => {
+                _ = self.sh.not_modified.fetchAdd(1, .monotonic);
+                return .skipped;
+            },
             .page => |p| p,
         };
         // A redirect target counts as seen too.
@@ -1039,6 +1115,7 @@ const Run = struct {
             .stopped => return .stopped,
             .stored, .skipped => {},
         }
+        if (leaf and self.conn.validators_file != null and (got.resp.etag != null or got.resp.last_modified != null)) try self.rememberValidators(t.url, got.resp);
         if (t.depth >= self.conn.max_depth) return stored.result;
         for (stored.links) |link| {
             if (out.items.len >= max_level_items) break;
@@ -1049,6 +1126,18 @@ const Run = struct {
             try out.append(gpa, .{ .url = keep, .depth = t.depth + 1, .seed = t.seed, .site = t.site });
         }
         return stored.result;
+    }
+
+    fn rememberValidators(self: *Run, url: []const u8, resp: fetch.Response) error{OutOfMemory}!void {
+        const io = self.conn.io;
+        self.sh.mutex.lockUncancelable(io);
+        defer self.sh.mutex.unlock(io);
+        if (self.sh.fresh.count() >= max_validators) return;
+        const owned_url = try self.arena.dupe(u8, url);
+        try self.sh.fresh.put(self.arena, owned_url, .{
+            .etag = if (resp.etag) |e| try self.arena.dupe(u8, e) else null,
+            .last_modified = if (resp.last_modified) |l| try self.arena.dupe(u8, l) else null,
+        });
     }
 
     const Stored = struct { result: Result, links: []const []const u8 = &.{} };
@@ -1374,6 +1463,62 @@ test "fetches seeds, obeys robots.txt, converts HTML, identifies itself" {
     try testing.expectEqual(@as(usize, 0), srv.count("/private/b")); // never requested
     try testing.expectEqual(@as(usize, 1), srv.count("/robots.txt")); // once per host
     for (srv.agents.items) |ag| try testing.expectEqualStrings("dksearch-test/1.0 (+https://example.org/bot)", ag);
+}
+
+test "pages at the depth limit are asked for conditionally on the next run, and a 304 is not stored again" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/a", .body = "<p>stable page</p>", .etag = "\"v1\"" },
+        .{ .path = "/b", .body = "<p>no validator page</p>" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [2][96]u8 = undefined;
+    const seeds = try std.fmt.allocPrint(testing.allocator, "{s}\n{s}\n", .{ srv.url(&b[0], "/a"), srv.url(&b[1], "/b") });
+    defer testing.allocator.free(seeds);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "seeds.txt", .data = seeds });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPathFile(testing.io, "seeds.txt", &pbuf);
+    const seeds_path = try testing.allocator.dupe(u8, pbuf[0..n]);
+    defer testing.allocator.free(seeds_path);
+    const vpath = try std.fmt.allocPrint(testing.allocator, "{s}.validators", .{seeds_path});
+    defer testing.allocator.free(vpath);
+    const opts = [_]config.Option{
+        .{ .key = "user_agent", .value = .{ .string = "dksearch-test/1.0 (+https://example.org/bot)" } },
+        .{ .key = "seeds_file", .value = .{ .string = seeds_path } },
+        .{ .key = "validators_file", .value = .{ .string = vpath } },
+    };
+    var conn = try CrawlConnector.init(testing.allocator, testing.io, .{ .name = "web", .kind = "crawl", .options = &opts });
+    defer conn.deinit();
+    conn.delay_ms = 0;
+    conn.timeout_s = 5;
+    conn.workers = 1;
+    conn.max_depth = 0; // the listed pages only: every one is at the limit
+
+    var first: Collect = .{};
+    defer first.deinit();
+    var ctl1: api.Control = .{};
+    _ = try conn.connector().run(first.sink(), &ctl1, null);
+    try testing.expectEqual(@as(usize, 2), first.ids.items.len);
+    try testing.expectEqual(@as(usize, 0), srv.conditional);
+    const saved = try tmp.dir.readFileAlloc(testing.io, "seeds.txt.validators", testing.allocator, .limited(4096));
+    defer testing.allocator.free(saved);
+    try testing.expect(std.mem.indexOf(u8, saved, "/a\t\"v1\"\t") != null);
+    try testing.expect(std.mem.indexOf(u8, saved, "/b\t") == null); // nothing to ask with
+
+    // Again: /a is asked conditionally and answered 304 (not submitted); /b has no validator and is fetched in full.
+    var second: Collect = .{};
+    defer second.deinit();
+    var ctl2: api.Control = .{};
+    _ = try conn.connector().run(second.sink(), &ctl2, null);
+    try testing.expectEqual(@as(usize, 1), srv.conditional);
+    try testing.expectEqual(@as(usize, 1), second.ids.items.len);
+    try testing.expectEqualStrings("no validator page", second.texts.items[0]);
+    // The validators survive a run that did not change them.
+    const again = try tmp.dir.readFileAlloc(testing.io, "seeds.txt.validators", testing.allocator, .limited(4096));
+    defer testing.allocator.free(again);
+    try testing.expect(std.mem.indexOf(u8, again, "/a\t\"v1\"\t") != null);
 }
 
 test "same-site redirects are followed, other sites are not, loops end" {

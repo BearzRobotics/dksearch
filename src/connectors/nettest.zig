@@ -21,6 +21,8 @@ pub const Route = struct {
     location: ?[]const u8 = null,
     /// Stall this long before answering (to test the deadline).
     stall_ms: i64 = 0,
+    /// Sent as `ETag`; a request with the same `If-None-Match` is answered 304 without a body.
+    etag: ?[]const u8 = null,
 };
 
 pub const TestServer = struct {
@@ -32,6 +34,8 @@ pub const TestServer = struct {
     paths: std.ArrayList([]u8) = .empty,
     agents: std.ArrayList([]u8) = .empty,
     times: std.ArrayList(i96) = .empty,
+    /// How many requests carried `If-None-Match`.
+    conditional: usize = 0,
 
     pub fn start(s: *TestServer, routes: []const Route) !void {
         try s.open();
@@ -114,15 +118,18 @@ pub const TestServer = struct {
         _ = parts.next();
         const path = parts.next() orelse return;
         var agent: []const u8 = "";
-        while (lines.next()) |l| if (std.ascii.startsWithIgnoreCase(l, "user-agent:")) {
-            agent = std.mem.trim(u8, l[11..], " ");
-        };
+        var if_none_match: ?[]const u8 = null;
+        while (lines.next()) |l| {
+            if (std.ascii.startsWithIgnoreCase(l, "user-agent:")) agent = std.mem.trim(u8, l[11..], " ");
+            if (std.ascii.startsWithIgnoreCase(l, "if-none-match:")) if_none_match = std.mem.trim(u8, l["if-none-match:".len..], " ");
+        }
         {
             s.mutex.lockUncancelable(io);
             defer s.mutex.unlock(io);
             try s.paths.append(testing.allocator, try testing.allocator.dupe(u8, path));
             try s.agents.append(testing.allocator, try testing.allocator.dupe(u8, agent));
             try s.times.append(testing.allocator, Io.Timestamp.now(io, .awake).nanoseconds);
+            if (if_none_match != null) s.conditional += 1;
         }
         var found: ?Route = null;
         for (s.routes) |rt| if (std.mem.eql(u8, rt.path, path)) {
@@ -130,7 +137,13 @@ pub const TestServer = struct {
         };
         const rt = found orelse Route{ .path = path, .status = 404, .content_type = "text/plain", .body = "not found" };
         if (rt.stall_ms > 0) try io.sleep(.fromMilliseconds(rt.stall_ms), .awake);
+        if (rt.etag) |tag| if (if_none_match) |inm| if (std.mem.eql(u8, tag, inm)) {
+            try w.interface.print("HTTP/1.1 304 Not Modified\r\netag: {s}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n", .{tag});
+            try w.interface.flush();
+            return;
+        };
         try w.interface.print("HTTP/1.1 {d} X\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: close\r\n", .{ rt.status, rt.content_type, rt.body.len });
+        if (rt.etag) |tag| try w.interface.print("etag: {s}\r\n", .{tag});
         if (rt.location) |l| try w.interface.print("location: {s}\r\n", .{l});
         try w.interface.writeAll("\r\n");
         try w.interface.writeAll(rt.body);
