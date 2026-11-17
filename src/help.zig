@@ -128,6 +128,7 @@ pub const commands = [_]Command{
         \\
         \\    dksearch api-key add laptop --collection books --collection docs
         \\    dksearch api-key add backup --all
+        \\    dksearch api-key add public --collection books --rate 60   # at most 60 requests a minute
         \\    dksearch api-key list
         \\    dksearch api-key remove laptop
         \\

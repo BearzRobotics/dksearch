@@ -22,7 +22,7 @@ dksearch admin-token [--config FILE]
 
 dksearch admin-password [--config FILE]
 
-dksearch api-key add NAME (--all | --collection NAME ...) [--config FILE]
+dksearch api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] [--config FILE]
 
 dksearch api-key list [--config FILE]
 
@@ -135,7 +135,9 @@ Usage: dksearch admin-password [--config FILE]
 api-key
 Make, list or remove API keys. A key lets a program (or another dksearch) use the search API and see only the collections it was made for (see **COLLECTIONS AND API KEYS** under CONFIGURATION). **add** prints the key (`dkk_` and 43 characters) to standard output, once, and stores only its SHA-256 hash in `data_dir/api-keys.toml` (mode 0600); the key can be limited to named collections (`--collection`, repeatable, each must be defined in the configuration) or made for every source (`--all`). **list** shows each key's number (the first eight hex digits of its hash), name and collections, never the key. **remove** takes the name or the number. Keys are looked at again when the file changes, so a key made or removed with the server running works or stops within a second.
 
-Usage: dksearch api-key add NAME (--all | --collection NAME ...) | list | remove NAME_OR_ID [--config FILE]
+**--rate** limits the key to that many requests per minute (fixed one-minute windows; over it the key gets 429 `rate_limited` with `Retry-After` until the minute ends); 0 or leaving it out means no limit. **list** shows the limit.
+
+Usage: dksearch api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] | list | remove NAME_OR_ID [--config FILE]
 
 Examples: dksearch api-key add laptop --collection books --collection docs
 

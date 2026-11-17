@@ -25,4 +25,4 @@ Sources were a flat list with an incidental filter. The roadmap asked for saved 
 
 - Anything that returns document content must take the scope into account; new endpoints must do so (a test per endpoint is in `handler.zig`).
 - The same scope will bound what a paired node may ask of another (P2P plan, step 1).
-- Rate limits per key and an administration page for keys and collections are not done yet; collections are edited in the configuration file and apply at restart.
+- Rate limits: a key may carry a per-minute limit (fixed windows, counted in memory, so a restart resets them); over it, 429 with `Retry-After`. Collections are edited on the Access page (validated edit of the configuration file, applied after a restart).
