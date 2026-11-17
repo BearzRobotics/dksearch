@@ -66,6 +66,11 @@ pub const Options = struct {
     /// Regular-expression filtering for the query-testing page and API (with
     /// the larger administration limits), if available.
     regex: ?*dk.regexsearch.Service = null,
+    /// The data directory (where `api-keys.toml` lives), and the collections and anonymous access setting, for the
+    /// Access page.
+    data_dir: []const u8 = "",
+    collections: []const dk.config.Collection = &.{},
+    anonymous_collections: ?[]const []const u8 = null,
     /// The Kiwix library's catalogue (tests point this at a local server).
     kiwix_catalog_url: []const u8 = dk.kiwix.catalog_base,
     kiwix_options: dk.kiwix.Options = .{},
@@ -131,7 +136,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -139,7 +144,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, access_page, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -155,6 +160,9 @@ pub const App = struct {
             .{ "/actions/settings", .action_settings },
             .{ "/maintenance", .maintenance },
             .{ "/actions/maintenance", .action_maintenance },
+            .{ "/access", .access_page },
+            .{ "/actions/key-add", .action_key_add },
+            .{ "/actions/key-remove", .action_key_remove },
             .{ "/zim", .zim_page },
             .{ "/actions/zim", .action_zim },
             .{ "/api/v1/admin/maintenance", .api_maintenance },
@@ -207,7 +215,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -233,6 +241,9 @@ pub const App = struct {
             .maintenance => self.pageMaintenance(arena, csrf),
             .action_maintenance => self.startOperation(arena, req, auth, false),
             .zim_page => self.pageZim(arena, csrf, t.params),
+            .access_page => self.pageAccess(arena, csrf, null),
+            .action_key_add => self.addKey(arena, req, auth),
+            .action_key_remove => self.removeKey(arena, req, auth),
             .action_zim => self.startZimDownload(arena, req, auth),
             .api_maintenance => self.startOperation(arena, req, auth, true),
             .api_status => self.apiStatus(arena),
@@ -1051,6 +1062,169 @@ pub const App = struct {
         return handler.htmlResponse(arena, .ok, aw.written());
     }
 
+    // ----------------------------------------------------- collections and API keys
+
+    const NewKey = struct { name: []const u8, token: []const u8 };
+
+    fn keysPath(self: *App, arena: Allocator) error{OutOfMemory}![]const u8 {
+        return std.fmt.allocPrint(arena, "{s}/{s}", .{ self.opts.data_dir, dk.access.file_name });
+    }
+
+    fn pageAccess(self: *App, arena: Allocator, csrf: ?[]const u8, fresh: ?NewKey) error{OutOfMemory}!Response {
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "Access", csrf, "access") catch return error.OutOfMemory;
+        self.writeAccess(arena, w, csrf, fresh) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        var r = handler.htmlResponse(arena, .ok, aw.written());
+        r.headers = handler.headersWith(arena, &.{handler.no_store}); // a page that may show a new key is never cached
+        return r;
+    }
+
+    fn writeAccess(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, fresh: ?NewKey) !void {
+        try w.writeAll("<p class=\"muted\">Who may see what. A <em>collection</em> is a named group of sources (written as <code>[[collection]]</code> in the configuration file); an <em>API key</em> lets a program see only the collections it was made for. Without keys, everyone can search everything unless <code>[access] anonymous_collections</code> says otherwise.</p>");
+        if (fresh) |f| {
+            try w.writeAll("<section class=\"card\"><h2>New key made</h2><p>Copy it now: it is shown only this once, and only its hash is kept. Key <strong>");
+            try html.writeEscaped(w, f.name);
+            try w.writeAll("</strong>:</p><p><code>");
+            try html.writeEscaped(w, f.token);
+            try w.writeAll("</code></p><p class=\"muted\">Send it as <code>Authorization: Bearer KEY</code>.</p></section>");
+        }
+        try w.writeAll("<section class=\"card\"><h2>Visitors without a key</h2><p>");
+        if (self.opts.anonymous_collections) |names| {
+            if (names.len == 0) {
+                try w.writeAll("May see <strong>nothing</strong>: the API needs a key and the search page finds nothing.");
+            } else {
+                try w.writeAll("May see only the collections: ");
+                for (names, 0..) |n, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try w.writeAll("<strong>");
+                    try html.writeEscaped(w, n);
+                    try w.writeAll("</strong>");
+                }
+                try w.writeAll(".");
+            }
+        } else try w.writeAll("May see <strong>every source</strong> (no limit is set).");
+        try w.writeAll(" Change this with <code>[access]</code> in the configuration file (read at start).</p></section>");
+
+        try w.writeAll("<section class=\"card\"><h2>Collections</h2>");
+        if (self.opts.collections.len == 0) {
+            try w.writeAll("<p class=\"muted\">None defined. Add <code>[[collection]]</code> tables with <code>name</code>, an optional <code>description</code> and <code>sources = [...]</code> to the configuration file.</p>");
+        } else {
+            try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Name</th><th>Sources</th><th>Description</th></tr></thead><tbody>");
+            for (self.opts.collections) |c| {
+                try w.writeAll("<tr><td><strong>");
+                try html.writeEscaped(w, c.name);
+                try w.writeAll("</strong></td><td>");
+                for (c.sources, 0..) |s, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try html.writeEscaped(w, s);
+                }
+                try w.writeAll("</td><td>");
+                try html.writeEscaped(w, c.description);
+                try w.writeAll("</td></tr>");
+            }
+            try w.writeAll("</tbody></table></div>");
+        }
+        try w.writeAll("</section>");
+
+        try w.writeAll("<section class=\"card\"><h2>API keys</h2>");
+        const keys = dk.access.load(arena, self.io, Io.Dir.cwd(), try self.keysPath(arena)) catch |e| {
+            try w.print("<p class=\"error\">The key file cannot be used ({t}); no key works until that is fixed (it must be readable by the owner only).</p></section>", .{e});
+            return;
+        };
+        if (keys.len == 0) {
+            try w.writeAll("<p class=\"muted\">No keys yet.</p>");
+        } else {
+            try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Number</th><th>Name</th><th>Collections</th><th>Made</th><th></th></tr></thead><tbody>");
+            for (keys) |k| {
+                try w.print("<tr><td><code>{s}</code></td><td>", .{k.id});
+                try html.writeEscaped(w, k.name);
+                try w.writeAll("</td><td>");
+                for (k.collections, 0..) |c, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    if (std.mem.eql(u8, c, dk.access.all_marker)) try w.writeAll("<em>everything</em>") else try html.writeEscaped(w, c);
+                }
+                try w.writeAll("</td><td>");
+                try writeTime(w, k.created);
+                try w.writeAll("</td><td>");
+                if (csrf) |token| {
+                    try w.writeAll("<form class=\"inline\" action=\"/actions/key-remove\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+                    try html.writeEscaped(w, token);
+                    try w.print("\"><input type=\"hidden\" name=\"which\" value=\"{s}\"><button type=\"submit\" class=\"btn danger\">Remove</button></form>", .{k.id});
+                }
+                try w.writeAll("</td></tr>");
+            }
+            try w.writeAll("</tbody></table></div>");
+        }
+        if (csrf != null and self.opts.jobs != null) {
+            try w.writeAll("<h3>Make a key</h3><form class=\"stack\" action=\"/actions/key-add\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+            try html.writeEscaped(w, csrf.?);
+            try w.writeAll("\"><label>Name <input name=\"name\" maxlength=\"64\" required placeholder=\"laptop\"><small>Only for you to recognise it.</small></label><fieldset><legend>May see</legend>");
+            try w.writeAll("<label class=\"check\"><input type=\"checkbox\" name=\"all\" value=\"1\"> every source</label>");
+            for (self.opts.collections) |c| {
+                try w.writeAll("<label class=\"check\"><input type=\"checkbox\" name=\"collection\" value=\"");
+                try html.writeEscaped(w, c.name);
+                try w.writeAll("\"> ");
+                try html.writeEscaped(w, c.name);
+                try w.writeAll("</label>");
+            }
+            try w.writeAll("</fieldset><p><button type=\"submit\" class=\"btn\">Make the key</button></p></form>");
+        } else {
+            try w.writeAll("<p class=\"muted\">Making and removing keys here needs <code>admin.actions = true</code> and a signed-in session; <code>dksearch api-key</code> works regardless.</p>");
+        }
+        try w.writeAll("</section>");
+    }
+
+    fn addKey(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const name = std.mem.trim(u8, params.get("name") orelse "", " ");
+        const all = params.get("all") != null;
+        const wanted = try params.all(arena, "collection");
+        if (!all and wanted.len == 0) return actionFailure(arena, false, .{ .status = .bad_request, .code = "no_scope", .message = "tick every source or at least one collection" });
+        if (all and wanted.len > 0) return actionFailure(arena, false, .{ .status = .bad_request, .code = "bad_scope", .message = "tick every source or collections, not both" });
+        for (wanted) |c| {
+            var known = false;
+            for (self.opts.collections) |col| if (std.mem.eql(u8, col.name, c)) {
+                known = true;
+            };
+            if (!known) return actionFailure(arena, false, .{ .status = .bad_request, .code = "unknown_collection", .message = "no such collection" });
+        }
+        const path = try self.keysPath(arena);
+        const keys = dk.access.load(arena, self.io, Io.Dir.cwd(), path) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "keys_unreadable", .message = "the key file cannot be read (it must be readable by its owner only)" });
+        var tok: [dk.access.token_len]u8 = undefined;
+        const chosen: []const []const u8 = if (all) &.{dk.access.all_marker} else wanted;
+        const updated = dk.access.add(arena, self.io, keys, name, chosen, unixNow(self.io), &tok) catch |e| return actionFailure(arena, false, switch (e) {
+            error.Duplicate => .{ .status = .conflict, .code = "duplicate", .message = "a key with that name already exists" },
+            error.BadName => .{ .status = .bad_request, .code = "bad_name", .message = "the name must be 1 to 64 printable characters without quotes" },
+            error.TooMany => .{ .status = .conflict, .code = "too_many", .message = "too many keys" },
+            error.OutOfMemory => return error.OutOfMemory,
+            else => .{ .status = .internal_server_error, .code = "key_failed", .message = "the key could not be made" },
+        });
+        dk.access.save(arena, self.io, Io.Dir.cwd(), path, updated) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "write_failed", .message = "the key file could not be written" });
+        const csrf: ?[]const u8 = switch (auth) {
+            .session => |s| try arena.dupe(u8, &s.csrf),
+            else => null,
+        };
+        return self.pageAccess(arena, csrf, .{ .name = name, .token = try arena.dupe(u8, &tok) });
+    }
+
+    fn removeKey(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const which = params.get("which") orelse "";
+        const path = try self.keysPath(arena);
+        const keys = dk.access.load(arena, self.io, Io.Dir.cwd(), path) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "keys_unreadable", .message = "the key file cannot be read" });
+        const left = (try dk.access.remove(arena, keys, which)) orelse return actionFailure(arena, false, .{ .status = .not_found, .code = "no_such_key", .message = "no such key" });
+        dk.access.save(arena, self.io, Io.Dir.cwd(), path, left) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "write_failed", .message = "the key file could not be written" });
+        return redirect(arena, "/access", null);
+    }
+
     // ----------------------------------------------------- Kiwix library
 
     /// A Metalink address must be on kiwix.org (or, in tests, whatever `kiwix_options` allows).
@@ -1292,6 +1466,7 @@ const nav_items = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "settings", "/settings", "Settings" },
     .{ "maintenance", "/maintenance", "Maintenance" },
     .{ "zim", "/zim", "ZIM files" },
+    .{ "access", "/access", "Access" },
     .{ "search", "/search", "Search test" },
 };
 
@@ -2718,6 +2893,52 @@ test "maintenance: check, backup, confirmed removal, and the page" {
     // Without a session (token only) the page explains how to proceed.
     const tok = try f.call(a, .GET, "/maintenance", .{ .auth = auth });
     try testing.expect(std.mem.indexOf(u8, tok.body, "Sign in with the password") != null);
+}
+
+test "Access: collections are listed, keys are made (shown once), listed and removed, with the form token" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const colls = [_]dk.config.Collection{.{ .name = "books", .description = "Books", .sources = &.{"notes"} }};
+    f.app.opts.collections = &colls;
+    f.app.opts.data_dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{f.tmp.sub_path});
+    f.app.opts.anonymous_collections = &.{"books"};
+
+    const page = try f.call(a, .GET, "/access", .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.ok, page.status);
+    try testing.expect(std.mem.indexOf(u8, page.body, "No keys yet") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "<strong>books</strong>") != null);
+    const csrf = csrfOf(page.body);
+
+    const bad_csrf = try f.call(a, .POST, "/actions/key-add", .{ .cookie = cookie, .body = "csrf=wrong&name=x&all=1" });
+    try testing.expectEqual(http.Status.forbidden, bad_csrf.status);
+    const no_scope = try f.call(a, .POST, "/actions/key-add", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&name=x", .{csrf}) });
+    try testing.expectEqual(http.Status.bad_request, no_scope.status);
+    const unknown = try f.call(a, .POST, "/actions/key-add", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&name=x&collection=nope", .{csrf}) });
+    try testing.expectEqual(http.Status.bad_request, unknown.status);
+
+    const made = try f.call(a, .POST, "/actions/key-add", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&name=laptop&collection=books", .{csrf}) });
+    try testing.expectEqual(http.Status.ok, made.status);
+    try testing.expect(std.mem.indexOf(u8, made.body, "dkk_") != null);
+    try testing.expect(std.mem.indexOf(u8, made.body, "only this once") != null);
+    const dup = try f.call(a, .POST, "/actions/key-add", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&name=laptop&all=1", .{csrf}) });
+    try testing.expectEqual(http.Status.conflict, dup.status);
+
+    // Listed afterwards, without the key itself; then removed.
+    const listed = try f.call(a, .GET, "/access", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, listed.body, "laptop") != null);
+    try testing.expect(std.mem.indexOf(u8, listed.body, "dkk_") == null);
+    const at = std.mem.indexOf(u8, listed.body, "name=\"which\" value=\"").? + "name=\"which\" value=\"".len;
+    const id = listed.body[at .. at + 8];
+    const removed = try f.call(a, .POST, "/actions/key-remove", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&which={s}", .{ csrf, id }) });
+    try testing.expectEqual(http.Status.see_other, removed.status);
+    try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/access", .{ .cookie = cookie })).body, "No keys yet") != null);
+    try testing.expectEqual(http.Status.not_found, (try f.call(a, .POST, "/actions/key-remove", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&which=ffffffff", .{csrf}) })).status);
 }
 
 test "ZIM files: the page explains when no folder is set, confirms before downloading, and only takes kiwix.org addresses" {
