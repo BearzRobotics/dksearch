@@ -77,6 +77,67 @@ pub fn validFileName(name: []const u8) bool {
     return std.mem.indexOf(u8, name, "..") == null;
 }
 
+/// The layout of `struct statvfs` on 64-bit Linux (glibc and musl).
+const Statvfs = extern struct {
+    f_bsize: c_ulong,
+    f_frsize: c_ulong,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_favail: u64,
+    f_fsid: c_ulong,
+    f_flag: c_ulong,
+    f_namemax: c_ulong,
+    spare: [6]c_int,
+};
+extern "c" fn statvfs(path: [*:0]const u8, buf: *Statvfs) c_int;
+
+/// Bytes a normal user can still write in the file system that holds `path`, or null if that cannot be told here.
+pub fn freeBytes(path: []const u8) ?u64 {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux or @sizeOf(usize) != 8 or !builtin.link_libc) return null;
+    var buf: [4096]u8 = undefined;
+    if (path.len == 0 or path.len >= buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    var st: Statvfs = undefined;
+    if (statvfs(@ptrCast(&buf), &st) != 0) return null;
+    const unit: u64 = if (st.f_frsize != 0) st.f_frsize else st.f_bsize;
+    return st.f_bavail * unit;
+}
+
+/// Room kept free beyond the file itself.
+pub const free_margin: u64 = 256 * 1024 * 1024;
+
+/// A source name for a downloaded file: lower case words joined by `-`, without the `.zim`, and without the
+/// date at the end (`wikipedia_en_all_maxi_2026-01.zim` becomes `wikipedia-en-all-maxi`).
+pub fn sourceNameFor(buf: []u8, file_name: []const u8) []const u8 {
+    var stem = file_name;
+    if (std.mem.endsWith(u8, stem, ".zim")) stem = stem[0 .. stem.len - 4];
+    // A trailing `_YYYY-MM` is the edition, not part of the name.
+    if (std.mem.lastIndexOfScalar(u8, stem, '_')) |i| {
+        const tail = stem[i + 1 ..];
+        if (tail.len == 7 and tail[4] == '-' and std.ascii.isDigit(tail[0]) and std.ascii.isDigit(tail[6])) stem = stem[0..i];
+    }
+    var n: usize = 0;
+    for (stem) |c| {
+        if (n >= buf.len or n >= 64) break;
+        const ch: u8 = if (std.ascii.isAlphanumeric(c)) std.ascii.toLower(c) else '-';
+        if (ch == '-' and (n == 0 or buf[n - 1] == '-')) continue;
+        buf[n] = ch;
+        n += 1;
+    }
+    while (n > 0 and buf[n - 1] == '-') n -= 1;
+    if (n == 0) {
+        const fallback = "zim";
+        @memcpy(buf[0..fallback.len], fallback);
+        return buf[0..fallback.len];
+    }
+    return buf[0..n];
+}
+
 /// Reads one page of the OPDS catalogue.
 pub fn parseCatalog(arena: Allocator, bytes: []const u8) ParseError!Catalog {
     var src: Io.Reader = .fixed(bytes);
@@ -689,4 +750,15 @@ test "a cancelled download stops at once" {
     ctl.cancel();
     try testing.expectError(error.Cancelled, download(testing.allocator, testing.io, a, .{ .meta4_url = server.url(&url_buf, "/c_2026-01.zim.meta4"), .dest_dir = dir, .file_name = "c_2026-01.zim" }, &ctl, .{ .allow_http = true }));
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "c_2026-01.zim", .{}));
+}
+
+test "source names for downloaded files, and free space can be asked" {
+    var buf: [80]u8 = undefined;
+    try testing.expectEqualStrings("wikipedia-en-all-maxi", sourceNameFor(&buf, "wikipedia_en_all_maxi_2026-01.zim"));
+    try testing.expectEqualStrings("gutenberg-en-all", sourceNameFor(&buf, "gutenberg_en_all_2026-02.zim"));
+    try testing.expectEqualStrings("ubuntu-stackexchange-com-en-all", sourceNameFor(&buf, "ubuntu.stackexchange.com_en_all_2026-01.zim"));
+    try testing.expectEqualStrings("a", sourceNameFor(&buf, "a.zim"));
+    try testing.expectEqualStrings("zim", sourceNameFor(&buf, "____.zim"));
+    if (freeBytes(".")) |n| try testing.expect(n > 0);
+    try testing.expect(freeBytes("/nonexistent-dksearch-dir") == null);
 }

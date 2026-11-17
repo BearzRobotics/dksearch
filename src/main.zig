@@ -922,6 +922,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
                 .sources = cfg.sources,
                 .backup_dir = cfg.admin_options.backup_dir,
                 .zim_dir = cfg.admin_options.zim_dir,
+                .config_path = config_path,
                 .chunk_min_bytes = cfg.search.chunk_index_min_kb * 1024,
             });
             job_manager_ready = true;

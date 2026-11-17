@@ -374,6 +374,7 @@ pub const App = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.NoConcurrency => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start a background task" },
             error.NotConfigured, error.BadArgument => .{ .status = .bad_request, .code = "bad_request", .message = "a source name is required" },
+            error.NoSpace => .{ .status = .conflict, .code = "no_space", .message = "not enough room" },
         });
         if (is_api) {
             var r = try handler.jsonResponse(arena, .accepted, .{ .started = name });
@@ -410,6 +411,7 @@ pub const App = struct {
             error.DataDirUnavailable => .{ .status = .internal_server_error, .code = "data_dir_unavailable", .message = "the data directory or its lock file cannot be used; see the server's error output" },
             error.OutOfMemory => return error.OutOfMemory,
             error.NoConcurrency => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start a background task" },
+            error.NoSpace => .{ .status = .conflict, .code = "no_space", .message = "not enough room" },
         });
         if (is_api) {
             var r = try handler.jsonResponse(arena, .accepted, .{ .started = op_text });
@@ -1508,7 +1510,12 @@ pub const App = struct {
             try writeBytes(w, size);
             try w.writeAll("</dd></div><div><dt>Saved to</dt><dd><code>");
             try html.writeEscaped(w, dir);
-            try w.writeAll("</code></dd></div></dl><p class=\"muted\">Check that the folder has room for it. The file is fetched from the library&rsquo;s mirrors over HTTPS, checked against the checksum the library publishes, and only then given its name; an interrupted download continues where it stopped. Only one task runs at a time, and imports can run meanwhile elsewhere.</p>");
+            try w.writeAll("</code></dd></div><div><dt>Free space there</dt><dd>");
+            if (dk.kiwix.freeBytes(dir)) |free| {
+                try writeBytes(w, free);
+                if (size > 0 and free < size + dk.kiwix.free_margin) try w.writeAll(" <strong class=\"error\">not enough for this file</strong>");
+            } else try w.writeAll("<span class=\"muted\">unknown</span>");
+            try w.writeAll("</dd></div></dl><p class=\"muted\">The file is fetched from the library&rsquo;s mirrors over HTTPS, checked against the checksum the library publishes, and only then given its name; an interrupted download continues where it stopped. Only one task runs at a time, and imports can run meanwhile elsewhere.</p>");
             if (csrf) |token| {
                 try w.writeAll("<form action=\"/actions/zim\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
                 try html.writeEscaped(w, token);
@@ -1598,6 +1605,7 @@ pub const App = struct {
             error.NotConfigured => .{ .status = .conflict, .code = "not_configured", .message = "downloads need a folder: set [admin] zim_dir" },
             error.BadArgument => .{ .status = .bad_request, .code = "bad_argument", .message = "that file name or address cannot be used" },
             error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "another operation is already running" },
+            error.NoSpace => .{ .status = .conflict, .code = "no_space", .message = try std.fmt.allocPrint(arena, "the ZIM folder has {d} MiB too little room for this file (it needs the file's size plus {d} MiB to spare)", .{ (self.opts.jobs.?.spaceShort(.{ .meta4_url = meta4, .file_name = file, .size = size }) orelse 0) / (1024 * 1024) + 1, dk.kiwix.free_margin / (1024 * 1024) }) },
             error.OutOfMemory => return error.OutOfMemory,
             else => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start the download" },
         });
@@ -3260,6 +3268,30 @@ test "ZIM files: the page explains when no folder is set, confirms before downlo
     try testing.expectEqual(http.Status.bad_request, refused.status);
     const bad_name = try f.call(a, .POST, "/actions/zim", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&file=..%2Fa.zim&meta4={s}", .{ csrf, ok_url }) });
     try testing.expectEqual(http.Status.bad_request, bad_name.status);
+}
+
+test "ZIM files: the confirmation shows the free space, and a download that cannot fit is refused with the numbers" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    var dir_buf: [160]u8 = undefined;
+    f.manager.opts.zim_dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}", .{f.tmp.sub_path});
+    if (dk.kiwix.freeBytes(f.manager.opts.zim_dir.?) == null) return error.SkipZigTest;
+    const ok_url = "https%3A%2F%2Fdownload.kiwix.org%2Fzim%2Fwikipedia%2Fa_2026-01.zim.meta4";
+    const huge = "1152921504606846976"; // 1 EiB
+    const confirm = try f.call(a, .GET, try std.fmt.allocPrint(a, "/zim?file=a_2026-01.zim&meta4={s}&size={s}", .{ ok_url, huge }), .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, confirm.body, "Free space there") != null);
+    try testing.expect(std.mem.indexOf(u8, confirm.body, "not enough for this file") != null);
+    const small = try f.call(a, .GET, try std.fmt.allocPrint(a, "/zim?file=a_2026-01.zim&meta4={s}&size=1024", .{ok_url}), .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, small.body, "not enough") == null);
+    const refused = try f.call(a, .POST, "/actions/zim", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&file=a_2026-01.zim&meta4={s}&size={s}", .{ csrfOf(confirm.body), ok_url, huge }) });
+    try testing.expectEqual(http.Status.conflict, refused.status);
+    try testing.expect(std.mem.indexOf(u8, refused.body, "too little room") != null);
 }
 
 test "sources can be added, edited, disabled and deleted from the interface, and apply at once" {

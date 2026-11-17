@@ -24,6 +24,7 @@ const runner = @import("runner.zig");
 const maintenance = @import("maintenance.zig");
 const sourcestore = @import("sourcestore.zig");
 const kiwix = @import("kiwix.zig");
+const sourceedit = @import("sourceedit.zig");
 
 /// The runner wants a clock without a context argument; one process runs one
 /// manager, so the clock's `Io` is kept here.
@@ -50,6 +51,8 @@ pub const Options = struct {
     backup_dir: ?[]const u8 = null,
     /// Where ZIM files downloaded from the Kiwix library go. Null turns downloads off.
     zim_dir: ?[]const u8 = null,
+    /// The configuration file, so that a downloaded ZIM file can be added as a source (null: it is not).
+    config_path: ?[]const u8 = null,
     /// How downloads behave (tests allow plain http to a local server).
     kiwix_options: kiwix.Options = .{},
     /// Documents of at least this many bytes also get their passages indexed (see `index_sqlite.OpenOptions`).
@@ -86,6 +89,8 @@ pub const StartError = error{
     /// A missing or unusable argument (the source name to remove).
     BadArgument,
     AlreadyRunning,
+    /// The folder for downloads has less room than the file needs.
+    NoSpace,
     /// The data directory or its lock file cannot be used (permissions,
     /// missing directory, disk error): not the same as another process
     /// holding the lock.
@@ -194,7 +199,22 @@ pub const Manager = struct {
     pub fn startDownload(self: *Manager, d: Download) StartError!void {
         if (self.opts.zim_dir == null) return error.NotConfigured;
         if (!kiwix.validFileName(d.file_name) or d.meta4_url.len == 0 or d.meta4_url.len > 2048) return error.BadArgument;
+        if (d.size > 0) if (self.spaceShort(d)) |_| return error.NoSpace;
         return self.begin(.download, d.file_name, d);
+    }
+
+    /// How much room the download folder lacks for `d` (what is already fetched of it counts), or null if there is
+    /// enough or it cannot be told.
+    pub fn spaceShort(self: *Manager, d: Download) ?u64 {
+        const dir = self.opts.zim_dir orelse return null;
+        const free = kiwix.freeBytes(dir) orelse return null;
+        var have: u64 = 0;
+        var pb: [1024]u8 = undefined;
+        if (std.fmt.bufPrint(&pb, "{s}/{s}.part", .{ dir, d.file_name })) |part| {
+            if (Io.Dir.cwd().statFile(self.io, part, .{})) |st| have = st.size else |_| {}
+        } else |_| {}
+        const need = (if (d.size > have) d.size - have else 0) + kiwix.free_margin;
+        return if (free >= need) null else need - free;
     }
 
     fn begin(self: *Manager, op: Op, arg: ?[]const u8, dl: ?Download) StartError!void {
@@ -409,7 +429,39 @@ pub const Manager = struct {
             return;
         };
         out.state = .completed;
-        self.summaryPrint(out, "Saved and verified: {s}. Add it as a source of kind zim (Sources, then Add a source) to search it.", .{path});
+        if (self.addDownloadedSource(arena_state.allocator(), path, d.file_name)) |name| {
+            self.summaryPrint(out, "Saved and verified: {s}. Added it as the source \"{s}\"; import it to search it (it is a large file: the first import takes a while).", .{ path, name });
+        } else {
+            self.summaryPrint(out, "Saved and verified: {s}. Add it as a source of kind zim (Sources, then Add a source) to search it.", .{path});
+        }
+    }
+
+    /// Adds `path` to the configuration as a `zim` source (best effort: null when this server has no configuration
+    /// file to edit, or the edit is refused). The name comes from the file name, made unique if need be.
+    fn addDownloadedSource(self: *Manager, arena: Allocator, path: []const u8, file_name: []const u8) ?[]const u8 {
+        const cfg_path = self.opts.config_path orelse return null;
+        const store = self.opts.store orelse return null;
+        const text = Io.Dir.cwd().readFileAlloc(self.io, cfg_path, arena, .limited(16 * 1024 * 1024)) catch return null;
+        var nbuf: [80]u8 = undefined;
+        const base = kiwix.sourceNameFor(&nbuf, file_name);
+        var name: []const u8 = arena.dupe(u8, base) catch return null;
+        var n: u32 = 1;
+        while (n < 100) : (n += 1) {
+            var taken = false;
+            for (store.snapshot()) |s| if (std.mem.eql(u8, s.name, name)) {
+                taken = true;
+            };
+            if (!taken) break;
+            name = std.fmt.allocPrint(arena, "{s}-{d}", .{ base, n + 1 }) catch return null;
+        }
+        const options = std.fmt.allocPrint(arena, "path = \"{s}\"\n", .{path}) catch return null;
+        var problem: sourceedit.Problem = .{};
+        const new_text = sourceedit.apply(arena, text, .{ .save = .{ .original = null, .spec = .{ .name = name, .kind = "zim", .options = options } } }, &problem) catch return null;
+        sourceedit.writeFile(self.io, arena, cfg_path, new_text) catch return null;
+        var diag: config.Diagnostic = .{};
+        const cfg = config.loadFromSlice(self.gpa, cfg_path, new_text, &diag) catch return null;
+        store.replace(cfg) catch return null;
+        return name;
     }
 
     fn task(self: *Manager, op: Op, source: config.Source, control: *connector.Control, lock: ?maintenance.WriterLock, dl: ?*OwnedDownload) Io.Cancelable!void {
@@ -805,4 +857,49 @@ test "backup without a backup directory is refused, and a check can be cancelled
     try testing.expectError(error.NotConfigured, m.startOp(.backup, null));
     try testing.expectError(error.BadArgument, m.startOp(.import, null));
     try testing.expectError(error.UnknownSource, m.startOp(.import, "nope"));
+}
+
+test "a downloaded ZIM file is added to the configuration as a source with a unique name, and a download without room is refused" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    const cfg_text = "# mine\n";
+    try env.tmp.dir.writeFile(testing.io, .{ .sub_path = "cfg.toml", .data = cfg_text });
+    var cp: [220]u8 = undefined;
+    const cfg_path = try std.fmt.bufPrint(&cp, "{s}/cfg.toml", .{env.data_dir[0..env.data_len]});
+    var d: config.Diagnostic = .{};
+    const cfg0 = try config.loadFromSlice(testing.allocator, cfg_path, cfg_text, &d);
+    var store = sourcestore.Store.init(testing.allocator, testing.io, cfg0.sources);
+    defer store.deinit();
+    var cfg_mut = cfg0;
+    defer cfg_mut.deinit();
+    var opts = env.options();
+    opts.store = &store;
+    opts.config_path = cfg_path;
+    opts.zim_dir = env.data_dir[0..env.data_len];
+    var m = Manager.init(testing.allocator, testing.io, opts);
+    defer m.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const first = m.addDownloadedSource(a, "/data/zim/wikipedia_en_all_maxi_2026-01.zim", "wikipedia_en_all_maxi_2026-01.zim").?;
+    try testing.expectEqualStrings("wikipedia-en-all-maxi", first);
+    const second = m.addDownloadedSource(a, "/data/zim/wikipedia_en_all_maxi_2026-02.zim", "wikipedia_en_all_maxi_2026-02.zim").?;
+    try testing.expectEqualStrings("wikipedia-en-all-maxi-2", second);
+    const file = try env.tmp.dir.readFileAlloc(testing.io, "cfg.toml", a, .limited(8192));
+    try testing.expect(std.mem.indexOf(u8, file, "# mine") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "kind = \"zim\"") != null and std.mem.indexOf(u8, file, "wikipedia_en_all_maxi_2026-02.zim") != null);
+    try testing.expectEqual(@as(usize, 2), store.snapshot().len); // and it is current at once
+    // Without a configuration file nothing is added.
+    var plain = Manager.init(testing.allocator, testing.io, env.options());
+    defer plain.deinit();
+    try testing.expect(plain.addDownloadedSource(a, "/x.zim", "x.zim") == null);
+
+    // A download that cannot fit is refused before anything starts; one of unknown size is not.
+    if (kiwix.freeBytes(env.data_dir[0..env.data_len]) != null) {
+        try testing.expectError(error.NoSpace, m.startDownload(.{ .meta4_url = "https://download.kiwix.org/zim/a.zim.meta4", .file_name = "a_2026-01.zim", .size = 1 << 60 }));
+        try testing.expect(m.spaceShort(.{ .meta4_url = "x", .file_name = "a.zim", .size = 1 << 60 }).? > 0);
+        try testing.expect(m.spaceShort(.{ .meta4_url = "x", .file_name = "a.zim", .size = 1000 }) == null);
+    }
 }

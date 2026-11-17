@@ -16,14 +16,14 @@ Each note records: project and version or commit; subsystems studied; experiment
 |---|---|---|---|
 | 1 | Apache Lucene | [lucene.md](lucene.md) | first pass (source reading); experiments pending |
 | 2 | YaCy | [yacy.md](yacy.md) | source read; private two-node experiment partly done |
-| 3 | Apache Nutch | [nutch.md](nutch.md) | not started |
-| 4 | Marginalia Search | [marginalia.md](marginalia.md) | not started |
-| 5 | Meilisearch | [meilisearch.md](meilisearch.md) | not started |
-| 6 | Typesense | [typesense.md](typesense.md) | not started |
-| 7 | Vespa | [vespa.md](vespa.md) | not started |
-| 8 | SearXNG | [searxng.md](searxng.md) | not started |
-| 9 | Common Crawl | [common-crawl.md](common-crawl.md) | not started |
-| 10 | Apache StormCrawler | [stormcrawler.md](stormcrawler.md) | not started |
+| 3 | Apache Nutch | [nutch.md](nutch.md) | source read; notes written (no experiments) |
+| 4 | Marginalia Search | [marginalia.md](marginalia.md) | source read; notes written (no experiments) |
+| 5 | Meilisearch | [meilisearch.md](meilisearch.md) | source read; notes written (no experiments) |
+| 6 | Typesense | [typesense.md](typesense.md) | source read; notes written (no experiments) |
+| 7 | Vespa | [vespa.md](vespa.md) | source read; notes written (no experiments) |
+| 8 | SearXNG | [searxng.md](searxng.md) | source read; notes written (no experiments) |
+| 9 | Common Crawl | [common-crawl.md](common-crawl.md) | docs read; one real WARC sample read by dksearch |
+| 10 | Apache StormCrawler | [stormcrawler.md](stormcrawler.md) | source read; notes written (no experiments) |
 
 YaCy is studied early because peer-to-peer needs can shape document identifiers, index structures and metadata. Cross-cutting work: [feature-comparison.md](feature-comparison.md), [p2p-experiments.md](p2p-experiments.md), [source-selection.md](source-selection.md), [test-corpus.md](test-corpus.md).
 
