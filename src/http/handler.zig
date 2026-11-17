@@ -164,14 +164,16 @@ pub fn handleAuthorized(arena: Allocator, searcher: dk.search.Searcher, services
 }
 
 /// The collections a bearer token's key may see, or an error message (a token that is not a valid key).
-fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8) error{OutOfMemory}!union(enum) { ok: struct { scope: dk.access.Scope, keyed: bool }, refused: []const u8 } {
+fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8) error{OutOfMemory}!union(enum) { ok: struct { scope: dk.access.Scope, keyed: bool, limited: ?u32 = null }, refused: []const u8 } {
     if (authorization) |h| {
         const prefix = "Bearer ";
         if (std.ascii.startsWithIgnoreCase(h, prefix)) {
             const token = std.mem.trim(u8, h[prefix.len..], " \t");
             const store = services.keys orelse return .{ .refused = "this server has no API keys" };
             const found = (try store.lookup(arena, token)) orelse return .{ .refused = "the API key is not valid" };
-            return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, found.collections), .keyed = true } };
+            // A key with a limit: counted here; the seconds to wait if it is over.
+            const wait: ?u32 = store.allow(found.id, found.rate);
+            return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, found.collections), .keyed = true, .limited = wait } };
         }
     }
     // Anonymous: every source unless the server limits it to some collections.
@@ -212,6 +214,12 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         .ok => |c| {
             services.scope = c.scope;
             services.keyed = c.keyed;
+            if (c.limited) |wait| {
+                const secs = try std.fmt.allocPrint(arena, "{d}", .{wait});
+                var resp = if (is_api) try apiError(arena, .too_many_requests, "rate_limited", "this API key has made too many requests this minute") else try htmlError(arena, .too_many_requests, "Too many requests", "This key has made too many requests this minute. Try again shortly.");
+                resp.headers = headersWith(arena, &.{ .{ .name = "retry-after", .value = secs }, no_store });
+                return resp;
+            }
         },
         .refused => |why| {
             var resp = if (is_api) try apiError(arena, .unauthorized, "invalid_key", why) else try htmlError(arena, .unauthorized, "Not allowed", why);
@@ -2114,6 +2122,42 @@ test "results carry an identity that does not depend on the node: the address fo
     // Without stored text a file has no identity; a web page always does.
     const none = handleServices(a, fake.searcher(), .{}, .GET, "/api/v1/search?q=text");
     try testing.expect(std.mem.indexOf(u8, none.body, "\"ident\":null") != null);
+}
+
+test "a key with a limit gets 429 and retry-after once it is over it; other callers are not affected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var store = dk.access.KeyStore.init(testing.allocator, testing.io, try tmp.dir.realPathFileAlloc(testing.io, ".", a));
+    defer store.deinit();
+    var tok_slow: [dk.access.token_len]u8 = undefined;
+    var tok_free: [dk.access.token_len]u8 = undefined;
+    var keys = try dk.access.addRated(a, testing.io, &.{}, "slow", &.{"*"}, 1, 2, &tok_slow);
+    keys = try dk.access.add(a, testing.io, keys, "free", &.{"*"}, 2, &tok_free);
+    try dk.access.save(a, testing.io, tmp.dir, dk.access.file_name, keys);
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    const services: Services = .{ .keys = &store };
+    const bearer = struct {
+        fn of(arena: Allocator, t: []const u8) ![]const u8 {
+            return std.fmt.allocPrint(arena, "Bearer {s}", .{t});
+        }
+    }.of;
+    const slow = try bearer(a, &tok_slow);
+    for (0..2) |_| try testing.expectEqual(http.Status.ok, handleAuthorized(a, fake.searcher(), services, .GET, "/api/v1/search?q=x", slow).status);
+    const over = handleAuthorized(a, fake.searcher(), services, .GET, "/api/v1/search?q=x", slow);
+    try testing.expectEqual(http.Status.too_many_requests, over.status);
+    try testing.expect(std.mem.indexOf(u8, over.body, "rate_limited") != null);
+    var retry: []const u8 = "";
+    for (over.headers) |h| if (std.mem.eql(u8, h.name, "retry-after")) {
+        retry = h.value;
+    };
+    try testing.expect((std.fmt.parseInt(u32, retry, 10) catch 0) >= 1);
+    // The page says it too; anonymous callers and the key without a limit are not counted.
+    try testing.expectEqual(http.Status.too_many_requests, handleAuthorized(a, fake.searcher(), services, .GET, "/search?q=x", slow).status);
+    for (0..5) |_| try testing.expectEqual(http.Status.ok, handleAuthorized(a, fake.searcher(), services, .GET, "/api/v1/search?q=x", try bearer(a, &tok_free)).status);
+    try testing.expectEqual(http.Status.ok, handleServices(a, fake.searcher(), services, .GET, "/api/v1/search?q=x").status);
 }
 
 test "retrieval cache: the same answer twice, served from the cache, and a changed document is read again" {

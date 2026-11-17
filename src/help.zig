@@ -119,7 +119,7 @@ pub const commands = [_]Command{
     },
     .{
         .name = "api-key",
-        .synopsis = "api-key add NAME (--all | --collection NAME ...) | list | remove NAME_OR_ID  [--config FILE]",
+        .synopsis = "api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] | list | remove NAME_OR_ID  [--config FILE]",
         .summary = "Make, list or remove API keys that limit what a caller can see",
         .detail =
         \\An API key lets a program (or another dksearch) use the search API and see only

@@ -1149,7 +1149,7 @@ pub const App = struct {
         if (keys.len == 0) {
             try w.writeAll("<p class=\"muted\">No keys yet.</p>");
         } else {
-            try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Number</th><th>Name</th><th>Collections</th><th>Made</th><th></th></tr></thead><tbody>");
+            try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Number</th><th>Name</th><th>Collections</th><th>Limit</th><th>Made</th><th></th></tr></thead><tbody>");
             for (keys) |k| {
                 try w.print("<tr><td><code>{s}</code></td><td>", .{k.id});
                 try html.writeEscaped(w, k.name);
@@ -1158,6 +1158,8 @@ pub const App = struct {
                     if (i > 0) try w.writeAll(", ");
                     if (std.mem.eql(u8, c, dk.access.all_marker)) try w.writeAll("<em>everything</em>") else try html.writeEscaped(w, c);
                 }
+                try w.writeAll("</td><td>");
+                if (k.rate > 0) try w.print("{d}/min", .{k.rate}) else try w.writeAll("<span class=\"muted\">none</span>");
                 try w.writeAll("</td><td>");
                 try writeTime(w, k.created);
                 try w.writeAll("</td><td>");
@@ -1182,7 +1184,7 @@ pub const App = struct {
                 try html.writeEscaped(w, c.name);
                 try w.writeAll("</label>");
             }
-            try w.writeAll("</fieldset><p><button type=\"submit\" class=\"btn\">Make the key</button></p></form>");
+            try w.writeAll("</fieldset><label>Requests per minute <input name=\"rate\" type=\"number\" min=\"0\" max=\"1000000\" value=\"0\"><small>0 is no limit. Over it, the key gets 429 until the minute ends.</small></label><p><button type=\"submit\" class=\"btn\">Make the key</button></p></form>");
         } else {
             try w.writeAll("<p class=\"muted\">Making and removing keys here needs <code>admin.actions = true</code> and a signed-in session; <code>dksearch api-key</code> works regardless.</p>");
         }
@@ -1357,6 +1359,7 @@ pub const App = struct {
         };
         const name = std.mem.trim(u8, params.get("name") orelse "", " ");
         const all = params.get("all") != null;
+        const rate = std.fmt.parseInt(u32, std.mem.trim(u8, params.get("rate") orelse "0", " "), 10) catch 0;
         const wanted = try params.all(arena, "collection");
         if (!all and wanted.len == 0) return actionFailure(arena, false, .{ .status = .bad_request, .code = "no_scope", .message = "tick every source or at least one collection" });
         if (all and wanted.len > 0) return actionFailure(arena, false, .{ .status = .bad_request, .code = "bad_scope", .message = "tick every source or collections, not both" });
@@ -1371,7 +1374,7 @@ pub const App = struct {
         const keys = dk.access.load(arena, self.io, Io.Dir.cwd(), path) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "keys_unreadable", .message = "the key file cannot be read (it must be readable by its owner only)" });
         var tok: [dk.access.token_len]u8 = undefined;
         const chosen: []const []const u8 = if (all) &.{dk.access.all_marker} else wanted;
-        const updated = dk.access.add(arena, self.io, keys, name, chosen, unixNow(self.io), &tok) catch |e| return actionFailure(arena, false, switch (e) {
+        const updated = dk.access.addRated(arena, self.io, keys, name, chosen, unixNow(self.io), rate, &tok) catch |e| return actionFailure(arena, false, switch (e) {
             error.Duplicate => .{ .status = .conflict, .code = "duplicate", .message = "a key with that name already exists" },
             error.BadName => .{ .status = .bad_request, .code = "bad_name", .message = "the name must be 1 to 64 printable characters without quotes" },
             error.TooMany => .{ .status = .conflict, .code = "too_many", .message = "too many keys" },

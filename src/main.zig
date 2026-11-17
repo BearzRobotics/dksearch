@@ -497,6 +497,7 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
     var config_path: ?[]const u8 = null;
     var name: ?[]const u8 = null;
     var all = false;
+    var rate: u32 = 0;
     var colls: std.ArrayList([]const u8) = .empty;
     defer colls.deinit(gpa);
     while (args.next()) |a| {
@@ -504,6 +505,9 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
             config_path = args.next() orelse return usageError(io, "--config needs a FILE");
         } else if (std.mem.startsWith(u8, a, "--config=")) {
             config_path = a["--config=".len..];
+        } else if (eq(a, "--rate")) {
+            const r = args.next() orelse return usageError(io, "--rate needs a number of requests per minute");
+            rate = std.fmt.parseInt(u32, r, 10) catch return usageError(io, "--rate must be a whole number of requests per minute (0: no limit)");
         } else if (eq(a, "--all")) {
             all = true;
         } else if (eq(a, "--collection") or eq(a, "-c")) {
@@ -538,6 +542,7 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
         for (keys) |k| {
             out(io, "{s}  {s}  collections: ", .{ k.id, k.name });
             for (k.collections, 0..) |c, i| out(io, "{s}{s}", .{ if (i > 0) "," else "", if (eq(c, dk.access.all_marker)) "ALL" else c });
+            if (k.rate > 0) out(io, "  limit: {d}/min", .{k.rate});
             out(io, "\n", .{});
         }
         return exit_ok;
@@ -572,7 +577,7 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
         const chosen: []const []const u8 = if (all) &.{dk.access.all_marker} else colls.items;
         var tok: [dk.access.token_len]u8 = undefined;
         const made_at: i64 = Io.Clock.real.now(io).toSeconds();
-        const updated = dk.access.add(arena, io, keys, key_name, chosen, made_at, &tok) catch |e| {
+        const updated = dk.access.addRated(arena, io, keys, key_name, chosen, made_at, rate, &tok) catch |e| {
             switch (e) {
                 error.Duplicate => err(io, "a key named {s} already exists", .{key_name}),
                 error.BadName => err(io, "the name must be 1 to 64 printable characters without quotes", .{}),

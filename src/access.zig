@@ -67,7 +67,12 @@ pub const Key = struct {
     collections: []const []const u8,
     /// Unix time the key was made.
     created: i64 = 0,
+    /// Requests per minute the key may make; 0 is no limit.
+    rate: u32 = 0,
 };
+
+/// The most requests per minute a key can be limited to.
+pub const max_rate = 1_000_000;
 
 pub const KeyError = error{ Unreadable, Malformed, InsecurePermissions, WriteFailed, EntropyUnavailable, TooMany, BadName, Duplicate, OutOfMemory };
 
@@ -131,6 +136,10 @@ pub fn parse(arena: Allocator, text: []const u8) KeyError![]const Key {
                 .integer => |n| n,
                 else => 0,
             } else 0,
+            .rate = if (t.get("rate")) |r| switch (r) {
+                .integer => |n| if (n > 0 and n <= max_rate) @intCast(n) else 0,
+                else => 0,
+            } else 0,
         };
     }
     return out;
@@ -147,6 +156,7 @@ pub fn render(arena: Allocator, keys: []const Key) Allocator.Error![]const u8 {
             try out.print(arena, "\"{s}\"", .{c});
         }
         try out.appendSlice(arena, "]\n");
+        if (k.rate > 0) try out.print(arena, "rate = {d}\n", .{k.rate});
     }
     return out.items;
 }
@@ -209,6 +219,11 @@ pub fn save(arena: Allocator, io: Io, dir: Io.Dir, path: []const u8, keys: []con
 /// Adds a key named `name` for `collections` (names are not checked against the configuration here) and returns the
 /// new list. The token is written to `token_out`; only its hash is kept.
 pub fn add(arena: Allocator, io: Io, keys: []const Key, name: []const u8, collections: []const []const u8, now: i64, token_out: *[token_len]u8) KeyError![]const Key {
+    return addRated(arena, io, keys, name, collections, now, 0, token_out);
+}
+
+/// Like `add`, with a limit of `rate` requests per minute (0: none).
+pub fn addRated(arena: Allocator, io: Io, keys: []const Key, name: []const u8, collections: []const []const u8, now: i64, rate: u32, token_out: *[token_len]u8) KeyError![]const Key {
     if (!validKeyName(name)) return error.BadName;
     if (keys.len >= max_keys) return error.TooMany;
     for (keys) |k| if (std.mem.eql(u8, k.name, name)) return error.Duplicate;
@@ -216,7 +231,7 @@ pub fn add(arena: Allocator, io: Io, keys: []const Key, name: []const u8, collec
     const h = hashOf(token_out);
     const out = try arena.alloc(Key, keys.len + 1);
     @memcpy(out[0..keys.len], keys);
-    out[keys.len] = .{ .id = try idOf(arena, h), .name = try arena.dupe(u8, name), .hash = h, .collections = try arena.dupe([]const u8, collections), .created = now };
+    out[keys.len] = .{ .id = try idOf(arena, h), .name = try arena.dupe(u8, name), .hash = h, .collections = try arena.dupe([]const u8, collections), .created = now, .rate = @min(rate, max_rate) };
     return out;
 }
 
@@ -246,16 +261,41 @@ pub const KeyStore = struct {
     size: u64 = std.math.maxInt(u64),
     mtime_ns: i96 = 0,
     checked_ns: i96 = 0,
+    /// Requests counted in the current minute, by key id.
+    windows: std.StringHashMapUnmanaged(struct { window: i64, count: u32 }) = .empty,
 
     pub fn init(gpa: Allocator, io: Io, dir_path: []const u8) KeyStore {
         return .{ .gpa = gpa, .io = io, .dir_path = dir_path, .arena = .init(gpa) };
     }
 
     pub fn deinit(self: *KeyStore) void {
+        self.windows.deinit(self.gpa);
         self.arena.deinit();
     }
 
-    pub const Found = struct { id: []const u8, name: []const u8, collections: []const []const u8 };
+    pub const Found = struct { id: []const u8, name: []const u8, collections: []const []const u8, rate: u32 = 0 };
+
+    /// Counts a request of key `id` against its limit of `rate` a minute (fixed one-minute windows). Null if it may
+    /// go ahead; otherwise the seconds until the window ends.
+    pub fn allow(self: *KeyStore, id: []const u8, rate: u32) ?u32 {
+        if (rate == 0) return null;
+        const now_s: i64 = std.Io.Clock.real.now(self.io).toSeconds();
+        const window = @divFloor(now_s, 60);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const gop = self.windows.getOrPut(self.gpa, id) catch return null; // out of memory: do not block anyone
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.arena.allocator().dupe(u8, id) catch {
+                _ = self.windows.remove(id);
+                return null;
+            };
+            gop.value_ptr.* = .{ .window = window, .count = 0 };
+        }
+        if (gop.value_ptr.window != window) gop.value_ptr.* = .{ .window = window, .count = 0 };
+        if (gop.value_ptr.count >= rate) return @intCast(@max(1, (window + 1) * 60 - now_s));
+        gop.value_ptr.count += 1;
+        return null;
+    }
 
     /// The key a presented token belongs to (strings copied into `out`), or null.
     pub fn lookup(self: *KeyStore, out: Allocator, token: []const u8) Allocator.Error!?Found {
@@ -265,7 +305,7 @@ pub const KeyStore = struct {
         const k = find(self.keys, token) orelse return null;
         const colls = try out.alloc([]const u8, k.collections.len);
         for (k.collections, colls) |c, *o| o.* = try out.dupe(u8, c);
-        return .{ .id = try out.dupe(u8, k.id), .name = try out.dupe(u8, k.name), .collections = colls };
+        return .{ .id = try out.dupe(u8, k.id), .name = try out.dupe(u8, k.name), .collections = colls, .rate = k.rate };
     }
 
     fn refresh(self: *KeyStore) void {
@@ -391,4 +431,28 @@ test "a key store notices a key made after it started, and one removed" {
     try save(a, testing.io, tmp.dir, file_name, &.{});
     store.checked_ns = 0;
     try testing.expect((try store.lookup(a, &tok)) == null);
+}
+
+test "a key's limit is stored, read back, and counted per minute" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tok: [token_len]u8 = undefined;
+    var keys = try addRated(a, testing.io, &.{}, "slow", &.{"*"}, 1, 2, &tok);
+    var tok2: [token_len]u8 = undefined;
+    keys = try add(a, testing.io, keys, "free", &.{"*"}, 2, &tok2);
+    const text = try render(a, keys);
+    try testing.expect(std.mem.indexOf(u8, text, "rate = 2") != null);
+    const back = try parse(a, text);
+    try testing.expectEqual(@as(u32, 2), back[0].rate);
+    try testing.expectEqual(@as(u32, 0), back[1].rate);
+    var store = KeyStore.init(testing.allocator, testing.io, ".");
+    defer store.deinit();
+    // Two requests pass, the third is told to wait; no limit never waits; another key has its own count.
+    try testing.expect(store.allow("aaaa", 2) == null);
+    try testing.expect(store.allow("aaaa", 2) == null);
+    const wait = store.allow("aaaa", 2);
+    try testing.expect(wait != null and wait.? >= 1 and wait.? <= 60);
+    try testing.expect(store.allow("bbbb", 2) == null);
+    for (0..100) |_| try testing.expect(store.allow("cccc", 0) == null);
 }
