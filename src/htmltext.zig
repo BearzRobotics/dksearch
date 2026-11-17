@@ -19,6 +19,7 @@ const dropped_tags = [_][]const u8{ "script", "style", "head", "noscript" };
 
 pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
+    var budget: Budget = .{};
     // A dropped tag whose end tag is missing is searched for only once: after
     // that it is just a tag. This keeps unclosed `<script>` soup linear.
     var missing_end: [dropped_tags.len]bool = @splat(false);
@@ -35,7 +36,7 @@ pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
                 i = e;
                 continue;
             }
-            if (tagAt(html, i)) |t| {
+            if (tagAt(html, i, &budget)) |t| {
                 if (!t.closing and !t.self_closing) {
                     if (indexOf(t.name, &dropped_tags)) |k| {
                         if (!missing_end[k]) {
@@ -74,17 +75,49 @@ fn declarationEnd(s: []const u8, i: usize) ?usize {
 
 const Tag = struct { name: []const u8, closing: bool, self_closing: bool, end: usize };
 
-/// A tag starting at `i` (the `<`), if it looks like one.
-fn tagAt(s: []const u8, i: usize) ?Tag {
-    const limit = @min(s.len, i + 2048);
-    const gt = std.mem.indexOfScalarPos(u8, s[0..limit], i + 1, '>') orelse return null;
+/// Longest tag looked at, in bytes (attribute values such as embedded JSON can be long).
+const max_tag_bytes = 8192;
+/// After this many tags whose quotes did not close, quotes are no longer taken into account in the rest of a page
+/// (each such tag costs a scan to `max_tag_bytes`, so hostile input could otherwise make the work quadratic).
+const max_quote_failures = 64;
+
+const Budget = struct { failures: u32 = 0 };
+
+/// A tag starting at `i` (the `<`), if it looks like one. The tag ends at the first `>` that is not inside a quoted
+/// attribute value, as in a browser, so `<span data-x='{"a":"<b>"}'>` is one tag; if a quote never closes the first
+/// `>` ends it.
+fn tagAt(s: []const u8, i: usize, budget: *Budget) ?Tag {
+    const limit = @min(s.len, i + max_tag_bytes);
     var j = i + 1;
-    const closing = j < gt and s[j] == '/';
+    const closing = j < limit and s[j] == '/';
     if (closing) j += 1;
     const start = j;
-    while (j < gt and std.ascii.isAlphanumeric(s[j])) j += 1;
+    while (j < limit and std.ascii.isAlphanumeric(s[j])) j += 1;
     if (j == start) return null; // "a < b" or "<>" is text
-    return .{ .name = s[start..j], .closing = closing, .self_closing = s[gt - 1] == '/', .end = gt + 1 };
+    const name_end = j;
+    var gt: ?usize = null;
+    if (budget.failures < max_quote_failures) {
+        var quote: u8 = 0;
+        var last: u8 = 0; // the last character that is not white space, outside quotes
+        var k = name_end;
+        while (k < limit) : (k += 1) {
+            const c = s[k];
+            if (quote != 0) {
+                if (c == quote) quote = 0;
+                continue;
+            }
+            if ((c == '"' or c == '\'') and last == '=') {
+                quote = c;
+            } else if (c == '>') {
+                gt = k;
+                break;
+            }
+            if (!std.ascii.isWhitespace(c)) last = c;
+        }
+        if (gt == null) budget.failures += 1;
+    }
+    const end = gt orelse (std.mem.indexOfScalarPos(u8, s[0..limit], i + 1, '>') orelse return null);
+    return .{ .name = s[start..name_end], .closing = closing, .self_closing = s[end - 1] == '/', .end = end + 1 };
 }
 
 fn indexOf(name: []const u8, list: []const []const u8) ?usize {
@@ -217,6 +250,7 @@ pub fn scan(arena: Allocator, html: []const u8, max_links: usize) Allocator.Erro
     var out: Scan = .{};
     var links: std.ArrayList([]const u8) = .empty;
     var missing_end: [dropped_tags.len]bool = @splat(false);
+    var budget: Budget = .{};
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
         i = lt;
@@ -229,7 +263,7 @@ pub fn scan(arena: Allocator, html: []const u8, max_links: usize) Allocator.Erro
             i = e;
             continue;
         }
-        const t = tagAt(html, i) orelse {
+        const t = tagAt(html, i, &budget) orelse {
             i += 1;
             continue;
         };
@@ -332,6 +366,16 @@ test "paragraphs and breaks become lines; inline tags vanish" {
     try expectText("a<br>b<br/>c", "a\nb\nc");
     try expectText("<ul><li>one</li><li>two</li></ul>", "one\ntwo");
     try expectText("<h1>Title</h1>body", "Title\nbody");
+}
+
+test "a > inside a quoted attribute value does not end the tag (embedded JSON, inline SVG)" {
+    try expectText("a<span data-mw='{\"parts\":[\"<span class=x>hidden</span>\"]}'>shown</span>b", "ashownb");
+    try expectText("a<div data-icon=\"<svg><path d='M1 2'/></svg>\">kept</div>b", "a\nkept\nb");
+    // A quote that never closes: the first > ends the tag, as before.
+    try expectText("a<span title=\"oops>text</span>b", "atext" ++ "b");
+    // Unquoted and spaced values, and a stray quote that is not a value.
+    try expectText("a<p class = \"c\" id=x>t</p>", "a\nt");
+    try expectText("a<b \"quoted\" word>x</b>", "ax");
 }
 
 test "script, style and comments are removed with their content" {
