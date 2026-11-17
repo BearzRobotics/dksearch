@@ -159,6 +159,8 @@ fn run(init: std.process.Init) u8 {
         return adminCredentialCmd(io, gpa, config_path, eq(first, "admin-token"));
     }
 
+    if (eq(first, "api-key")) return apiKeyCmd(io, gpa, &args);
+
     if (eq(first, "check") or eq(first, "backup")) {
         var config_path: ?[]const u8 = null;
         var dir: ?[]const u8 = null;
@@ -489,6 +491,106 @@ fn readLine(io: Io, gpa: std.mem.Allocator, prompt: ?[]const u8) ?[]u8 {
     return line.toOwnedSlice(gpa) catch null;
 }
 
+/// `dksearch api-key add NAME (--all | --collection C ...) | list | remove NAME_OR_ID` [--config FILE].
+fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
+    const sub_cmd = args.next() orelse return usageError(io, "api-key needs add, list or remove");
+    var config_path: ?[]const u8 = null;
+    var name: ?[]const u8 = null;
+    var all = false;
+    var colls: std.ArrayList([]const u8) = .empty;
+    defer colls.deinit(gpa);
+    while (args.next()) |a| {
+        if (eq(a, "--config")) {
+            config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+        } else if (std.mem.startsWith(u8, a, "--config=")) {
+            config_path = a["--config=".len..];
+        } else if (eq(a, "--all")) {
+            all = true;
+        } else if (eq(a, "--collection") or eq(a, "-c")) {
+            const c = args.next() orelse return usageError(io, "--collection needs a NAME");
+            colls.append(gpa, c) catch return exit_io;
+        } else if (std.mem.startsWith(u8, a, "--collection=")) {
+            colls.append(gpa, a["--collection=".len..]) catch return exit_io;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            err(io, "unknown option for api-key: {s}", .{a});
+            return exit_usage;
+        } else if (name == null) {
+            name = a;
+        } else {
+            return usageError(io, "api-key takes one NAME");
+        }
+    }
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ cfg.data_dir, dk.access.file_name }) catch return exit_io;
+    const keys = dk.access.load(arena, io, Io.Dir.cwd(), path) catch |e| {
+        err(io, "cannot read {s}: {t}", .{ path, e });
+        return exit_io;
+    };
+
+    if (eq(sub_cmd, "list")) {
+        if (keys.len == 0) out(io, "no API keys\n", .{});
+        for (keys) |k| {
+            out(io, "{s}  {s}  collections: ", .{ k.id, k.name });
+            for (k.collections, 0..) |c, i| out(io, "{s}{s}", .{ if (i > 0) "," else "", if (eq(c, dk.access.all_marker)) "ALL" else c });
+            out(io, "\n", .{});
+        }
+        return exit_ok;
+    }
+    if (eq(sub_cmd, "remove")) {
+        const which = name orelse return usageError(io, "api-key remove needs a NAME or ID");
+        const left = (dk.access.remove(arena, keys, which) catch return exit_io) orelse {
+            err(io, "no API key named or numbered {s}", .{which});
+            return exit_failure;
+        };
+        dk.access.save(arena, io, Io.Dir.cwd(), path, left) catch |e| {
+            err(io, "cannot write {s}: {t}", .{ path, e });
+            return exit_io;
+        };
+        out(io, "removed; it stops working within a second on a running server\n", .{});
+        return exit_ok;
+    }
+    if (eq(sub_cmd, "add")) {
+        const key_name = name orelse return usageError(io, "api-key add needs a NAME");
+        if (!all and colls.items.len == 0) return usageError(io, "api-key add needs --all or at least one --collection NAME");
+        if (all and colls.items.len > 0) return usageError(io, "give --all or --collection, not both");
+        for (colls.items) |c| {
+            var known = false;
+            for (cfg.collections) |col| if (eq(col.name, c)) {
+                known = true;
+            };
+            if (!known) {
+                err(io, "there is no collection named {s} in the configuration", .{c});
+                return exit_usage;
+            }
+        }
+        const chosen: []const []const u8 = if (all) &.{dk.access.all_marker} else colls.items;
+        var tok: [dk.access.token_len]u8 = undefined;
+        const made_at: i64 = Io.Clock.real.now(io).toSeconds();
+        const updated = dk.access.add(arena, io, keys, key_name, chosen, made_at, &tok) catch |e| {
+            switch (e) {
+                error.Duplicate => err(io, "a key named {s} already exists", .{key_name}),
+                error.BadName => err(io, "the name must be 1 to 64 printable characters without quotes", .{}),
+                else => err(io, "cannot make the key: {t}", .{e}),
+            }
+            return exit_usage;
+        };
+        dk.access.save(arena, io, Io.Dir.cwd(), path, updated) catch |e| {
+            err(io, "cannot write {s}: {t}", .{ path, e });
+            return exit_io;
+        };
+        out(io, "{s}\n", .{tok});
+        err(io, "key {s} written (as a hash) to {s}. This is the only time the key is shown. Send it as: Authorization: Bearer KEY", .{ key_name, path });
+        return exit_ok;
+    }
+    return usageError(io, "api-key needs add, list or remove");
+}
+
 fn adminCredentialCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, want_token: bool) u8 {
     var diag: dk.config.Diagnostic = .{};
     var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
@@ -759,6 +861,8 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     var admin_app: dkhttp.admin.App = undefined;
     // The sources, shared so that editing them in the interface takes effect at once.
     var source_store = dk.sourcestore.Store.init(gpa, io, cfg.sources);
+    var key_store = dk.access.KeyStore.init(gpa, io, cfg.data_dir);
+    defer key_store.deinit();
     defer source_store.deinit();
     var job_manager: dk.jobs.Manager = undefined;
     var job_manager_ready = false;
@@ -852,7 +956,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
 
     installSignalHandlers(onServeSignal);
     var result: u8 = exit_ok;
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

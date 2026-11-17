@@ -112,7 +112,7 @@ const PublicApp = struct {
 
     fn handle(ptr: *anyopaque, arena: Allocator, req: Request) handler.Response {
         const self: *PublicApp = @ptrCast(@alignCast(ptr));
-        return handler.handleServices(arena, self.searcher, self.services, req.method, req.target);
+        return handler.handleAuthorized(arena, self.searcher, self.services, req.method, req.target, req.authorization);
     }
 
     var dummy_for_tests: PublicApp = .{ .searcher = FixedSearch.searcher() };

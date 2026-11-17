@@ -87,7 +87,26 @@ pub const Services = struct {
     zims: ?*const dk.zimserve.Service = null,
     /// The configured sources, for the Source drop-down (follows edits made in the admin panel).
     sources: ?*dk.sourcestore.Store = null,
+    /// Named groups of sources, for the `collection:` filter and the Collections choice.
+    collections: []const dk.config.Collection = &.{},
+    /// The collections anyone may search without an API key; null means every source.
+    anonymous: ?[]const []const u8 = null,
+    /// API keys, if the server has any; null means none can be used.
+    keys: ?*dk.access.KeyStore = null,
+    /// What the caller of the request being handled may see. Set for each request by `handleAuthorized`, never
+    /// by the request itself.
+    scope: dk.access.Scope = .{},
+    /// True if the caller presented a valid API key (as opposed to being anonymous).
+    keyed: bool = false,
 };
+
+/// Limits `q` to what the caller may see and tells it what the `collection:` names mean.
+fn limitQuery(arena: Allocator, q: *dk.search.Query, services: Services) error{OutOfMemory}!void {
+    q.scope = services.scope.sources;
+    const defs = try arena.alloc(dk.search.CollectionDef, services.collections.len);
+    for (services.collections, defs) |c, *d| d.* = .{ .name = c.name, .sources = c.sources };
+    q.collections = defs;
+}
 
 /// How much each source counts in the ranking (only those that differ from 100).
 fn sourceBoosts(arena: Allocator, services: Services) error{OutOfMemory}![]const dk.search.SourceBoost {
@@ -97,11 +116,24 @@ fn sourceBoosts(arena: Allocator, services: Services) error{OutOfMemory}![]const
     return out.items;
 }
 
+/// The collections the caller may search: those with at least one source it may see.
+fn collectionChoices(arena: Allocator, services: Services) error{OutOfMemory}![]const html.CollectionChoice {
+    var out: std.ArrayList(html.CollectionChoice) = .empty;
+    for (services.collections) |c| {
+        var any = false;
+        for (c.sources) |s| if (services.scope.allows(s)) {
+            any = true;
+        };
+        if (any) try out.append(arena, .{ .name = c.name, .description = c.description });
+    }
+    return out.items;
+}
+
 /// The enabled sources, sorted by kind and then name, for the Source drop-down.
 fn sourceChoices(arena: Allocator, services: Services) error{OutOfMemory}![]const html.SourceChoice {
     const store = services.sources orelse return &.{};
     var out: std.ArrayList(html.SourceChoice) = .empty;
-    for (store.snapshot()) |src| if (src.enabled) try out.append(arena, .{ .name = try arena.dupe(u8, src.name), .kind = try arena.dupe(u8, src.kind) });
+    for (store.snapshot()) |src| if (src.enabled and services.scope.allows(src.name)) try out.append(arena, .{ .name = try arena.dupe(u8, src.name), .kind = try arena.dupe(u8, src.kind) });
     std.mem.sort(html.SourceChoice, out.items, {}, struct {
         fn lt(_: void, a: html.SourceChoice, b: html.SourceChoice) bool {
             const k = std.mem.order(u8, a.kind, b.kind);
@@ -113,12 +145,35 @@ fn sourceChoices(arena: Allocator, services: Services) error{OutOfMemory}![]cons
 }
 
 pub fn handleServices(arena: Allocator, searcher: dk.search.Searcher, services: Services, method: http.Method, target: []const u8) Response {
-    return handleInner(arena, searcher, services, method, target) catch |e| switch (e) {
+    return handleAuthorized(arena, searcher, services, method, target, null);
+}
+
+/// Like `handleServices`, for a caller that may present an API key (`Authorization: Bearer dkk_...`): what it may
+/// see is the scope of its key, or, with no key, the anonymous scope of the server.
+pub fn handleAuthorized(arena: Allocator, searcher: dk.search.Searcher, services: Services, method: http.Method, target: []const u8, authorization: ?[]const u8) Response {
+    return handleInner(arena, searcher, services, method, target, authorization) catch |e| switch (e) {
         error.OutOfMemory => plain(.service_unavailable, "temporarily out of memory\n"),
     };
 }
 
-fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Services, method: http.Method, target: []const u8) error{OutOfMemory}!Response {
+/// The collections a bearer token's key may see, or an error message (a token that is not a valid key).
+fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8) error{OutOfMemory}!union(enum) { ok: struct { scope: dk.access.Scope, keyed: bool }, refused: []const u8 } {
+    if (authorization) |h| {
+        const prefix = "Bearer ";
+        if (std.ascii.startsWithIgnoreCase(h, prefix)) {
+            const token = std.mem.trim(u8, h[prefix.len..], " \t");
+            const store = services.keys orelse return .{ .refused = "this server has no API keys" };
+            const found = (try store.lookup(arena, token)) orelse return .{ .refused = "the API key is not valid" };
+            return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, found.collections), .keyed = true } };
+        }
+    }
+    // Anonymous: every source unless the server limits it to some collections.
+    const names = services.anonymous orelse return .{ .ok = .{ .scope = .{}, .keyed = false } };
+    return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, names), .keyed = false } };
+}
+
+fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Services, method: http.Method, target: []const u8, authorization: ?[]const u8) error{OutOfMemory}!Response {
+    var services = services_in;
     const regex = services.regex;
     const t = query.parseTarget(arena, target) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -141,10 +196,28 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Service
         return resp;
     }
 
+    // Who is asking, and what they may see. Pages that show no documents need no key.
+    switch (try scopeFor(arena, services_in, authorization)) {
+        .ok => |c| {
+            services.scope = c.scope;
+            services.keyed = c.keyed;
+        },
+        .refused => |why| {
+            var resp = if (is_api) try apiError(arena, .unauthorized, "invalid_key", why) else try htmlError(arena, .unauthorized, "Not allowed", why);
+            resp.headers = headersWith(arena, &.{ .{ .name = "www-authenticate", .value = "Bearer" }, no_store });
+            return resp;
+        },
+    }
+    if (is_api and r != .api_health and !services.keyed and services.scope.none()) {
+        var resp = try apiError(arena, .unauthorized, "key_required", "this server needs an API key (Authorization: Bearer ...)");
+        resp.headers = headersWith(arena, &.{ .{ .name = "www-authenticate", .value = "Bearer" }, no_store });
+        return resp;
+    }
+
     return switch (r) {
         .home => blk: {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHomeForm(&aw.writer, null, .{ .regex_enabled = regex != null, .sources = try sourceChoices(arena, services) }) catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, null, .{ .regex_enabled = regex != null, .sources = try sourceChoices(arena, services), .collections = try collectionChoices(arena, services) }) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
@@ -159,9 +232,9 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services: Service
             html.writeHelpRegex(&aw.writer, if (regex) |svc| svc.limits else null) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
-        .api_search => try apiSearch(arena, searcher, regex, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
+        .api_search => try apiSearch(arena, searcher, regex, services, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
         .api_retrieve => try apiRetrieve(arena, searcher, services, t.params),
-        .search_page => try pageSearch(arena, searcher, regex, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
+        .search_page => try pageSearch(arena, searcher, regex, services, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
         .document => try documentPage(arena, searcher, services, t.path, t.params),
         .zim => try zimPage(arena, services, t.path),
         .other => unreachable,
@@ -317,14 +390,15 @@ pub fn regexSearch(arena: Allocator, searcher: dk.search.Searcher, service: ?*dk
     return .{ .ok = r };
 }
 
-fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
+fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, services: Services, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
     const parsed = switch (try parseQuery(arena, params, false)) {
         .ok => |p| p,
         .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
     var q = parsed.q;
     q.boosts = boosts;
-    switch (try applySources(arena, &q, sources, params)) {
+    try limitQuery(arena, &q, services);
+    switch (try applySources(arena, &q, sources, services.collections, params)) {
         .ok => {},
         .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     }
@@ -423,7 +497,7 @@ fn zimPage(arena: Allocator, services: Services, path: []const u8) error{OutOfMe
     const rest = path["/zim/".len..];
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return htmlError(arena, .not_found, "Not found", "No such article.");
     const name = rest[0..slash];
-    if (!validSourceName(name)) return htmlError(arena, .not_found, "Not found", "No such article.");
+    if (!validSourceName(name) or !services.scope.allows(name)) return htmlError(arena, .not_found, "Not found", "No such article.");
     const decoded = (try dk.zimserve.decodePath(arena, rest[slash + 1 ..])) orelse return htmlError(arena, .not_found, "Not found", "No such article.");
     const got = svc.fetch(arena, name, decoded) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
@@ -471,6 +545,8 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     _ = std.fmt.hexToBytes(&id, hex) catch return htmlError(arena, .not_found, "Not found", "No such document.");
     const info = searcher.info(arena, id) catch |e| return searchFailure(arena, e, false);
     const hit = info orelse return htmlError(arena, .not_found, "Not found", "No such document.");
+    // A document outside the caller's scope is as good as absent.
+    if (!services.scope.allows(hit.connector)) return htmlError(arena, .not_found, "Not found", "No such document.");
     const can_open = if (services.originals) |o| (if (hit.url) |u| o.serves(hit.connector, u) else false) else false;
     if (want_file) return if (can_open) originalFile(arena, services.originals.?, hit) else htmlError(arena, .not_found, "Not found", "The original file of this document is not available here.");
     if (want_image) |n| return if (can_open) documentImage(arena, services.originals.?, hit, n) else htmlError(arena, .not_found, "Not found", "The pictures of this document are not available here.");
@@ -552,7 +628,7 @@ fn documentImage(arena: Allocator, svc: *const dk.originals.Service, hit: dk.sea
 
 /// Turns the ticked sources (`source`, repeatable) and the single `connector` into source conditions on `q`: each is
 /// a source name or `kind:NAME` for every source of a kind, and they are alternatives. Returns what was picked.
-fn applySources(arena: Allocator, q: *dk.search.Query, sources: []const html.SourceChoice, params: query.Params) error{OutOfMemory}!union(enum) { ok: []const []const u8, bad: ParamError } {
+fn applySources(arena: Allocator, q: *dk.search.Query, sources: []const html.SourceChoice, colls: []const dk.config.Collection, params: query.Params) error{OutOfMemory}!union(enum) { ok: []const []const u8, bad: ParamError } {
     var picked: std.ArrayList([]const u8) = .empty;
     for (try params.all(arena, "source")) |v| {
         if (!validFilter(v)) return .{ .bad = .{ .name = "source", .message = "invalid value" } };
@@ -568,9 +644,13 @@ fn applySources(arena: Allocator, q: *dk.search.Query, sources: []const html.Sou
         for (picked.items) |c| {
             if (std.mem.startsWith(u8, c, "kind:")) {
                 for (sources) |src| if (std.mem.eql(u8, src.kind, c["kind:".len..])) try list.append(arena, .{ .field = .source, .text = src.name });
+            } else if (std.mem.startsWith(u8, c, "collection:")) {
+                for (colls) |col| if (std.mem.eql(u8, col.name, c["collection:".len..])) {
+                    for (col.sources) |m| try list.append(arena, .{ .field = .source, .text = m });
+                };
             } else try list.append(arena, .{ .field = .source, .text = c });
         }
-        // Only kinds with no sources: match nothing rather than everything.
+        // Only kinds or collections with no sources: match nothing rather than everything.
         if (list.items.len == 0) try list.append(arena, .{ .field = .source, .text = "(no source of that kind)" });
         q.filters = list.items;
         q.connector = null;
@@ -625,7 +705,8 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
     };
     var q = parsed.q;
     q.boosts = try sourceBoosts(arena, services);
-    switch (try applySources(arena, &q, try sourceChoices(arena, services), params)) {
+    try limitQuery(arena, &q, services);
+    switch (try applySources(arena, &q, try sourceChoices(arena, services), services.collections, params)) {
         .ok => {},
         .bad => |b| return apiError(arena, .bad_request, "invalid_parameter", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     }
@@ -812,20 +893,21 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
     return jsonResponse(arena, .ok, .{ .chunks = out, .candidates = @as(u32, @intCast(kept.items.len)), .duplicates_merged = duplicates, .without_text = skipped });
 }
 
-fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
+fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, services: Services, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
     const parsed = switch (try parseQuery(arena, params, true)) {
         .ok => |p| p,
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
     var q = parsed.q;
     q.boosts = boosts;
+    try limitQuery(arena, &q, services);
     // The ticked sources (`source`, repeatable) and the older single `connector`: each is a source name or
     // `kind:NAME` for every source of a kind. They are alternatives (`kind:zim` is all its sources).
-    const picked = switch (try applySources(arena, &q, sources, params)) {
+    const picked = switch (try applySources(arena, &q, sources, services.collections, params)) {
         .ok => |p| p,
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
-    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .picked = picked, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .sort = params.get("sort") orelse "" };
+    var form: html.Form = .{ .q = parsed.typed, .language = q.language orelse "", .picked = picked, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .collections = try collectionChoices(arena, services), .sort = params.get("sort") orelse "" };
     if (parsed.re) |req| {
         // A pattern typed in the box is already part of `q` and travels with it; only one given
         // as a parameter has to be carried separately (the pager and the exact-spelling link).
@@ -854,7 +936,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         // An empty box just shows the form again.
         error.EmptyQuery => {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHomeForm(&aw.writer, "Enter something to search for.", .{ .regex_enabled = regex != null, .sources = sources }) catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, "Enter something to search for.", .{ .regex_enabled = regex != null, .sources = sources, .collections = try collectionChoices(arena, services) }) catch return error.OutOfMemory;
             return htmlResponse(arena, .ok, aw.written());
         },
         else => return searchFailure(arena, e, false),
@@ -1157,6 +1239,85 @@ test "the API tells what it knows about each hit, takes filter and sort paramete
     // The page keeps the chosen order and offers it.
     const page = handle(a, idx.searcher(), .GET, "/search?q=kernel&sort=newest");
     try testing.expect(std.mem.indexOf(u8, page.body, "<option value=\"newest\" selected>Newest</option>") != null);
+}
+
+test "API keys and the anonymous scope decide what search, documents and articles show" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var idx = try dk.index_sqlite.SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const wiki: dk.document.Document = .{ .connector = "wiki", .source_id = "1", .title = "Wiki page", .text = "the shared word lives here" };
+    const notes: dk.document.Document = .{ .connector = "notes", .source_id = "1", .title = "Note", .text = "the shared word is also here" };
+    try idx.indexer().add(wiki.id(), wiki);
+    try idx.indexer().add(notes.id(), notes);
+
+    const colls = [_]dk.config.Collection{
+        .{ .name = "public", .sources = &.{"notes"} },
+        .{ .name = "reference", .sources = &.{"wiki"} },
+    };
+    var store = dk.access.KeyStore.init(testing.allocator, testing.io, try tmp.dir.realPathFileAlloc(testing.io, ".", a));
+    defer store.deinit();
+    var tok_ref: [dk.access.token_len]u8 = undefined;
+    var tok_all: [dk.access.token_len]u8 = undefined;
+    var keys = try dk.access.add(a, testing.io, &.{}, "ref", &.{"reference"}, 1, &tok_ref);
+    keys = try dk.access.add(a, testing.io, keys, "all", &.{"*"}, 2, &tok_all);
+    try dk.access.save(a, testing.io, tmp.dir, dk.access.file_name, keys);
+
+    // Anonymous visitors see only the "public" collection; keys see theirs.
+    const services: Services = .{ .collections = &colls, .anonymous = &.{"public"}, .keys = &store };
+    const get = struct {
+        fn at(arena: Allocator, searcher: dk.search.Searcher, sv: Services, target: []const u8, auth: ?[]const u8) Response {
+            return handleAuthorized(arena, searcher, sv, .GET, target, auth);
+        }
+    }.at;
+    const bearer = struct {
+        fn of(arena: Allocator, token: []const u8) ![]const u8 {
+            return std.fmt.allocPrint(arena, "Bearer {s}", .{token});
+        }
+    }.of;
+    const wiki_hex = std.fmt.bytesToHex(wiki.id(), .lower);
+    const notes_hex = std.fmt.bytesToHex(notes.id(), .lower);
+
+    const anon = get(a, idx.searcher(), services, "/api/v1/search?q=shared", null);
+    try testing.expectEqual(http.Status.ok, anon.status);
+    try testing.expect(std.mem.indexOf(u8, anon.body, "\"connector\":\"notes\"") != null);
+    try testing.expect(std.mem.indexOf(u8, anon.body, "\"connector\":\"wiki\"") == null);
+    // The same through the page, and with the source named in the query or the parameters: still limited.
+    try testing.expect(std.mem.indexOf(u8, get(a, idx.searcher(), services, "/search?q=shared+source%3Awiki", null).body, "Wiki page") == null);
+    try testing.expect(std.mem.indexOf(u8, get(a, idx.searcher(), services, "/api/v1/search?q=shared&connector=wiki", null).body, "\"connector\":\"wiki\"") == null);
+    // Documents outside the scope are as good as absent; those inside are shown.
+    try testing.expectEqual(http.Status.not_found, get(a, idx.searcher(), services, try std.fmt.allocPrint(a, "/doc/{s}", .{wiki_hex}), null).status);
+    try testing.expectEqual(http.Status.ok, get(a, idx.searcher(), services, try std.fmt.allocPrint(a, "/doc/{s}", .{notes_hex}), null).status);
+    // A key for "reference" sees the wiki and not the notes; the key for everything sees both.
+    const ref = get(a, idx.searcher(), services, "/api/v1/search?q=shared", try bearer(a, &tok_ref));
+    try testing.expect(std.mem.indexOf(u8, ref.body, "\"connector\":\"wiki\"") != null and std.mem.indexOf(u8, ref.body, "\"connector\":\"notes\"") == null);
+    try testing.expectEqual(http.Status.ok, get(a, idx.searcher(), services, try std.fmt.allocPrint(a, "/doc/{s}", .{wiki_hex}), try bearer(a, &tok_ref)).status);
+    try testing.expectEqual(http.Status.not_found, get(a, idx.searcher(), services, try std.fmt.allocPrint(a, "/doc/{s}", .{notes_hex}), try bearer(a, &tok_ref)).status);
+    const everything = get(a, idx.searcher(), services, "/api/v1/search?q=shared", try bearer(a, &tok_all));
+    try testing.expect(std.mem.indexOf(u8, everything.body, "\"connector\":\"wiki\"") != null and std.mem.indexOf(u8, everything.body, "\"connector\":\"notes\"") != null);
+    // The collection choice: the page offers the collections the caller may use, and "collection:" works in a query.
+    try testing.expect(std.mem.indexOf(u8, get(a, idx.searcher(), services, "/", null).body, "value=\"collection:public\"") != null);
+    try testing.expect(std.mem.indexOf(u8, get(a, idx.searcher(), services, "/", null).body, "value=\"collection:reference\"") == null);
+    try testing.expect(std.mem.indexOf(u8, get(a, idx.searcher(), services, "/", try bearer(a, &tok_all)).body, "value=\"collection:reference\"") != null);
+    const by_coll = get(a, idx.searcher(), services, "/api/v1/search?q=shared+collection%3Areference", try bearer(a, &tok_all));
+    try testing.expect(std.mem.indexOf(u8, by_coll.body, "\"connector\":\"wiki\"") != null and std.mem.indexOf(u8, by_coll.body, "\"connector\":\"notes\"") == null);
+    // A key that is not valid is refused, not treated as anonymous.
+    try testing.expectEqual(http.Status.unauthorized, get(a, idx.searcher(), services, "/api/v1/search?q=shared", "Bearer dkk_notakeynotakeynotakeynotakeynotakeynotake").status);
+    try testing.expectEqual(http.Status.unauthorized, get(a, idx.searcher(), .{ .collections = &colls }, "/api/v1/search?q=shared", "Bearer dkk_x").status); // no key store
+    // Nothing for anonymous visitors: the API needs a key, the page still loads and finds nothing.
+    const closed: Services = .{ .collections = &colls, .anonymous = &.{}, .keys = &store };
+    const need = get(a, idx.searcher(), closed, "/api/v1/search?q=shared", null);
+    try testing.expectEqual(http.Status.unauthorized, need.status);
+    try testing.expect(std.mem.indexOf(u8, need.body, "key_required") != null);
+    try testing.expectEqual(http.Status.ok, get(a, idx.searcher(), closed, "/api/v1/health", null).status);
+    try testing.expectEqual(http.Status.ok, get(a, idx.searcher(), closed, "/", null).status);
+    try testing.expect(std.mem.indexOf(u8, get(a, idx.searcher(), closed, "/search?q=shared", null).body, "Wiki page") == null);
+    try testing.expectEqual(http.Status.ok, get(a, idx.searcher(), closed, "/api/v1/search?q=shared", try bearer(a, &tok_all)).status);
+    // Without any access settings everything is open, as before.
+    try testing.expectEqual(http.Status.ok, get(a, idx.searcher(), .{}, "/api/v1/search?q=shared", null).status);
 }
 
 test "retrieval: the best passages of the candidate documents, with headings, spans, neighbours and attribution" {

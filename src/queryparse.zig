@@ -273,6 +273,7 @@ fn columnOf(key: []const u8) ?Column {
 }
 
 const filter_names = [_]struct { []const u8, search.FilterField }{
+    .{ "collection", .collection },
     .{ "source", .source },
     .{ "src", .source },
     .{ "connector", .source },
@@ -459,7 +460,7 @@ fn makeFilter(arena: Allocator, key: []const u8, value_in: []const u8, now: i64)
             return .{ .field = f, .text = try std.ascii.allocLowerString(arena, value) };
         },
         .source, .language, .path, .author => return .{ .field = f, .text = try arena.dupe(u8, value) },
-        .mime, .kind, .tag => return .{ .field = f, .text = try std.ascii.allocLowerString(arena, value) },
+        .mime, .kind, .tag, .collection => return .{ .field = f, .text = try std.ascii.allocLowerString(arena, value) },
         .meta => return .{ .field = f, .key = meta_key, .text = try std.ascii.allocLowerString(arena, value) },
     }
 }

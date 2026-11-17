@@ -265,6 +265,26 @@ pub const SearchSettings = struct {
     regex_concurrency: u32 = 2,
 };
 
+/// A named group of sources.
+pub const Collection = struct {
+    /// 1-64 characters of [a-z0-9_-], like a source name (and in the same namespace for `source=`: a collection
+    /// may not have the name of a source).
+    name: []const u8,
+    description: []const u8 = "",
+    /// The names of the member sources (each must be a configured source).
+    sources: []const []const u8,
+};
+
+/// Who may see what without an API key.
+pub const Access = struct {
+    /// The collections anyone can search without a key. Null (the default): every source. An empty list: nothing,
+    /// so the API needs a key (the search page then finds nothing for visitors).
+    anonymous_collections: ?[]const []const u8 = null,
+};
+
+pub const max_collections = 200;
+pub const max_collection_sources = 1000;
+
 pub const Config = struct {
     arena: std.heap.ArenaAllocator,
 
@@ -283,6 +303,9 @@ pub const Config = struct {
     data_dir: []const u8,
     /// Configured sources; empty by default.
     sources: []const Source,
+    /// Named groups of sources (`[[collection]]`): what a search can be limited to, and what an API key can see.
+    collections: []const Collection = &.{},
+    access: Access = .{},
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -301,7 +324,7 @@ const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_m
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
 const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
-const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source" };
+const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access" };
 
 /// Parses and validates configuration text. `source_name` is only used in
 /// diagnostics (normally the file path).
@@ -445,6 +468,24 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     }
 
     cfg.sources = try readSources(a, src, root, diag);
+    cfg.collections = try readCollections(a, src, root, cfg.sources, diag);
+    if (try subTable(src, root, "access", diag)) |t| {
+        try checkKeys(src, "access", t, &[_][]const u8{"anonymous_collections"}, diag);
+        if (t.get("anonymous_collections")) |v| {
+            const list = try stringList(a, src, "access.anonymous_collections", v, diag);
+            for (list) |c| {
+                var known = false;
+                for (cfg.collections) |col| if (std.mem.eql(u8, col.name, c)) {
+                    known = true;
+                };
+                if (!known) {
+                    diag.set(src, "access.anonymous_collections", "names a collection that is not defined: \"{s}\"", .{c});
+                    return error.InvalidValue;
+                }
+            }
+            cfg.access.anonymous_collections = list;
+        }
+    }
 
     if (cfg.server.access_log) |sl| if (cfg.admin.access_log) |al| {
         if (std.mem.eql(u8, sl, al) and !std.mem.eql(u8, sl, "stderr")) {
@@ -460,6 +501,90 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
 }
 
 const source_common_keys = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights", "boost", "schedule" };
+
+/// An array of strings, copied into `a`.
+fn stringList(a: Allocator, src: []const u8, key: []const u8, v: toml.Value, diag: *Diagnostic) Error![]const []const u8 {
+    const arr = switch (v) {
+        .array => |x| x,
+        else => {
+            diag.set(src, key, "expected an array of strings, got {s}", .{v.typeName()});
+            return error.WrongType;
+        },
+    };
+    const out = try a.alloc([]const u8, arr.items.items.len);
+    for (arr.items.items, out) |item, *o| switch (item) {
+        .string => |s| o.* = try a.dupe(u8, s),
+        else => {
+            diag.set(src, key, "expected an array of strings, got an item of type {s}", .{item.typeName()});
+            return error.WrongType;
+        },
+    };
+    return out;
+}
+
+fn readCollections(a: Allocator, src: []const u8, root: *toml.Table, sources: []const Source, diag: *Diagnostic) Error![]const Collection {
+    const v = root.get("collection") orelse return &.{};
+    const arr = switch (v) {
+        .array => |x| x,
+        else => {
+            diag.set(src, "collection", "expected an array of tables ([[collection]]), got {s}", .{v.typeName()});
+            return error.WrongType;
+        },
+    };
+    if (arr.items.items.len > max_collections) {
+        diag.set(src, "collection", "at most {d} collections", .{max_collections});
+        return error.InvalidValue;
+    }
+    var out = try a.alloc(Collection, arr.items.items.len);
+    var kbuf: [96]u8 = undefined;
+    for (arr.items.items, 0..) |item, i| {
+        const t = switch (item) {
+            .table => |x| x,
+            else => {
+                diag.set(src, std.fmt.bufPrint(&kbuf, "collection[{d}]", .{i}) catch "collection", "expected a table, got {s}", .{item.typeName()});
+                return error.WrongType;
+            },
+        };
+        const where = std.fmt.bufPrint(&kbuf, "collection[{d}]", .{i}) catch "collection";
+        try checkKeys(src, where, t, &[_][]const u8{ "name", "description", "sources" }, diag);
+        const name = try reqStr(src, where, t, "name", diag);
+        var nbuf: [128]u8 = undefined;
+        if (!validSourceName(name)) {
+            diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.name", .{where}) catch "collection.name", "must be 1-64 characters of a-z, 0-9, '_' or '-', starting with a letter or digit, got \"{s}\"", .{name});
+            return error.InvalidValue;
+        }
+        for (out[0..i]) |prev| if (std.mem.eql(u8, prev.name, name)) {
+            diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.name", .{where}) catch "collection.name", "duplicate collection name \"{s}\"", .{name});
+            return error.InvalidValue;
+        };
+        for (sources) |s| if (std.mem.eql(u8, s.name, name)) {
+            diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.name", .{where}) catch "collection.name", "\"{s}\" is also the name of a source; a collection needs its own name", .{name});
+            return error.InvalidValue;
+        };
+        const members_v = t.get("sources") orelse {
+            diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.sources", .{where}) catch "collection.sources", "is required", .{});
+            return error.InvalidValue;
+        };
+        const members = try stringList(a, src, std.fmt.bufPrint(&nbuf, "{s}.sources", .{where}) catch "collection.sources", members_v, diag);
+        if (members.len == 0 or members.len > max_collection_sources) {
+            diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.sources", .{where}) catch "collection.sources", "needs 1 to {d} sources", .{max_collection_sources});
+            return error.InvalidValue;
+        }
+        for (members) |m| {
+            var known = false;
+            for (sources) |s| if (std.mem.eql(u8, s.name, m)) {
+                known = true;
+            };
+            if (!known) {
+                diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.sources", .{where}) catch "collection.sources", "names a source that is not configured: \"{s}\"", .{m});
+                return error.InvalidValue;
+            }
+        }
+        const desc = if (try str(src, where, t, "description", diag)) |d| try a.dupe(u8, d) else "";
+        out[i] = .{ .name = try a.dupe(u8, name), .description = desc, .sources = members };
+    }
+    return out;
+}
 
 pub fn validSourceName(name: []const u8) bool {
     if (name.len == 0 or name.len > 64) return false;
@@ -877,6 +1002,34 @@ test "sources: common keys, defaults and connector options" {
     try testing.expectEqual(@as(?document.Redistribution, .forbidden), b.rights);
     try testing.expectEqual(@as(?document.Redistribution, null), a.rights);
     try testing.expectEqual(@as(usize, 0), b.options.len);
+}
+
+test "collections and the anonymous access setting are read and checked" {
+    var d: Diagnostic = .{};
+    const base = "[[source]]\nname = \"a\"\nkind = \"files\"\n[[source]]\nname = \"b\"\nkind = \"files\"\n";
+    var c = try loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"mine\"\ndescription = \"my stuff\"\nsources = [\"a\", \"b\"]\n[access]\nanonymous_collections = [\"mine\"]\n", &d);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 1), c.collections.len);
+    try testing.expectEqualStrings("mine", c.collections[0].name);
+    try testing.expectEqualStrings("my stuff", c.collections[0].description);
+    try testing.expectEqual(@as(usize, 2), c.collections[0].sources.len);
+    try testing.expectEqual(@as(usize, 1), c.access.anonymous_collections.?.len);
+    // No access table: everyone sees everything.
+    var plain = try loadFromSlice(testing.allocator, "t.toml", base, &d);
+    defer plain.deinit();
+    try testing.expect(plain.access.anonymous_collections == null);
+    try testing.expectEqual(@as(usize, 0), plain.collections.len);
+    // An empty list is allowed (nothing without a key).
+    var none = try loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"mine\"\nsources = [\"a\"]\n[access]\nanonymous_collections = []\n", &d);
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.access.anonymous_collections.?.len);
+    // Mistakes are named: unknown source, a collection named like a source, duplicates, an unknown collection.
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = [\"nope\"]\n", &d));
+    try testing.expectEqualStrings("collection[0].sources", d.key());
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"a\"\nsources = [\"b\"]\n", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = [\"a\"]\n[[collection]]\nname = \"x\"\nsources = [\"b\"]\n", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[access]\nanonymous_collections = [\"ghost\"]\n", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = []\n", &d));
 }
 
 test "ranking settings and a source's boost are read and checked" {

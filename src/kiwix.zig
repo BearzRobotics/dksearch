@@ -491,7 +491,11 @@ fn attempt(gpa: Allocator, io: Io, arena: Allocator, start_url: []const u8, part
             activity.last_ns.store(nowNs(io), .monotonic);
         }
         if (done != meta.size) return error.Network; // cut short: the partial file stays for a retry
+        // Flushing a large file to a slow disk can take longer than the stall limit without any data moving: that is
+        // not a stall of the connection, so the watch is given a long extension while it lasts.
+        activity.last_ns.store(nowNs(io) + 30 * 60 * std.time.ns_per_s, .monotonic);
         file.sync(io) catch return error.Io;
+        activity.last_ns.store(nowNs(io), .monotonic);
         var digest: [32]u8 = undefined;
         hasher.final(&digest);
         if (!std.mem.eql(u8, &digest, &meta.sha256)) return error.Checksum;

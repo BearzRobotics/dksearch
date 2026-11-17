@@ -69,6 +69,9 @@ pub fn writeSnippet(w: *Writer, snippet: []const u8) Writer.Error!void {
 /// A source offered in the Source drop-down.
 pub const SourceChoice = struct { name: []const u8, kind: []const u8 };
 
+/// A collection offered next to the sources.
+pub const CollectionChoice = struct { name: []const u8, description: []const u8 = "" };
+
 fn kindLabel(kind: []const u8) []const u8 {
     const labels = [_][2][]const u8{
         .{ "files", "Local files" },
@@ -99,6 +102,8 @@ pub const Form = struct {
     exact_only: bool = false,
     /// The sources this server has, for the Source drop-down (grouped by kind).
     sources: []const SourceChoice = &.{},
+    /// Collections (named groups of sources) the caller may search.
+    collections: []const CollectionChoice = &.{},
     /// The chosen order (`newest`, ...); empty for best match first.
     sort: []const u8 = "",
 };
@@ -119,8 +124,27 @@ fn isPicked(picked: []const []const u8, value: []const u8) bool {
 /// The sources as tick boxes grouped by kind (works without JavaScript). Ticking a kind's "All" box means
 /// every source of that kind, now and later. Nothing ticked searches everything.
 fn writeSourcePicker(w: *Writer, f: Form) Writer.Error!void {
-    if (f.sources.len == 0 and f.picked.len == 0) return;
+    if (f.sources.len == 0 and f.picked.len == 0 and f.collections.len == 0) return;
     try w.writeAll("<fieldset class=\"sources\"><legend>Sources <small>(none ticked: all)</small></legend>");
+    if (f.collections.len > 0) {
+        try w.writeAll("<div class=\"srcgroup\"><strong>Collections</strong>");
+        for (f.collections) |col| {
+            var buf: [80]u8 = undefined;
+            const value = std.fmt.bufPrint(&buf, "collection:{s}", .{col.name}) catch continue;
+            try w.writeAll("<label class=\"check\"");
+            if (col.description.len > 0) {
+                try w.writeAll(" title=\"");
+                try writeEscaped(w, col.description);
+                try w.writeAll("\"");
+            }
+            try w.writeAll("><input type=\"checkbox\" name=\"source\" value=\"");
+            try writeEscaped(w, value);
+            try w.writeAll(if (isPicked(f.picked, value)) "\" checked> " else "\"> ");
+            try writeEscaped(w, col.name);
+            try w.writeAll("</label>");
+        }
+        try w.writeAll("</div>");
+    }
     var i: usize = 0;
     while (i < f.sources.len) {
         const kind = f.sources[i].kind;
@@ -151,6 +175,12 @@ fn writeSourcePicker(w: *Writer, f: Form) Writer.Error!void {
     // is visible and can be unticked.
     for (f.picked) |p| {
         var known = false;
+        if (std.mem.startsWith(u8, p, "collection:")) {
+            for (f.collections) |col| if (std.mem.eql(u8, col.name, p["collection:".len..])) {
+                known = true;
+            };
+            if (known) continue;
+        }
         const is_kind = std.mem.startsWith(u8, p, "kind:");
         for (f.sources) |src| {
             if (if (is_kind) std.mem.eql(u8, src.kind, p["kind:".len..]) else std.mem.eql(u8, src.name, p)) known = true;

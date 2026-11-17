@@ -736,7 +736,8 @@ pub const SqliteIndex = struct {
             \\  AND (?5 IS NULL OR d.content_type = ?5)
             \\  AND (?6 IS NULL OR d.connector = ?6)
         );
-        try filterSql(arena, filters, &sql, &binds);
+        try filterSql(arena, filters, q.collections, &sql, &binds);
+        try scopeSql(arena, q.scope, &sql, &binds);
         try sql.appendSlice(arena, " ORDER BY bm25(chunks_fts, 2.0, 1.0), d.id, m.idx LIMIT ?7");
         const st = Stmt.prepare(self.db, try arena.dupeSentinel(u8, sql.items, 0)) catch return &.{}; // no chunk index here
         defer st.deinit();
@@ -955,16 +956,17 @@ pub const SqliteIndex = struct {
 
     /// Appends ` AND <condition>` for each filter to `sql`, with the values to
     /// bind (numbered from 9 up) in `binds`. Values never become SQL text.
-    fn filterSql(arena: Allocator, filters: []const search.Filter, sql: *std.ArrayList(u8), binds: *std.ArrayList(Bind)) search.Error!void {
+    fn filterSql(arena: Allocator, filters: []const search.Filter, colls: []const search.CollectionDef, sql: *std.ArrayList(u8), binds: *std.ArrayList(Bind)) search.Error!void {
         const P = struct {
             arena: Allocator,
             binds: *std.ArrayList(Bind),
+            colls: []const search.CollectionDef,
             fn add(self: @This(), b: Bind) Allocator.Error![]const u8 {
                 try self.binds.append(self.arena, b);
                 return std.fmt.allocPrint(self.arena, "?{d}", .{8 + self.binds.items.len});
             }
         };
-        const pb: P = .{ .arena = arena, .binds = binds };
+        const pb: P = .{ .arena = arena, .binds = binds, .colls = colls };
         // Positive conditions on the same text field are alternatives (`ext:pdf ext:md`
         // means either); everything else must all hold.
         var any_of: std.ArrayList(u8) = .empty;
@@ -1007,9 +1009,22 @@ pub const SqliteIndex = struct {
         }
     }
 
+    /// ` AND d.connector IN (...)` for the sources the caller may see; nothing when there is no limit.
+    fn scopeSql(arena: Allocator, scope: ?[]const []const u8, sql: *std.ArrayList(u8), binds: *std.ArrayList(Bind)) search.Error!void {
+        const list = scope orelse return;
+        if (list.len == 0) return sql.appendSlice(arena, " AND 0");
+        try sql.appendSlice(arena, " AND d.connector IN (");
+        for (list, 0..) |name, i| {
+            try binds.append(arena, .{ .text = name });
+            if (i > 0) try sql.appendSlice(arena, ", ");
+            try sql.print(arena, "?{d}", .{8 + binds.items.len});
+        }
+        try sql.append(arena, ')');
+    }
+
     fn isAlternative(field: search.FilterField) bool {
         return switch (field) {
-            .source, .language, .mime, .kind, .ext, .domain, .path, .author, .tag => true,
+            .source, .collection, .language, .mime, .kind, .ext, .domain, .path, .author, .tag => true,
             else => false,
         };
     }
@@ -1018,6 +1033,24 @@ pub const SqliteIndex = struct {
         {
             switch (f.field) {
                 .source => try cl.print(arena, "d.connector = {s}", .{try pb.add(.{ .text = f.text })}),
+                .collection => {
+                    // Any source of the collection; a name that is not one matches nothing.
+                    var members: ?[]const []const u8 = null;
+                    for (pb.colls) |col| if (std.ascii.eqlIgnoreCase(col.name, f.text)) {
+                        members = col.sources;
+                    };
+                    const list = members orelse {
+                        try cl.appendSlice(arena, "0");
+                        return;
+                    };
+                    if (list.len == 0) return cl.appendSlice(arena, "0");
+                    try cl.appendSlice(arena, "d.connector IN (");
+                    for (list, 0..) |m, i| {
+                        if (i > 0) try cl.appendSlice(arena, ", ");
+                        try cl.appendSlice(arena, try pb.add(.{ .text = m }));
+                    }
+                    try cl.append(arena, ')');
+                },
                 .language => {
                     const n = try pb.add(.{ .text = f.text });
                     // "en" also matches "en-US", ignoring case.
@@ -1132,7 +1165,8 @@ pub const SqliteIndex = struct {
             \\  AND (?5 IS NULL OR d.content_type = ?5)
             \\  AND (?6 IS NULL OR d.connector = ?6)
         );
-        try filterSql(arena, filters, &sql, &binds);
+        try filterSql(arena, filters, q.collections, &sql, &binds);
+        try scopeSql(arena, q.scope, &sql, &binds);
         if (q.sort != .relevance and q.sort != .title and !self.has_meta) return error.InvalidQuery; // an old index: `rebuild` upgrades it
         try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm));
         try sql.appendSlice(arena, " LIMIT ?7 OFFSET ?8");
@@ -1664,6 +1698,38 @@ test "passages of large documents are indexed, found with their conditions, repl
     defer off.close();
     try off.indexer().add(d.id(), d);
     try testing.expectEqual(@as(usize, 0), (try off.searcher().searchChunks(a, .{ .text = "quagga" }, 10)).len);
+}
+
+test "a scope limits every result, and collection: means any source of the collection" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    _ = try put(&idx, "wiki", "1", "Wiki", "the common word appears here");
+    _ = try put(&idx, "notes", "1", "Notes", "the common word appears here too");
+    _ = try put(&idx, "mail", "1", "Mail", "the common word appears here also");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const colls = [_]search.CollectionDef{ .{ .name = "mine", .sources = &.{ "notes", "mail" } }, .{ .name = "empty", .sources = &.{} } };
+    const run = struct {
+        fn go(ar: Allocator, i: *SqliteIndex, q: search.Query) !usize {
+            return (try i.searcher().search(ar, q)).hits.len;
+        }
+    }.go;
+    try testing.expectEqual(@as(usize, 3), try run(a, &idx, .{ .text = "common" }));
+    // The scope limits the results, whatever else is asked.
+    try testing.expectEqual(@as(usize, 1), try run(a, &idx, .{ .text = "common", .scope = &.{"notes"} }));
+    try testing.expectEqual(@as(usize, 0), try run(a, &idx, .{ .text = "common", .scope = &.{} }));
+    try testing.expectEqual(@as(usize, 0), try run(a, &idx, .{ .text = "common source:wiki", .scope = &.{"notes"} }));
+    try testing.expectEqual(@as(usize, 0), try run(a, &idx, .{ .text = "common", .scope = &.{"notes"}, .connector = "wiki" }));
+    // A collection: any of its sources; combined with the scope, only those inside it.
+    try testing.expectEqual(@as(usize, 2), try run(a, &idx, .{ .text = "common collection:mine", .collections = &colls }));
+    try testing.expectEqual(@as(usize, 1), try run(a, &idx, .{ .text = "common collection:mine", .collections = &colls, .scope = &.{ "wiki", "notes" } }));
+    try testing.expectEqual(@as(usize, 1), try run(a, &idx, .{ .text = "common -collection:mine", .collections = &colls }));
+    try testing.expectEqual(@as(usize, 0), try run(a, &idx, .{ .text = "common collection:empty", .collections = &colls }));
+    try testing.expectEqual(@as(usize, 0), try run(a, &idx, .{ .text = "common collection:nosuch", .collections = &colls }));
+    // Searching by conditions alone is limited too.
+    try testing.expectEqual(@as(usize, 1), try run(a, &idx, .{ .text = "", .filter_strings = &.{"source:mail"}, .scope = &.{"mail"} }));
+    try testing.expectEqual(@as(usize, 0), try run(a, &idx, .{ .text = "", .filter_strings = &.{"source:mail"}, .scope = &.{"notes"} }));
 }
 
 test "the title and body weights decide which counts more" {

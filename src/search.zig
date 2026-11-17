@@ -36,6 +36,8 @@ pub const Fuzzy = enum {
 pub const FilterField = enum {
     /// The connector (source) name.
     source,
+    /// A collection: any source that belongs to it (`collection:books`). Needs `Query.collections`.
+    collection,
     language,
     /// The media type: exact (`text/html`) or a family (`image/*`).
     mime,
@@ -115,11 +117,19 @@ pub const Query = struct {
     /// How much each source counts, in percent (sources not named count 100). Set by the server from the
     /// sources' `boost` settings.
     boosts: []const SourceBoost = &.{},
+    /// The sources the caller may see (null: all). Applied to every result, whatever else the query says; set by
+    /// the server from the API key (or the anonymous access setting), never from the request itself.
+    scope: ?[]const []const u8 = null,
+    /// What `collection:` names mean, for the filter of that name.
+    collections: []const CollectionDef = &.{},
     /// Fill `Hit.explain` with the parts of each score.
     explain: bool = false,
 };
 
 pub const SourceBoost = struct { source: []const u8, percent: u32 };
+
+/// A named group of sources.
+pub const CollectionDef = struct { name: []const u8, sources: []const []const u8 };
 
 /// The parts of a score: `score` = `text` x `source` x `recency`. `text` is the weighted text match; `title` and
 /// `body` are how well the title and the text match on their own (not weighted, and not additive: the search
