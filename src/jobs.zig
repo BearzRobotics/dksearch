@@ -24,6 +24,7 @@ const runner = @import("runner.zig");
 const maintenance = @import("maintenance.zig");
 const sourcestore = @import("sourcestore.zig");
 const kiwix = @import("kiwix.zig");
+const ollama = @import("ollama.zig");
 const sourceedit = @import("sourceedit.zig");
 
 /// The runner wants a clock without a context argument; one process runs one
@@ -51,6 +52,8 @@ pub const Options = struct {
     backup_dir: ?[]const u8 = null,
     /// Where ZIM files downloaded from the Kiwix library go. Null turns downloads off.
     zim_dir: ?[]const u8 = null,
+    /// The Ollama server (`[ollama] url`, or the default address) that `model_pull` talks to.
+    ollama_url: []const u8 = "http://127.0.0.1:11434",
     /// The configuration file, so that a downloaded ZIM file can be added as a source (null: it is not).
     config_path: ?[]const u8 = null,
     /// How downloads behave (tests allow plain http to a local server).
@@ -72,6 +75,8 @@ pub const Op = enum {
     remove,
     /// Download a ZIM file from the Kiwix library into `zim_dir`.
     download,
+    /// Pull a model into the local Ollama (the model name is the argument).
+    model_pull,
 };
 
 /// What a download needs, copied by the manager.
@@ -217,6 +222,12 @@ pub const Manager = struct {
         return if (free >= need) null else need - free;
     }
 
+    /// Starts pulling the Ollama model `name` as a background task (cancellable).
+    pub fn startPull(self: *Manager, name: []const u8) StartError!void {
+        if (!ollama.validModelName(name)) return error.BadArgument;
+        return self.begin(.model_pull, name, null);
+    }
+
     fn begin(self: *Manager, op: Op, arg: ?[]const u8, dl: ?Download) StartError!void {
         var source: config.Source = .{ .name = "", .kind = "" };
         switch (op) {
@@ -235,6 +246,7 @@ pub const Manager = struct {
             .backup => if (self.opts.backup_dir == null) return error.NotConfigured,
             .check => {},
             .download => source.name = arg orelse return error.BadArgument,
+            .model_pull => source.name = arg orelse return error.BadArgument,
         }
 
         self.mutex.lockUncancelable(self.io);
@@ -244,7 +256,7 @@ pub const Manager = struct {
         // The lock is taken here, so a conflict is reported to the caller,
         // and handed to the task, which releases it when the run ends.
         var lock: ?maintenance.WriterLock = null;
-        if (op != .download) {
+        if (op != .download and op != .model_pull) {
             var dir = Io.Dir.cwd().openDir(self.io, self.opts.data_dir, .{}) catch return error.DataDirUnavailable;
             defer dir.close(self.io);
             lock = maintenance.WriterLock.acquire(self.io, dir, "write.lock") catch |e| return switch (e) {
@@ -464,6 +476,27 @@ pub const Manager = struct {
         return name;
     }
 
+    fn runPull(self: *Manager, name: []const u8, control: *connector.Control, out: *Outcome) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const client = ollama.Client.init(self.gpa, self.io, self.opts.ollama_url) catch return self.fail(out, "out of memory");
+        defer client.deinit();
+        client.pull(arena_state.allocator(), name, control) catch |e| {
+            switch (e) {
+                error.Cancelled => {
+                    out.state = .cancelled;
+                    self.summaryPrint(out, "Stopped. Ollama keeps nothing of an unfinished pull of {s}; start it again to continue.", .{name});
+                },
+                error.Unreachable => self.fail(out, "Ollama did not answer (is it running at the address in [ollama] url?)"),
+                error.Refused => self.fail(out, "Ollama refused the model (the name may not exist in its library, or there is no room)"),
+                else => self.fail(out, "pulling the model failed"),
+            }
+            return;
+        };
+        out.state = .completed;
+        self.summaryPrint(out, "Pulled {s}. It is now in Ollama's model list; use it for embeddings or answers on the Models page.", .{name});
+    }
+
     fn task(self: *Manager, op: Op, source: config.Source, control: *connector.Control, lock: ?maintenance.WriterLock, dl: ?*OwnedDownload) Io.Cancelable!void {
         // Each runner sets the state on every path; `failed` is the safe default.
         var outcome: Outcome = .{ .state = .failed };
@@ -473,6 +506,7 @@ pub const Manager = struct {
             .backup => runBackup(self, control, &outcome),
             .remove => runRemove(self, source.name, control, &outcome),
             .download => runDownload(self, dl.?, control, &outcome),
+            .model_pull => runPull(self, source.name, control, &outcome),
         }
         if (dl) |d| d.destroy(self.gpa);
         if (lock) |l| l.release(self.io);

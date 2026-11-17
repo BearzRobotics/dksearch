@@ -53,6 +53,8 @@ pub const Request = struct {
     content_type: []const u8 = "application/json",
     /// More headers to send (a peer's signature, at most four).
     extra_headers: []const http.Header = &.{},
+    /// The method, when it is neither the default GET nor the POST that a body implies (DELETE for Ollama).
+    method: ?http.Method = null,
 };
 
 /// Fetches `req.url`. Everything returned is allocated from `arena`; on
@@ -109,7 +111,7 @@ fn run(client: *http.Client, arena: Allocator, req: Request) Failure!Response {
         headers[n_headers] = h;
         n_headers += 1;
     }
-    var request = client.request(if (req.body != null) .POST else .GET, uri, .{
+    var request = client.request(req.method orelse (if (req.body != null) http.Method.POST else http.Method.GET), uri, .{
         .redirect_behavior = .unhandled,
         .keep_alive = false,
         .headers = .{ .user_agent = .{ .override = req.user_agent }, .content_type = if (req.body != null) .{ .override = req.content_type } else .default },

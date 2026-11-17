@@ -14,6 +14,15 @@ GET /api/v1/retrieve?q=TEXT[&source=S]...[&filter=F]...[&k=N][&candidates=N][&co
 AUTHENTICATION
 : By default the search API needs no key. A server can limit what anonymous callers see (`[access] anonymous_collections`) and issue API keys (`dksearch api-key add`). A key is sent as `Authorization: Bearer dkk_...` and restricts the results of `/api/v1/search` and `/api/v1/retrieve`, and the documents, pictures and articles under `/doc/` and `/zim/`, to the collections it was made for. Signed requests: a request may carry `dk-node` (the sender's node id, `dkn_...`), `dk-time` (Unix seconds), `dk-nonce` (22 characters) and `dk-sig` (base64url Ed25519 signature of `"dksearch-v1 request\n" METHOD "\n" TARGET "\n" HOST "\n" TIME "\n" NONCE`, with TARGET the request target as sent and HOST the lower-case `Host`). A key bound to a node (`api-key add --node`) is accepted only with a valid, recent, unused signature by that node (401 `invalid_key` otherwise, the message says why). A caller that sends `dk-nonce` (signed or not) to a node that has an identity gets `dk-node` and `dk-sig` on the answer: a signature of `"dksearch-v1 response\n" NONCE "\n" STATUS "\n" SHA256-HEX-OF-BODY`. See NODE IDENTITY in **dksearch**(1). Errors: 429 `rate_limited` (with `Retry-After`, in seconds) for a key over its per-minute limit (`dksearch api-key add --rate`; every request with the key counts, the others are not affected); 401 `invalid_key` for a key that is not valid or is sent to a server with no keys, 401 `key_required` when the server gives anonymous callers nothing (`/api/v1/health` stays open). A document outside the key's scope is answered with 404, the same as one that does not exist. The `collection:NAME` filter of the query language and `source=collection:NAME` select a collection within the scope.
 
+GET /api/v1/answer
+A short answer written by the local model of `[answers]` (Ollama) from the best passages for a question. Off unless `[answers] enabled`; 404 `answers_off` otherwise.
+
+Parameters:
+q
+: Required. The question, 3 to 500 characters.
+
+The answer is `{"answer": TEXT, "model": NAME, "sources": [{"n": 1, "title": ..., "source": ..., "view_url": ...}], "notice": ...}`: `sources` are the numbered passages the text may cite as [1], [2]. With no matching passage `answer` is null and `reason` says why (the model is not asked). Errors: 400 `invalid_parameter`, 429 `busy` (the server's per-minute limit of answers, with `Retry-After`), 503 `model_unavailable`. The caller's scope applies to the passages like to every search.
+
 GET /api/v1/export
 Copy the documents of a source to a peer that replicates them (`kind = "peer"`, see **dksearch**(1)).
 

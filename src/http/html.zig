@@ -123,12 +123,51 @@ pub const Form = struct {
     /// Web results this server asked for from the providers, and who answered; shown below the local results.
     external: []const dk.fallback.External = &.{},
     external_notes: []const []const u8 = &.{},
+    /// The AI answer for this search (`answer=1`), its sources, or why there is none; and whether the box is offered.
+    answer: ?AnswerBlock = null,
+    answer_note: ?[]const u8 = null,
+    answers_offered: bool = false,
+    answer_checked: bool = false,
     /// Where to go to ask the providers (`web=1`) when that is not done by itself; null: not offered.
     web_href: ?[]const u8 = null,
     web_names: []const u8 = "",
 };
 
 pub const FallbackLink = struct { label: []const u8, href: []const u8 };
+
+pub const AnswerSource = struct { n: u32, title: []const u8, href: []const u8, source: []const u8 };
+pub const AnswerBlock = struct { text: []const u8, model: []const u8, sources: []const AnswerSource };
+
+/// The answer above the results: text only (never markup), labelled, with the passages it was made from.
+fn writeAnswer(w: *Writer, f: Form) Writer.Error!void {
+    if (f.answer_note) |n| {
+        try w.writeAll("<p class=\"muted small\">");
+        try writeEscaped(w, n);
+        try w.writeAll("</p>\n");
+    }
+    const a = f.answer orelse return;
+    try w.writeAll("<section class=\"answer\" aria-label=\"AI answer\"><h2>Answer</h2><p class=\"muted small\">Written by a language model (");
+    try writeEscaped(w, a.model);
+    try w.writeAll(") on this machine from the passages below. It can be wrong: check the sources.</p><p>");
+    var lines = std.mem.splitScalar(u8, a.text, '\n');
+    var first = true;
+    while (lines.next()) |l| {
+        if (!first) try w.writeAll("<br>");
+        first = false;
+        try writeEscaped(w, l);
+    }
+    try w.writeAll("</p><ol class=\"answer-sources\">");
+    for (a.sources) |s| {
+        try w.print("<li value=\"{d}\"><a href=\"", .{s.n});
+        try writeEscaped(w, s.href);
+        try w.writeAll("\">");
+        try writeEscaped(w, s.title);
+        try w.writeAll("</a> <span class=\"muted small\">");
+        try writeEscaped(w, s.source);
+        try w.writeAll("</span></li>");
+    }
+    try w.writeAll("</ol></section>\n");
+}
 
 /// `12345` as `12,345`.
 pub fn writeCount(w: *Writer, n: u64) Writer.Error!void {
@@ -302,6 +341,7 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
         }
         try w.writeAll(")</label>");
     }
+    if (f.answers_offered) try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"answer\" value=\"1\"{s}> Also write an answer with the local AI model (slower)</label>", .{if (f.answer_checked) " checked" else ""});
     try w.writeAll("<label>Order <select name=\"sort\">");
     const orders = [_][2][]const u8{ .{ "", "Best match" }, .{ "newest", "Newest" }, .{ "oldest", "Oldest" }, .{ "largest", "Largest" }, .{ "smallest", "Smallest" }, .{ "title", "Title" } };
     for (orders) |o| {
@@ -376,6 +416,7 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     try writeForm(w, f);
     try w.writeAll("</div>\n");
     try writeInterpretation(w, f, page, offset);
+    try writeAnswer(w, f);
     if (f.default_note) |name| {
         try w.writeAll("<p class=\"muted small\">Searching only <strong>");
         try writeEscaped(w, name);

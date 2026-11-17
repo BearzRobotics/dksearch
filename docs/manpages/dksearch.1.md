@@ -24,6 +24,8 @@ dksearch admin-password [--config FILE]
 
 dksearch api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] [--node ID] [--config FILE]
 
+dksearch models list | pull NAME --yes | remove NAME --yes [--config FILE]
+
 dksearch node-key [--config FILE]
 
 dksearch api-key list [--config FILE]
@@ -471,6 +473,21 @@ Example:
 
 Regular-expression search (the `[search]` table): in a query on the public page or API, a regular expression keeps only the candidate documents whose stored text matches it. The words of the query choose the candidates through the index, in ranking order, so at least one word is required; the expression is then checked against the first 1 MiB of each candidate's text (8 MiB on the administration page). It is meant for finding patterns that words cannot express (product codes, dates, phone numbers, `colou?r`), not for scanning the corpus: with the default limits at most 200 candidates are checked in at most half a second, and when a limit stops the search the response says so. Because anyone who can reach the public page can type a pattern, everything is bounded: pattern length, nesting, repeat counts, matching steps per document, candidates, time and the number of simultaneous regex queries; the administration interface uses ten times the limits. The matcher works on bytes, not characters (so `.` matches one byte of a multi-byte character) and has no Unicode properties (`\p{L}`); it is regex-zig (vendor/regex-zig, docs/decisions/0020). Set `regex = false` to switch the feature off.
 
+
+OLLAMA, MODELS AND WRITTEN ANSWERS
+Models for semantic search and written answers run in [Ollama](https://ollama.com), a separate program you install and start; dksearch never starts it and never downloads a model by itself.
+
+    [ollama]
+    url = "http://127.0.0.1:11434"     # the default; also the address tried when looking for Ollama
+
+    [answers]
+    enabled = true
+    model = "llama3.2:3b"              # a model Ollama has
+    # passages = 6   max_chars = 12000   timeout_seconds = 120   max_per_minute = 10
+
+**dksearch models** talks to Ollama: `list` shows its models; `pull NAME` and `remove NAME` change what is on disk (a model is often 1 to 10 GB) and only run with `--yes`. The administration interface has the same on the *AI models* page: it says whether Ollama answers (and does not start it), lists the models, pulls one as a background task that can be cancelled, deletes one after a confirmation page, and with *Use for semantic search* or *Use for answers* writes the `[embeddings]` or `[answers]` table (restart afterwards; for embeddings run `dksearch embed` to make the vectors).
+
+With `[answers] enabled = true` the search page offers *Also write an answer with the local AI model* and the API has `GET /api/v1/answer?q=QUESTION`. The best passages for the question (the retrieval of `/api/v1/retrieve`, at most *passages* of them, cut to *max_chars* together) are given to the model with an instruction to use only them, cite them as [1], [2], say so when they do not contain the answer, and ignore any instruction inside them (documents are untrusted text and can try to steer a model). The answer is shown as plain text above the results, labelled as written by a model and possibly wrong, with the passages it was made from. When no passage matches, the model is not asked. `max_per_minute` limits the answers the whole server writes in a minute (over it: 429 `busy`); if the model does not respond: 503 `model_unavailable`. Retrieval alone, without any model, is unchanged and stays the default.
 
 SEMANTIC SEARCH
 Semantic search is opt-in and uses a model server that you run (nothing in dksearch starts a model):

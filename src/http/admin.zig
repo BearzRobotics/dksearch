@@ -76,6 +76,10 @@ pub const Options = struct {
     node_name: []const u8 = "",
     /// This node's public id (`dkn_...`), if it has an identity.
     node_id: ?[]const u8 = null,
+    /// The Ollama server (`[ollama] url` or the default address), and the models in use, for the Models page.
+    ollama_url: []const u8 = "http://127.0.0.1:11434",
+    embeddings_model: ?[]const u8 = null,
+    answers_model: ?[]const u8 = null,
     /// The Kiwix library's catalogue (tests point this at a local server).
     kiwix_catalog_url: []const u8 = dk.kiwix.catalog_base,
     kiwix_options: dk.kiwix.Options = .{},
@@ -141,7 +145,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/actions/collection-edit", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/actions/collection-edit", "/zim", "/actions/zim", "/models", "/actions/model-pull", "/actions/model-remove", "/actions/model-use", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -149,7 +153,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -169,6 +173,10 @@ pub const App = struct {
             .{ "/actions/key-add", .action_key_add },
             .{ "/actions/peer-test", .action_peer_test },
             .{ "/actions/peer-edit", .action_peer_edit },
+            .{ "/models", .models_page },
+            .{ "/actions/model-pull", .action_model_pull },
+            .{ "/actions/model-remove", .action_model_remove },
+            .{ "/actions/model-use", .action_model_use },
             .{ "/actions/collection-edit", .action_collection_edit },
             .{ "/actions/key-remove", .action_key_remove },
             .{ "/zim", .zim_page },
@@ -223,7 +231,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_peer_test or route == .action_peer_edit or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -249,6 +257,10 @@ pub const App = struct {
             .maintenance => self.pageMaintenance(arena, csrf),
             .action_maintenance => self.startOperation(arena, req, auth, false),
             .zim_page => self.pageZim(arena, csrf, t.params),
+            .models_page => self.pageModels(arena, csrf, null, t.params.get("remove")),
+            .action_model_pull => self.modelAction(arena, req, auth, .pull),
+            .action_model_remove => self.modelAction(arena, req, auth, .remove),
+            .action_model_use => self.modelAction(arena, req, auth, .use),
             .access_page => self.pageAccessFull(arena, csrf, null, null, t.params.get("suggest") != null),
             .action_peer_test => self.testPeer(arena, req, auth),
             .action_peer_edit => self.editPeer(arena, req, auth),
@@ -1655,6 +1667,161 @@ pub const App = struct {
         }
     }
 
+    // ----------------------------------------------------- AI models (Ollama)
+
+    const ModelAction = enum { pull, remove, use };
+
+    fn pageModels(self: *App, arena: Allocator, csrf: ?[]const u8, notice: ?[]const u8, confirm_remove: ?[]const u8) error{OutOfMemory}!Response {
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "AI models", csrf, "models") catch return error.OutOfMemory;
+        self.writeModels(arena, w, csrf, notice, confirm_remove) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
+    }
+
+    fn writeModels(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, notice: ?[]const u8, confirm_remove: ?[]const u8) !void {
+        if (notice) |n| {
+            try w.writeAll("<p class=\"notice\" role=\"status\">");
+            try html.writeEscaped(w, n);
+            try w.writeAll("</p>");
+        }
+        try w.writeAll("<p class=\"muted\">Models for semantic search and written answers run in <a href=\"https://ollama.com\">Ollama</a>, a separate program you install and start yourself; dksearch never starts it and never downloads a model unless you press the button.</p>");
+        const client = dk.ollama.Client.init(self.gpa, self.io, self.opts.ollama_url) catch return error.OutOfMemory;
+        defer client.deinit();
+        const version = client.version(arena);
+        try w.writeAll("<section class=\"card\"><h2>Ollama</h2>");
+        if (version) |v| {
+            try w.writeAll("<p>Found: version <strong>");
+            try html.writeEscaped(w, v);
+            try w.writeAll("</strong> at <code>");
+            try html.writeEscaped(w, self.opts.ollama_url);
+            try w.writeAll("</code>.</p>");
+        } else {
+            try w.writeAll("<p class=\"error\">Nothing answers at <code>");
+            try html.writeEscaped(w, self.opts.ollama_url);
+            try w.writeAll("</code>. Install Ollama (ollama.com) and start it, or set <code>[ollama] url</code> if it runs elsewhere.</p></section>");
+            return;
+        }
+        try w.writeAll("<p class=\"muted\">In use: embeddings (semantic search) <strong>");
+        try html.writeEscaped(w, self.opts.embeddings_model orelse "none");
+        try w.writeAll("</strong>; written answers <strong>");
+        try html.writeEscaped(w, self.opts.answers_model orelse "off");
+        try w.writeAll("</strong>. Changes to these are saved to the configuration file and apply after a restart.</p></section>");
+
+        const models = client.list(arena) catch &[_]dk.ollama.Model{};
+        try w.writeAll("<section class=\"card\"><h2>Models</h2>");
+        if (confirm_remove) |name| if (csrf) |token| if (dk.ollama.validModelName(name)) {
+            try w.writeAll("<form class=\"stack\" action=\"/actions/model-remove\" method=\"post\"><p class=\"error\">Delete the model <strong>");
+            try html.writeEscaped(w, name);
+            try w.writeAll("</strong> from Ollama? It has to be downloaded again to use it.</p><input type=\"hidden\" name=\"csrf\" value=\"");
+            try html.writeEscaped(w, token);
+            try w.writeAll("\"><input type=\"hidden\" name=\"name\" value=\"");
+            try html.writeEscaped(w, name);
+            try w.writeAll("\"><button type=\"submit\" class=\"btn danger\">Delete it</button> <a href=\"/models\">Keep it</a></form>");
+        };
+        if (models.len == 0) {
+            try w.writeAll("<p class=\"muted\">No models yet. Pull one below.</p>");
+        } else {
+            try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Model</th><th>Size</th><th>Details</th><th></th></tr></thead><tbody>");
+            for (models) |m| {
+                try w.writeAll("<tr><td><strong>");
+                try html.writeEscaped(w, m.name);
+                try w.writeAll("</strong></td><td>");
+                try writeBytes(w, m.size);
+                try w.writeAll("</td><td>");
+                try html.writeEscaped(w, m.family);
+                try w.writeAll(" ");
+                try html.writeEscaped(w, m.parameters);
+                try w.writeAll(" ");
+                try html.writeEscaped(w, m.quantization);
+                try w.writeAll("</td><td>");
+                if (csrf) |token| if (self.canEditConfig()) {
+                    for ([_][2][]const u8{ .{ "embeddings", "Use for semantic search" }, .{ "answers", "Use for answers" } }) |b| {
+                        try w.writeAll("<form class=\"inline\" action=\"/actions/model-use\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+                        try html.writeEscaped(w, token);
+                        try w.print("\"><input type=\"hidden\" name=\"for\" value=\"{s}\"><input type=\"hidden\" name=\"name\" value=\"", .{b[0]});
+                        try html.writeEscaped(w, m.name);
+                        try w.print("\"><button type=\"submit\" class=\"btn\">{s}</button></form> ", .{b[1]});
+                    }
+                    try w.writeAll("<a class=\"btn danger\" href=\"/models?remove=");
+                    try html.writeEscaped(w, m.name);
+                    try w.writeAll("\">Delete&hellip;</a>");
+                };
+                try w.writeAll("</td></tr>");
+            }
+            try w.writeAll("</tbody></table></div>");
+        }
+        try w.writeAll("</section>");
+        if (csrf) |token| if (self.opts.jobs != null) {
+            try w.writeAll("<section class=\"card\"><h2>Pull a model</h2><form class=\"stack\" action=\"/actions/model-pull\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+            try html.writeEscaped(w, token);
+            try w.writeAll("\"><label>Model name <input name=\"name\" list=\"suggested\" maxlength=\"200\" required placeholder=\"nomic-embed-text\"><small>As in Ollama&rsquo;s library. Models are large (often 1 to 10 GB) and are downloaded by Ollama from its library; this runs in the background and can be cancelled.</small></label><datalist id=\"suggested\"><option value=\"nomic-embed-text\"><option value=\"mxbai-embed-large\"><option value=\"bge-m3\"><option value=\"llama3.2:3b\"><option value=\"qwen2.5:3b\"><option value=\"gemma2:2b\"><option value=\"phi3:mini\"></datalist><p><button type=\"submit\" class=\"btn\">Download the model</button></p></form><p class=\"muted small\">For semantic search use an <em>embedding</em> model (nomic-embed-text, mxbai-embed-large, bge-m3); for written answers a small chat model (llama3.2:3b, qwen2.5:3b, gemma2:2b).</p></section>");
+        };
+    }
+
+    fn modelAction(self: *App, arena: Allocator, req: server.Request, auth: Auth, action: ModelAction) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const name = std.mem.trim(u8, params.get("name") orelse "", " ");
+        if (!dk.ollama.validModelName(name)) return actionFailure(arena, false, .{ .status = .bad_request, .code = "bad_model", .message = "that is not a model name (letters, digits and . _ - : /)" });
+        const csrf = try csrfCopy(arena, auth);
+        switch (action) {
+            .pull => {
+                const jobs = self.opts.jobs orelse return actionFailure(arena, false, .{ .status = .conflict, .code = "not_configured", .message = "pulling models needs admin.actions = true" });
+                jobs.startPull(name) catch |e| return actionFailure(arena, false, switch (e) {
+                    error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "another operation is already running" },
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start the download" },
+                });
+                return redirect(arena, "/", null);
+            },
+            .remove => {
+                const client = dk.ollama.Client.init(self.gpa, self.io, self.opts.ollama_url) catch return error.OutOfMemory;
+                defer client.deinit();
+                client.remove(arena, name) catch return actionFailure(arena, false, .{ .status = .bad_gateway, .code = "ollama_failed", .message = "Ollama did not delete the model (is it running, and is the name right?)" });
+                return self.pageModels(arena, csrf, try std.fmt.allocPrint(arena, "Deleted {s}.", .{name}), null);
+            },
+            .use => {
+                const path = self.opts.config_path orelse return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "the server was started without --config, so there is no configuration file to edit" });
+                if (!self.canEditConfig()) return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "editing the configuration is not available here" });
+                const target = params.get("for") orelse "";
+                self.edit_mutex.lockUncancelable(self.io);
+                defer self.edit_mutex.unlock(self.io);
+                const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_unreadable", .message = "cannot read the configuration file" }),
+                };
+                var problem: dk.sourceedit.Problem = .{};
+                const changes: []const dk.sourceedit.Setting = if (std.mem.eql(u8, target, "embeddings"))
+                    &.{
+                        .{ .table = "embeddings", .key = "url", .value = .{ .string = self.opts.ollama_url } },
+                        .{ .table = "embeddings", .key = "model", .value = .{ .string = name } },
+                        .{ .table = "embeddings", .key = "api", .value = .{ .string = "ollama" } },
+                    }
+                else if (std.mem.eql(u8, target, "answers"))
+                    &.{
+                        .{ .table = "answers", .key = "model", .value = .{ .string = name } },
+                        .{ .table = "answers", .key = "enabled", .value = .{ .boolean = true } },
+                    }
+                else
+                    return actionFailure(arena, false, .{ .status = .bad_request, .code = "bad_target", .message = "for must be embeddings or answers" });
+                const new_text = dk.sourceedit.applySettings(arena, text, changes, &problem) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Invalid => return self.pageModels(arena, csrf, try arena.dupe(u8, problem.message()), null),
+                };
+                dk.sourceedit.writeFile(self.io, arena, path, new_text) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Io => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_not_writable", .message = "the configuration file could not be written; nothing was changed" }),
+                };
+                const what: []const u8 = if (std.mem.eql(u8, target, "embeddings")) "semantic search (then run `dksearch embed` to make the vectors)" else "written answers";
+                return self.pageModels(arena, csrf, try std.fmt.allocPrint(arena, "Saved: {s} will use {s}. Restart dksearch for it to take effect.", .{ what, name }), null);
+            },
+        }
+    }
+
     fn startZimDownload(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
         const params = switch (try self.checkAction(arena, req, auth, false)) {
             .ok => |p| p,
@@ -1775,6 +1942,7 @@ const nav_items = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "settings", "/settings", "Settings" },
     .{ "maintenance", "/maintenance", "Maintenance" },
     .{ "zim", "/zim", "ZIM files" },
+    .{ "models", "/models", "AI models" },
     .{ "access", "/access", "Access" },
     .{ "search", "/search", "Search test" },
 };
@@ -1966,8 +2134,9 @@ fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const 
             .backup => try w.writeAll("Backing up"),
             .remove => try w.writeAll("Removing "),
             .download => try w.writeAll("Downloading "),
+            .model_pull => try w.writeAll("Pulling the model "),
         }
-        if (c.op == .import or c.op == .remove or c.op == .download) {
+        if (c.op == .import or c.op == .remove or c.op == .download or c.op == .model_pull) {
             try w.writeAll("<strong>");
             try html.writeEscaped(w, c.source);
             try w.writeAll("</strong>");
@@ -2500,6 +2669,7 @@ fn opTitle(op: dk.jobs.Op) []const u8 {
         .backup => "Backup",
         .remove => "Removal",
         .download => "Download",
+        .model_pull => "Model pull",
     };
 }
 
@@ -3772,6 +3942,59 @@ test "Access: suggestions are asked for only on request, and a peer that cannot 
     const asked = try f.call(a, .GET, "/access?suggest=1", .{ .cookie = cookie });
     try testing.expect(std.mem.indexOf(u8, asked.body, "Suggested by your peers") != null);
     try testing.expect(std.mem.indexOf(u8, asked.body, "<strong>office</strong> did not answer") != null);
+}
+
+test "Models: Ollama is looked for, not started; choosing a model for embeddings or answers edits the configuration" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.toml", .data = "# mine\n" });
+    var pb: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}/c.toml", .{tmp.sub_path});
+    f.app.opts.config_path = path;
+    // Both the page and the job manager must look at an address where nothing runs: a test must never reach a real
+    // Ollama (a pull there would download a model).
+    f.app.opts.ollama_url = "http://127.0.0.1:1";
+    f.manager.opts.ollama_url = "http://127.0.0.1:1";
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const page = try f.call(a, .GET, "/models", .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.ok, page.status);
+    try testing.expect(std.mem.indexOf(u8, page.body, "Nothing answers at") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "never starts it") != null);
+    const csrf = csrfOf(page.body);
+    const post = struct {
+        fn go(fx: *Fixture, ar: Allocator, ck: []const u8, token: []const u8, target: []const u8, rest: []const u8) !Response {
+            return fx.call(ar, .POST, target, .{ .cookie = ck, .body = try std.fmt.allocPrint(ar, "csrf={s}&{s}", .{ token, rest }) });
+        }
+    }.go;
+    // Bad names and a wrong token are refused.
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/model-use", .{ .cookie = cookie, .body = "csrf=wrong&name=m&for=answers" })).status);
+    try testing.expectEqual(http.Status.bad_request, (try post(&f, a, cookie, csrf, "/actions/model-use", "name=a%20b&for=answers")).status);
+    try testing.expectEqual(http.Status.bad_request, (try post(&f, a, cookie, csrf, "/actions/model-use", "name=m&for=nonsense")).status);
+    // Choosing writes the configuration (validated as a whole) and says a restart is needed.
+    const emb = try post(&f, a, cookie, csrf, "/actions/model-use", "name=nomic-embed-text&for=embeddings");
+    try testing.expectEqual(http.Status.ok, emb.status);
+    try testing.expect(std.mem.indexOf(u8, emb.body, "Restart dksearch") != null);
+    const ans = try post(&f, a, cookie, csrf, "/actions/model-use", "name=llama3.2%3A3b&for=answers");
+    try testing.expectEqual(http.Status.ok, ans.status);
+    const file = try tmp.dir.readFileAlloc(testing.io, "c.toml", a, .limited(4096));
+    try testing.expect(std.mem.indexOf(u8, file, "# mine") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "model = \"nomic-embed-text\"") != null and std.mem.indexOf(u8, file, "api = \"ollama\"") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "model = \"llama3.2:3b\"") != null and std.mem.indexOf(u8, file, "enabled = true") != null);
+    // Deleting asks Ollama; with none there it is reported, not pretended.
+    try testing.expectEqual(http.Status.bad_gateway, (try post(&f, a, cookie, csrf, "/actions/model-remove", "name=nomic-embed-text")).status);
+    // A pull starts as a background task and fails cleanly when Ollama is not there.
+    try testing.expectEqual(http.Status.see_other, (try post(&f, a, cookie, csrf, "/actions/model-pull", "name=nomic-embed-text")).status);
+    try f.waitIdle();
+    const last = (try f.manager.lastResult(a)).?;
+    try testing.expectEqual(dk.state_sqlite.JobState.failed, last.state);
+    try testing.expect(std.mem.indexOf(u8, last.failure orelse "", "Ollama did not answer") != null);
 }
 
 test "Access: collections are added and removed from the page, written to the configuration file" {

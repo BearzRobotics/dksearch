@@ -10,6 +10,7 @@ const std = @import("std");
 const toml = @import("toml");
 const document = @import("document.zig");
 const fallback_mod = @import("fallback.zig");
+const ollama_mod = @import("ollama.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{
@@ -323,6 +324,22 @@ pub const Embeddings = struct {
     batch: u32 = 16,
 };
 
+/// The Ollama server dksearch may talk to (`[ollama]`); the default address is also tried to detect one.
+pub const Ollama = struct { url: []const u8 };
+
+/// An optional answer over retrieved passages from a model in Ollama (`[answers]`), off unless `enabled`.
+pub const Answers = struct {
+    enabled: bool = false,
+    model: []const u8 = "",
+    /// Passages given to the model, 1 to 12.
+    passages: u32 = 6,
+    /// Most characters of passages in the prompt.
+    max_chars: u32 = 12000,
+    timeout_s: u32 = 120,
+    /// Most answers this server makes a minute, all visitors together.
+    max_per_minute: u32 = 10,
+};
+
 /// Other search engines as a fallback (`[fallback]`), off unless `enabled`.
 pub const Fallback = struct {
     enabled: bool = false,
@@ -387,6 +404,8 @@ pub const Config = struct {
     docserver: ?DocServer = null,
     embeddings: ?Embeddings = null,
     fallback: Fallback = .{},
+    ollama: ?Ollama = null,
+    answers: Answers = .{},
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -405,7 +424,7 @@ const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_m
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
 const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
-const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings", "fallback" };
+const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings", "fallback", "ollama", "answers" };
 
 /// Parses and validates configuration text. `source_name` is only used in
 /// diagnostics (normally the file path).
@@ -576,6 +595,29 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     cfg.docserver = try readDocServer(a, src, root, diag);
     cfg.embeddings = try readEmbeddings(a, src, root, diag);
     cfg.fallback = try readFallback(a, src, root, diag);
+    if (try subTable(src, root, "ollama", diag)) |t| {
+        try checkKeys(src, "ollama", t, &[_][]const u8{"url"}, diag);
+        cfg.ollama = .{ .url = try baseAddress(a, src, "ollama.url", try reqStr(src, "ollama", t, "url", diag), diag) };
+    }
+    if (try subTable(src, root, "answers", diag)) |t| {
+        try checkKeys(src, "answers", t, &[_][]const u8{ "enabled", "model", "passages", "max_chars", "timeout_seconds", "max_per_minute" }, diag);
+        if (try optBool(src, "answers", t, "enabled", diag)) |b| cfg.answers.enabled = b;
+        if (try str(src, "answers", t, "model", diag)) |m| {
+            if (!ollama_mod.validModelName(m)) {
+                diag.set(src, "answers.model", "must be a model name such as \"llama3.2:3b\"", .{});
+                return error.InvalidValue;
+            }
+            cfg.answers.model = try a.dupe(u8, m);
+        }
+        if (try intIn(src, "answers", t, "passages", 1, 12, diag)) |n| cfg.answers.passages = @intCast(n);
+        if (try intIn(src, "answers", t, "max_chars", 1000, 100000, diag)) |n| cfg.answers.max_chars = @intCast(n);
+        if (try intIn(src, "answers", t, "timeout_seconds", 5, 3600, diag)) |n| cfg.answers.timeout_s = @intCast(n);
+        if (try intIn(src, "answers", t, "max_per_minute", 1, 1000, diag)) |n| cfg.answers.max_per_minute = @intCast(n);
+        if (cfg.answers.enabled and cfg.answers.model.len == 0) {
+            diag.set(src, "answers.model", "is required when answers are enabled (a model Ollama has: see `dksearch models list`)", .{});
+            return error.InvalidValue;
+        }
+    }
     cfg.peers = try readPeers(a, src, root, diag);
     if (cfg.peers.len > 0 and cfg.node_name.len == 0) {
         diag.set(src, "node.name", "is required when peers are configured (peers show this name beside the results they get from here)", .{});
@@ -1423,6 +1465,21 @@ test "the fallback engines are read and checked, and are off unless asked for" {
         "[fallback]\n[[fallback.provider]]\nkind = \"brave\"\nkey = \"a\"\nkey_file = \"b\"\n",
     };
     for (bad) |text| try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", text, &d));
+}
+
+test "ollama and answers are read and checked" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "[ollama]\nurl = \"http://127.0.0.1:11434/\"\n[answers]\nenabled = true\nmodel = \"llama3.2:3b\"\npassages = 4\n", &d);
+    defer c.deinit();
+    try testing.expectEqualStrings("http://127.0.0.1:11434", c.ollama.?.url);
+    try testing.expect(c.answers.enabled);
+    try testing.expectEqual(@as(u32, 4), c.answers.passages);
+    var off = try loadFromSlice(testing.allocator, "t.toml", "", &d);
+    defer off.deinit();
+    try testing.expect(off.ollama == null and !off.answers.enabled);
+    for ([_][]const u8{ "[answers]\nenabled = true\n", "[answers]\nmodel = \"bad name\"\n", "[answers]\nmodel = \"m\"\npassages = 50\n", "[ollama]\nurl = \"ftp://x\"\n" }) |text| {
+        try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", text, &d));
+    }
 }
 
 test "embeddings are read and checked" {

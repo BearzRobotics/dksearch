@@ -57,3 +57,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0039 | Replicating a peer's documents |
 | 0040 | Signed node identity |
 | 0041 | Fallback to other search engines |
+| 0042 | Ollama, models and written answers |

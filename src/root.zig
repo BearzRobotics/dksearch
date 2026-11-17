@@ -30,6 +30,8 @@ pub const sourcestats = @import("sourcestats.zig");
 pub const embed = @import("embed.zig");
 pub const identity = @import("identity.zig");
 pub const fallback = @import("fallback.zig");
+pub const ollama = @import("ollama.zig");
+pub const answer = @import("answer.zig");
 pub const optioninfo = @import("optioninfo.zig");
 pub const settinginfo = @import("settinginfo.zig");
 pub const officetext = @import("officetext.zig");
@@ -83,6 +85,8 @@ test {
     _ = embed;
     _ = identity;
     _ = fallback;
+    _ = ollama;
+    _ = answer;
     _ = optioninfo;
     _ = settinginfo;
     _ = officetext;

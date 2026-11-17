@@ -61,6 +61,19 @@ pub const commands = [_]Command{
         ,
     },
     .{
+        .name = "models",
+        .synopsis = "models list | pull NAME --yes | remove NAME --yes  [--config FILE]",
+        .summary = "List, download or delete the models of the local Ollama",
+        .detail =
+        \\Talks to the Ollama server at [ollama] url (default http://127.0.0.1:11434). `list`
+        \\shows the models it has. `pull NAME` downloads a model (often 1 to 10 GB) and `remove
+        \\NAME` deletes one: both change what is on disk, so they only run with --yes. dksearch
+        \\never starts Ollama and never pulls anything by itself. Use a model for semantic search
+        \\with [embeddings] (api = "ollama") and for written answers with [answers].
+        \\
+        ,
+    },
+    .{
         .name = "node-key",
         .synopsis = "node-key [--config FILE]",
         .summary = "Make this node's identity (a key pair) and print its node id",

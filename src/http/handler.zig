@@ -48,7 +48,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_export, api_peers, api_health, style, document, zim, wopi, other };
+const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_export, api_peers, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -58,6 +58,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/help/regex")) return .help_regex;
     if (std.mem.eql(u8, path, "/api/v1/search")) return .api_search;
     if (std.mem.eql(u8, path, "/api/v1/retrieve")) return .api_retrieve;
+    if (std.mem.eql(u8, path, "/api/v1/answer")) return .api_answer;
     if (std.mem.eql(u8, path, "/api/v1/export")) return .api_export;
     if (std.mem.eql(u8, path, "/api/v1/peers")) return .api_peers;
     if (std.mem.eql(u8, path, "/api/v1/health")) return .api_health;
@@ -97,6 +98,8 @@ pub const Services = struct {
     default_collection: ?[]const u8 = null,
     /// A document server that office files can be opened in (`[docserver]`).
     docserver: ?*const dk.docserver.Service = null,
+    /// The optional AI answer over retrieved passages (`[answers]`; null when off).
+    answers: ?*dk.answer.Service = null,
     /// Other search engines as a fallback (opt-in; null when `[fallback]` is off).
     fallback: ?*const dk.fallback.Settings = null,
     /// This node's identity (signs answers to callers that sent a nonce) and the nonces already seen (so a signed
@@ -375,7 +378,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
     return switch (r) {
         .home => blk: {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHomeForm(&aw.writer, null, .{ .regex_enabled = regex != null, .sources = try sourceChoicesFor(arena, services, searcher), .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, null, .{ .answers_offered = services.answers != null and !services.scope.none(), .regex_enabled = regex != null, .sources = try sourceChoicesFor(arena, services, searcher), .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
@@ -392,6 +395,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         },
         .api_search => try apiSearch(arena, searcher, regex, services, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
         .api_retrieve => try apiRetrieve(arena, searcher, services, t.params),
+        .api_answer => try apiAnswer(arena, searcher, services, t.params),
         .api_export => try apiExport(arena, searcher, services, t.params),
         .api_peers => try apiPeers(arena, services),
         .search_page => try pageSearch(arena, searcher, regex, services, try sourceChoicesFor(arena, services, searcher), try sourceBoosts(arena, services), t.params),
@@ -733,6 +737,92 @@ fn apiExport(arena: Allocator, searcher: dk.search.Searcher, services: Services,
     var resp = try jsonResponse(arena, .ok, .{ .source = src.name, .documents = out.items, .next = if (more and last != null) try std.fmt.allocPrint(arena, "{d}", .{last.?}) else null });
     resp.headers = headersWith(arena, &.{no_store});
     return resp;
+}
+
+const AnswerOutcome = union(enum) {
+    ok: struct { text: []const u8, model: []const u8, passages: []const dk.answer.Passage },
+    off,
+    no_passages,
+    busy,
+    unavailable,
+    bad_question,
+};
+
+/// The AI answer to `question`: the best passages (the retrieval of `/api/v1/retrieve`) go to the model of
+/// `[answers]` through Ollama. Nothing is asked of the model when no passage was found.
+fn answerFor(arena: Allocator, searcher: dk.search.Searcher, services: Services, question: []const u8) error{OutOfMemory}!AnswerOutcome {
+    const svc = services.answers orelse return .off;
+    const q = std.mem.trim(u8, question, " \t\r\n");
+    if (q.len < 3 or q.len > 500) return .bad_question;
+    var enc: std.Io.Writer.Allocating = .init(arena);
+    query.writeEncoded(&enc.writer, q) catch return error.OutOfMemory;
+    const target = try std.fmt.allocPrint(arena, "/api/v1/retrieve?q={s}&k={d}", .{ enc.written(), svc.passages });
+    const t = query.parseTarget(arena, target) catch return error.OutOfMemory;
+    const resp = try apiRetrieve(arena, searcher, services, t.params);
+    if (resp.status != .ok) return .no_passages;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, resp.body, .{}) catch return .no_passages;
+    const chunks = switch (parsed) {
+        .object => |o| switch (o.get("chunks") orelse return .no_passages) {
+            .array => |a| a.items,
+            else => return .no_passages,
+        },
+        else => return .no_passages,
+    };
+    var list: std.ArrayList(dk.answer.Passage) = .empty;
+    for (chunks) |c| {
+        const o = switch (c) {
+            .object => |x| x,
+            else => continue,
+        };
+        const text = switch (o.get("text") orelse continue) {
+            .string => |s| s,
+            else => continue,
+        };
+        const src: []const u8 = switch (o.get("source") orelse .null) {
+            .string => |s| s,
+            else => "",
+        };
+        const title: ?[]const u8 = switch (o.get("title") orelse .null) {
+            .string => |s| s,
+            else => null,
+        };
+        const view: []const u8 = switch (o.get("view_url") orelse .null) {
+            .string => |s| s,
+            else => "",
+        };
+        try list.append(arena, .{ .title = title, .source = src, .text = text, .view_url = view });
+    }
+    if (list.items.len == 0) return .no_passages;
+    const text = svc.answer(arena, q, list.items) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Busy => .busy,
+        error.ModelUnavailable => .unavailable,
+    };
+    return .{ .ok = .{ .text = text, .model = svc.model, .passages = list.items } };
+}
+
+/// `GET /api/v1/answer?q=QUESTION`: a short answer from the local model, made from the best passages, with them.
+fn apiAnswer(arena: Allocator, searcher: dk.search.Searcher, services: Services, params: query.Params) error{OutOfMemory}!Response {
+    const outcome = try answerFor(arena, searcher, services, params.get("q") orelse "");
+    switch (outcome) {
+        .off => return apiError(arena, .not_found, "answers_off", "answers are not turned on on this server ([answers])"),
+        .bad_question => return apiError(arena, .bad_request, "invalid_parameter", "q: a question of 3 to 500 characters is required"),
+        .no_passages => return jsonResponse(arena, .ok, .{ .answer = @as(?[]const u8, null), .reason = "no passage in the documents matched the question", .sources = &[_]u8{} }),
+        .busy => {
+            var r = try apiError(arena, .too_many_requests, "busy", "this server has reached its limit of answers for this minute");
+            r.headers = headersWith(arena, &.{ .{ .name = "retry-after", .value = "10" }, no_store });
+            return r;
+        },
+        .unavailable => return apiError(arena, .service_unavailable, "model_unavailable", "the model could not be reached or gave no answer (is Ollama running with the model of [answers]?)"),
+        .ok => |ok| {
+            const Src = struct { n: u32, title: ?[]const u8, source: []const u8, view_url: []const u8 };
+            const sources = try arena.alloc(Src, ok.passages.len);
+            for (ok.passages, sources, 1..) |p, *s, n| s.* = .{ .n = @intCast(n), .title = p.title, .source = p.source, .view_url = p.view_url };
+            var r = try jsonResponse(arena, .ok, .{ .answer = ok.text, .model = ok.model, .sources = sources, .notice = "Written by a language model from these passages; it can be wrong." });
+            r.headers = headersWith(arena, &.{no_store});
+            return r;
+        },
+    }
 }
 
 /// `GET /api/v1/peers`: the peers this node is willing to introduce (`introduce = true`), by name and address only.
@@ -1610,6 +1700,24 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         }
         form.peer_notes = notes;
     } else if (wantsPeers(params)) form.peers_on = true;
+    if (services.answers != null and !services.scope.none()) {
+        form.answers_offered = true;
+        if (if (params.get("answer")) |v| std.mem.eql(u8, v, "1") else false) {
+            form.answer_checked = true;
+            if (q.offset == 0) switch (try answerFor(arena, searcher, services, parsed.typed)) {
+                .ok => |ok| {
+                    const srcs = try arena.alloc(html.AnswerSource, ok.passages.len);
+                    for (ok.passages, srcs, 1..) |p, *s, n| s.* = .{ .n = @intCast(n), .title = p.title orelse p.source, .href = p.view_url, .source = p.source };
+                    form.answer = .{ .text = ok.text, .model = ok.model, .sources = srcs };
+                },
+                .no_passages => form.answer_note = "No passage in the documents matched well enough to write an answer.",
+                .busy => form.answer_note = "This server has reached its limit of answers for this minute; try again shortly.",
+                .unavailable => form.answer_note = "The answer could not be written: the model did not respond.",
+                .bad_question => form.answer_note = "A question of 3 to 500 characters is needed for an answer.",
+                .off => {},
+            };
+        }
+    }
     try applyFallback(arena, services, params, &form, shown.hits.len, q.offset);
     var aw: std.Io.Writer.Allocating = .init(arena);
     html.writeResults(&aw.writer, form, shown, q.offset, html_page_size) catch return error.OutOfMemory;
@@ -2839,6 +2947,40 @@ test "the fallback: nothing without it, links when local results are few, web re
     const colls = [_]dk.config.Collection{.{ .name = "c", .sources = &.{"n"} }};
     const closed: Services = .{ .fallback = &settings, .collections = &colls, .anonymous = &.{} };
     try testing.expect(std.mem.indexOf(u8, handleServices(a, few.searcher(), closed, .GET, "/search?q=lamp").body, "Search elsewhere") == null);
+}
+
+test "answers: off by default, a question is needed, nothing is asked of the model without passages, and an unreachable model is said" {
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    const id: dk.document.Id = .{ 0x41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try mem.store().put(id, "# Edda\n\nOdin had two ravens, Huginn and Muninn.");
+    const hits = [_]dk.search.Hit{.{ .id = id, .connector = "books", .url = "file:///x/edda.md", .title = "Edda", .snippet = null, .score = 1 }};
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var found: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
+    var empty: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    // Off: 404 on the API, and no box on the page.
+    try testing.expectEqual(http.Status.not_found, handleServices(a, found.searcher(), .{ .content = mem.store() }, .GET, "/api/v1/answer?q=who+had+ravens").status);
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, found.searcher(), .{ .content = mem.store() }, .GET, "/").body, "AI model") == null);
+    const client = try dk.ollama.Client.init(testing.allocator, testing.io, "http://127.0.0.1:1");
+    defer client.deinit();
+    var svc: dk.answer.Service = .{ .client = client, .model = "m", .passages = 4, .max_chars = 4000, .timeout_s = 2, .max_per_minute = 5, .io = testing.io };
+    const services: Services = .{ .content = mem.store(), .answers = &svc };
+    try testing.expectEqual(http.Status.bad_request, handleServices(a, found.searcher(), services, .GET, "/api/v1/answer?q=hi").status);
+    // No passage: an empty answer with the reason, and the model is not asked (the limit is not used).
+    const none = handleServices(a, empty.searcher(), services, .GET, "/api/v1/answer?q=who+had+ravens");
+    try testing.expectEqual(http.Status.ok, none.status);
+    try testing.expect(std.mem.indexOf(u8, none.body, "\"answer\":null") != null);
+    try testing.expectEqual(@as(u32, 0), svc.used);
+    // Passages found, the model does not answer: 503 with the reason.
+    const down = handleServices(a, found.searcher(), services, .GET, "/api/v1/answer?q=who+had+ravens");
+    try testing.expectEqual(http.Status.service_unavailable, down.status);
+    try testing.expect(std.mem.indexOf(u8, down.body, "model_unavailable") != null);
+    // The page offers the box, and says when the model did not respond.
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, found.searcher(), services, .GET, "/").body, "Also write an answer") != null);
+    const page = handleServices(a, found.searcher(), services, .GET, "/search?q=who+had+ravens&answer=1");
+    try testing.expect(std.mem.indexOf(u8, page.body, "the model did not respond") != null);
 }
 
 test "retrieval cache: the same answer twice, served from the cache, and a changed document is read again" {

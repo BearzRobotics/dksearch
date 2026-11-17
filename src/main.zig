@@ -160,6 +160,7 @@ fn run(init: std.process.Init) u8 {
     }
 
     if (eq(first, "api-key")) return apiKeyCmd(io, gpa, &args);
+    if (eq(first, "models")) return modelsCmd(io, gpa, &args);
     if (eq(first, "node-key")) {
         var config_path: ?[]const u8 = null;
         while (args.next()) |a| {
@@ -506,6 +507,82 @@ fn readLine(io: Io, gpa: std.mem.Allocator, prompt: ?[]const u8) ?[]u8 {
 }
 
 /// `dksearch api-key add NAME (--all | --collection C ...) | list | remove NAME_OR_ID` [--config FILE].
+/// `dksearch models list | pull NAME [--yes] | remove NAME [--yes]`: the models of the Ollama server (found at
+/// `[ollama] url` or the default address). Pulling and removing change what is on disk, so they need `--yes`.
+fn modelsCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
+    const sub_cmd = args.next() orelse return usageError(io, "models needs list, pull or remove");
+    var config_path: ?[]const u8 = null;
+    var name: ?[]const u8 = null;
+    var yes = false;
+    while (args.next()) |a| {
+        if (eq(a, "--config")) {
+            config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+        } else if (std.mem.startsWith(u8, a, "--config=")) {
+            config_path = a["--config=".len..];
+        } else if (eq(a, "--yes") or eq(a, "-y")) {
+            yes = true;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            err(io, "unknown option for models: {s}", .{a});
+            return exit_usage;
+        } else if (name == null) {
+            name = a;
+        } else return usageError(io, "models takes one NAME");
+    }
+    var url: []const u8 = dk.ollama.default_url;
+    var diag: dk.config.Diagnostic = .{};
+    var cfg_opt: ?dk.config.Config = if (config_path != null) (loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag)) else null;
+    defer if (cfg_opt) |*c| c.deinit();
+    if (cfg_opt) |c| if (c.ollama) |o| {
+        url = o.url;
+    };
+    const client = dk.ollama.Client.init(gpa, io, url) catch return exit_io;
+    defer client.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    if (client.version(arena)) |v| out(io, "Ollama {s} at {s}\n", .{ v, url }) else {
+        err(io, "no Ollama answers at {s} (is it running? set [ollama] url if it is elsewhere)", .{url});
+        return exit_failure;
+    }
+    if (eq(sub_cmd, "list")) {
+        const models = client.list(arena) catch |e| {
+            err(io, "cannot list the models: {t}", .{e});
+            return exit_failure;
+        };
+        if (models.len == 0) out(io, "no models yet; `dksearch models pull NAME --yes` downloads one\n", .{});
+        for (models) |m| out(io, "{s}  {d} MiB  {s} {s} {s}\n", .{ m.name, m.size / (1024 * 1024), m.family, m.parameters, m.quantization });
+        return exit_ok;
+    }
+    const model = name orelse return usageError(io, "models pull and remove need a model NAME");
+    if (!dk.ollama.validModelName(model)) return usageError(io, "that is not a model name (letters, digits and . _ - : /)");
+    if (eq(sub_cmd, "pull")) {
+        if (!yes) {
+            err(io, "this downloads the model {s} into Ollama (often 1 to 10 GB, from Ollama's library); run it again with --yes to do it", .{model});
+            return exit_usage;
+        }
+        out(io, "pulling {s} (this can take a long while)...\n", .{model});
+        client.pull(arena, model, null) catch |e| {
+            err(io, "pulling {s} failed: {t}", .{ model, e });
+            return exit_failure;
+        };
+        out(io, "done: {s}\n", .{model});
+        return exit_ok;
+    }
+    if (eq(sub_cmd, "remove")) {
+        if (!yes) {
+            err(io, "this deletes the model {s} from Ollama; run it again with --yes to do it", .{model});
+            return exit_usage;
+        }
+        client.remove(arena, model) catch |e| {
+            err(io, "removing {s} failed: {t}", .{ model, e });
+            return exit_failure;
+        };
+        out(io, "removed {s}\n", .{model});
+        return exit_ok;
+    }
+    return usageError(io, "models needs list, pull or remove");
+}
+
 /// `dksearch node-key`: makes this node's identity (an Ed25519 key pair in data_dir/node-identity.toml) if there is none,
 /// and prints the node id. Running it again changes nothing.
 fn nodeKeyCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
@@ -989,6 +1066,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
                 .backup_dir = cfg.admin_options.backup_dir,
                 .zim_dir = cfg.admin_options.zim_dir,
                 .config_path = config_path,
+                .ollama_url = if (cfg.ollama) |o| o.url else dk.ollama.default_url,
                 .chunk_min_bytes = cfg.search.chunk_index_min_kb * 1024,
             });
             job_manager_ready = true;
@@ -1003,6 +1081,9 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .title_weight = cfg.search.title_weight,
             .body_weight = cfg.search.body_weight,
             .peers = peer_service,
+            .ollama_url = if (cfg.ollama) |o| o.url else dk.ollama.default_url,
+            .embeddings_model = if (cfg.embeddings) |e| e.model else null,
+            .answers_model = if (cfg.answers.enabled) cfg.answers.model else null,
             .node_name = cfg.node_name,
             .node_id = node_id_text,
             .data_dir = cfg.data_dir,
@@ -1111,11 +1192,19 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         out(io, "note: fallback to other search engines is ON: the visitors' words can be sent to {d} service(s) (see [fallback])\n", .{cfg.fallback.providers.len});
     }
     defer if (fallback_service) |s| s.deinit();
+    // The optional AI answer: a model in Ollama, only with `[answers] enabled = true`.
+    var ollama_client: ?*dk.ollama.Client = null;
+    var answer_service: dk.answer.Service = undefined;
+    if (cfg.answers.enabled) {
+        ollama_client = dk.ollama.Client.init(gpa, io, if (cfg.ollama) |o| o.url else dk.ollama.default_url) catch return exit_io;
+        answer_service = .{ .client = ollama_client.?, .model = cfg.answers.model, .passages = cfg.answers.passages, .max_chars = cfg.answers.max_chars, .timeout_s = cfg.answers.timeout_s, .max_per_minute = cfg.answers.max_per_minute, .io = io };
+    }
+    defer if (ollama_client) |c| c.deinit();
     var source_stats = dk.sourcestats.Cache.init(gpa, io);
     defer source_stats.deinit();
     var retrieve_cache = dk.retrievecache.Cache.init(gpa, io, @as(usize, cfg.search.retrieve_cache_mb) * 1024 * 1024);
     defer retrieve_cache.deinit();
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .fallback = if (fallback_on) &fallback_settings else null, .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .answers = if (ollama_client != null) &answer_service else null, .fallback = if (fallback_on) &fallback_settings else null, .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };
