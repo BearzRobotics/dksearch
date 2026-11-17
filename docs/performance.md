@@ -96,6 +96,19 @@ A folder of economics and banking books (`files` source with `pdf_text`, `pdf_wo
 
 The skipped scans are what OCR (on the roadmap) is for. Three PDFs were over this run's 64 MiB limit and were refused.
 
+## Crawl, and typo tolerance (2026-11-16)
+
+Crawl, six minutes, 785 seeds on 450 hosts, depth 3, following links to other sites, 500 ms between requests to a site (a busy desktop and an ordinary home connection; the numbers are for comparison, not for planning):
+
+| Crawler | Real pages | Sites |
+|---|---|---|
+| dksearch, one request at a time (before) | 35 | about 10 |
+| dksearch, 16 workers, depth-first | 2,441 | 119 |
+| dksearch, 16 workers, breadth-first (window 200) | 3,085 | 389 |
+| YaCy 1.942, defaults, global mode | 855 | 541 |
+
+Typo-tolerant search on the 297,447-document playground index (index.db 844 MB): 30 to 70 ms for a word with a close match, about 500 ms when nothing is close (the vocabulary scan is time-limited). Retrieval (`/api/v1/retrieve`) over 13 large books: 0.3 s with one document-level pass, 1 to 2 s after passages, pages and the PDF page lookup were added.
+
 ## Extrapolation from the synthetic data (a guess, not a measurement)
 
 English Wikipedia's article text is on the order of 20 GB. Scaling the numbers above linearly gives roughly an hour of CPU for an import, an index of about twice the text size (tens of GB), compressed content of a few GB, and a `state.db` that would be several GB with the current per-record rights text. Real text has a larger vocabulary and longer articles, so treat every one of these as a rough order of magnitude and measure with a real dump before planning hardware.
