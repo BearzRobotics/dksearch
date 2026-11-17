@@ -160,6 +160,20 @@ fn run(init: std.process.Init) u8 {
     }
 
     if (eq(first, "api-key")) return apiKeyCmd(io, gpa, &args);
+    if (eq(first, "node-key")) {
+        var config_path: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (eq(a, "--config")) {
+                config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+            } else if (std.mem.startsWith(u8, a, "--config=")) {
+                config_path = a["--config=".len..];
+            } else {
+                err(io, "unknown option for node-key: {s}", .{a});
+                return exit_usage;
+            }
+        }
+        return nodeKeyCmd(io, gpa, config_path);
+    }
 
     if (eq(first, "check") or eq(first, "backup")) {
         var config_path: ?[]const u8 = null;
@@ -492,12 +506,44 @@ fn readLine(io: Io, gpa: std.mem.Allocator, prompt: ?[]const u8) ?[]u8 {
 }
 
 /// `dksearch api-key add NAME (--all | --collection C ...) | list | remove NAME_OR_ID` [--config FILE].
+/// `dksearch node-key`: makes this node's identity (an Ed25519 key pair in data_dir/node-identity.toml) if there is none,
+/// and prints the node id. Running it again changes nothing.
+fn nodeKeyCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ cfg.data_dir, dk.identity.file_name }) catch return exit_io;
+    var made = false;
+    const existing = dk.identity.Identity.load(arena, io, Io.Dir.cwd(), path) catch |e| {
+        err(io, "cannot use {s}: {t}", .{ path, e });
+        return exit_io;
+    };
+    var id = existing orelse blk: {
+        const fresh = dk.identity.Identity.generate(io);
+        fresh.save(arena, io, Io.Dir.cwd(), path) catch |e| {
+            err(io, "cannot write {s}: {t}", .{ path, e });
+            return exit_io;
+        };
+        made = true;
+        break :blk fresh;
+    };
+    var buf: [dk.identity.id_len]u8 = undefined;
+    out(io, "{s}\n", .{id.idText(&buf)});
+    if (made) err(io, "made the node identity in {s} (keep it secret, mode 0600); give the id above to the owners of peers that should recognise this node, and restart the server to use it", .{path}) else err(io, "this node already has an identity ({s})", .{path});
+    return exit_ok;
+}
+
 fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
     const sub_cmd = args.next() orelse return usageError(io, "api-key needs add, list or remove");
     var config_path: ?[]const u8 = null;
     var name: ?[]const u8 = null;
     var all = false;
     var rate: u32 = 0;
+    var bound_node: ?[]const u8 = null;
     var colls: std.ArrayList([]const u8) = .empty;
     defer colls.deinit(gpa);
     while (args.next()) |a| {
@@ -505,6 +551,8 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
             config_path = args.next() orelse return usageError(io, "--config needs a FILE");
         } else if (std.mem.startsWith(u8, a, "--config=")) {
             config_path = a["--config=".len..];
+        } else if (eq(a, "--node")) {
+            bound_node = args.next() orelse return usageError(io, "--node needs a node id (dkn_...)");
         } else if (eq(a, "--rate")) {
             const r = args.next() orelse return usageError(io, "--rate needs a number of requests per minute");
             rate = std.fmt.parseInt(u32, r, 10) catch return usageError(io, "--rate must be a whole number of requests per minute (0: no limit)");
@@ -543,6 +591,7 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
             out(io, "{s}  {s}  collections: ", .{ k.id, k.name });
             for (k.collections, 0..) |c, i| out(io, "{s}{s}", .{ if (i > 0) "," else "", if (eq(c, dk.access.all_marker)) "ALL" else c });
             if (k.rate > 0) out(io, "  limit: {d}/min", .{k.rate});
+            if (k.node) |n| out(io, "  bound to node {s}", .{n});
             out(io, "\n", .{});
         }
         return exit_ok;
@@ -577,7 +626,7 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
         const chosen: []const []const u8 = if (all) &.{dk.access.all_marker} else colls.items;
         var tok: [dk.access.token_len]u8 = undefined;
         const made_at: i64 = Io.Clock.real.now(io).toSeconds();
-        const updated = dk.access.addRated(arena, io, keys, key_name, chosen, made_at, rate, &tok) catch |e| {
+        const updated = dk.access.addBound(arena, io, keys, key_name, chosen, made_at, rate, bound_node, &tok) catch |e| {
             switch (e) {
                 error.Duplicate => err(io, "a key named {s} already exists", .{key_name}),
                 error.BadName => err(io, "the name must be 1 to 64 printable characters without quotes", .{}),
@@ -876,6 +925,23 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         };
     }
     defer if (peer_service) |p| p.deinit();
+    // This node's identity, if one was made with `dksearch node-key`: it signs requests to peers and answers to callers.
+    var node_identity: ?dk.identity.Identity = null;
+    var node_id_buf: [dk.identity.id_len]u8 = undefined;
+    var node_id_text: ?[]const u8 = null;
+    {
+        const ipath = std.fmt.allocPrint(arena_state.allocator(), "{s}/{s}", .{ cfg.data_dir, dk.identity.file_name }) catch return exit_io;
+        node_identity = dk.identity.Identity.load(arena_state.allocator(), io, Io.Dir.cwd(), ipath) catch |e| {
+            err(io, "cannot use the node identity {s}: {t} (it must be readable only by you; `dksearch node-key` makes one)", .{ ipath, e });
+            return exit_io;
+        };
+        if (node_identity) |*id| node_id_text = id.idText(&node_id_buf);
+    }
+    var replay = dk.identity.Replay.init(gpa, io);
+    defer replay.deinit();
+    if (node_identity) |*id| if (peer_service) |p| {
+        p.identity = id;
+    };
     if (peer_service) |p| p.cache_ttl_seconds = cfg.search.peer_cache_seconds;
     defer source_store.deinit();
     var job_manager: dk.jobs.Manager = undefined;
@@ -938,6 +1004,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .body_weight = cfg.search.body_weight,
             .peers = peer_service,
             .node_name = cfg.node_name,
+            .node_id = node_id_text,
             .data_dir = cfg.data_dir,
             .collections = cfg.collections,
             .anonymous_collections = cfg.access.anonymous_collections,
@@ -1015,7 +1082,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     defer source_stats.deinit();
     var retrieve_cache = dk.retrievecache.Cache.init(gpa, io, @as(usize, cfg.search.retrieve_cache_mb) * 1024 * 1024);
     defer retrieve_cache.deinit();
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

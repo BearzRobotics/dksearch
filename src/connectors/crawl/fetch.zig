@@ -32,6 +32,9 @@ pub const Response = struct {
     /// `ETag` and `Last-Modified` of the answer, to ask again conditionally next time.
     etag: ?[]const u8 = null,
     last_modified: ?[]const u8 = null,
+    /// `dk-node` and `dk-sig` of the answer: the node that says it made it and its signature (see identity.zig).
+    node: ?[]const u8 = null,
+    node_sig: ?[]const u8 = null,
     body: []const u8 = &.{},
 };
 
@@ -48,6 +51,8 @@ pub const Request = struct {
     /// A request body (the request is then a POST) and its media type.
     body: ?[]const u8 = null,
     content_type: []const u8 = "application/json",
+    /// More headers to send (a peer's signature, at most four).
+    extra_headers: []const http.Header = &.{},
 };
 
 /// Fetches `req.url`. Everything returned is allocated from `arena`; on
@@ -84,7 +89,7 @@ fn sleep(io: Io, d: Io.Duration) void {
 
 fn run(client: *http.Client, arena: Allocator, req: Request) Failure!Response {
     const uri = std.Uri.parse(req.url) catch return error.BadUrl;
-    var headers: [4]http.Header = undefined;
+    var headers: [8]http.Header = undefined;
     var n_headers: usize = 0;
     headers[n_headers] = .{ .name = "accept", .value = req.accept };
     n_headers += 1;
@@ -98,6 +103,10 @@ fn run(client: *http.Client, arena: Allocator, req: Request) Failure!Response {
     }
     if (req.if_modified_since) |v| {
         headers[n_headers] = .{ .name = "if-modified-since", .value = v };
+        n_headers += 1;
+    }
+    for (req.extra_headers[0..@min(req.extra_headers.len, 4)]) |h| {
+        headers[n_headers] = h;
         n_headers += 1;
     }
     var request = client.request(if (req.body != null) .POST else .GET, uri, .{
@@ -137,6 +146,8 @@ fn run(client: *http.Client, arena: Allocator, req: Request) Failure!Response {
     while (hit.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "etag") and h.value.len <= 300) out.etag = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "last-modified") and h.value.len <= 100) out.last_modified = try arena.dupe(u8, h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "dk-node") and h.value.len <= 64) out.node = try arena.dupe(u8, h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "dk-sig") and h.value.len <= 120) out.node_sig = try arena.dupe(u8, h.value);
     }
 
     // Only a successful answer's body is wanted; for anything else the

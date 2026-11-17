@@ -69,8 +69,11 @@ pub const Key = struct {
     created: i64 = 0,
     /// Requests per minute the key may make; 0 is no limit.
     rate: u32 = 0,
+    /// A node id (`dkn_...`): the key then works only with a valid signature of that node (see identity.zig).
+    node: ?[]const u8 = null,
 };
 
+const id_node_len = 4 + 43;
 /// The most requests per minute a key can be limited to.
 pub const max_rate = 1_000_000;
 
@@ -136,6 +139,7 @@ pub fn parse(arena: Allocator, text: []const u8) KeyError![]const Key {
                 .integer => |n| n,
                 else => 0,
             } else 0,
+            .node = if (t.getString("node")) |n| (if (n.len == id_node_len and std.mem.startsWith(u8, n, "dkn_")) try arena.dupe(u8, n) else return error.Malformed) else null,
             .rate = if (t.get("rate")) |r| switch (r) {
                 .integer => |n| if (n > 0 and n <= max_rate) @intCast(n) else 0,
                 else => 0,
@@ -157,6 +161,7 @@ pub fn render(arena: Allocator, keys: []const Key) Allocator.Error![]const u8 {
         }
         try out.appendSlice(arena, "]\n");
         if (k.rate > 0) try out.print(arena, "rate = {d}\n", .{k.rate});
+        if (k.node) |n| try out.print(arena, "node = \"{s}\"\n", .{n});
     }
     return out.items;
 }
@@ -224,6 +229,12 @@ pub fn add(arena: Allocator, io: Io, keys: []const Key, name: []const u8, collec
 
 /// Like `add`, with a limit of `rate` requests per minute (0: none).
 pub fn addRated(arena: Allocator, io: Io, keys: []const Key, name: []const u8, collections: []const []const u8, now: i64, rate: u32, token_out: *[token_len]u8) KeyError![]const Key {
+    return addBound(arena, io, keys, name, collections, now, rate, null, token_out);
+}
+
+/// Like `addRated`, bound to the node `node` (a `dkn_...` id) when given.
+pub fn addBound(arena: Allocator, io: Io, keys: []const Key, name: []const u8, collections: []const []const u8, now: i64, rate: u32, node: ?[]const u8, token_out: *[token_len]u8) KeyError![]const Key {
+    if (node) |n| if (n.len != id_node_len or !std.mem.startsWith(u8, n, "dkn_")) return error.BadName;
     if (!validKeyName(name)) return error.BadName;
     if (keys.len >= max_keys) return error.TooMany;
     for (keys) |k| if (std.mem.eql(u8, k.name, name)) return error.Duplicate;
@@ -231,7 +242,7 @@ pub fn addRated(arena: Allocator, io: Io, keys: []const Key, name: []const u8, c
     const h = hashOf(token_out);
     const out = try arena.alloc(Key, keys.len + 1);
     @memcpy(out[0..keys.len], keys);
-    out[keys.len] = .{ .id = try idOf(arena, h), .name = try arena.dupe(u8, name), .hash = h, .collections = try arena.dupe([]const u8, collections), .created = now, .rate = @min(rate, max_rate) };
+    out[keys.len] = .{ .id = try idOf(arena, h), .name = try arena.dupe(u8, name), .hash = h, .collections = try arena.dupe([]const u8, collections), .created = now, .rate = @min(rate, max_rate), .node = if (node) |n| try arena.dupe(u8, n) else null };
     return out;
 }
 
@@ -273,7 +284,7 @@ pub const KeyStore = struct {
         self.arena.deinit();
     }
 
-    pub const Found = struct { id: []const u8, name: []const u8, collections: []const []const u8, rate: u32 = 0 };
+    pub const Found = struct { id: []const u8, name: []const u8, collections: []const []const u8, rate: u32 = 0, node: ?[]const u8 = null };
 
     /// Counts a request of key `id` against its limit of `rate` a minute (fixed one-minute windows). Null if it may
     /// go ahead; otherwise the seconds until the window ends.
@@ -305,7 +316,7 @@ pub const KeyStore = struct {
         const k = find(self.keys, token) orelse return null;
         const colls = try out.alloc([]const u8, k.collections.len);
         for (k.collections, colls) |c, *o| o.* = try out.dupe(u8, c);
-        return .{ .id = try out.dupe(u8, k.id), .name = try out.dupe(u8, k.name), .collections = colls, .rate = k.rate };
+        return .{ .id = try out.dupe(u8, k.id), .name = try out.dupe(u8, k.name), .collections = colls, .rate = k.rate, .node = if (k.node) |n| try out.dupe(u8, n) else null };
     }
 
     fn refresh(self: *KeyStore) void {
@@ -455,4 +466,17 @@ test "a key's limit is stored, read back, and counted per minute" {
     try testing.expect(wait != null and wait.? >= 1 and wait.? <= 60);
     try testing.expect(store.allow("bbbb", 2) == null);
     for (0..100) |_| try testing.expect(store.allow("cccc", 0) == null);
+}
+
+test "a key bound to a node is stored and read back, and a bad node id is refused" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tok: [token_len]u8 = undefined;
+    const node = "dkn_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const keys = try addBound(a, testing.io, &.{}, "b", &.{"*"}, 1, 0, node, &tok);
+    const back = try parse(a, try render(a, keys));
+    try testing.expectEqualStrings(node, back[0].node.?);
+    var tok2: [token_len]u8 = undefined;
+    try testing.expectError(error.BadName, addBound(a, testing.io, &.{}, "c", &.{"*"}, 1, 0, "not-an-id", &tok2));
 }

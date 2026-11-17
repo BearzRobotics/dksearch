@@ -74,6 +74,8 @@ pub const Options = struct {
     /// The peers this node can ask, and its own name, for the Access page.
     peers: ?*dk.peers.Service = null,
     node_name: []const u8 = "",
+    /// This node's public id (`dkn_...`), if it has an identity.
+    node_id: ?[]const u8 = null,
     /// The Kiwix library's catalogue (tests point this at a local server).
     kiwix_catalog_url: []const u8 = dk.kiwix.catalog_base,
     kiwix_options: dk.kiwix.Options = .{},
@@ -1212,6 +1214,11 @@ pub const App = struct {
 
     fn writePeers(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, suggest: bool) !void {
         try w.writeAll("<section class=\"card\"><h2>Peers</h2>");
+        if (self.opts.node_id) |nid| {
+            try w.writeAll("<p>Node id: <code>");
+            try html.writeEscaped(w, nid);
+            try w.writeAll("</code> <span class=\"muted\">(public; give it to the owners of peers that should recognise this node, and ask for theirs to pin)</span></p>");
+        } else try w.writeAll("<p class=\"muted\">This node has no identity yet: <code>dksearch node-key</code> makes one (then restart).</p>");
         const svc = self.opts.peers orelse {
             try w.writeAll("<p class=\"muted\">No peers yet. Peers are other dksearch nodes you may ask (see the manual, <em>Peers and federated search</em>). They are saved in the configuration file and start working after a restart.</p>");
             try self.writePeerForm(w, csrf);
@@ -1461,6 +1468,7 @@ pub const App = struct {
             .timeout => try std.fmt.allocPrint(arena, "{s}: no answer within the time limit.", .{name}),
             .down => try std.fmt.allocPrint(arena, "{s}: could not connect (check the address, the port and that the peer is running; for https, its certificate).", .{name}),
             .bad_answer => try std.fmt.allocPrint(arena, "{s}: answered, but not like a dksearch node.", .{name}),
+            .untrusted => try std.fmt.allocPrint(arena, "{s}: answered, but not signed by the node id it is pinned to: wrong id in the configuration, or not the node you meant.", .{name}),
             else => try std.fmt.allocPrint(arena, "{s}: not asked ({t}).", .{ name, r.status }),
         };
         const csrf: ?[]const u8 = switch (auth) {

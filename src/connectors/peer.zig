@@ -11,6 +11,9 @@
 //!   url             required: the other node, `http://host:port` or `https://host`
 //!   source          required: the name of the source on that node
 //!   key_file        a file holding the API key (or `key`; the file is better, keep it mode 0600)
+//!   identity_file   this node's identity file (`data_dir/node-identity.toml`): requests are signed with it, which a
+//!                   key bound to this node requires
+//!   node            the other node's id (`dkn_...`): its answers must be signed by it
 //!   max_file_bytes  optional: largest text accepted for one document (default 4 MiB)
 //!   timeout_seconds optional: per request (default 60)
 //!   language        optional: language tag for documents that carry none
@@ -28,10 +31,11 @@ const doc = @import("../document.zig");
 const files = @import("files.zig");
 const fetch = @import("crawl/fetch.zig");
 const cabundle = @import("crawl/cabundle.zig");
+const identity = @import("../identity.zig");
 
 pub const kind = "peer";
 pub const default_max_file_bytes: u32 = 4 * 1024 * 1024;
-const allowed_options = [_][]const u8{ "url", "source", "key", "key_file", "max_file_bytes", "timeout_seconds", "language" };
+const allowed_options = [_][]const u8{ "url", "source", "key", "key_file", "identity_file", "node", "max_file_bytes", "timeout_seconds", "language" };
 const max_page_bytes = 64 * 1024 * 1024;
 const page_size = 50;
 
@@ -77,7 +81,11 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
         diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].key", .{source.name}) catch "key", "give either key or key_file, not both", .{});
         return error.InvalidValue;
     }
-    for ([_][]const u8{ "key", "key_file" }) |k| if (source.option(k)) |v| switch (v) {
+    if (source.optionString("node")) |n| if (n.len != 47 or !std.mem.startsWith(u8, n, "dkn_")) {
+        diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].node", .{source.name}) catch "node", "must be a node id (dkn_ and 43 characters)", .{});
+        return error.InvalidValue;
+    };
+    for ([_][]const u8{ "key", "key_file", "identity_file", "node" }) |k| if (source.option(k)) |v| switch (v) {
         .string => {},
         else => {
             diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].{s}", .{ source.name, k }) catch k, "expected string", .{});
@@ -113,6 +121,8 @@ pub const PeerConnector = struct {
     remote_source: []const u8,
     key: ?[]const u8,
     key_file: ?[]const u8,
+    identity_file: ?[]const u8,
+    node: ?[]const u8,
     max_file_bytes: u32,
     timeout_s: u32,
     language: ?[]const u8,
@@ -129,11 +139,17 @@ pub const PeerConnector = struct {
         errdefer if (key) |k| gpa.free(k);
         const key_file = if (source.optionString("key_file")) |k| try gpa.dupe(u8, k) else null;
         errdefer if (key_file) |k| gpa.free(k);
+        const identity_file = if (source.optionString("identity_file")) |k| try gpa.dupe(u8, k) else null;
+        errdefer if (identity_file) |k| gpa.free(k);
+        const node = if (source.optionString("node")) |k| try gpa.dupe(u8, k) else null;
+        errdefer if (node) |k| gpa.free(k);
         const language = if (source.optionString("language")) |l| try gpa.dupe(u8, l) else null;
         return .{
             .gpa = gpa,
             .io = io,
             .name = name,
+            .identity_file = identity_file,
+            .node = node,
             .url = url,
             .remote_source = remote,
             .key = key,
@@ -150,6 +166,8 @@ pub const PeerConnector = struct {
         self.gpa.free(self.remote_source);
         if (self.key) |k| self.gpa.free(k);
         if (self.key_file) |k| self.gpa.free(k);
+        if (self.identity_file) |k| self.gpa.free(k);
+        if (self.node) |k| self.gpa.free(k);
         if (self.language) |l| self.gpa.free(l);
         self.checkpoint_buf.deinit(self.gpa);
         self.* = undefined;
@@ -186,6 +204,15 @@ pub const PeerConnector = struct {
             auth = std.fmt.allocPrint(self.gpa, "Bearer {s}", .{k}) catch return error.OutOfMemory;
         };
 
+        // This node's identity signs the requests (a key bound to it needs that); a pinned peer must sign its answers.
+        var ident_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer ident_arena.deinit();
+        var my_identity: ?identity.Identity = null;
+        if (self.identity_file) |path| {
+            my_identity = identity.Identity.load(ident_arena.allocator(), self.io, Io.Dir.cwd(), path) catch return error.InvalidSource;
+            if (my_identity == null) return error.InvalidSource; // named but missing: run `dksearch node-key` first
+        }
+        const pinned: ?[32]u8 = if (self.node) |n| (identity.parseId(n) orelse return error.InvalidSource) else null;
         var client: http.Client = .{ .allocator = self.gpa, .io = self.io };
         defer client.deinit();
         cabundle.load(&client.ca_bundle, self.gpa, self.io, .builtin) catch |e| switch (e) {
@@ -205,12 +232,32 @@ pub const PeerConnector = struct {
             defer page.deinit();
             const a = page.allocator();
             const url = try std.fmt.allocPrint(a, "{s}/api/v1/export?source={s}&after={s}&limit={d}", .{ self.url, self.remote_source, cursor.items, page_size });
+            const target = url[self.url.len..];
+            var hdrs: [4]http.Header = undefined;
+            var n_hdrs: usize = 0;
+            var nonce: []const u8 = "";
+            if (my_identity) |*id| {
+                const authority = std.ascii.allocLowerString(a, self.url[(std.mem.indexOf(u8, self.url, "://") orelse 0) + 3 ..]) catch return error.OutOfMemory;
+                const h = identity.signRequest(a, self.io, id, "GET", target, authority) catch return error.OutOfMemory;
+                hdrs = .{ .{ .name = "dk-node", .value = h.node }, .{ .name = "dk-time", .value = h.time }, .{ .name = "dk-nonce", .value = h.nonce }, .{ .name = "dk-sig", .value = h.sig } };
+                n_hdrs = 4;
+                nonce = h.nonce;
+            } else if (pinned != null) {
+                var raw: [16]u8 = undefined;
+                self.io.random(&raw);
+                const nb = a.alloc(u8, 22) catch return error.OutOfMemory;
+                _ = std.base64.url_safe_no_pad.Encoder.encode(nb, &raw);
+                nonce = nb;
+                hdrs[0] = .{ .name = "dk-nonce", .value = nb };
+                n_hdrs = 1;
+            }
             const got = fetch.get(&client, a, .{
                 .url = url,
                 .user_agent = "dksearch-peer/0.1",
                 .accept = "application/json",
                 .max_body_bytes = max_page_bytes,
                 .authorization = auth,
+                .extra_headers = hdrs[0..n_hdrs],
             }, .fromSeconds(self.timeout_s)) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return self.stopped(cursor.items),
@@ -220,6 +267,12 @@ pub const PeerConnector = struct {
             first = false;
             // 401 or 404 mean the key is wrong or the source is not shared with it: nothing to copy.
             if (got.status != 200) return error.SourceFailed;
+            if (pinned) |pk| {
+                var want_buf: [identity.id_len]u8 = undefined;
+                const want = identity.formatId(pk, &want_buf);
+                const ok = if (got.node) |nn| (std.mem.eql(u8, nn, want) and got.node_sig != null and identity.verifyResponse(a, pk, got.node_sig.?, nonce, got.status, got.body)) else false;
+                if (!ok) return error.SourceFailed; // an answer that is not from the node it should be from is not copied
+            }
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, got.body, .{}) catch return error.SourceFailed;
             const root = switch (parsed) {
                 .object => |o| o,

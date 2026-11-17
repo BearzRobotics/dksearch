@@ -301,6 +301,8 @@ pub const Peer = struct {
     key: ?[]const u8 = null,
     key_file: ?[]const u8 = null,
     enabled: bool = true,
+    /// The peer's node id (`dkn_...`): its answers must be signed by it (see identity.zig). Null: not checked.
+    node: ?[]const u8 = null,
     /// This node may tell the peers it asks about this peer (`GET /api/v1/peers`), as a suggestion they accept or not.
     introduce: bool = false,
     /// How long to wait for this peer's answer.
@@ -692,7 +694,7 @@ fn readPeers(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic
                 return error.WrongType;
             },
         };
-        try checkKeys(src, where, t, &[_][]const u8{ "name", "url", "key", "key_file", "enabled", "introduce", "timeout_ms" }, diag);
+        try checkKeys(src, where, t, &[_][]const u8{ "name", "url", "key", "key_file", "enabled", "introduce", "node", "timeout_ms" }, diag);
         const name = try reqStr(src, where, t, "name", diag);
         if (!validSourceName(name)) {
             diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.name", .{where}) catch "peer.name", "must be 1-64 characters of a-z, 0-9, '_' or '-', starting with a letter or digit, got \"{s}\"", .{name});
@@ -719,6 +721,13 @@ fn readPeers(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic
         }
         if (try optBool(src, where, t, "enabled", diag)) |b| p.enabled = b;
         if (try optBool(src, where, t, "introduce", diag)) |b| p.introduce = b;
+        if (try str(src, where, t, "node", diag)) |nv| {
+            if (nv.len != 47 or !std.mem.startsWith(u8, nv, "dkn_")) {
+                diag.set(src, std.fmt.bufPrint(&nbuf, "{s}.node", .{where}) catch "peer.node", "must be a node id (dkn_ and 43 characters, shown by `dksearch node-key` on that node)", .{});
+                return error.InvalidValue;
+            }
+            p.node = try a.dupe(u8, nv);
+        }
         if (try intIn(src, where, t, "timeout_ms", 100, 30000, diag)) |n| p.timeout_ms = @intCast(n);
         out[i] = p;
     }
@@ -1284,6 +1293,14 @@ test "a document server is read and checked" {
         "[docserver]\nkind = \"onlyoffice\"\nurl = \"http://h\"\npublic_url = \"http://p\"\njwt_secret = \"x\"\njwt_secret_file = \"y\"\n",
     };
     for (bad) |text| try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", text, &d));
+}
+
+test "a peer can be pinned to a node id, which must look like one" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "[node]\nname = \"h\"\n[[peer]]\nname = \"a\"\nurl = \"http://h:1\"\nnode = \"dkn_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n", &d);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 47), c.peers[0].node.?.len);
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", "[node]\nname = \"h\"\n[[peer]]\nname = \"a\"\nurl = \"http://h:1\"\nnode = \"nope\"\n", &d));
 }
 
 test "a peer can be marked to be introduced" {

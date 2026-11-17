@@ -61,6 +61,20 @@ pub const commands = [_]Command{
         ,
     },
     .{
+        .name = "node-key",
+        .synopsis = "node-key [--config FILE]",
+        .summary = "Make this node's identity (a key pair) and print its node id",
+        .detail =
+        \\Makes an Ed25519 key pair in data_dir/node-identity.toml (mode 0600) if the node has
+        \\none, and prints the node id (dkn_ and 43 characters). Running it again only prints
+        \\the id. The id is public: give it to the owners of peers that should recognise this
+        \\node, so they can bind an API key to it (`api-key add NAME ... --node ID`) or pin it
+        \\in a [[peer]] (`node = "ID"`). The file is secret. Restart `serve` to use it: requests
+        \\to peers are then signed, and answers to callers that ask are signed.
+        \\
+        ,
+    },
+    .{
         .name = "embed",
         .synopsis = "embed [--config FILE]",
         .summary = "Make the vectors for semantic search (needs [embeddings])",
@@ -132,7 +146,7 @@ pub const commands = [_]Command{
     },
     .{
         .name = "api-key",
-        .synopsis = "api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] | list | remove NAME_OR_ID  [--config FILE]",
+        .synopsis = "api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] [--node ID] | list | remove NAME_OR_ID  [--config FILE]",
         .summary = "Make, list or remove API keys that limit what a caller can see",
         .detail =
         \\An API key lets a program (or another dksearch) use the search API and see only

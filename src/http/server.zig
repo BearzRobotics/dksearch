@@ -94,6 +94,12 @@ pub const Request = struct {
     authorization: ?[]const u8 = null,
     /// The `Cookie` header, if any.
     cookie: ?[]const u8 = null,
+    /// The `Host` header, if any.
+    host: ?[]const u8 = null,
+    /// A peer's signature headers (`dk-node`, `dk-time`, `dk-nonce`, `dk-sig`), if all four came.
+    signed: ?dk.identity.Signed = null,
+    /// A `dk-nonce` sent without a signature: the caller wants the answer signed.
+    nonce_only: ?[]const u8 = null,
     /// The body (at most `Limits.max_body_bytes`), empty if none.
     body: []const u8 = "",
 };
@@ -112,7 +118,7 @@ const PublicApp = struct {
 
     fn handle(ptr: *anyopaque, arena: Allocator, req: Request) handler.Response {
         const self: *PublicApp = @ptrCast(@alignCast(ptr));
-        return handler.handleAuthorized(arena, self.searcher, self.services, req.method, req.target, req.authorization);
+        return handler.handleSigned(arena, self.searcher, self.services, req.method, req.target, req.authorization, .{ .host = req.host, .signed = req.signed, .nonce_only = req.nonce_only });
     }
 
     var dummy_for_tests: PublicApp = .{ .searcher = FixedSearch.searcher() };
@@ -368,13 +374,30 @@ fn connection(state: *State, slot: usize, stream: net.Stream) Io.Cancelable!void
         // invalidates the head's strings.
         var dreq: Request = .{ .method = req.head.method, .target = a.dupe(u8, req.head.target) catch return };
         var hdrs = req.iterateHeaders();
+        var sig_node: ?[]const u8 = null;
+        var sig_time: ?[]const u8 = null;
+        var sig_nonce: ?[]const u8 = null;
+        var sig_sig: ?[]const u8 = null;
         while (hdrs.next()) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
                 dreq.authorization = a.dupe(u8, h.value) catch return;
             } else if (std.ascii.eqlIgnoreCase(h.name, "cookie")) {
                 dreq.cookie = a.dupe(u8, h.value) catch return;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "host") and h.value.len <= 300) {
+                dreq.host = a.dupe(u8, h.value) catch return;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "dk-node") and h.value.len <= 64) {
+                sig_node = a.dupe(u8, h.value) catch return;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "dk-time") and h.value.len <= 24) {
+                sig_time = a.dupe(u8, h.value) catch return;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "dk-nonce") and h.value.len <= 40) {
+                sig_nonce = a.dupe(u8, h.value) catch return;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "dk-sig") and h.value.len <= 120) {
+                sig_sig = a.dupe(u8, h.value) catch return;
             }
         }
+        // A request is "signed" when it has all four; a bare nonce asks only for a signed answer.
+        if (sig_node != null and sig_time != null and sig_nonce != null and sig_sig != null) dreq.signed = .{ .node = sig_node.?, .time = sig_time.?, .nonce = sig_nonce.?, .sig = sig_sig.? };
+        dreq.nonce_only = if (dreq.signed == null) sig_nonce else null;
         if (clen > 0) {
             var bbuf: [512]u8 = undefined;
             const br = req.readerExpectNone(&bbuf);

@@ -108,6 +108,8 @@ const peer = [_]Option{
     .{ .key = "url", .label = "The other node", .type = .text, .required = true, .placeholder = "https://search.example.org", .help = "Its address, with no path. It must be one of your peers or at least have given you a key." },
     .{ .key = "source", .label = "Its source", .type = .text, .required = true, .placeholder = "books", .help = "The name of the source on that node. Its owner must have set share = true on it and given your key access to it." },
     .{ .key = "key_file", .label = "Key file", .type = .path, .placeholder = "/etc/dksearch/office.key", .help = "A file on this machine holding the API key the other node made for you, readable only by you." },
+    .{ .key = "identity_file", .label = "This node's identity file", .type = .path, .placeholder = "/var/lib/dksearch/node-identity.toml", .help = "Optional: sign the requests with this node's identity (made by dksearch node-key). Needed when the other node bound your key to this node." },
+    .{ .key = "node", .label = "The other node's id", .type = .text, .placeholder = "dkn_...", .help = "Optional: its answers must be signed by this node id, so an impostor at the same address cannot be copied." },
     lang,
     .{ .key = "max_file_bytes", .label = "Largest document text (bytes)", .type = .number, .min = 1, .max = 67108864, .default = "4194304", .help = "Larger documents are skipped." },
     .{ .key = "timeout_seconds", .label = "Time limit per request (seconds)", .type = .number, .min = 1, .max = 3600, .default = "60", .help = "How long to wait for each page of documents." },

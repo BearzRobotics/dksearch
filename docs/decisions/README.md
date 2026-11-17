@@ -55,3 +55,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0037 | One connector for archives and dumps |
 | 0038 | Semantic search, opt-in |
 | 0039 | Replicating a peer's documents |
+| 0040 | Signed node identity |

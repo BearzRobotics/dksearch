@@ -22,7 +22,9 @@ dksearch admin-token [--config FILE]
 
 dksearch admin-password [--config FILE]
 
-dksearch api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] [--config FILE]
+dksearch api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] [--node ID] [--config FILE]
+
+dksearch node-key [--config FILE]
 
 dksearch api-key list [--config FILE]
 
@@ -135,9 +137,9 @@ Usage: dksearch admin-password [--config FILE]
 api-key
 Make, list or remove API keys. A key lets a program (or another dksearch) use the search API and see only the collections it was made for (see **COLLECTIONS AND API KEYS** under CONFIGURATION). **add** prints the key (`dkk_` and 43 characters) to standard output, once, and stores only its SHA-256 hash in `data_dir/api-keys.toml` (mode 0600); the key can be limited to named collections (`--collection`, repeatable, each must be defined in the configuration) or made for every source (`--all`). **list** shows each key's number (the first eight hex digits of its hash), name and collections, never the key. **remove** takes the name or the number. Keys are looked at again when the file changes, so a key made or removed with the server running works or stops within a second.
 
-**--rate** limits the key to that many requests per minute (fixed one-minute windows; over it the key gets 429 `rate_limited` with `Retry-After` until the minute ends); 0 or leaving it out means no limit. **list** shows the limit.
+**--node** binds the key to a node (see NODE IDENTITY): it then works only with a signature of that node. **--rate** limits the key to that many requests per minute (fixed one-minute windows; over it the key gets 429 `rate_limited` with `Retry-After` until the minute ends); 0 or leaving it out means no limit. **list** shows the limit.
 
-Usage: dksearch api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] | list | remove NAME_OR_ID [--config FILE]
+Usage: dksearch api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] [--node ID] | list | remove NAME_OR_ID [--config FILE]
 
 Examples: dksearch api-key add laptop --collection books --collection docs
 
@@ -534,6 +536,14 @@ On the node that wants the copy, a source of kind `peer` pulls it:
     schedule = "daily"
 
 A replica is an ordinary source: it has its own name, rights flags, schedule and boost, it can be put in collections, and each document keeps the redistribution flag the owner stated (`allowed`, `restricted` or `unknown`) and says where it was copied from (the attribution, and an `origin` field). Documents are updated when the owner changes them; a document the owner later removes is not removed from the copy. Copied documents have the same `ident` as the originals, so a federated search that also asks the peer shows them once. Everything the peer sends is untrusted: sizes are bounded, ids must be well formed, text must be valid UTF-8, links that are not `http` or `https` are dropped.
+
+NODE IDENTITY
+A node can have an identity: an Ed25519 key pair. **dksearch node-key** makes it (once) in `data_dir/node-identity.toml`, mode 0600, and prints the node id, `dkn_` and 43 characters: the public key. The file is secret (anyone who has it can speak as this node; a file others can read is refused). Restart `serve` to use it. The identity does not discover anyone or decide whom to trust: peers and keys stay configured by hand. It makes two things stronger:
+
+- **Signed requests.** With an identity, every request this node sends to a peer carries `dk-node`, `dk-time`, `dk-nonce` and `dk-sig`: a signature over the method, the target, the host the request is addressed to, the time and a fresh nonce. It cannot be replayed to another node, on another path, with another method, later than five minutes, or twice. A key made with `dksearch api-key add NAME ... --node ID` (give the id of the node that will use it) is *bound*: it works only on requests signed by that node, so a leaked key is useless without the secret. Both clocks must be right within five minutes, and the Host the other node sees must be the address you configured (behind a proxy that rewrites Host, a bound key will not work).
+- **Pinned peers.** `node = "dkn_..."` in a `[[peer]]` (or in a `kind = "peer"` source) says whose answers to believe. The peer is sent a nonce and must sign its answer (the nonce, the status and a hash of the body) with that node's key; an answer that is unsigned or signed by another node is not used (status `untrusted` on the Access page; a replica run fails rather than copy from an impostor). A node with an identity signs its answers to any caller that sends a nonce.
+
+Give your node id to the owners of peers that should recognise you, and ask for theirs. A replica source needs `identity_file` pointing at the identity file (for bound keys) and, to pin, `node`. The Access page shows this node's id.
 
 PEERS AND FEDERATED SEARCH
 A *peer* is another dksearch node you may ask. Peers are configured by hand, never discovered:

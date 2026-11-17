@@ -97,6 +97,10 @@ pub const Services = struct {
     default_collection: ?[]const u8 = null,
     /// A document server that office files can be opened in (`[docserver]`).
     docserver: ?*const dk.docserver.Service = null,
+    /// This node's identity (signs answers to callers that sent a nonce) and the nonces already seen (so a signed
+    /// request cannot be used twice). Both null when the node has no identity.
+    identity: ?*const dk.identity.Identity = null,
+    replay: ?*dk.identity.Replay = null,
     /// Other nodes this one can ask (`peers=1`), if any are configured.
     peers: ?*dk.peers.Service = null,
     /// What retrieval derives from stored texts (chunks, PDF page indexes), kept between requests.
@@ -240,19 +244,64 @@ pub fn handleServices(arena: Allocator, searcher: dk.search.Searcher, services: 
 /// Like `handleServices`, for a caller that may present an API key (`Authorization: Bearer dkk_...`): what it may
 /// see is the scope of its key, or, with no key, the anonymous scope of the server.
 pub fn handleAuthorized(arena: Allocator, searcher: dk.search.Searcher, services: Services, method: http.Method, target: []const u8, authorization: ?[]const u8) Response {
-    return handleInner(arena, searcher, services, method, target, authorization) catch |e| switch (e) {
+    return handleSigned(arena, searcher, services, method, target, authorization, .{});
+}
+
+/// What a request says about who sent it beyond the API key: the address it was sent to and a peer's signature
+/// (see identity.zig).
+pub const Caller = struct {
+    host: ?[]const u8 = null,
+    signed: ?dk.identity.Signed = null,
+    /// A `dk-nonce` without a signature: the caller only wants the answer signed.
+    nonce_only: ?[]const u8 = null,
+};
+
+/// Like `handleAuthorized`, for a caller that may also have signed its request. A key bound to a node needs that
+/// node's signature, and when this node has an identity it signs the answers to callers that sent a nonce.
+pub fn handleSigned(arena: Allocator, searcher: dk.search.Searcher, services: Services, method: http.Method, target: []const u8, authorization: ?[]const u8, caller: Caller) Response {
+    var resp = handleInner(arena, searcher, services, method, target, authorization, caller) catch |e| switch (e) {
         error.OutOfMemory => plain(.service_unavailable, "temporarily out of memory\n"),
     };
+    if (services.identity) |id| {
+        const nonce: ?[]const u8 = if (caller.signed) |s| s.nonce else caller.nonce_only;
+        if (nonce) |n| if (n.len == 22) {
+            const sig = dk.identity.signResponse(arena, id, n, @backingInt(resp.status), resp.body) catch return resp;
+            var id_buf: [dk.identity.id_len]u8 = undefined;
+            const node = arena.dupe(u8, id.idText(&id_buf)) catch return resp;
+            const headers = arena.alloc(Header, resp.headers.len + 2) catch return resp;
+            @memcpy(headers[0..resp.headers.len], resp.headers);
+            headers[resp.headers.len] = .{ .name = "dk-node", .value = node };
+            headers[resp.headers.len + 1] = .{ .name = "dk-sig", .value = sig };
+            resp.headers = headers;
+        };
+    }
+    return resp;
 }
 
 /// The collections a bearer token's key may see, or an error message (a token that is not a valid key).
-fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8) error{OutOfMemory}!union(enum) { ok: struct { scope: dk.access.Scope, keyed: bool, limited: ?u32 = null }, refused: []const u8 } {
+fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8, caller: Caller, method: http.Method, target: []const u8) error{OutOfMemory}!union(enum) { ok: struct { scope: dk.access.Scope, keyed: bool, limited: ?u32 = null }, refused: []const u8 } {
     if (authorization) |h| {
         const prefix = "Bearer ";
         if (std.ascii.startsWithIgnoreCase(h, prefix)) {
             const token = std.mem.trim(u8, h[prefix.len..], " \t");
             const store = services.keys orelse return .{ .refused = "this server has no API keys" };
             const found = (try store.lookup(arena, token)) orelse return .{ .refused = "the API key is not valid" };
+            // A key bound to a node works only with that node's signature on this very request.
+            if (found.node) |bound| {
+                const replay = services.replay orelse return .{ .refused = "this key is bound to a node, and this server has no node identity to check signatures with" };
+                const signed = caller.signed orelse return .{ .refused = "this key needs a signed request from its node (dk-node, dk-time, dk-nonce, dk-sig)" };
+                var pk: [32]u8 = undefined;
+                const host = try std.ascii.allocLowerString(arena, caller.host orelse "");
+                const now = std.Io.Clock.real.now(replay.io).toSeconds();
+                const verdict = dk.identity.verifyRequest(arena, signed, @tagName(method), target, host, now, replay, &pk);
+                if (verdict != .ok) return .{ .refused = switch (verdict) {
+                    .bad_time => "the request's signature is too old or from the future (check both clocks)",
+                    .replayed => "the request's signature was already used",
+                    else => "the request's signature is not valid",
+                } };
+                const want = dk.identity.parseId(bound) orelse return .{ .refused = "this key's node id is not valid" };
+                if (!std.mem.eql(u8, &want, &pk)) return .{ .refused = "the request is signed by another node than the one this key is bound to" };
+            }
             // A key with a limit: counted here; the seconds to wait if it is over.
             const wait: ?u32 = store.allow(found.id, found.rate);
             return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, found.collections), .keyed = true, .limited = wait } };
@@ -263,7 +312,7 @@ fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8) er
     return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, names), .keyed = false } };
 }
 
-fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Services, method: http.Method, target: []const u8, authorization: ?[]const u8) error{OutOfMemory}!Response {
+fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Services, method: http.Method, target: []const u8, authorization: ?[]const u8, caller: Caller) error{OutOfMemory}!Response {
     var services = services_in;
     const regex = services.regex;
     const t = query.parseTarget(arena, target) catch |e| switch (e) {
@@ -292,7 +341,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
     if (r == .wopi) return wopiPage(arena, searcher, services, t.path, t.params);
 
     // Who is asking, and what they may see. Pages that show no documents need no key.
-    switch (try scopeFor(arena, services_in, authorization)) {
+    switch (try scopeFor(arena, services_in, authorization, caller, method, target)) {
         .ok => |c| {
             services.scope = c.scope;
             services.keyed = c.keyed;
@@ -557,6 +606,7 @@ fn statusText(s: dk.peers.Status) []const u8 {
         .down => "could not be reached",
         .refused => "refused the request (check the key)",
         .bad_answer => "sent an answer that could not be used",
+        .untrusted => "answered, but not signed by the node it is pinned to (check its node id)",
         .backoff => "was skipped for a moment after failing",
         .unavailable => "cannot be asked (this build has no network support)",
     };
@@ -2621,6 +2671,74 @@ test "peers offered for introduction: only with a key, only those marked, with n
     try testing.expect(std.mem.indexOf(u8, r.body, "hidden") == null and std.mem.indexOf(u8, r.body, "off.example") == null);
     try testing.expect(std.mem.indexOf(u8, r.body, "secret") == null and std.mem.indexOf(u8, r.body, "dkk_") == null); // no key ever leaves
     try testing.expect(std.mem.indexOf(u8, r.body, "\"node\":\"home\"") != null);
+}
+
+test "a key bound to a node works only with that node's signature on that very request; answers are signed for callers that ask" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const caller = dk.identity.Identity.generate(testing.io);
+    const stranger = dk.identity.Identity.generate(testing.io);
+    const me = dk.identity.Identity.generate(testing.io);
+    var caller_id: [dk.identity.id_len]u8 = undefined;
+    var keys_store = dk.access.KeyStore.init(testing.allocator, testing.io, try tmp.dir.realPathFileAlloc(testing.io, ".", a));
+    defer keys_store.deinit();
+    var tok_bound: [dk.access.token_len]u8 = undefined;
+    var tok_plain: [dk.access.token_len]u8 = undefined;
+    var keys = try dk.access.addBound(a, testing.io, &.{}, "bound", &.{"*"}, 1, 0, caller.idText(&caller_id), &tok_bound);
+    keys = try dk.access.add(a, testing.io, keys, "plain", &.{"*"}, 2, &tok_plain);
+    try dk.access.save(a, testing.io, tmp.dir, dk.access.file_name, keys);
+    var replay = dk.identity.Replay.init(testing.allocator, testing.io);
+    defer replay.deinit();
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    const services: Services = .{ .keys = &keys_store, .identity = &me, .replay = &replay };
+    const target = "/api/v1/search?q=odin";
+    const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{&tok_bound});
+    const host = "peer.example.org:8080";
+
+    // No signature, or a bad one: refused, with the reason.
+    const unsigned = handleSigned(a, fake.searcher(), services, .GET, target, bearer, .{ .host = host });
+    try testing.expectEqual(http.Status.unauthorized, unsigned.status);
+    try testing.expect(std.mem.indexOf(u8, unsigned.body, "signed request") != null);
+    const by_stranger = try dk.identity.signRequest(a, testing.io, &stranger, "GET", target, host);
+    const wrong = handleSigned(a, fake.searcher(), services, .GET, target, bearer, .{ .host = host, .signed = .{ .node = by_stranger.node, .time = by_stranger.time, .nonce = by_stranger.nonce, .sig = by_stranger.sig } });
+    try testing.expectEqual(http.Status.unauthorized, wrong.status);
+    try testing.expect(std.mem.indexOf(u8, wrong.body, "another node") != null);
+    // The bound node's own signature: accepted, and the answer is signed over the nonce.
+    const h = try dk.identity.signRequest(a, testing.io, &caller, "GET", target, host);
+    const signed: dk.identity.Signed = .{ .node = h.node, .time = h.time, .nonce = h.nonce, .sig = h.sig };
+    const ok = handleSigned(a, fake.searcher(), services, .GET, target, bearer, .{ .host = host, .signed = signed });
+    try testing.expectEqual(http.Status.ok, ok.status);
+    var dk_node: []const u8 = "";
+    var dk_sig: []const u8 = "";
+    for (ok.headers) |hd| {
+        if (std.mem.eql(u8, hd.name, "dk-node")) dk_node = hd.value;
+        if (std.mem.eql(u8, hd.name, "dk-sig")) dk_sig = hd.value;
+    }
+    var my_id: [dk.identity.id_len]u8 = undefined;
+    try testing.expectEqualStrings(me.idText(&my_id), dk_node);
+    try testing.expect(dk.identity.verifyResponse(a, me.publicKey(), dk_sig, h.nonce, 200, ok.body));
+    // The same signed request again, for another path, or for another host: refused.
+    const again = handleSigned(a, fake.searcher(), services, .GET, target, bearer, .{ .host = host, .signed = signed });
+    try testing.expectEqual(http.Status.unauthorized, again.status);
+    try testing.expect(std.mem.indexOf(u8, again.body, "already used") != null);
+    const h2 = try dk.identity.signRequest(a, testing.io, &caller, "GET", target, host);
+    const s2: dk.identity.Signed = .{ .node = h2.node, .time = h2.time, .nonce = h2.nonce, .sig = h2.sig };
+    try testing.expectEqual(http.Status.unauthorized, handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=thor", bearer, .{ .host = host, .signed = s2 }).status);
+    try testing.expectEqual(http.Status.unauthorized, handleSigned(a, fake.searcher(), services, .GET, target, bearer, .{ .host = "evil.example.org", .signed = s2 }).status);
+    // A key that is not bound needs no signature; a node without an identity cannot honour a bound key.
+    try testing.expectEqual(http.Status.ok, handleSigned(a, fake.searcher(), services, .GET, target, try std.fmt.allocPrint(a, "Bearer {s}", .{&tok_plain}), .{}).status);
+    const no_identity: Services = .{ .keys = &keys_store };
+    try testing.expectEqual(http.Status.unauthorized, handleSigned(a, fake.searcher(), no_identity, .GET, target, bearer, .{ .host = host, .signed = signed }).status);
+    // A caller that only sends a nonce gets a signed answer, without having proved who it is.
+    const nonce_only = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/health", null, .{ .nonce_only = "abcdefghijklmnopqrstuv" });
+    var has_sig = false;
+    for (nonce_only.headers) |hd| if (std.mem.eql(u8, hd.name, "dk-sig")) {
+        has_sig = true;
+    };
+    try testing.expect(has_sig);
 }
 
 test "retrieval cache: the same answer twice, served from the cache, and a changed document is read again" {

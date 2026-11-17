@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
 const config = @import("config.zig");
 const doc = @import("document.zig");
+const identity_mod = @import("identity.zig");
 const search = @import("search.zig");
 
 const have_http = build_options.crawler;
@@ -37,6 +38,8 @@ pub const Status = enum {
     refused,
     /// The answer was not what the protocol says; ignored.
     bad_answer,
+    /// Answered, but not signed by the node this peer is pinned to (or not signed at all).
+    untrusted,
     /// Left out for a while after repeated failures.
     backoff,
     /// This build cannot make network requests.
@@ -108,6 +111,8 @@ const PeerState = struct {
     base: []const u8,
     /// `Bearer ...`, or null if there is no key.
     auth: ?[]const u8,
+    /// The public key this peer's answers must be signed by, if it is pinned (`node` in its table).
+    pinned: ?[32]u8 = null,
     failures: std.atomic.Value(u32) = .init(0),
     /// Monotonic time (ns) before which the peer is not asked.
     quiet_until: std.atomic.Value(i64) = .init(0),
@@ -141,6 +146,8 @@ pub const Service = struct {
     node: []const u8,
     peers: []PeerState,
     client: if (have_http) std.http.Client else void,
+    /// This node's identity: when set, requests to peers are signed. Set after `init`.
+    identity: ?*const identity_mod.Identity = null,
     /// How long a good answer is reused for the same question (0: never). Set after `init`.
     cache_ttl_seconds: u32 = 0,
     cache_mutex: Io.Mutex = .init,
@@ -170,7 +177,7 @@ pub const Service = struct {
             const auth: ?[]const u8 = if (key) |k| (if (k.len > 0) try std.fmt.allocPrint(gpa, "Bearer {s}", .{k}) else null) else null;
             if (owned) |o| gpa.free(o);
             errdefer if (auth) |a| gpa.free(a);
-            slot.* = .{ .cfg = c, .base = try gpa.dupe(u8, c.url), .auth = auth };
+            slot.* = .{ .cfg = c, .base = try gpa.dupe(u8, c.url), .auth = auth, .pinned = if (c.node) |n| identity_mod.parseId(n) else null };
             made += 1;
         }
         if (have_http) {
@@ -402,7 +409,28 @@ pub const Service = struct {
         url.writer.writeAll(extra) catch return r;
         // Finding passages reads and splits documents: it is given twice the time of a search.
         const wait_ms: i96 = @as(i96, p.cfg.timeout_ms) * (if (kind == .retrieve) @as(i96, 2) else 1);
-        const resp = fetch.get(&self.client, a, .{ .url = url.written(), .user_agent = user_agent, .accept = "application/json", .max_body_bytes = max_answer_bytes, .authorization = p.auth }, .{ .nanoseconds = wait_ms * std.time.ns_per_ms }) catch |e| {
+        // Signed with this node's identity when it has one; a pinned peer is also sent a nonce to sign its answer with.
+        const target = url.written()[p.base.len..];
+        var hdrs: [4]std.http.Header = undefined;
+        var n_hdrs: usize = 0;
+        var nonce: []const u8 = "";
+        if (self.identity) |id| {
+            const authority = std.ascii.allocLowerString(a, p.base[(std.mem.indexOf(u8, p.base, "://") orelse 0) + 3 ..]) catch return r;
+            if (identity_mod.signRequest(a, self.io, id, "GET", target, authority)) |h| {
+                hdrs = .{ .{ .name = "dk-node", .value = h.node }, .{ .name = "dk-time", .value = h.time }, .{ .name = "dk-nonce", .value = h.nonce }, .{ .name = "dk-sig", .value = h.sig } };
+                n_hdrs = 4;
+                nonce = h.nonce;
+            } else |_| return r;
+        } else if (p.pinned != null) {
+            var raw: [16]u8 = undefined;
+            self.io.random(&raw);
+            const nb = a.alloc(u8, 22) catch return r;
+            _ = std.base64.url_safe_no_pad.Encoder.encode(nb, &raw);
+            nonce = nb;
+            hdrs[0] = .{ .name = "dk-nonce", .value = nb };
+            n_hdrs = 1;
+        }
+        const resp = fetch.get(&self.client, a, .{ .url = url.written(), .user_agent = user_agent, .accept = "application/json", .max_body_bytes = max_answer_bytes, .authorization = p.auth, .extra_headers = hdrs[0..n_hdrs] }, .{ .nanoseconds = wait_ms * std.time.ns_per_ms }) catch |e| {
             r.status = switch (e) {
                 error.Timeout => .timeout,
                 error.BadResponse, error.TooLarge => .bad_answer,
@@ -416,6 +444,17 @@ pub const Service = struct {
             r.http_status = resp.status;
             self.penalise(p);
             return r;
+        }
+        // A pinned peer must prove it is that node: its answer is signed over our nonce, its status and its body.
+        if (p.pinned) |pk| {
+            var want_buf: [identity_mod.id_len]u8 = undefined;
+            const want = identity_mod.formatId(pk, &want_buf);
+            const signed_ok = if (resp.node) |nn| (std.mem.eql(u8, nn, want) and resp.node_sig != null and identity_mod.verifyResponse(a, pk, resp.node_sig.?, nonce, resp.status, resp.body)) else false;
+            if (!signed_ok) {
+                r.status = .untrusted;
+                self.penalise(p);
+                return r;
+            }
         }
         switch (kind) {
             .search => {
@@ -1108,4 +1147,27 @@ test "introductions: plain addresses only, names made safe, and nonsense refused
     try testing.expectEqualStrings("b", got[1].from);
     for ([_][]const u8{ "", "[]", "{}", "{\"peers\":5}" }) |bad| try testing.expectError(error.BadAnswer, parseIntroductions(a, bad, "b"));
     try testing.expect(validBase("http://h:1") and !validBase("ftp://h") and !validBase("https://") and !validBase("https://h/x"));
+}
+
+test "a peer pinned to a node id is only trusted when its answer is signed by that node" {
+    if (!have_http) return error.SkipZigTest;
+    var srv: nettest.TestServer = undefined;
+    try srv.start(&.{.{ .path = "/api/v1/search?q=odin&limit=10", .content_type = "application/json", .body = "{\"hits\":[{\"id\":\"0102030405060708090a0b0c0d0e0f10\",\"connector\":\"b\",\"title\":\"Odin\"}]}" }});
+    defer srv.stop();
+    var ub: [2][64]u8 = undefined;
+    const other = identity_mod.Identity.generate(testing.io);
+    var idb: [identity_mod.id_len]u8 = undefined;
+    const peers = [_]config.Peer{
+        .{ .name = "open", .url = srv.url(&ub[0], "") },
+        .{ .name = "pinned", .url = srv.url(&ub[1], ""), .node = other.idText(&idb) },
+    };
+    const svc = try Service.init(testing.allocator, testing.io, "home", &peers);
+    defer svc.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const replies = try svc.ask(ar.allocator(), .search, "odin", "&limit=10");
+    // The unpinned peer answers as before; the pinned one answered without a signature, so it is not believed.
+    try testing.expectEqual(Status.ok, replies[0].status);
+    try testing.expectEqual(Status.untrusted, replies[1].status);
+    try testing.expectEqual(@as(usize, 0), replies[1].hits.len);
 }
