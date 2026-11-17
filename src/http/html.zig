@@ -79,6 +79,7 @@ fn kindLabel(kind: []const u8) []const u8 {
         .{ "wikipedia", "Wikipedia" },
         .{ "zim", "ZIM files" },
         .{ "dump", "Archives and dumps" },
+        .{ "peer", "Copies of a peer's source" },
         .{ "feeds", "Feeds" },
         .{ "crawl", "Web crawls" },
         .{ "archive", "Internet Archive" },

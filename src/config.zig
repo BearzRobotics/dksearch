@@ -195,6 +195,9 @@ pub const Source = struct {
     /// How much this source's results count in the ranking, in percent: 100 changes nothing, 150 ranks
     /// them half as high again, 50 halves them.
     boost: u32 = 100,
+    /// Peers with a key for this source may copy its documents' text (`/api/v1/export`). Off by default; never with
+    /// `rights = "forbidden"`.
+    share: bool = false,
     /// How often the server imports this source by itself (`schedule = "daily"`, `"6h"`, `"30m"`): the
     /// text as written, and in seconds (0: never, import by hand or with a timer).
     schedule: ?[]const u8 = null,
@@ -578,7 +581,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     return cfg;
 }
 
-const source_common_keys = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights", "boost", "schedule" };
+const source_common_keys = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights", "boost", "schedule", "share" };
 
 /// An array of strings, copied into `a`.
 fn stringList(a: Allocator, src: []const u8, key: []const u8, v: toml.Value, diag: *Diagnostic) Error![]const []const u8 {
@@ -832,6 +835,7 @@ fn readSources(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnost
         if (try optBool(src, where, t, "enabled", diag)) |b| s.enabled = b;
         if (try optBool(src, where, t, "retain_text", diag)) |b| s.retain_text = b;
         if (try intIn(src, where, t, "boost", 1, 1000, diag)) |n| s.boost = @intCast(n);
+        if (try optBool(src, where, t, "share", diag)) |b| s.share = b;
         if (try str(src, where, t, "schedule", diag)) |sv| {
             s.schedule_seconds = parseInterval(sv) orelse {
                 diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}].schedule", .{i}) catch "source.schedule", "must be hourly, daily, weekly, or a number with m, h or d (30m, 6h, 2d; at least 10 minutes), got \"{s}\"", .{sv});
@@ -844,6 +848,11 @@ fn readSources(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnost
                 diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}].rights", .{i}) catch "source.rights", "must be \"unknown\", \"allowed\", \"restricted\" or \"forbidden\", got \"{s}\"", .{rv});
                 return error.InvalidValue;
             };
+        }
+
+        if (s.share and s.rights != null and s.rights.? == .forbidden) {
+            diag.set(src, std.fmt.bufPrint(&kbuf, "source[{d}].share", .{i}) catch "source.share", "cannot be true while rights is \"forbidden\"", .{});
+            return error.InvalidValue;
         }
 
         var opts: std.ArrayList(Option) = .empty;

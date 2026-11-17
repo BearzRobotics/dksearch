@@ -518,6 +518,23 @@ With a document server (OnlyOffice Docs, or Collabora Online / LibreOffice Onlin
 
 For Collabora, allow dksearch as a WOPI host (`storage.wopi.host`, in Docker `-e 'extra_params=--o:ssl.enable=false --o:storage.wopi.host[0]=.+'`; use a precise pattern in real use). OnlyOffice by default refuses to fetch from private addresses (`services.CoAuthoring.request-filtering-agent.allowPrivateIPAddress`); set it for a dksearch on your LAN. `public_url` must be an address the document server can reach: from a Docker container `127.0.0.1` is the container itself, so use the host's address (`172.17.0.1` on the default bridge) and have dksearch listen there (`server.address`). OnlyOffice's page uses a policy that allows only its own script (by hash), the document server's script and frame; the rest of dksearch stays script-free.
 
+REPLICATING A PEER'S DOCUMENTS
+Federated search asks a peer at query time. A node can also keep a *copy* of one of a peer's sources, so its documents are searchable here when the peer is away. Both sides agree to it:
+
+On the node that owns the documents, a source is shared only if its owner says so, with `share = true` in its `[[source]]` table (or the checkbox on the source's page in the administration interface); it is refused together with `rights = "forbidden"`, and nothing is shared by default. The other node also needs an API key (`dksearch api-key add`) whose collections include that source. `GET /api/v1/export?source=NAME` (see **dksearch-api**(7)) then hands out the source's documents with their full text, a page at a time; it always needs a key, even on a server that answers anonymous searches, and a source that is not shared, is off, is forbidden or is outside the key's collections looks like one that does not exist.
+
+On the node that wants the copy, a source of kind `peer` pulls it:
+
+    [[source]]
+    name = "office-books"
+    kind = "peer"
+    url = "https://search.example.org"         # the other node
+    source = "books"                          # its source name
+    key_file = "/etc/dksearch/office.key"      # the key it made for you, mode 0600
+    schedule = "daily"
+
+A replica is an ordinary source: it has its own name, rights flags, schedule and boost, it can be put in collections, and each document keeps the redistribution flag the owner stated (`allowed`, `restricted` or `unknown`) and says where it was copied from (the attribution, and an `origin` field). Documents are updated when the owner changes them; a document the owner later removes is not removed from the copy. Copied documents have the same `ident` as the originals, so a federated search that also asks the peer shows them once. Everything the peer sends is untrusted: sizes are bounded, ids must be well formed, text must be valid UTF-8, links that are not `http` or `https` are dropped.
+
 PEERS AND FEDERATED SEARCH
 A *peer* is another dksearch node you may ask. Peers are configured by hand, never discovered:
 

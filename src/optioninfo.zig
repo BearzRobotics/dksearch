@@ -104,6 +104,15 @@ const crawl = [_]Option{
     lang,
 };
 
+const peer = [_]Option{
+    .{ .key = "url", .label = "The other node", .type = .text, .required = true, .placeholder = "https://search.example.org", .help = "Its address, with no path. It must be one of your peers or at least have given you a key." },
+    .{ .key = "source", .label = "Its source", .type = .text, .required = true, .placeholder = "books", .help = "The name of the source on that node. Its owner must have set share = true on it and given your key access to it." },
+    .{ .key = "key_file", .label = "Key file", .type = .path, .placeholder = "/etc/dksearch/office.key", .help = "A file on this machine holding the API key the other node made for you, readable only by you." },
+    lang,
+    .{ .key = "max_file_bytes", .label = "Largest document text (bytes)", .type = .number, .min = 1, .max = 67108864, .default = "4194304", .help = "Larger documents are skipped." },
+    .{ .key = "timeout_seconds", .label = "Time limit per request (seconds)", .type = .number, .min = 1, .max = 3600, .default = "60", .help = "How long to wait for each page of documents." },
+};
+
 const archive = [_]Option{
     .{ .key = "query", .label = "Search query", .type = .text, .required = true, .placeholder = "collection:gutenberg AND mediatype:texts", .help = "Any Internet Archive search, as on archive.org's advanced search." },
     user_agent,
@@ -126,6 +135,7 @@ pub fn forKind(kind: []const u8) []const Option {
     if (std.mem.eql(u8, kind, "feeds")) return &feeds;
     if (std.mem.eql(u8, kind, "crawl")) return &crawl;
     if (std.mem.eql(u8, kind, "archive")) return &archive;
+    if (std.mem.eql(u8, kind, "peer")) return &peer;
     return &.{};
 }
 
@@ -264,7 +274,7 @@ const FakeParams = struct {
 };
 
 test "every kind has fields, every key appears once, and required ones are marked" {
-    for ([_][]const u8{ "files", "gutenberg", "wikipedia", "zim", "dump", "feeds", "crawl", "archive" }) |k| {
+    for ([_][]const u8{ "files", "gutenberg", "wikipedia", "zim", "dump", "feeds", "crawl", "archive", "peer" }) |k| {
         const opts = forKind(k);
         try testing.expect(opts.len >= 3);
         var required: usize = 0;

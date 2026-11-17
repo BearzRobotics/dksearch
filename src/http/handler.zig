@@ -48,7 +48,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_health, style, document, zim, wopi, other };
+const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_export, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -58,6 +58,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/help/regex")) return .help_regex;
     if (std.mem.eql(u8, path, "/api/v1/search")) return .api_search;
     if (std.mem.eql(u8, path, "/api/v1/retrieve")) return .api_retrieve;
+    if (std.mem.eql(u8, path, "/api/v1/export")) return .api_export;
     if (std.mem.eql(u8, path, "/api/v1/health")) return .api_health;
     if (std.mem.eql(u8, path, "/assets/style.css")) return .style;
     if (std.mem.startsWith(u8, path, "/doc/")) return .document;
@@ -307,6 +308,12 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
             return resp;
         },
     }
+    // Copying documents needs a key, however open the server is to anonymous searches.
+    if (r == .api_export and !services.keyed) {
+        var resp = try apiError(arena, .unauthorized, "key_required", "exporting documents needs an API key (Authorization: Bearer ...)");
+        resp.headers = headersWith(arena, &.{ .{ .name = "www-authenticate", .value = "Bearer" }, no_store });
+        return resp;
+    }
     if (is_api and r != .api_health and !services.keyed and services.scope.none()) {
         var resp = try apiError(arena, .unauthorized, "key_required", "this server needs an API key (Authorization: Bearer ...)");
         resp.headers = headersWith(arena, &.{ .{ .name = "www-authenticate", .value = "Bearer" }, no_store });
@@ -333,6 +340,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         },
         .api_search => try apiSearch(arena, searcher, regex, services, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
         .api_retrieve => try apiRetrieve(arena, searcher, services, t.params),
+        .api_export => try apiExport(arena, searcher, services, t.params),
         .search_page => try pageSearch(arena, searcher, regex, services, try sourceChoicesFor(arena, services, searcher), try sourceBoosts(arena, services), t.params),
         .sources_page => try sourcesPage(arena, searcher, services),
         .document => try documentPage(arena, searcher, services, t.path, t.params),
@@ -586,6 +594,90 @@ pub fn regexSearch(arena: Allocator, searcher: dk.search.Searcher, service: ?*dk
         error.Io => .{ .status = .internal_server_error, .code = "internal_error", .message = "the search failed" },
     } };
     return .{ .ok = r };
+}
+
+const max_export_documents = 200;
+const max_export_text_bytes = 4 * 1024 * 1024;
+const max_export_page_bytes = 16 * 1024 * 1024;
+
+const ExportDoc = struct {
+    id: []const u8,
+    ident: ?[]const u8,
+    source: []const u8,
+    url: ?[]const u8,
+    title: ?[]const u8,
+    text: []const u8,
+    language: ?[]const u8,
+    content_type: ?[]const u8,
+    modified_at: ?i64,
+    published_at: ?i64,
+    author: ?[]const u8,
+    /// What the source's owner says may be done with the text: unknown, allowed or restricted.
+    redistribution: []const u8,
+};
+
+/// `GET /api/v1/export?source=NAME[&after=CURSOR][&limit=N]`: the documents of a source whose owner set `share = true`,
+/// with their full text, for a peer that replicates them. Needs a key whose scope includes the source.
+fn apiExport(arena: Allocator, searcher: dk.search.Searcher, services: Services, params: query.Params) error{OutOfMemory}!Response {
+    const name = params.get("source") orelse return apiError(arena, .bad_request, "invalid_parameter", "source: is required");
+    const store = services.content orelse return apiError(arena, .service_unavailable, "no_content", "document texts are not available here");
+    const sources = services.sources orelse return apiError(arena, .not_found, "not_shared", "no such source, or it is not shared");
+    var found: ?dk.config.Source = null;
+    for (sources.snapshot()) |s| if (std.mem.eql(u8, s.name, name)) {
+        found = s;
+    };
+    // A source that does not exist, is off, is not shared or is outside the key's scope looks the same.
+    const src = found orelse return apiError(arena, .not_found, "not_shared", "no such source, or it is not shared");
+    if (!src.enabled or !src.share or !services.scope.allows(src.name)) return apiError(arena, .not_found, "not_shared", "no such source, or it is not shared");
+    if (src.rights != null and src.rights.? == .forbidden) return apiError(arena, .not_found, "not_shared", "no such source, or it is not shared");
+    const after = std.fmt.parseInt(i64, params.get("after") orelse "0", 10) catch return apiError(arena, .bad_request, "invalid_parameter", "after: must be a cursor from an earlier answer");
+    if (after < 0) return apiError(arena, .bad_request, "invalid_parameter", "after: must be a cursor from an earlier answer");
+    const limit = std.fmt.parseInt(u32, params.get("limit") orelse "50", 10) catch return apiError(arena, .bad_request, "invalid_parameter", "limit: must be 1 to 200");
+    if (limit < 1 or limit > max_export_documents) return apiError(arena, .bad_request, "invalid_parameter", "limit: must be 1 to 200");
+
+    const rows = searcher.exportPage(arena, src.name, after, limit) catch |e| return searchFailure(arena, e, true);
+    const redistribution: []const u8 = if (src.rights) |r| @tagName(r) else "unknown";
+    var out: std.ArrayList(ExportDoc) = .empty;
+    var bytes: usize = 0;
+    var last: ?i64 = null;
+    var cut = false;
+    for (rows) |row| {
+        // The cursor moves past documents without retained text or too large: they cannot be sent.
+        const text = store.get(arena, row.id) catch {
+            last = row.cursor;
+            continue;
+        };
+        if (text.len > max_export_text_bytes) {
+            last = row.cursor;
+            continue;
+        }
+        if (bytes + text.len > max_export_page_bytes and out.items.len > 0) {
+            cut = true; // this one starts the next page
+            break;
+        }
+        bytes += text.len;
+        const stamp = store.stamp(row.id);
+        try out.append(arena, .{
+            .id = try arena.dupe(u8, &std.fmt.bytesToHex(row.id, .lower)),
+            .ident = try dk.peers.identHex(arena, row.url, stamp),
+            .source = src.name,
+            .url = row.url,
+            .title = row.title,
+            .text = text,
+            .language = row.language,
+            .content_type = row.content_type,
+            .modified_at = row.modified_at,
+            .published_at = row.published_at,
+            .author = row.author,
+            .redistribution = redistribution,
+        });
+        last = row.cursor;
+    }
+    // Another page may follow when this one was full or was cut for size.
+    const more = rows.len >= limit or cut;
+    var resp = try jsonResponse(arena, .ok, .{ .source = src.name, .documents = out.items, .next = if (more and last != null) try std.fmt.allocPrint(arena, "{d}", .{last.?}) else null });
+    resp.headers = headersWith(arena, &.{no_store});
+    return resp;
 }
 
 fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, services: Services, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
@@ -2409,6 +2501,80 @@ test "semantic=1 says why when it cannot reorder, and the plain results are stil
     try testing.expect(std.mem.indexOf(u8, down.body, "could not be reached") != null);
     // Paging past the first page is not reordered.
     try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), .{ .embed = &svc2 }, .GET, "/api/v1/search?q=lamp&semantic=1&offset=10").body, "first page") != null);
+}
+
+test "export: only shared sources, only with a key that covers them, paged with a cursor, with their text and rights" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var idx = try dk.index_sqlite.SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    const docs = [_]dk.document.Document{
+        .{ .connector = "books", .source_id = "1", .title = "Edda", .text = "ravens of the north", .canonical_url = "https://e.org/edda", .modified_at = 500 },
+        .{ .connector = "books", .source_id = "2", .title = "Saga", .text = "a second book", .canonical_url = "file:///b/saga.txt" },
+        .{ .connector = "diary", .source_id = "1", .title = "Diary", .text = "private words" },
+        .{ .connector = "secret", .source_id = "1", .title = "Secret", .text = "forbidden words" },
+    };
+    for (docs) |d| {
+        try idx.indexer().add(d.id(), d);
+        try mem.store().put(d.id(), d.text.?);
+    }
+    const cfgs = [_]dk.config.Source{
+        .{ .name = "books", .kind = "files", .share = true, .rights = .allowed },
+        .{ .name = "diary", .kind = "files" },
+        .{ .name = "secret", .kind = "files", .share = true, .rights = .forbidden }, // refused by the file's validation; here for the API's own check
+        .{ .name = "off", .kind = "files", .enabled = false, .share = true },
+    };
+    var sources = dk.sourcestore.Store.init(testing.allocator, testing.io, &cfgs);
+    defer sources.deinit();
+    var keys_store = dk.access.KeyStore.init(testing.allocator, testing.io, try tmp.dir.realPathFileAlloc(testing.io, ".", a));
+    defer keys_store.deinit();
+    var tok_all: [dk.access.token_len]u8 = undefined;
+    var tok_diary: [dk.access.token_len]u8 = undefined;
+    var keys = try dk.access.add(a, testing.io, &.{}, "all", &.{"*"}, 1, &tok_all);
+    keys = try dk.access.add(a, testing.io, keys, "diaryonly", &.{"onlydiary"}, 2, &tok_diary);
+    try dk.access.save(a, testing.io, tmp.dir, dk.access.file_name, keys);
+    const colls = [_]dk.config.Collection{.{ .name = "onlydiary", .sources = &.{"diary"} }};
+    const services: Services = .{ .sources = &sources, .content = mem.store(), .keys = &keys_store, .collections = &colls };
+    const get = struct {
+        fn at(arena: Allocator, searcher: dk.search.Searcher, sv: Services, target: []const u8, token: ?[]const u8) !Response {
+            const auth: ?[]const u8 = if (token) |t| try std.fmt.allocPrint(arena, "Bearer {s}", .{t}) else null;
+            return handleAuthorized(arena, searcher, sv, .GET, target, auth);
+        }
+    }.at;
+
+    // No key: refused, however open the server is.
+    try testing.expectEqual(http.Status.unauthorized, (try get(a, idx.searcher(), services, "/api/v1/export?source=books", null)).status);
+    // A key for everything: the shared source, with text, rights and an identity.
+    const r = try get(a, idx.searcher(), services, "/api/v1/export?source=books&limit=1", &tok_all);
+    try testing.expectEqual(http.Status.ok, r.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, r.body, .{});
+    defer parsed.deinit();
+    const first = parsed.value.object.get("documents").?.array.items;
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqualStrings("ravens of the north", first[0].object.get("text").?.string);
+    try testing.expectEqualStrings("allowed", first[0].object.get("redistribution").?.string);
+    try testing.expectEqual(@as(usize, 32), first[0].object.get("ident").?.string.len);
+    const next = parsed.value.object.get("next").?.string;
+    // The next page continues after the cursor and ends.
+    const r2 = try get(a, idx.searcher(), services, try std.fmt.allocPrint(a, "/api/v1/export?source=books&limit=1&after={s}", .{next}), &tok_all);
+    try testing.expect(std.mem.indexOf(u8, r2.body, "a second book") != null and std.mem.indexOf(u8, r2.body, "ravens") == null);
+    const r3 = try get(a, idx.searcher(), services, try std.fmt.allocPrint(a, "/api/v1/export?source=books&limit=50&after={s}", .{next}), &tok_all);
+    try testing.expect(std.mem.indexOf(u8, r3.body, "\"next\":null") != null);
+    // Not shared, forbidden, switched off, unknown, or outside the key's collections: all the same answer.
+    for ([_][]const u8{ "diary", "secret", "off", "nosuch" }) |name| {
+        const x = try get(a, idx.searcher(), services, try std.fmt.allocPrint(a, "/api/v1/export?source={s}", .{name}), &tok_all);
+        try testing.expectEqual(http.Status.not_found, x.status);
+    }
+    try testing.expectEqual(http.Status.not_found, (try get(a, idx.searcher(), services, "/api/v1/export?source=books", &tok_diary)).status);
+    // Bad parameters.
+    try testing.expectEqual(http.Status.bad_request, (try get(a, idx.searcher(), services, "/api/v1/export", &tok_all)).status);
+    try testing.expectEqual(http.Status.bad_request, (try get(a, idx.searcher(), services, "/api/v1/export?source=books&limit=1000", &tok_all)).status);
+    try testing.expectEqual(http.Status.bad_request, (try get(a, idx.searcher(), services, "/api/v1/export?source=books&after=-1", &tok_all)).status);
 }
 
 test "retrieval cache: the same answer twice, served from the cache, and a changed document is read again" {

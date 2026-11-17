@@ -105,6 +105,7 @@ test {
     _ = @import("htmltext.zig");
     if (connectors.have_crawler) _ = connectors.crawl;
     if (connectors.have_crawler) _ = connectors.archive;
+    if (connectors.have_crawler) _ = connectors.peer;
     _ = @import("sqlite.zig");
 }
 

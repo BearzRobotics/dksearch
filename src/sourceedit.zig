@@ -27,6 +27,8 @@ pub const Spec = struct {
     rights: ?[]const u8 = null,
     /// Ranking boost in percent (100 = none).
     boost: u32 = 100,
+    /// Let peers with a key copy this source's text.
+    share: bool = false,
     /// How often to import by itself ("daily", "6h", ...); empty or null: never.
     schedule: ?[]const u8 = null,
     /// The connector's options as TOML, one `key = value` per line.
@@ -68,7 +70,7 @@ pub const Problem = struct {
     }
 };
 
-const reserved = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights", "boost", "schedule" };
+const reserved = [_][]const u8{ "name", "kind", "enabled", "retain_text", "rights", "boost", "schedule", "share" };
 
 /// Applies `edit` to the configuration text and returns the new text (caller
 /// frees it). The result has been validated as a whole configuration.
@@ -135,6 +137,7 @@ pub fn apply(gpa: Allocator, text: []const u8, edit: Edit, problem: *Problem) Er
             if (!spec.retain_text) try t.entries.put(a, try doc.dupe("retain_text"), .{ .boolean = false });
             if (spec.schedule) |sc| if (sc.len > 0) try t.entries.put(a, try doc.dupe("schedule"), .{ .string = try doc.dupe(sc) });
             if (spec.boost != 100) try t.entries.put(a, try doc.dupe("boost"), .{ .integer = @intCast(spec.boost) });
+            if (spec.share) try t.entries.put(a, try doc.dupe("share"), .{ .boolean = true });
             if (spec.rights) |r| if (r.len > 0) try t.entries.put(a, try doc.dupe("rights"), .{ .string = try doc.dupe(r) });
 
             // The options: TOML text, scalars only, none of the fields above.

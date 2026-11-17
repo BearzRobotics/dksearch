@@ -438,6 +438,7 @@ pub const App = struct {
             .enabled = if (params.get("form") != null) checked(params.get("enabled")) else (if (params.get("enabled")) |v| checked(v) else true),
             .retain_text = if (params.get("form") != null) checked(params.get("retain_text")) else (if (params.get("retain_text")) |v| checked(v) else true),
             .rights = if (params.get("rights")) |r| (if (r.len > 0) r else null) else null,
+            .share = if (params.get("form") != null) checked(params.get("share")) else (if (params.get("share")) |v| checked(v) else false),
             .boost = if (params.get("boost")) |b| (std.fmt.parseInt(u32, std.mem.trim(u8, b, " "), 10) catch 100) else 100,
             .schedule = if (params.get("schedule")) |sc| (if (std.mem.trim(u8, sc, " ").len > 0) std.mem.trim(u8, sc, " ") else null) else null,
             // The form posts one field per option (`opt_KEY`) and a box for any other settings; the
@@ -613,6 +614,7 @@ pub const App = struct {
                 .rights = if (found.rights) |r| @tagName(r) else null,
                 .boost = found.boost,
                 .schedule = found.schedule,
+                .share = found.share,
                 .options = try dk.sourceedit.optionsText(arena, found),
             };
             original = found.name;
@@ -2170,6 +2172,13 @@ const kind_infos = [_]KindInfo{
         .template = "path = \"/data/wikipedia_en_all_maxi.zim\"   # the downloaded .zim file (change this)\n# url_base = \"http://localhost:8080/content/wikipedia_en_all_maxi/\"   # optional: makes each result link to a kiwix-serve\n",
     },
     .{
+        .kind = "peer",
+        .title = "A copy of another node's source",
+        .blurb = "Copies the documents of a source on another dksearch node into this one, so they are searchable here when that node is away. The other node's owner must share the source with your key.",
+        .needs = "The other node's address, the source's name there, and a file holding your API key for it.",
+        .template = "url = \"https://search.example.org\"   # the other node (change this)\nsource = \"books\"                     # its source, which must have share = true\nkey_file = \"/etc/dksearch/office.key\"  # your key for it, mode 0600\n",
+    },
+    .{
         .kind = "dump",
         .title = "Archives and data dumps",
         .blurb = "Indexes ZIP archives, WARC web archives (including Common Crawl files), Stack Exchange data dumps and Reddit dumps that you already have on disk.",
@@ -2400,6 +2409,7 @@ fn writeSourceForm(arena: Allocator, w: *Io.Writer, csrf: []const u8, spec: dk.s
     try w.writeAll("\"><input type=\"hidden\" name=\"fields\" value=\"1\"></p>");
     try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{s}> enabled</label>", .{if (spec.enabled) " checked" else ""});
     try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"retain_text\" value=\"1\"{s}> keep each document&rsquo;s text (needed to rebuild the index without the source)</label>", .{if (spec.retain_text) " checked" else ""});
+    try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"share\" value=\"1\"{s}> let peers with a key copy this source&rsquo;s text (see Peers on the Access page; never for rights &ldquo;forbidden&rdquo;)</label>", .{if (spec.share) " checked" else ""});
     try w.writeAll("<label>Rights <select name=\"rights\">");
     for ([_][]const u8{ "", "unknown", "allowed", "restricted", "forbidden" }) |r| {
         const sel = if (spec.rights) |cur| std.mem.eql(u8, cur, r) else r.len == 0;

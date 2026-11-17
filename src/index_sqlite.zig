@@ -374,7 +374,7 @@ pub const SqliteIndex = struct {
     }
 
     pub fn searcher(self: *SqliteIndex) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = searchImpl, .info = infoImpl, .search_chunks = searchChunksImpl, .source_stats = sourceStatsImpl } };
+        return .{ .ptr = self, .vtable = &.{ .search = searchImpl, .info = infoImpl, .search_chunks = searchChunksImpl, .source_stats = sourceStatsImpl, .export_page = exportPageImpl } };
     }
 
     pub fn imageSearcher(self: *SqliteIndex) search.ImageSearcher {
@@ -660,6 +660,41 @@ pub const SqliteIndex = struct {
     // ------------------------------------------------------------ search
 
     /// What the index records about one document.
+    pub fn exportPageImpl(ptr: *anyopaque, arena: Allocator, connector: []const u8, after: i64, limit: u32) search.Error![]const search.ExportRow {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
+        const sql = if (self.has_meta)
+            "SELECT rowid, id, url, title, language, content_type, modified_at, published_at, author FROM docs WHERE connector = ?1 AND rowid > ?2 ORDER BY rowid LIMIT ?3"
+        else
+            "SELECT rowid, id, url, title, language, content_type, NULL, published_at, NULL FROM docs WHERE connector = ?1 AND rowid > ?2 ORDER BY rowid LIMIT ?3";
+        const st = Stmt.prepare(self.db, sql) catch |e| return searchError(e);
+        defer st.deinit();
+        st.text(1, connector) catch |e| return searchError(e);
+        st.int(2, after) catch |e| return searchError(e);
+        st.int(3, limit) catch |e| return searchError(e);
+        var out: std.ArrayList(search.ExportRow) = .empty;
+        const dup = struct {
+            fn one(a: Allocator, s: Stmt, i: c_int) Allocator.Error!?[]const u8 {
+                const t = s.colText(i) orelse return null;
+                return try a.dupe(u8, t);
+            }
+        }.one;
+        while (st.step() catch |e| return searchError(e)) {
+            const blob = st.colBlob(1) orelse continue;
+            if (blob.len != @sizeOf(doc.Id)) continue;
+            try out.append(arena, .{
+                .cursor = st.colInt(0),
+                .id = blob[0..@sizeOf(doc.Id)].*,
+                .url = try dup(arena, st, 2),
+                .title = try dup(arena, st, 3),
+                .language = try dup(arena, st, 4),
+                .content_type = try dup(arena, st, 5),
+                .modified_at = colOptInt(st, 6),
+                .published_at = colOptInt(st, 7),
+                .author = try dup(arena, st, 8),
+            });
+        }
+        return out.items;
+    }
     pub fn sourceStatsImpl(ptr: *anyopaque, arena: Allocator) search.Error![]const search.SourceStat {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
         const sql = if (self.has_meta) "SELECT connector, COUNT(*), MAX(indexed_at) FROM docs GROUP BY connector" else "SELECT connector, COUNT(*), NULL FROM docs GROUP BY connector";
@@ -1312,7 +1347,7 @@ pub const SearchPool = struct {
     }
 
     pub fn searcher(self: *SearchPool) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = poolSearch, .info = poolInfo, .search_chunks = poolSearchChunks, .source_stats = poolSourceStats } };
+        return .{ .ptr = self, .vtable = &.{ .search = poolSearch, .info = poolInfo, .search_chunks = poolSearchChunks, .source_stats = poolSourceStats, .export_page = poolExportPage } };
     }
 
     pub fn imageSearcher(self: *SearchPool) search.ImageSearcher {
@@ -1332,6 +1367,18 @@ pub const SearchPool = struct {
         unreachable;
     }
 
+    fn poolExportPage(ptr: *anyopaque, arena: Allocator, connector: []const u8, after: i64, limit: u32) search.Error![]const search.ExportRow {
+        const self: *SearchPool = @ptrCast(@alignCast(ptr));
+        self.idle.waitUncancelable(self.io);
+        defer self.idle.post(self.io);
+        for (self.slots) |*slot| {
+            if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                defer slot.busy.store(false, .release);
+                return SqliteIndex.exportPageImpl(&slot.index, arena, connector, after, limit);
+            }
+        }
+        unreachable;
+    }
     fn poolSourceStats(ptr: *anyopaque, arena: Allocator) search.Error![]const search.SourceStat {
         const self: *SearchPool = @ptrCast(@alignCast(ptr));
         self.idle.waitUncancelable(self.io);

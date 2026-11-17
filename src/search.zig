@@ -205,6 +205,20 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// One document of a source as listed for export to a peer (without its text, which is in the content store).
+pub const ExportRow = struct {
+    /// Position in the source's listing: the next page continues after it.
+    cursor: i64,
+    id: doc.Id,
+    url: ?[]const u8,
+    title: ?[]const u8,
+    language: ?[]const u8,
+    content_type: ?[]const u8,
+    modified_at: ?i64,
+    published_at: ?i64,
+    author: ?[]const u8,
+};
+
 /// What the index holds for one source.
 pub const SourceStat = struct { name: []const u8, docs: u64, last_added: ?i64 = null };
 
@@ -223,7 +237,15 @@ pub const Searcher = struct {
         search_chunks: ?*const fn (ptr: *anyopaque, arena: Allocator, q: Query, limit: u32) Error![]const ChunkHit = null,
         /// How many documents each source has and when the last one was added. Optional.
         source_stats: ?*const fn (ptr: *anyopaque, arena: Allocator) Error![]const SourceStat = null,
+        /// The documents of one source after a position, in a stable order. Optional.
+        export_page: ?*const fn (ptr: *anyopaque, arena: Allocator, connector: []const u8, after: i64, limit: u32) Error![]const ExportRow = null,
     };
+
+    /// A page of the documents of `connector` after the cursor `after` (0: from the start); empty if the index cannot say.
+    pub fn exportPage(self: Searcher, arena: Allocator, connector: []const u8, after: i64, limit: u32) Error![]const ExportRow {
+        const f = self.vtable.export_page orelse return &.{};
+        return f(self.ptr, arena, connector, after, limit);
+    }
 
     /// Documents per source (empty if the index cannot say).
     pub fn sourceStats(self: Searcher, arena: Allocator) Error![]const SourceStat {

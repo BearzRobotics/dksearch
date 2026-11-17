@@ -28,13 +28,15 @@ pub const have_crawler = build_options.crawler;
 pub const crawl = if (have_crawler) @import("connectors/crawl.zig") else struct {};
 /// The Internet Archive metadata connector shares the crawler's HTTP client.
 pub const archive = if (have_crawler) @import("connectors/archive.zig") else struct {};
+/// Copies a shared source of another dksearch node (network, like the crawler).
+pub const peer = if (have_crawler) @import("connectors/peer.zig") else struct {};
 
 /// Every kind this build knows, for help text and error messages.
 pub const kinds = blk: {
     var k: []const []const u8 = &.{ files.kind, gutenberg.kind, zim.kind, dump.kind };
     if (have_wikipedia) k = k ++ &[_][]const u8{wikipedia.kind};
     if (have_feeds) k = k ++ &[_][]const u8{feeds.kind};
-    if (have_crawler) k = k ++ &[_][]const u8{ crawl.kind, archive.kind };
+    if (have_crawler) k = k ++ &[_][]const u8{ crawl.kind, archive.kind, peer.kind };
     break :blk k;
 };
 
@@ -43,7 +45,7 @@ pub const kinds_text = blk: {
     var t: []const u8 = "files, gutenberg, zim, dump";
     if (have_wikipedia) t = t ++ ", wikipedia";
     if (have_feeds) t = t ++ ", feeds";
-    if (have_crawler) t = t ++ ", crawl, archive";
+    if (have_crawler) t = t ++ ", crawl, archive, peer";
     break :blk t;
 };
 
@@ -65,6 +67,7 @@ pub const Instance = union(enum) {
     feeds: if (have_feeds) feeds.FeedsConnector else Absent,
     crawl: if (have_crawler) crawl.CrawlConnector else Absent,
     archive: if (have_crawler) archive.ArchiveConnector else Absent,
+    peer: if (have_crawler) peer.PeerConnector else Absent,
 
     pub fn deinit(self: *Instance) void {
         switch (self.*) {
@@ -90,6 +93,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     if (have_feeds and std.mem.eql(u8, source.kind, "feeds")) return feeds.validate(source, diag);
     if (have_crawler and std.mem.eql(u8, source.kind, "crawl")) return crawl.validate(source, diag);
     if (have_crawler and std.mem.eql(u8, source.kind, "archive")) return archive.validate(source, diag);
+    if (have_crawler and std.mem.eql(u8, source.kind, "peer")) return peer.validate(source, diag);
     var kbuf: [128]u8 = undefined;
     diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].kind", .{source.name}) catch "kind", "unknown connector kind \"{s}\" (this build has: {s})", .{ source.kind, kinds_text });
     return error.InvalidValue;
@@ -112,6 +116,7 @@ pub fn create(gpa: Allocator, io: Io, source: config.Source) Allocator.Error!Ins
     if (have_feeds and std.mem.eql(u8, source.kind, "feeds")) return .{ .feeds = try feeds.FeedsConnector.init(gpa, io, source) };
     if (have_crawler and std.mem.eql(u8, source.kind, "crawl")) return .{ .crawl = try crawl.CrawlConnector.init(gpa, io, source) };
     if (have_crawler and std.mem.eql(u8, source.kind, "archive")) return .{ .archive = try archive.ArchiveConnector.init(gpa, io, source) };
+    if (have_crawler and std.mem.eql(u8, source.kind, "peer")) return .{ .peer = try peer.PeerConnector.init(gpa, io, source) };
     unreachable; // `validate` rejects unknown kinds
 }
 

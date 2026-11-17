@@ -14,6 +14,21 @@ GET /api/v1/retrieve?q=TEXT[&source=S]...[&filter=F]...[&k=N][&candidates=N][&co
 AUTHENTICATION
 : By default the search API needs no key. A server can limit what anonymous callers see (`[access] anonymous_collections`) and issue API keys (`dksearch api-key add`). A key is sent as `Authorization: Bearer dkk_...` and restricts the results of `/api/v1/search` and `/api/v1/retrieve`, and the documents, pictures and articles under `/doc/` and `/zim/`, to the collections it was made for. Errors: 429 `rate_limited` (with `Retry-After`, in seconds) for a key over its per-minute limit (`dksearch api-key add --rate`; every request with the key counts, the others are not affected); 401 `invalid_key` for a key that is not valid or is sent to a server with no keys, 401 `key_required` when the server gives anonymous callers nothing (`/api/v1/health` stays open). A document outside the key's scope is answered with 404, the same as one that does not exist. The `collection:NAME` filter of the query language and `source=collection:NAME` select a collection within the scope.
 
+GET /api/v1/export
+Copy the documents of a source to a peer that replicates them (`kind = "peer"`, see **dksearch**(1)).
+
+Parameters:
+source
+: Required. The name of a source whose owner set `share = true`.
+
+after
+: Optional. The `next` value of the previous answer; the first page without it.
+
+limit
+: Optional. Documents per page, 1 to 200, default 50. A page is also cut at 16 MiB of text.
+
+Needs an API key (`Authorization: Bearer dkk_...`) whose collections include the source, whatever the anonymous setting of the server: 401 `key_required` without one. A source that does not exist, is off, is not shared, has `rights = "forbidden"` or is outside the key's collections answers 404 `not_shared`. The answer is `{"source": NAME, "documents": [...], "next": CURSOR or null}`. Each document has `id`, `ident` (see `/api/v1/search`), `source`, `url`, `title`, `text` (the full stored text; documents with no retained text or over 4 MiB are left out), `language`, `content_type`, `modified_at`, `published_at`, `author` and `redistribution` (what the source's owner says may be done with the text: `unknown`, `allowed` or `restricted`). Pages are in a stable order, so a replica can continue from a cursor.
+
 GET /api/v1/health
 
 GET /, GET /search?q=TEXT[&language=L][&source=S]...[&connector=C][&offset=N]

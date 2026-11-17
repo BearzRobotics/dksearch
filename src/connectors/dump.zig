@@ -240,10 +240,7 @@ pub const DumpConnector = struct {
             const result = self.readFile(file_arena.allocator(), dir, rel, sink, control);
             switch (result) {
                 .ok => {},
-                .bad_file => {
-                    _ = control.rejected.fetchAdd(1, .monotonic);
-                    control.rejectAt(.unreadable, rel);
-                },
+                .bad_file => control.rejectAt(.unreadable, rel),
                 .stopped => return self.stopped(done),
                 .out_of_memory => return error.OutOfMemory,
             }
@@ -321,8 +318,7 @@ const Ctx = struct {
     }
 
     fn reject(self: *Ctx, why: api.Reason, what: []const u8) void {
-        _ = self.control.rejected.fetchAdd(1, .monotonic);
-        self.control.rejectAt(why, what);
+        self.control.rejectAt(why, what); // counts it too
     }
 
     fn cancelled(self: *Ctx) bool {
