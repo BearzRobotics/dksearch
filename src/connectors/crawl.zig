@@ -10,7 +10,8 @@
 //!   (network error, 5xx) disallows the host for the run; a 4xx answer means
 //!   no rules, as the RFC says;
 //! - requests to one host are at least `delay_ms` apart (more if the site's
-//!   `crawl-delay` asks), one at a time, no concurrency;
+//!   `crawl-delay` asks), one at a time: several seeds are crawled at once
+//!   (`workers`), but a host is only ever asked by one of them at a time;
 //! - redirects are followed only within the same host (a leading `www.` is
 //!   ignored) and each hop is checked against `robots.txt`;
 //! - bodies are capped (`max_page_bytes`) and every request has a deadline.
@@ -46,6 +47,8 @@ pub const hard_max_pages: u32 = 1_000_000;
 pub const default_max_hosts: u32 = 100;
 pub const hard_max_hosts: u32 = 100_000;
 pub const default_timeout_s: u32 = 30;
+pub const default_workers: u32 = 8;
+pub const max_workers: u32 = 64;
 pub const max_timeout_s: u32 = 300;
 const max_redirects = 5;
 /// Links taken from one page, pending URLs per tree, and URLs remembered per run.
@@ -68,7 +71,7 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers" };
 
 // ------------------------------------------------------------ validation
 
@@ -160,6 +163,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     try boolOption(source, "follow_external", diag);
     try boolOption(source, "allow_private_addresses", diag);
     try intOption(source, "timeout_seconds", 1, max_timeout_s, diag);
+    try intOption(source, "workers", 1, max_workers, diag);
     _ = try needString(source, "ca_bundle", false, diag);
     if (try needString(source, "language", false, diag)) |l| if (!files.validLanguageTag(l)) {
         diag.set("", key(&kbuf, source, "language"), "must be a language tag such as \"en\" (letters, digits and '-', at most 35 characters)", .{});
@@ -183,6 +187,8 @@ pub const CrawlConnector = struct {
     follow_external: bool,
     allow_private: bool,
     timeout_s: u32,
+    /// How many seeds are crawled at once (each in its own task, with its own connection).
+    workers: u32,
     ca: cabundle.Choice,
     language: ?[]const u8,
     checkpoint_buf: std.ArrayList(u8) = .empty,
@@ -221,6 +227,7 @@ pub const CrawlConnector = struct {
             .follow_external = source.optionBool("follow_external") orelse false,
             .allow_private = source.optionBool("allow_private_addresses") orelse false,
             .timeout_s = @intCast(source.optionInt("timeout_seconds") orelse default_timeout_s),
+            .workers = @intCast(source.optionInt("workers") orelse default_workers),
             .ca = ca,
             .language = language,
         };
@@ -257,51 +264,120 @@ pub const CrawlConnector = struct {
             else => return error.InvalidSource,
         };
 
-        var client: http.Client = .{ .allocator = self.gpa, .io = self.io };
-        defer client.deinit();
-        cabundle.load(&client.ca_bundle, self.gpa, self.io, self.ca) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidSource,
-        };
-        client.now = Io.Clock.real.now(self.io);
-
-        var r: Run = .{ .conn = self, .arena = run_arena.allocator(), .client = &client, .sink = sink, .control = control };
-
         var start: usize = 0;
         if (resume_from) |at| {
             for (seeds, 0..) |sd, i| if (std.mem.eql(u8, sd.line, at)) {
                 start = i + 1;
             };
         }
+        if (start >= seeds.len) return .{};
 
-        var done: ?[]const u8 = if (start > 0) seeds[start - 1].line else null;
-        r.last_done = done;
-        var since: u32 = 0;
-        for (seeds[start..], start..) |seed, seed_index| {
-            // With no link following the seeds are the whole job; otherwise the
-            // number of pages is open-ended and only the page budget bounds it.
-            if (self.max_depth == 0) control.setProgress(seed_index, seeds.len) else control.setProgress(r.fetched, self.max_pages);
-            if (control.isCancelled()) return self.stopped(done);
-            switch (try r.crawlSeed(seed)) {
-                .stopped => return self.stopped(done),
+        var locked: LockedSink = .{ .inner = sink, .io = self.io };
+        var sh: Shared = .{ .first_seed = start };
+        sh.next_seed.store(start, .monotonic);
+        sh.finished = try run_arena.allocator().alloc(bool, seeds.len - start);
+        @memset(sh.finished, false);
+        sh.last_done = if (start > 0) seeds[start - 1].line else null;
+
+        const n_workers: usize = @min(self.workers, seeds.len - start);
+        var ctx: WorkerContext = .{ .conn = self, .arena = run_arena.allocator(), .sink = locked.sink(), .control = control, .sh = &sh, .seeds = seeds };
+        var group: Io.Group = .init;
+        var started: usize = 0;
+        while (started + 1 < n_workers) : (started += 1) {
+            // If no more tasks can be started, the ones that were do the work.
+            group.concurrent(self.io, workerTask, .{&ctx}) catch break;
+        }
+        workerTask(&ctx) catch {}; // this thread works too
+        group.await(self.io) catch {};
+
+        if (sh.out_of_memory.load(.monotonic)) return error.OutOfMemory;
+        if (ctx.load_failed.load(.monotonic)) return error.InvalidSource;
+        sh.mutex.lockUncancelable(self.io);
+        const done = sh.last_done;
+        sh.mutex.unlock(self.io);
+        if (control.isCancelled() or sh.stop.load(.monotonic)) return self.stopped(done);
+        // Not one page could be reached: the network is the likely cause.
+        if (sh.stored.load(.monotonic) == 0 and sh.network_failures.load(.monotonic) > 0) return error.Offline;
+        return .{};
+    }
+
+    /// What every worker task of a run is given.
+    const WorkerContext = struct {
+        conn: *CrawlConnector,
+        arena: Allocator,
+        sink: api.Sink,
+        control: *api.Control,
+        sh: *Shared,
+        seeds: []const Seed,
+        load_failed: std.atomic.Value(bool) = .init(false),
+    };
+
+    /// One worker: takes the next seed, crawls it, records it as finished, until there are none left, the page
+    /// budget is spent, or the run is stopped.
+    fn workerTask(ctx: *WorkerContext) Io.Cancelable!void {
+        const self = ctx.conn;
+        const sh = ctx.sh;
+        var client: http.Client = .{ .allocator = self.gpa, .io = self.io };
+        defer client.deinit();
+        cabundle.load(&client.ca_bundle, self.gpa, self.io, self.ca) catch |e| {
+            if (e == error.OutOfMemory) sh.out_of_memory.store(true, .monotonic) else ctx.load_failed.store(true, .monotonic);
+            sh.stop.store(true, .monotonic);
+            return;
+        };
+        client.now = Io.Clock.real.now(self.io);
+        var r: Run = .{ .conn = self, .arena = ctx.arena, .client = &client, .sink = ctx.sink, .control = ctx.control, .sh = sh };
+
+        while (true) {
+            if (ctx.control.isCancelled() or sh.stop.load(.monotonic) or sh.exhausted.load(.monotonic)) return;
+            const index = sh.next_seed.fetchAdd(1, .monotonic);
+            if (index >= ctx.seeds.len) return;
+            const seed = ctx.seeds[index];
+            // With no link following the seeds are the whole job; otherwise the number of pages is open-ended
+            // and only the page budget bounds it.
+            if (self.max_depth == 0) ctx.control.setProgress(index, ctx.seeds.len) else ctx.control.setProgress(sh.fetched.load(.monotonic), self.max_pages);
+            const result = r.crawlSeed(seed) catch {
+                sh.out_of_memory.store(true, .monotonic);
+                sh.stop.store(true, .monotonic);
+                return;
+            };
+            switch (result) {
+                .stopped => {
+                    sh.stop.store(true, .monotonic);
+                    return;
+                },
                 .stored, .skipped => {},
             }
-            if (r.exhausted) break; // the page budget for this run is spent
-            done = seed.line;
-            r.last_done = done;
-            r.unsaved = 0;
-            since += 1;
-            if (since >= checkpoint_every) {
-                since = 0;
-                sink.checkpoint(seed.line) catch |e| switch (e) {
-                    error.Stopped => return self.stopped(done),
-                    else => return error.SourceFailed,
-                };
+            // A seed cut short by the page budget is not finished: it will be visited again on a resume.
+            if (sh.exhausted.load(.monotonic)) return;
+            self.finishSeed(sh, ctx.seeds, index, ctx.sink);
+        }
+    }
+
+    /// Records that seed `index` is finished and moves the resume position forward over every seed that is now
+    /// finished in a row from the start; every few seeds the position is reported to the pipeline.
+    fn finishSeed(self: *CrawlConnector, sh: *Shared, seeds: []const Seed, index: usize, sink: api.Sink) void {
+        sh.mutex.lockUncancelable(self.io);
+        sh.finished[index - sh.first_seed] = true;
+        var moved = false;
+        while (sh.prefix < sh.finished.len and sh.finished[sh.prefix]) {
+            sh.last_done = seeds[sh.first_seed + sh.prefix].line;
+            sh.prefix += 1;
+            moved = true;
+        }
+        sh.unsaved = 0;
+        var report: ?[]const u8 = null;
+        if (moved) {
+            sh.finished_since_checkpoint += 1;
+            if (sh.finished_since_checkpoint >= checkpoint_every) {
+                sh.finished_since_checkpoint = 0;
+                report = sh.last_done;
             }
         }
-        // Not one page could be reached: the network is the likely cause.
-        if (seeds.len > 0 and r.stored == 0 and r.network_failures > 0) return error.Offline;
-        return .{};
+        sh.mutex.unlock(self.io);
+        if (report) |line| sink.checkpoint(line) catch |e| switch (e) {
+            error.Stopped => sh.stop.store(true, .monotonic),
+            else => {},
+        };
     }
 
     fn stopped(self: *CrawlConnector, done: ?[]const u8) api.Outcome {
@@ -471,27 +547,74 @@ const Host = struct {
     rules: robots.Rules,
     /// When the last request to this origin finished (monotonic).
     last: ?Io.Timestamp = null,
+    /// Held while this origin is being asked, so only one worker talks to it at a time (and, from creation
+    /// until its `robots.txt` is read, so nobody uses rules that are not there yet).
+    lock: Io.Mutex = .init,
+};
+
+/// What the workers of one run share. `mutex` guards the host table, the visited set and the position
+/// bookkeeping; the counters are atomic.
+const Shared = struct {
+    mutex: Io.Mutex = .init,
+    hosts: std.StringHashMapUnmanaged(*Host) = .empty,
+    /// Every URL fetched or queued this run, so none is requested twice.
+    visited: std.StringHashMapUnmanaged(void) = .empty,
+    /// Page requests made (robots.txt excluded), against `max_pages`.
+    fetched: std.atomic.Value(u64) = .init(0),
+    exhausted: std.atomic.Value(bool) = .init(false),
+    stored: std.atomic.Value(u64) = .init(0),
+    network_failures: std.atomic.Value(u64) = .init(0),
+    /// Set when a worker has to stop the whole run (cancelled, the pipeline refused, out of memory).
+    stop: std.atomic.Value(bool) = .init(false),
+    out_of_memory: std.atomic.Value(bool) = .init(false),
+    /// The next seed to hand out.
+    next_seed: std.atomic.Value(usize) = .init(0),
+    /// Seeds from `first_seed` on: which are finished, how many in a row from the start, and the line of the
+    /// last of those (the position to resume from: everything before it is done). Under `mutex`.
+    first_seed: usize = 0,
+    finished: []bool = &.{},
+    prefix: usize = 0,
+    last_done: ?[]const u8 = null,
+    finished_since_checkpoint: u32 = 0,
+    /// Pages stored since the work was last committed. Under `mutex`.
+    unsaved: u32 = 0,
+};
+
+/// Serialises the pipeline's sink, which one thread at a time may use.
+const LockedSink = struct {
+    inner: api.Sink,
+    io: Io,
+    mutex: Io.Mutex = .init,
+
+    fn sink(self: *LockedSink) api.Sink {
+        return .{ .ptr = self, .vtable = &.{ .submit = submit, .checkpoint = checkpoint } };
+    }
+
+    fn submit(ptr: *anyopaque, d: doc.Document) api.Sink.Error!void {
+        const self: *LockedSink = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.inner.submit(d);
+    }
+
+    fn checkpoint(ptr: *anyopaque, position: []const u8) api.Sink.Error!void {
+        const self: *LockedSink = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.inner.checkpoint(position);
+    }
 };
 
 const Run = struct {
     conn: *CrawlConnector,
     /// Lives for the whole run: host table and parsed robots rules.
     arena: Allocator,
+    /// This worker's own HTTP client.
     client: *http.Client,
+    /// The locked sink (shared by all workers).
     sink: api.Sink,
     control: *api.Control,
-    hosts: std.StringHashMapUnmanaged(*Host) = .empty,
-    /// Every URL fetched or queued this run, so none is requested twice.
-    visited: std.StringHashMapUnmanaged(void) = .empty,
-    /// Page requests made (robots.txt excluded), against `max_pages`.
-    fetched: u64 = 0,
-    exhausted: bool = false,
-    stored: u64 = 0,
-    /// The last address that was crawled completely: a safe place to resume from.
-    last_done: ?[]const u8 = null,
-    /// Pages stored since the work was last committed.
-    unsaved: u32 = 0,
-    network_failures: u64 = 0,
+    sh: *Shared,
     /// The address being fetched, named in the examples of what was skipped (a copy, because the address
     /// itself lives in a short-lived arena).
     current_buf: [api.Control.max_sample_bytes]u8 = undefined,
@@ -535,12 +658,30 @@ const Run = struct {
     /// entry): such a site is always allowed; `max_hosts` bounds only sites
     /// reached by following links and redirects.
     fn hostFor(self: *Run, u: Url, listed: bool) error{ OutOfMemory, Canceled, TooManyHosts }!*Host {
+        const io = self.conn.io;
         const origin = try originOf(self.arena, u);
-        if (self.hosts.get(origin)) |h| return h;
-        if (!listed and self.hosts.count() >= self.conn.max_hosts) return error.TooManyHosts;
-        const host = try self.arena.create(Host);
-        host.* = .{ .rules = .allow_all };
-        try self.hosts.put(self.arena, origin, host);
+        self.sh.mutex.lockUncancelable(io);
+        if (self.sh.hosts.get(origin)) |h| {
+            self.sh.mutex.unlock(io);
+            return h; // its rules are ready once its lock can be taken (see `Host.lock`)
+        }
+        if (!listed and self.sh.hosts.count() >= self.conn.max_hosts) {
+            self.sh.mutex.unlock(io);
+            return error.TooManyHosts;
+        }
+        const host = self.arena.create(Host) catch {
+            self.sh.mutex.unlock(io);
+            return error.OutOfMemory;
+        };
+        host.* = .{ .rules = .disallow_all };
+        host.lock.lockUncancelable(io); // taken before anyone can find the host
+        self.sh.hosts.put(self.arena, origin, host) catch {
+            host.lock.unlock(io);
+            self.sh.mutex.unlock(io);
+            return error.OutOfMemory;
+        };
+        self.sh.mutex.unlock(io);
+        defer host.lock.unlock(io);
         host.rules = try self.fetchRobots(origin, host);
         return host;
     }
@@ -564,7 +705,7 @@ const Run = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
                 error.Network, error.Timeout => {
-                    self.network_failures += 1;
+                    _ = self.sh.network_failures.fetchAdd(1, .monotonic);
                     return .disallow_all;
                 },
                 // Unusable or oversized: do not guess, stay away for this run.
@@ -600,7 +741,7 @@ const Run = struct {
     fn get(self: *Run, a: Allocator, start: []const u8, site_host: []const u8, accept: []const u8, max_bytes: usize, listed: bool) error{OutOfMemory}!Fetched {
         var url = try withoutFragment(a, start);
         var hops: u32 = 0;
-        self.fetched += 1;
+        _ = self.sh.fetched.fetchAdd(1, .monotonic);
         self.setCurrent(url);
         while (true) {
             const u = parseUrl(url) orelse return self.skip(.limit);
@@ -609,6 +750,9 @@ const Run = struct {
                 error.Canceled => return .stopped,
                 error.TooManyHosts => return self.skip(.limit),
             };
+            // One worker at a time asks a host: the lock is held through the wait for its turn and the request.
+            host.lock.lockUncancelable(self.conn.io);
+            defer host.lock.unlock(self.conn.io);
             if (!host.rules.allowed(try targetOf(a, u))) return self.skip(.robots);
             if (!self.waitTurn(host)) return .stopped;
 
@@ -623,7 +767,7 @@ const Run = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return .stopped,
                 error.Network, error.Timeout => {
-                    self.network_failures += 1;
+                    _ = self.sh.network_failures.fetchAdd(1, .monotonic);
                     return self.skip(.network);
                 },
                 // A certificate that does not verify is a refusal, not an outage.
@@ -664,8 +808,11 @@ const Run = struct {
     /// True the first time `url` is seen this run; remembers it. Also false
     /// once the table is full, which keeps memory bounded.
     fn firstVisit(self: *Run, url: []const u8) error{OutOfMemory}!?[]const u8 {
-        if (self.visited.count() >= max_visited) return null;
-        const gop = try self.visited.getOrPut(self.arena, url);
+        const io = self.conn.io;
+        self.sh.mutex.lockUncancelable(io);
+        defer self.sh.mutex.unlock(io);
+        if (self.sh.visited.count() >= max_visited) return null;
+        const gop = try self.sh.visited.getOrPut(self.arena, url);
         if (gop.found_existing) return null;
         gop.key_ptr.* = try self.arena.dupe(u8, url);
         return gop.key_ptr.*;
@@ -687,7 +834,7 @@ const Run = struct {
         for (pages.items) |page| {
             last = try self.crawlTree(page, self.conn.max_depth, u.host);
             if (last == .stopped) return .stopped;
-            if (self.exhausted) break;
+            if (self.sh.exhausted.load(.monotonic)) break;
         }
         return last;
     }
@@ -695,7 +842,7 @@ const Run = struct {
     /// Expands the sitemap (or sitemap index) at `url` into page URLs on the
     /// sitemap's own site. Returns true if the run was stopped.
     fn sitemapPages(self: *Run, a: Allocator, url: []const u8, site: []const u8, level: u32, n_files: *u32, out: *std.ArrayList([]const u8)) error{OutOfMemory}!bool {
-        if (n_files.* >= max_sitemap_files or self.fetched >= self.conn.max_pages) return false;
+        if (n_files.* >= max_sitemap_files or self.sh.fetched.load(.monotonic) >= self.conn.max_pages) return false;
         n_files.* += 1;
         var tmp = std.heap.ArenaAllocator.init(self.conn.gpa);
         defer tmp.deinit();
@@ -752,10 +899,11 @@ const Run = struct {
         var head: usize = 0;
         while (head < queue.items.len) {
             if (self.control.isCancelled()) return .stopped;
-            if (self.fetched >= self.conn.max_pages) {
-                self.exhausted = true;
+            if (self.sh.fetched.load(.monotonic) >= self.conn.max_pages) {
+                self.sh.exhausted.store(true, .monotonic);
                 break;
             }
+            if (self.sh.stop.load(.monotonic)) return .stopped;
             const item = queue.items[head];
             head += 1;
 
@@ -828,16 +976,21 @@ const Run = struct {
             error.OutOfMemory => return error.OutOfMemory,
         };
         _ = self.control.submitted.fetchAdd(1, .monotonic);
-        self.stored += 1;
-        self.unsaved += 1;
-        if (self.unsaved >= save_every_pages) {
-            self.unsaved = 0;
-            // Restarting from the last finished address re-reads the current one: nothing is skipped.
-            if (self.last_done) |safe_pos| self.sink.checkpoint(safe_pos) catch |e| switch (e) {
-                error.Stopped => return .{ .result = .stopped },
-                else => {}, // not fatal: the next page tries again
-            };
+        _ = self.sh.stored.fetchAdd(1, .monotonic);
+        const io = self.conn.io;
+        var save_at: ?[]const u8 = null;
+        self.sh.mutex.lockUncancelable(io);
+        self.sh.unsaved += 1;
+        if (self.sh.unsaved >= save_every_pages) {
+            self.sh.unsaved = 0;
+            save_at = self.sh.last_done;
         }
+        self.sh.mutex.unlock(io);
+        // Restarting from the last finished address re-reads the unfinished ones: nothing is skipped.
+        if (save_at) |safe_pos| self.sink.checkpoint(safe_pos) catch |e| switch (e) {
+            error.Stopped => return .{ .result = .stopped },
+            else => {}, // not fatal: the next page tries again
+        };
         return .{ .result = .stored, .links = scanned.links };
     }
 };
@@ -1058,6 +1211,7 @@ fn testConnector(tmp: *testing.TmpDir, seeds: []const u8, ua: []const u8) !Crawl
     var c = try CrawlConnector.init(testing.allocator, testing.io, .{ .name = "web", .kind = "crawl", .options = &opts });
     c.delay_ms = 0; // validation forbids this; tests only
     c.timeout_s = 5;
+    c.workers = 1; // the test servers answer one request at a time and the tests rely on the order
     return c;
 }
 
@@ -1199,6 +1353,47 @@ test "oversized pages and stalled servers are refused within bounds" {
     try testing.expectEqual(@as(usize, 1), got.ids.items.len);
     try testing.expectEqualStrings("fine", got.texts.items[0]);
     try testing.expectEqual(@as(u64, 2), ctl.rejected.load(.monotonic));
+}
+
+test "seeds on different hosts are crawled at the same time, and the resume position stays valid" {
+    // Four servers that each need 500 ms for their page: in a row that is two seconds, at once about half a second.
+    var srvs: [4]TestServer = undefined;
+    var started: usize = 0;
+    defer for (srvs[0..started]) |*sv| sv.stop();
+    var seeds: std.ArrayList(u8) = .empty;
+    defer seeds.deinit(testing.allocator);
+    var bufs: [4][96]u8 = undefined;
+    for (&srvs, 0..) |*sv, i| {
+        try sv.start(&.{
+            .{ .path = "/robots.txt", .status = 404 },
+            .{ .path = "/page", .body = "<p>page body</p>", .stall_ms = 500 },
+        });
+        started += 1;
+        try seeds.print(testing.allocator, "{s}\n", .{sv.url(&bufs[i], "/page")});
+    }
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var conn = try testConnector(&tmp, seeds.items, "t/1");
+    defer conn.deinit();
+    conn.workers = 4;
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    const t0 = Io.Timestamp.now(testing.io, .awake);
+    const out = try conn.connector().run(got.sink(), &ctl, null);
+    const took_ms = @divTrunc(t0.durationTo(Io.Timestamp.now(testing.io, .awake)).nanoseconds, std.time.ns_per_ms);
+    try testing.expect(!out.interrupted);
+    try testing.expectEqual(@as(usize, 4), got.ids.items.len);
+    try testing.expect(took_ms < 1400); // not the two seconds of a crawl one page at a time
+
+    // A run stopped part-way reports the last seed before which every seed is finished, never one that is not.
+    var got2: Collect = .{};
+    defer got2.deinit();
+    var ctl2: api.Control = .{};
+    ctl2.cancel();
+    const cut = try conn.connector().run(got2.sink(), &ctl2, null);
+    try testing.expect(cut.interrupted);
+    try testing.expect(cut.checkpoint == null);
 }
 
 test "requests to one host are spaced by the delay" {

@@ -83,6 +83,7 @@ const crawl = [_]Option{
     .{ .key = "allow_private_addresses", .label = "Allow private and local addresses", .type = .flag, .help = "Only with the option above; seeds you list yourself are always fetched." },
     .{ .key = "max_hosts", .label = "Most other sites per run", .type = .number, .min = 1, .max = 100000, .default = "100", .help = "Sites found by following links; sites you list are not counted." },
     .{ .key = "max_page_bytes", .label = "Largest page (bytes)", .type = .number, .min = 1, .max = 33554432, .default = "2097152", .help = "Larger pages are skipped." },
+    .{ .key = "workers", .label = "Seeds crawled at once", .type = .number, .min = 1, .max = 64, .default = "8", .help = "How many addresses are crawled at the same time. A site is still asked by one at a time, with the delay above between requests, so this changes how fast the crawl moves across many sites, not how hard any one site is hit." },
     timeout,
     ca,
     lang,
