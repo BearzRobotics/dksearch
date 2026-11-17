@@ -51,3 +51,13 @@ The crawler now takes seeds in windows (`window`, 200 here), crawls each window 
 Two intermediate versions showed what matters: with plain levels and no setting-aside, 16 workers piled up behind the lock of one popular site (254 of 679 pages came from one site, 1.9 pages per second); setting such pages aside restored the speed (8.6 pages per second at the end of the third run).
 
 **Reading:** dksearch now fetches about 3.6 times as many real pages as YaCy in the same time and takes in about as many of the listed addresses (123 against 131). It reaches fewer distinct sites (389 against 541), because YaCy takes one step from every seed in the whole list first and dksearch only from the 200 seeds of its first window; a larger window or one window for the whole list would close that, at the price of resuming from the start of a bigger window. Both obey robots.txt. Still not compared: the text each extracts, and later behaviour (YaCy's count flattened after four minutes).
+
+## Text quality (78 pages that both crawlers fetched)
+
+Compared by the words of each page's extracted text (YaCy's `text_t` field against dksearch's stored text).
+
+- **Same words on most pages:** median word-set overlap (Jaccard) 0.99, and in 65 of 78 pages the two texts have nearly the same length.
+- **A bug in dksearch's HTML-to-text found by this:** on 12 pages dksearch's text was longer, with hundreds of extra "words" that YaCy did not have: inline SVG path data (`m243 39 40 12c...`) and the HTML inside Wikipedia's `data-mw` attributes (`span class ... display none rel dc references typeof mw extension ref ...`). The cause: the tag scanner ended a tag at the first `>`, so a `>` inside a quoted attribute value (embedded JSON, an inline icon) leaked the rest of the attribute into the text. That text would have been indexed and could have matched searches. Fixed: a tag now ends at the first `>` outside quotes (as in a browser), with a budget so that unclosed quotes cannot make the scan quadratic.
+- **After the fix**, fetching the same pages again: no page is more than 25 % longer than YaCy's text, median overlap 0.994, 90th-percentile length ratio 1.00 (before: 11 of 77 pages much longer). The remaining difference is about 11 extra words per page on average.
+
+Conclusion: for the same pages the two crawlers' extracted text now agrees closely; the difference found was dksearch's own defect.
