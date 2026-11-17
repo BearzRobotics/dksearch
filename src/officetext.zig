@@ -1,5 +1,5 @@
 //! The text and the details of office documents and ebooks: `docx` (Word), `odt` (OpenDocument
-//! text) and `epub`. All three are ZIP files of XML parts; the XML is read with xml-zig, and an
+//! text), `xlsx` and `ods` (spreadsheets), `pptx` and `odp` (presentations) and `epub`. All three are ZIP files of XML parts; the XML is read with xml-zig, and an
 //! EPUB's chapters (XHTML) with the same converter as web pages.
 //!
 //! Only text is taken. Images, styles, comments' authors, tracked deletions and field codes are
@@ -16,12 +16,20 @@ pub const Kind = enum {
     docx,
     odt,
     epub,
+    xlsx,
+    ods,
+    pptx,
+    odp,
 
     pub fn contentType(self: Kind) []const u8 {
         return switch (self) {
             .docx => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             .odt => "application/vnd.oasis.opendocument.text",
             .epub => "application/epub+zip",
+            .xlsx => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            .ods => "application/vnd.oasis.opendocument.spreadsheet",
+            .pptx => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            .odp => "application/vnd.oasis.opendocument.presentation",
         };
     }
 };
@@ -29,7 +37,7 @@ pub const Kind = enum {
 pub fn kindOf(path: []const u8) ?Kind {
     const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return null;
     const ext = path[dot + 1 ..];
-    inline for (.{ .{ "docx", Kind.docx }, .{ "odt", Kind.odt }, .{ "epub", Kind.epub } }) |p| {
+    inline for (.{ .{ "docx", Kind.docx }, .{ "odt", Kind.odt }, .{ "epub", Kind.epub }, .{ "xlsx", Kind.xlsx }, .{ "ods", Kind.ods }, .{ "pptx", Kind.pptx }, .{ "odp", Kind.odp } }) |p| {
         if (std.ascii.eqlIgnoreCase(ext, p[0])) return p[1];
     }
     return null;
@@ -52,6 +60,12 @@ const max_chapters = 5000;
 
 const ns_w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const ns_text = "urn:oasis:names:tc:opendocument:xmlns:text:1.0";
+const ns_table = "urn:oasis:names:tc:opendocument:xmlns:table:1.0";
+const ns_draw = "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0";
+const ns_ss = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const ns_a = "http://schemas.openxmlformats.org/drawingml/2006/main";
+const max_sheets = 500;
+const max_shared_strings = 4 * 1024 * 1024;
 const ns_dc = "http://purl.org/dc/elements/1.1/";
 const ns_dcterms = "http://purl.org/dc/terms/";
 const ns_meta = "urn:oasis:names:tc:opendocument:xmlns:meta:1.0";
@@ -74,9 +88,21 @@ pub fn extract(arena: Allocator, archive: *ziparchive.Archive, kind: Kind, max_t
             }
             if (archive.has("docProps/core.xml")) readCoreProps(arena, archive, &out) catch {};
         },
-        .odt => {
-            try odtBody(arena, archive, &text, max_text_bytes);
+        .odt, .ods, .odp => {
+            try odtBody(arena, archive, &text, max_text_bytes, switch (kind) {
+                .ods => .sheet,
+                .odp => .slides,
+                else => .text,
+            });
             if (archive.has("meta.xml")) readOdtMeta(arena, archive, &out) catch {};
+        },
+        .xlsx => {
+            try xlsxBody(arena, archive, &text, max_text_bytes);
+            if (archive.has("docProps/core.xml")) readCoreProps(arena, archive, &out) catch {};
+        },
+        .pptx => {
+            try pptxBody(arena, archive, &text, max_text_bytes);
+            if (archive.has("docProps/core.xml")) readCoreProps(arena, archive, &out) catch {};
         },
         .epub => try epub(arena, archive, &text, &out, max_text_bytes),
     }
@@ -198,16 +224,29 @@ fn readCoreProps(arena: Allocator, archive: *ziparchive.Archive, out: *Extracted
 
 // ---------------------------------------------------------------------- odt
 
-fn odtBody(arena: Allocator, archive: *ziparchive.Archive, text: *std.ArrayList(u8), max: usize) Error!void {
+const OdMode = enum { text, sheet, slides };
+
+fn odtBody(arena: Allocator, archive: *ziparchive.Archive, text: *std.ArrayList(u8), max: usize, mode: OdMode) Error!void {
     const bytes = try readPart(arena, archive, "content.xml");
     var src: std.Io.Reader = undefined;
     var rd = xmlReader(arena, bytes, &src);
     defer rd.deinit();
     var in_paragraph: u32 = 0; // inside text:p or text:h: only there is character data text
+    var cell_start: usize = 0; // where the current spreadsheet cell's text began
     while (true) {
         const ev = rd.next() catch return error.Unreadable;
         switch (ev) {
             .start_element => |s| {
+                if (mode == .sheet and std.mem.eql(u8, s.name.uri, ns_table)) {
+                    if (std.mem.eql(u8, s.name.local, "table")) {
+                        // A sheet's name is worth finding by.
+                        if (attr(s.attributes, ns_table, "name")) |n| {
+                            try append(arena, text, max, n);
+                            try append(arena, text, max, "\n");
+                        }
+                    } else if (std.mem.eql(u8, s.name.local, "table-cell") or std.mem.eql(u8, s.name.local, "covered-table-cell")) cell_start = text.items.len;
+                    continue;
+                }
                 if (!std.mem.eql(u8, s.name.uri, ns_text)) continue;
                 if (std.mem.eql(u8, s.name.local, "p") or std.mem.eql(u8, s.name.local, "h")) {
                     in_paragraph += 1;
@@ -222,10 +261,25 @@ fn odtBody(arena: Allocator, archive: *ziparchive.Archive, text: *std.ArrayList(
                 }
             },
             .end_element => |e| {
+                if (mode == .sheet and std.mem.eql(u8, e.name.uri, ns_table)) {
+                    if (std.mem.eql(u8, e.name.local, "table-cell")) {
+                        // Cells are separated by a tab; empty ones leave nothing.
+                        while (text.items.len > cell_start and (text.items[text.items.len - 1] == ' ' or text.items[text.items.len - 1] == '\n')) _ = text.pop();
+                        if (text.items.len > cell_start) try append(arena, text, max, "\t");
+                    } else if (std.mem.eql(u8, e.name.local, "table-row")) {
+                        if (text.items.len > 0 and text.items[text.items.len - 1] == '\t') text.items[text.items.len - 1] = '\n';
+                    }
+                    continue;
+                }
+                if (mode == .slides and std.mem.eql(u8, e.name.uri, ns_draw) and std.mem.eql(u8, e.name.local, "page")) {
+                    try append(arena, text, max, "\n");
+                    continue;
+                }
                 if (!std.mem.eql(u8, e.name.uri, ns_text)) continue;
                 if (std.mem.eql(u8, e.name.local, "p") or std.mem.eql(u8, e.name.local, "h")) {
                     if (in_paragraph > 0) in_paragraph -= 1;
-                    try append(arena, text, max, "\n");
+                    // Within a spreadsheet cell, paragraphs run on; the cell ends with a tab.
+                    try append(arena, text, max, if (mode == .sheet) " " else "\n");
                 }
             },
             .text, .cdata => |t| if (in_paragraph > 0) try append(arena, text, max, t),
@@ -233,6 +287,178 @@ fn odtBody(arena: Allocator, archive: *ziparchive.Archive, text: *std.ArrayList(
             else => {},
         }
     }
+}
+
+// ---------------------------------------------------------------- xlsx, pptx
+
+fn lessNatural(_: void, x: []const u8, y: []const u8) bool {
+    if (x.len != y.len) return x.len < y.len; // slide2 before slide10
+    return std.mem.lessThan(u8, x, y);
+}
+
+/// Names of the parts `dir/<prefix>N.xml` (directly in `dir`), in number order.
+fn numbered(arena: Allocator, archive: *ziparchive.Archive, dir: []const u8, prefix: []const u8, limit: usize) Allocator.Error![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    for (archive.entries) |e| {
+        if (!std.mem.startsWith(u8, e.name, dir) or !std.mem.endsWith(u8, e.name, ".xml")) continue;
+        const rest = e.name[dir.len .. e.name.len - 4];
+        if (!std.mem.startsWith(u8, rest, prefix) or rest.len == prefix.len) continue;
+        if (std.mem.indexOfNone(u8, rest[prefix.len..], "0123456789") != null) continue;
+        if (names.items.len >= limit) break;
+        try names.append(arena, e.name);
+    }
+    std.mem.sort([]const u8, names.items, {}, lessNatural);
+    return names.items;
+}
+
+/// Spreadsheet text: the strings of each sheet's cells (shared strings are looked up), numbers as written, rows on
+/// lines and cells separated by tabs; sheet names first when the workbook lists them in the same number.
+fn xlsxBody(arena: Allocator, archive: *ziparchive.Archive, text: *std.ArrayList(u8), max: usize) Error!void {
+    var shared: std.ArrayList([]const u8) = .empty;
+    if (archive.has("xl/sharedStrings.xml")) {
+        const bytes = try readPart(arena, archive, "xl/sharedStrings.xml");
+        var src: std.Io.Reader = undefined;
+        var rd = xmlReader(arena, bytes, &src);
+        defer rd.deinit();
+        var cur: std.ArrayList(u8) = .empty;
+        var in_t = false;
+        var in_phonetic: u32 = 0; // furigana runs are not the cell's text
+        while (true) {
+            const ev = rd.next() catch return error.Unreadable;
+            switch (ev) {
+                .start_element => |s| {
+                    if (!std.mem.eql(u8, s.name.uri, ns_ss)) continue;
+                    if (std.mem.eql(u8, s.name.local, "t")) in_t = true else if (std.mem.eql(u8, s.name.local, "rPh")) in_phonetic += 1 else if (std.mem.eql(u8, s.name.local, "si")) cur = .empty;
+                },
+                .end_element => |e| {
+                    if (!std.mem.eql(u8, e.name.uri, ns_ss)) continue;
+                    if (std.mem.eql(u8, e.name.local, "t")) in_t = false else if (std.mem.eql(u8, e.name.local, "rPh")) {
+                        if (in_phonetic > 0) in_phonetic -= 1;
+                    } else if (std.mem.eql(u8, e.name.local, "si")) {
+                        if (shared.items.len >= max_shared_strings) return error.TooLarge;
+                        try shared.append(arena, cur.items);
+                    }
+                },
+                .text, .cdata => |t| if (in_t and in_phonetic == 0) {
+                    if (cur.items.len + t.len > max) return error.TooLarge;
+                    try cur.appendSlice(arena, t);
+                },
+                .end_of_document => break,
+                else => {},
+            }
+        }
+    }
+    const sheets = try numbered(arena, archive, "xl/worksheets/", "sheet", max_sheets);
+    var names: std.ArrayList([]const u8) = .empty;
+    if (archive.has("xl/workbook.xml")) names = sheetNames(arena, archive) catch .empty;
+    for (sheets, 0..) |part, i| {
+        if (names.items.len == sheets.len) {
+            try append(arena, text, max, names.items[i]);
+            try append(arena, text, max, "\n");
+        }
+        try xlsxSheet(arena, archive, part, shared.items, text, max);
+    }
+}
+
+fn sheetNames(arena: Allocator, archive: *ziparchive.Archive) Error!std.ArrayList([]const u8) {
+    const bytes = try readPart(arena, archive, "xl/workbook.xml");
+    var src: std.Io.Reader = undefined;
+    var rd = xmlReader(arena, bytes, &src);
+    defer rd.deinit();
+    var out: std.ArrayList([]const u8) = .empty;
+    while (true) {
+        const ev = rd.next() catch return error.Unreadable;
+        switch (ev) {
+            .start_element => |s| if (std.mem.eql(u8, s.name.uri, ns_ss) and std.mem.eql(u8, s.name.local, "sheet")) {
+                if (attr(s.attributes, "", "name")) |n| try out.append(arena, try arena.dupe(u8, n));
+            },
+            .end_of_document => break,
+            else => {},
+        }
+    }
+    return out;
+}
+
+fn xlsxSheet(arena: Allocator, archive: *ziparchive.Archive, part: []const u8, shared: []const []const u8, text: *std.ArrayList(u8), max: usize) Error!void {
+    const bytes = try readPart(arena, archive, part);
+    var src: std.Io.Reader = undefined;
+    var rd = xmlReader(arena, bytes, &src);
+    defer rd.deinit();
+    const Ty = enum { number, shared, text, boolean, skip };
+    var ty: Ty = .number;
+    var in_v = false;
+    var in_t = false; // inline string text
+    var value: std.ArrayList(u8) = .empty;
+    while (true) {
+        const ev = rd.next() catch return error.Unreadable;
+        switch (ev) {
+            .start_element => |s| {
+                if (!std.mem.eql(u8, s.name.uri, ns_ss)) continue;
+                if (std.mem.eql(u8, s.name.local, "c")) {
+                    value.clearRetainingCapacity();
+                    const t = attr(s.attributes, "", "t") orelse "n";
+                    ty = if (std.mem.eql(u8, t, "s")) .shared else if (std.mem.eql(u8, t, "str") or std.mem.eql(u8, t, "inlineStr")) .text else if (std.mem.eql(u8, t, "b")) .boolean else if (std.mem.eql(u8, t, "e")) .skip else .number;
+                } else if (std.mem.eql(u8, s.name.local, "v")) in_v = true else if (std.mem.eql(u8, s.name.local, "t")) in_t = true;
+            },
+            .end_element => |e| {
+                if (!std.mem.eql(u8, e.name.uri, ns_ss)) continue;
+                if (std.mem.eql(u8, e.name.local, "v")) in_v = false else if (std.mem.eql(u8, e.name.local, "t")) in_t = false else if (std.mem.eql(u8, e.name.local, "c")) {
+                    const cell: []const u8 = switch (ty) {
+                        .shared => blk: {
+                            const i = std.fmt.parseInt(usize, std.mem.trim(u8, value.items, " "), 10) catch break :blk "";
+                            break :blk if (i < shared.len) shared[i] else "";
+                        },
+                        .boolean => if (std.mem.eql(u8, std.mem.trim(u8, value.items, " "), "1")) "TRUE" else "FALSE",
+                        .skip => "",
+                        else => value.items,
+                    };
+                    if (cell.len > 0) {
+                        try append(arena, text, max, cell);
+                        try append(arena, text, max, "\t");
+                    }
+                } else if (std.mem.eql(u8, e.name.local, "row")) {
+                    if (text.items.len > 0 and text.items[text.items.len - 1] == '\t') text.items[text.items.len - 1] = '\n';
+                }
+            },
+            .text, .cdata => |t| if (in_v or in_t) {
+                if (value.items.len + t.len > max) return error.TooLarge;
+                try value.appendSlice(arena, t);
+            },
+            .end_of_document => break,
+            else => {},
+        }
+    }
+}
+
+/// Presentation text: each slide's text in order, paragraphs on lines, then the speaker notes.
+fn pptxBody(arena: Allocator, archive: *ziparchive.Archive, text: *std.ArrayList(u8), max: usize) Error!void {
+    const slides = try numbered(arena, archive, "ppt/slides/", "slide", max_sheets * 10);
+    for (slides) |part| try pptxSlide(arena, archive, part, text, max);
+    const notes = try numbered(arena, archive, "ppt/notesSlides/", "notesSlide", max_sheets * 10);
+    for (notes) |part| try pptxSlide(arena, archive, part, text, max);
+}
+
+fn pptxSlide(arena: Allocator, archive: *ziparchive.Archive, part: []const u8, text: *std.ArrayList(u8), max: usize) Error!void {
+    const bytes = try readPart(arena, archive, part);
+    var src: std.Io.Reader = undefined;
+    var rd = xmlReader(arena, bytes, &src);
+    defer rd.deinit();
+    var in_t = false;
+    while (true) {
+        const ev = rd.next() catch return error.Unreadable;
+        switch (ev) {
+            .start_element => |s| if (std.mem.eql(u8, s.name.uri, ns_a)) {
+                if (std.mem.eql(u8, s.name.local, "t")) in_t = true else if (std.mem.eql(u8, s.name.local, "br")) try append(arena, text, max, "\n");
+            },
+            .end_element => |e| if (std.mem.eql(u8, e.name.uri, ns_a)) {
+                if (std.mem.eql(u8, e.name.local, "t")) in_t = false else if (std.mem.eql(u8, e.name.local, "p")) try append(arena, text, max, "\n");
+            },
+            .text, .cdata => |t| if (in_t) try append(arena, text, max, t),
+            .end_of_document => break,
+            else => {},
+        }
+    }
+    try append(arena, text, max, "\n");
 }
 
 fn readOdtMeta(arena: Allocator, archive: *ziparchive.Archive, out: *Extracted) Error!void {
@@ -486,4 +712,45 @@ test "resolving chapter paths" {
     try testing.expectEqualStrings("x.xhtml", (try resolvePath(a, "OEBPS/", "../x.xhtml")).?);
     try testing.expect((try resolvePath(a, "", "../x.xhtml")) == null);
     try testing.expect((try resolvePath(a, "", "")) == null);
+}
+
+test "spreadsheets: sheet names, cell text and numbers, rows on lines (xlsx and ods made by LibreOffice)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ar: ziparchive.Archive = undefined;
+    const file = try openFixture(&tmp, "s.xlsx", @embedFile("testdata/office/sample.xlsx"), &ar, a);
+    defer file.close(testing.io);
+    const got = try extract(a, &ar, .xlsx, 1 << 20);
+    try testing.expectEqualStrings("prices\nitem\tprice\nmjolnir\t42\ngungnir\t77", got.text);
+    var ar2: ziparchive.Archive = undefined;
+    const file2 = try openFixture(&tmp, "s.ods", @embedFile("testdata/office/sample.ods"), &ar2, a);
+    defer file2.close(testing.io);
+    const ods = try extract(a, &ar2, .ods, 1 << 20);
+    try testing.expect(std.mem.indexOf(u8, ods.text, "item\tprice\nmjolnir\t42\ngungnir\t77") != null);
+    try testing.expectError(error.TooLarge, extract(a, &ar2, .ods, 10));
+}
+
+test "presentations: slides in order, paragraphs on lines (pptx and odp made by LibreOffice)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ar: ziparchive.Archive = undefined;
+    const file = try openFixture(&tmp, "s.pptx", @embedFile("testdata/office/sample.pptx"), &ar, a);
+    defer file.close(testing.io);
+    const got = try extract(a, &ar, .pptx, 1 << 20);
+    const first = std.mem.indexOf(u8, got.text, "narwhals").?;
+    const second = std.mem.indexOf(u8, got.text, "platypus").?;
+    try testing.expect(first < second);
+    try testing.expect(std.mem.indexOf(u8, got.text, "platypus\nand a second paragraph") != null);
+    var ar2: ziparchive.Archive = undefined;
+    const file2 = try openFixture(&tmp, "s.odp", @embedFile("testdata/office/sample.odp"), &ar2, a);
+    defer file2.close(testing.io);
+    const odp = try extract(a, &ar2, .odp, 1 << 20);
+    try testing.expect(std.mem.indexOf(u8, odp.text, "narwhals").? < std.mem.indexOf(u8, odp.text, "platypus").?);
+    try testing.expect(std.mem.indexOf(u8, odp.text, "platypus\nand a second paragraph") != null);
 }
