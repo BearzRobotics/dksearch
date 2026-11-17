@@ -28,4 +28,4 @@ Status: implemented for search and retrieval; administration pages are a follow-
 
 - A node needs a key for each peer and the peer's operator must issue it; revoking the key ends the sharing at once.
 - Links to a peer's pages need browser access to that peer (no key in a browser); a proxy that adds the key is a later, explicit option.
-- Still to do: federated retrieval (passages with attribution), a content-based document identity to merge the same file across nodes, admin pages with peer status and a pairing test, caching of remote answers.
+- Still to do: a content-based document identity to merge the same file across nodes, admin pages with peer status and a pairing test, caching of remote answers.
