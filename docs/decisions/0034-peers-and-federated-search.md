@@ -1,6 +1,6 @@
 # 0034: Peers and federated search
 
-Status: implemented for search; retrieval and administration pages are follow-ups.
+Status: implemented for search and retrieval; administration pages are a follow-up.
 
 ## Context
 
@@ -15,6 +15,7 @@ Status: implemented for search; retrieval and administration pages are follow-up
 - **Untrusted answers**: body at most 512 KiB, at most 50 results, every string cut to a bound, ids must be 32 hex digits, malformed entries are skipped (an answer that is mostly malformed is refused), scores are ignored for ordering, and the link to a result's page is built from the id and the configured URL, never taken from the answer. The page escapes everything as for local results.
 - **Merging by reciprocal-rank fusion** (k = 60): index scores are not comparable. The same page on several nodes is one result (identity: the address without scheme, host case, fragment and trailing slash; files have none and stay separate), shown from this node when it has it, with `also_on` naming the others.
 - **Limited callers do not get peers.** A caller whose scope is limited by a key or the anonymous setting is neither offered nor given federated results, because the key this node holds for a peer is a different privilege than theirs.
+- **Federated retrieval** is the same over `/api/v1/retrieve` (`peers=1`): each node returns its best passages with attribution, the asking node fuses the lists by rank, a passage of the same page and start counts once, a peer's passages link to that peer, and their pictures are not carried (those addresses need the peer's key). Peers get twice the search time limit because finding passages reads and splits documents.
 - The page works without JavaScript; the merge happens on the server.
 
 ## Alternatives

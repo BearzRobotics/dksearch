@@ -43,12 +43,41 @@ pub const Status = enum {
     unavailable,
 };
 
+pub const Kind = enum { search, retrieve };
+
+/// A passage a peer returned for `/api/v1/retrieve`, bounded and with its link built here.
+pub const RemoteChunk = struct {
+    node: []const u8,
+    doc_id: []const u8,
+    view_url: []const u8,
+    source: []const u8,
+    title: ?[]const u8,
+    url: ?[]const u8,
+    heading: []const []const u8,
+    index: u32,
+    of: u32,
+    start: usize,
+    end: usize,
+    page: ?u32,
+    page_source: ?[]const u8,
+    entries: []const []const u8,
+    score: f64,
+    text: []const u8,
+    before: []const []const u8,
+    after: []const []const u8,
+};
+
+pub const max_chunk_text_bytes = 16 * 1024;
+pub const max_chunks_per_peer = 50;
+
 pub const Reply = struct {
     peer: []const u8,
     status: Status,
     ms: u32 = 0,
     /// Results, owned by the request arena.
     hits: []const search.Hit = &.{},
+    /// Passages (for `Kind.retrieve`), owned by the request arena.
+    chunks: []const RemoteChunk = &.{},
     /// Entries of the answer that were skipped for being malformed.
     skipped: u32 = 0,
     /// The status code of a refusal.
@@ -137,22 +166,25 @@ pub const Service = struct {
         svc: *Service,
         peer: *PeerState,
         q: []const u8,
-        limit: u32,
+        kind: Kind,
+        /// Further query parameters, already encoded, starting with `&`.
+        extra: []const u8,
         /// The task's own memory, freed after the answer is copied out.
         arena: std.heap.ArenaAllocator,
         reply: Reply,
         done: bool = false,
     };
 
-    /// Asks every enabled peer for `limit` results for `q`, in parallel; returns one reply per enabled peer, in
-    /// configuration order, with everything in `arena`.
-    pub fn ask(self: *Service, arena: Allocator, q: []const u8, limit: u32) Allocator.Error![]Reply {
+    /// Asks every enabled peer the same question, in parallel; returns one reply per enabled peer, in
+    /// configuration order, with everything in `arena`. `extra` is appended to the query string as given
+    /// (`&limit=10`, `&k=8&context=1`).
+    pub fn ask(self: *Service, arena: Allocator, kind: Kind, q: []const u8, extra: []const u8) Allocator.Error![]Reply {
         const slots = try arena.alloc(Slot, self.peers.len);
         var n: usize = 0;
         var group: Io.Group = .init;
         for (self.peers) |*p| {
             if (!p.cfg.enabled) continue;
-            slots[n] = .{ .svc = self, .peer = p, .q = q, .limit = @min(limit, max_hits_per_peer), .arena = .init(self.gpa), .reply = .{ .peer = p.cfg.name, .status = .down } };
+            slots[n] = .{ .svc = self, .peer = p, .q = q, .kind = kind, .extra = extra, .arena = .init(self.gpa), .reply = .{ .peer = p.cfg.name, .status = .down } };
             n += 1;
         }
         for (slots[0..n]) |*s| {
@@ -167,18 +199,21 @@ pub const Service = struct {
             const hits = try arena.alloc(search.Hit, s.reply.hits.len);
             for (s.reply.hits, hits) |h, *dst| dst.* = try copyHit(arena, h);
             o.hits = hits;
+            const chunks = try arena.alloc(RemoteChunk, s.reply.chunks.len);
+            for (s.reply.chunks, chunks) |c, *dst| dst.* = try copyChunk(arena, c);
+            o.chunks = chunks;
         }
         return out;
     }
 
     fn runSlot(s: *Slot) void {
         const t0 = nowNs(s.svc.io);
-        s.reply = s.svc.askOne(s.arena.allocator(), s.peer, s.q, s.limit);
+        s.reply = s.svc.askOne(s.arena.allocator(), s.peer, s.kind, s.q, s.extra);
         s.reply.ms = @intCast(@max(0, @divTrunc(nowNs(s.svc.io) - t0, std.time.ns_per_ms)));
         s.done = true;
     }
 
-    fn askOne(self: *Service, a: Allocator, p: *PeerState, q: []const u8, limit: u32) Reply {
+    fn askOne(self: *Service, a: Allocator, p: *PeerState, kind: Kind, q: []const u8, extra: []const u8) Reply {
         var r: Reply = .{ .peer = p.cfg.name, .status = .down };
         if (!have_http) {
             r.status = .unavailable;
@@ -190,10 +225,12 @@ pub const Service = struct {
             return r;
         }
         var url: Io.Writer.Allocating = .init(a);
-        url.writer.print("{s}/api/v1/search?q=", .{p.base}) catch return r;
+        url.writer.print("{s}/api/v1/{s}?q=", .{ p.base, @tagName(kind) }) catch return r;
         writeEncoded(&url.writer, q) catch return r;
-        url.writer.print("&limit={d}", .{limit}) catch return r;
-        const resp = fetch.get(&self.client, a, .{ .url = url.written(), .user_agent = user_agent, .accept = "application/json", .max_body_bytes = max_answer_bytes, .authorization = p.auth }, .{ .nanoseconds = @as(i96, p.cfg.timeout_ms) * std.time.ns_per_ms }) catch |e| {
+        url.writer.writeAll(extra) catch return r;
+        // Finding passages reads and splits documents: it is given twice the time of a search.
+        const wait_ms: i96 = @as(i96, p.cfg.timeout_ms) * (if (kind == .retrieve) @as(i96, 2) else 1);
+        const resp = fetch.get(&self.client, a, .{ .url = url.written(), .user_agent = user_agent, .accept = "application/json", .max_body_bytes = max_answer_bytes, .authorization = p.auth }, .{ .nanoseconds = wait_ms * std.time.ns_per_ms }) catch |e| {
             r.status = switch (e) {
                 error.Timeout => .timeout,
                 error.BadResponse, error.TooLarge => .bad_answer,
@@ -208,16 +245,29 @@ pub const Service = struct {
             self.penalise(p);
             return r;
         }
-        const parsed = parseAnswer(a, resp.body, p.cfg.name, p.base) catch {
-            r.status = .bad_answer;
-            self.penalise(p);
-            return r;
-        };
+        switch (kind) {
+            .search => {
+                const parsed = parseAnswer(a, resp.body, p.cfg.name, p.base) catch {
+                    r.status = .bad_answer;
+                    self.penalise(p);
+                    return r;
+                };
+                r.hits = parsed.hits;
+                r.skipped = parsed.skipped;
+            },
+            .retrieve => {
+                const parsed = parseRetrieveAnswer(a, resp.body, p.cfg.name, p.base) catch {
+                    r.status = .bad_answer;
+                    self.penalise(p);
+                    return r;
+                };
+                r.chunks = parsed.chunks;
+                r.skipped = parsed.skipped;
+            },
+        }
         p.failures.store(0, .monotonic);
         p.quiet_until.store(0, .monotonic);
         r.status = .ok;
-        r.hits = parsed.hits;
-        r.skipped = parsed.skipped;
         return r;
     }
 
@@ -254,6 +304,114 @@ fn copyHit(a: Allocator, h: search.Hit) Allocator.Error!search.Hit {
     if (h.node) |v| o.node = try a.dupe(u8, v);
     if (h.remote_view) |v| o.remote_view = try a.dupe(u8, v);
     return o;
+}
+
+fn dupeAll(a: Allocator, list: []const []const u8) Allocator.Error![]const []const u8 {
+    const out = try a.alloc([]const u8, list.len);
+    for (list, out) |s, *d| d.* = try a.dupe(u8, s);
+    return out;
+}
+
+fn copyChunk(a: Allocator, c: RemoteChunk) Allocator.Error!RemoteChunk {
+    var o = c;
+    o.node = try a.dupe(u8, c.node);
+    o.doc_id = try a.dupe(u8, c.doc_id);
+    o.view_url = try a.dupe(u8, c.view_url);
+    o.source = try a.dupe(u8, c.source);
+    if (c.title) |v| o.title = try a.dupe(u8, v);
+    if (c.url) |v| o.url = try a.dupe(u8, v);
+    if (c.page_source) |v| o.page_source = try a.dupe(u8, v);
+    o.heading = try dupeAll(a, c.heading);
+    o.entries = try dupeAll(a, c.entries);
+    o.text = try a.dupe(u8, c.text);
+    o.before = try dupeAll(a, c.before);
+    o.after = try dupeAll(a, c.after);
+    return o;
+}
+
+pub const ParsedChunks = struct { chunks: []const RemoteChunk, skipped: u32 };
+
+fn stringArray(a: Allocator, v: ?std.json.Value, max_items: usize, max_bytes: usize) Allocator.Error![]const []const u8 {
+    const arr = switch (v orelse return &.{}) {
+        .array => |x| x,
+        else => return &.{},
+    };
+    var out: std.ArrayList([]const u8) = .empty;
+    for (arr.items) |item| {
+        if (out.items.len >= max_items) break;
+        if (try bounded(a, item, max_bytes)) |s| try out.append(a, s);
+    }
+    return out.items;
+}
+
+/// Reads the body of a peer's `/api/v1/retrieve` answer with the same distrust as `parseAnswer`: a `chunks` array of
+/// objects, each with a well formed `doc_id` and `text`; counts and sizes bounded; the link built from the id.
+pub fn parseRetrieveAnswer(a: Allocator, body: []const u8, node: []const u8, base: []const u8) AnswerError!ParsedChunks {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.BadAnswer;
+    const obj = switch (root) {
+        .object => |o| o,
+        else => return error.BadAnswer,
+    };
+    const arr = switch (obj.get("chunks") orelse return error.BadAnswer) {
+        .array => |x| x,
+        else => return error.BadAnswer,
+    };
+    var out: std.ArrayList(RemoteChunk) = .empty;
+    var skipped: u32 = 0;
+    for (arr.items) |item| {
+        if (out.items.len >= max_chunks_per_peer) break;
+        const c = switch (item) {
+            .object => |o| o,
+            else => {
+                skipped += 1;
+                continue;
+            },
+        };
+        const id_hex = switch (c.get("doc_id") orelse .null) {
+            .string => |s| s,
+            else => {
+                skipped += 1;
+                continue;
+            },
+        };
+        var id: doc.Id = undefined;
+        const text = try bounded(a, c.get("text"), max_chunk_text_bytes);
+        if (id_hex.len != 32 or (std.fmt.hexToBytes(&id, id_hex) catch null) == null or text == null) {
+            skipped += 1;
+            continue;
+        }
+        const source = (try bounded(a, c.get("source"), 64)) orelse {
+            skipped += 1;
+            continue;
+        };
+        const score: f64 = switch (c.get("score") orelse .null) {
+            .float => |f| if (std.math.isFinite(f)) f else 0,
+            .integer => |i| @floatFromInt(i),
+            else => 0,
+        };
+        try out.append(a, .{
+            .node = node,
+            .doc_id = try a.dupe(u8, id_hex),
+            .view_url = try std.fmt.allocPrint(a, "{s}/doc/{s}", .{ base, id_hex }),
+            .source = source,
+            .title = try bounded(a, c.get("title"), max_field_bytes),
+            .url = try bounded(a, c.get("url"), max_field_bytes * 2),
+            .heading = try stringArray(a, c.get("heading"), 8, 300),
+            .index = smallInt(c.get("index"), u32) orelse 0,
+            .of = smallInt(c.get("of"), u32) orelse 0,
+            .start = smallInt(c.get("start"), usize) orelse 0,
+            .end = smallInt(c.get("end"), usize) orelse 0,
+            .page = smallInt(c.get("page"), u32),
+            .page_source = try bounded(a, c.get("page_source"), 16),
+            .entries = try stringArray(a, c.get("entries"), 8, 200),
+            .score = score,
+            .text = text.?,
+            .before = try stringArray(a, c.get("before"), 3, max_chunk_text_bytes),
+            .after = try stringArray(a, c.get("after"), 3, max_chunk_text_bytes),
+        });
+    }
+    if (skipped > 3 and skipped * 2 > arr.items.len) return error.BadAnswer;
+    return .{ .chunks = out.items, .skipped = skipped };
 }
 
 pub const Parsed = struct { hits: []const search.Hit, skipped: u32 };
@@ -515,7 +673,7 @@ test "peers are asked in parallel: one answers, one is slow, one is down, one re
     defer ar.deinit();
     const a = ar.allocator();
     const t0 = nowNs(testing.io);
-    const replies = try svc.ask(a, "odin ravens", 10);
+    const replies = try svc.ask(a, .search, "odin ravens", "&limit=10");
     const took_ms = @divTrunc(nowNs(testing.io) - t0, std.time.ns_per_ms);
     try testing.expect(took_ms < 2000); // the slow peer's 3 s were not waited for
     try testing.expectEqual(@as(usize, 4), replies.len); // the disabled one is not asked
@@ -527,10 +685,43 @@ test "peers are asked in parallel: one answers, one is slow, one is down, one re
     try testing.expectEqual(@as(u16, 401), replies[2].http_status);
     try testing.expectEqual(Status.down, replies[3].status);
     // Asked again at once: the failed ones are not tried (backoff), the good one is.
-    const again = try svc.ask(a, "odin ravens", 10);
+    const again = try svc.ask(a, .search, "odin ravens", "&limit=10");
     try testing.expectEqual(Status.ok, again[0].status);
     try testing.expectEqual(Status.backoff, again[1].status);
     try testing.expectEqual(Status.backoff, again[2].status);
     try testing.expectEqual(Status.backoff, again[3].status);
     try testing.expectEqual(@as(usize, 1), slow.count("/api/v1/search?q=odin%20ravens&limit=10"));
+}
+
+test "a retrieval answer is read within bounds, ids are checked, links come from the id, pictures are not carried" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const body = "{\"chunks\":[{\"doc_id\":\"0102030405060708090a0b0c0d0e0f10\",\"view_url\":\"http://evil/\",\"source\":\"books\",\"title\":\"Edda\",\"url\":\"https://e.org/edda\",\"heading\":[\"Norse\",5],\"index\":2,\"of\":9,\"start\":10,\"end\":99,\"page\":4,\"page_source\":\"text\",\"entries\":[\"ODIN\"],\"score\":1.5,\"text\":\"Odin had <i>two</i> ravens\",\"before\":[\"b\"],\"after\":[],\"images\":[{\"n\":1,\"url\":\"/doc/x/image/1\"}]},{\"doc_id\":\"bad\",\"text\":\"x\",\"source\":\"s\"},{\"doc_id\":\"0102030405060708090a0b0c0d0e0f11\",\"source\":\"s\"}],\"candidates\":3}";
+    const p = try parseRetrieveAnswer(a, body, "office", "http://peer:8080");
+    try testing.expectEqual(@as(usize, 1), p.chunks.len);
+    try testing.expectEqual(@as(u32, 2), p.skipped);
+    const c = p.chunks[0];
+    try testing.expectEqualStrings("http://peer:8080/doc/0102030405060708090a0b0c0d0e0f10", c.view_url);
+    try testing.expectEqual(@as(usize, 1), c.heading.len); // the non-string entry is dropped
+    try testing.expectEqualStrings("Odin had <i>two</i> ravens", c.text); // text stays text
+    try testing.expectEqual(@as(?u32, 4), c.page);
+    for ([_][]const u8{ "", "{}", "{\"chunks\":{}}", "[1]" }) |bad| try testing.expectError(error.BadAnswer, parseRetrieveAnswer(a, bad, "n", "http://h"));
+}
+
+test "passages are asked for with the same limits, and a peer's passages arrive attributed" {
+    if (!have_http) return error.SkipZigTest;
+    var srv: nettest.TestServer = undefined;
+    try srv.start(&.{.{ .path = "/api/v1/retrieve?q=odin&k=3&context=1", .content_type = "application/json", .body = "{\"chunks\":[{\"doc_id\":\"0102030405060708090a0b0c0d0e0f10\",\"source\":\"books\",\"text\":\"Odin\",\"score\":2}]}" }});
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    const peers = [_]config.Peer{.{ .name = "p", .url = srv.url(&ub, "") }};
+    const svc = try Service.init(testing.allocator, testing.io, "home", &peers);
+    defer svc.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const replies = try svc.ask(ar.allocator(), .retrieve, "odin", "&k=3&context=1");
+    try testing.expectEqual(Status.ok, replies[0].status);
+    try testing.expectEqual(@as(usize, 1), replies[0].chunks.len);
+    try testing.expectEqualStrings("p", replies[0].chunks[0].node);
 }

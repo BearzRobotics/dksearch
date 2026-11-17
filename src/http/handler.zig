@@ -421,8 +421,9 @@ fn federate(arena: Allocator, services: Services, params: query.Params, q: dk.se
     if (svc.enabledCount() == 0 or services.scope.sources != null or q.offset != 0) return null;
     const text = params.get("q") orelse return null;
     if (text.len == 0) return null;
-    const limit: u32 = if (q.limit == 0) 10 else q.limit;
-    const replies = try svc.ask(arena, text, limit);
+    const limit: u32 = @min(if (q.limit == 0) 10 else q.limit, dk.peers.max_hits_per_peer);
+    const extra = try std.fmt.allocPrint(arena, "&limit={d}", .{limit});
+    const replies = try svc.ask(arena, .search, text, extra);
     const notes = try arena.alloc(PeerNote, replies.len);
     for (replies, notes) |r, *n| n.* = .{ .peer = r.peer, .status = @tagName(r.status), .ms = r.ms, .results = @intCast(r.hits.len), .http_status = if (r.http_status != 0) r.http_status else null };
     return .{ .hits = try dk.peers.fuse(arena, local, replies, limit), .notes = notes };
@@ -751,7 +752,98 @@ const RetrievedChunk = struct {
     after: []const []const u8,
     /// Pictures that sit in this passage of the original file: `n` and, when the original can be served, the address.
     images: []const RetrievedImage,
+    /// The peer node the passage came from; null for this node. Its `view_url` is then an address on that peer.
+    node: ?[]const u8 = null,
+    /// Other nodes that returned the same passage.
+    also_on: []const []const u8 = &.{},
 };
+
+/// With `peers=1`: asks the peers for their best passages and merges them with `local` by reciprocal-rank fusion
+/// (BM25 scores of different indexes are not comparable). The same passage of the same page on several nodes counts
+/// once. Pictures of a peer's passages are not carried over (their addresses need that peer's key). Null when not
+/// asked for or not allowed (see `federate`).
+fn federateRetrieval(arena: Allocator, services: Services, params: query.Params, text: []const u8, k: u32, context: u32, local: []const RetrievedChunk) error{OutOfMemory}!?struct { chunks: []const RetrievedChunk, notes: []const PeerNote } {
+    if (!wantsPeers(params)) return null;
+    const svc = services.peers orelse return null;
+    if (svc.enabledCount() == 0 or services.scope.sources != null) return null;
+    var extra: std.Io.Writer.Allocating = .init(arena);
+    extra.writer.print("&k={d}&context={d}", .{ k, context }) catch return error.OutOfMemory;
+    for ([_][]const u8{ "chunk_chars", "overlap" }) |name| if (params.get(name)) |v| if (v.len > 0 and v.len < 8 and std.mem.indexOfNone(u8, v, "0123456789") == null) extra.writer.print("&{s}={s}", .{ name, v }) catch return error.OutOfMemory;
+    const replies = try svc.ask(arena, .retrieve, text, extra.written());
+    const notes = try arena.alloc(PeerNote, replies.len);
+    for (replies, notes) |r, *n| n.* = .{ .peer = r.peer, .status = @tagName(r.status), .ms = r.ms, .results = @intCast(r.chunks.len), .http_status = if (r.http_status != 0) r.http_status else null };
+
+    const Entry = struct { chunk: RetrievedChunk, score: f64, order: usize, also: std.ArrayList([]const u8) = .empty };
+    var entries: std.ArrayList(Entry) = .empty;
+    var seen: std.StringHashMapUnmanaged(usize) = .empty;
+    for (local, 0..) |c, rank| {
+        const key = try retrievalKey(arena, c.url, c.start, null, c.doc_id, c.index);
+        try seen.put(arena, key, entries.items.len);
+        try entries.append(arena, .{ .chunk = c, .score = 1.0 / (dk.peers.rrf_k + @as(f64, @floatFromInt(rank + 1))), .order = entries.items.len });
+    }
+    for (replies) |r| {
+        if (r.status != .ok) continue;
+        for (r.chunks, 0..) |c, rank| {
+            const contribution = 1.0 / (dk.peers.rrf_k + @as(f64, @floatFromInt(rank + 1)));
+            const key = try retrievalKey(arena, c.url, c.start, c.node, c.doc_id, c.index);
+            if (seen.get(key)) |at| {
+                entries.items[at].score += contribution;
+                var have = false;
+                if (entries.items[at].chunk.node) |n0| if (std.mem.eql(u8, n0, c.node)) {
+                    have = true;
+                };
+                for (entries.items[at].also.items) |x| if (std.mem.eql(u8, x, c.node)) {
+                    have = true;
+                };
+                if (!have) try entries.items[at].also.append(arena, c.node);
+                continue;
+            }
+            try seen.put(arena, key, entries.items.len);
+            try entries.append(arena, .{ .chunk = .{
+                .doc_id = c.doc_id,
+                .view_url = c.view_url,
+                .source = c.source,
+                .title = c.title,
+                .url = c.url,
+                .heading = c.heading,
+                .index = c.index,
+                .of = c.of,
+                .start = c.start,
+                .end = c.end,
+                .page = c.page,
+                .page_source = c.page_source,
+                .entries = c.entries,
+                .score = c.score,
+                .text = c.text,
+                .before = c.before,
+                .after = c.after,
+                .images = &.{},
+                .node = c.node,
+            }, .score = contribution, .order = entries.items.len });
+        }
+    }
+    std.mem.sort(Entry, entries.items, {}, struct {
+        fn less(_: void, x: Entry, y: Entry) bool {
+            if (x.score != y.score) return x.score > y.score;
+            return x.order < y.order;
+        }
+    }.less);
+    const n = @min(k, entries.items.len);
+    const out = try arena.alloc(RetrievedChunk, n);
+    for (entries.items[0..n], out) |e, *o| {
+        o.* = e.chunk;
+        o.score = e.score;
+        o.also_on = e.also.items;
+    }
+    return .{ .chunks = out, .notes = notes };
+}
+
+/// What makes two passages the same across nodes: the same web page and start in it; passages of documents without a
+/// shared address (files) are only the same as themselves.
+fn retrievalKey(arena: Allocator, url: ?[]const u8, start: usize, node: ?[]const u8, doc_id: []const u8, index: u32) error{OutOfMemory}![]const u8 {
+    if (try dk.peers.identity(arena, url)) |ident| return std.fmt.allocPrint(arena, "{s}#{d}", .{ ident, start });
+    return std.fmt.allocPrint(arena, "{s}/{s}#{d}", .{ node orelse "", doc_id, index });
+}
 
 const RetrievedImage = struct { n: u32, url: ?[]const u8 };
 
@@ -946,7 +1038,8 @@ fn apiRetrieve(arena: Allocator, searcher: dk.search.Searcher, services: Service
             .images = images,
         };
     }
-    return jsonResponse(arena, .ok, .{ .chunks = out, .candidates = @as(u32, @intCast(kept.items.len)), .duplicates_merged = duplicates, .without_text = skipped });
+    const fed = try federateRetrieval(arena, services, params, params.get("q") orelse "", k, context, out);
+    return jsonResponse(arena, .ok, .{ .chunks = if (fed) |f| f.chunks else out, .candidates = @as(u32, @intCast(kept.items.len)), .duplicates_merged = duplicates, .without_text = skipped, .peers = if (fed) |f| f.notes else null });
 }
 
 const CachedChunks = struct { chunks: []const dk.retrieve.Chunk, text_bytes: usize };
@@ -1768,6 +1861,17 @@ test "peers: asked only on request, reported when they fail, never for a limited
     // (The peer failed a moment ago, so it is skipped now; either way the page says so.)
     try testing.expect(std.mem.indexOf(u8, page.body, "<strong>office</strong> was skipped") != null);
     try testing.expect(std.mem.indexOf(u8, page.body, "checked") != null);
+    // Passages: asked for in the same way, reported in the same way; a limited caller gets none.
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    try mem.store().put(hits[0].id, "Odin had two ravens.");
+    const with_content: Services = .{ .peers = svc, .content = mem.store() };
+    svc.peers[0].quiet_until.store(0, .monotonic);
+    const rp = handleServices(a, fake.searcher(), with_content, .GET, "/api/v1/retrieve?q=odin+ravens&peers=1");
+    try testing.expectEqual(http.Status.ok, rp.status);
+    try testing.expect(std.mem.indexOf(u8, rp.body, "\"peer\":\"office\"") != null);
+    try testing.expect(std.mem.indexOf(u8, rp.body, "Odin had two ravens") != null);
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), with_content, .GET, "/api/v1/retrieve?q=odin+ravens").body, "\"peers\":null") != null);
     // A caller whose view is limited gets neither the box nor the peers.
     const limited: Services = .{ .peers = svc, .collections = &colls, .anonymous = &.{"public"} };
     const lim = handleServices(a, fake.searcher(), limited, .GET, "/api/v1/search?q=note&peers=1");
