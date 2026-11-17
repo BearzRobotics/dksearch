@@ -6,7 +6,6 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 ## Next
 
-- **Crawler: private addresses.** Resolve a host before connecting and refuse addresses in private, loopback and link-local ranges (also after redirects and for every address a name resolves to), unless `allow_private_addresses` says otherwise.
 - **Fallback to other search engines (opt-in, off by default).** Link-out buttons for Brave, Google, Bing, DuckDuckGo and others, and server-side fallback through APIs (Brave Search API, a SearXNG instance, Marginalia) when local results are few, labelled as external. See the privacy notes in the decision record when it is written.
 - **Ollama, found and managed.** Detect a local Ollama, list, pull and remove models from the administration interface and the command line (never started silently, always confirmed), use it for embeddings and for an optional answer add-on over retrieved passages (the core stays retrieval only).
 - **Vector index.** A persistent index of every document's vector so semantic search can find documents the words missed, not only reorder lexical candidates.
@@ -28,4 +27,4 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 ## Known limits (see the manual and the decision records)
 
-The crawler does not detect a hostname that resolves to a private address (next); it sends conditional requests only for pages at the depth limit (ADR 0036) and does not recrawl by schedule per page; regex is bytewise; ZIM support is tested on small real files only; Wuffs (image decoding) is alpha upstream; semantic ordering reorders lexical candidates only (ADR 0038).
+A hostname is checked for private addresses before the first request but a DNS answer that changes in between (rebinding) is not stopped; the crawler sends conditional requests only for pages at the depth limit (ADR 0036) and does not recrawl by schedule per page; regex is bytewise; ZIM support is tested on small real files only; Wuffs (image decoding) is alpha upstream; semantic ordering reorders lexical candidates only (ADR 0038).

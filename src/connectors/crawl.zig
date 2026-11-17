@@ -665,6 +665,63 @@ fn originOf(arena: Allocator, u: Url) Allocator.Error![]const u8 {
 /// ranges, any IPv6 literal, and numbers that merely look like addresses
 /// (decimal, hex or short forms some resolvers accept). A name that *resolves*
 /// to a private address cannot be told from here.
+/// True if `a` is an address that must not be reached from a crawl of the public web: unspecified, loopback,
+/// private, link-local, shared (carrier-grade NAT), documentation, benchmarking, multicast or reserved; and the
+/// IPv6 forms of those, including IPv4 addresses mapped into IPv6.
+pub fn addressIsPrivate(a: std.Io.net.IpAddress) bool {
+    switch (a) {
+        .ip4 => |x| return ip4IsPrivate(x.bytes),
+        .ip6 => |x| {
+            const b = x.bytes;
+            // ::ffff:a.b.c.d is the IPv4 address a.b.c.d.
+            if (std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff) return ip4IsPrivate(b[12..16].*);
+            if (std.mem.allEqual(u8, b[0..15], 0) and (b[15] == 0 or b[15] == 1)) return true; // :: and ::1
+            if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true; // fe80::/10 link-local
+            if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7 unique local
+            if (b[0] == 0xff) return true; // multicast
+            if (b[0] == 0x20 and b[1] == 0x01 and b[2] == 0x0d and b[3] == 0xb8) return true; // documentation
+            if (b[0] == 0x01 and b[1] == 0 and std.mem.allEqual(u8, b[2..8], 0)) return true; // discard-only 100::/64
+            return false;
+        },
+    }
+}
+
+fn ip4IsPrivate(b: [4]u8) bool {
+    return b[0] == 0 or b[0] == 10 or b[0] == 127 or b[0] >= 224 or
+        (b[0] == 100 and b[1] >= 64 and b[1] <= 127) or
+        (b[0] == 169 and b[1] == 254) or
+        (b[0] == 172 and b[1] >= 16 and b[1] <= 31) or
+        (b[0] == 192 and b[1] == 168) or
+        (b[0] == 192 and b[1] == 0 and b[2] == 0) or
+        (b[0] == 192 and b[1] == 0 and b[2] == 2) or
+        (b[0] == 198 and (b[1] == 18 or b[1] == 19)) or
+        (b[0] == 198 and b[1] == 51 and b[2] == 100) or
+        (b[0] == 203 and b[1] == 0 and b[2] == 113);
+}
+
+/// Resolves `host` and says whether any address it has is private (see `addressIsPrivate`). A name that does not
+/// resolve is not private: the request will fail on its own. Names that look like addresses are judged by `isPrivateHost`.
+pub fn resolvesToPrivate(io: Io, host: []const u8) bool {
+    if (isPrivateHost(host)) return true;
+    const hn = std.Io.net.HostName.init(host) catch return true;
+    var buf: [32]std.Io.net.HostName.LookupResult = undefined;
+    var queue: Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buf);
+    var name_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    var fut = io.async(std.Io.net.HostName.lookup, .{ hn, io, &queue, .{ .port = 443, .canonical_name_buffer = &name_buf } });
+    defer fut.cancel(io) catch {};
+    var private = false;
+    while (true) {
+        const r = queue.getOne(io) catch break; // closed: the lookup is finished (or failed)
+        switch (r) {
+            .address => |ad| if (addressIsPrivate(ad)) {
+                private = true;
+            },
+            .canonical_name => {},
+        }
+    }
+    return private;
+}
+
 fn isPrivateHost(host_in: []const u8) bool {
     var buf: [256]u8 = undefined;
     if (host_in.len == 0 or host_in.len > buf.len) return true;
@@ -684,13 +741,7 @@ fn isPrivateHost(host_in: []const u8) bool {
     if (!numeric) return false;
     const quad = std.Io.net.Ip4Address.parse(trimmed, 0) catch return true; // odd forms: refuse
     const b = quad.bytes;
-    return b[0] == 0 or b[0] == 10 or b[0] == 127 or b[0] >= 224 or
-        (b[0] == 100 and b[1] >= 64 and b[1] <= 127) or
-        (b[0] == 169 and b[1] == 254) or
-        (b[0] == 172 and b[1] >= 16 and b[1] <= 31) or
-        (b[0] == 192 and b[1] == 168) or
-        (b[0] == 192 and b[1] == 0 and b[2] == 0) or
-        (b[0] == 198 and (b[1] == 18 or b[1] == 19));
+    return ip4IsPrivate(b);
 }
 
 /// The URL without its fragment, as the page's identity.
@@ -730,6 +781,8 @@ const Host = struct {
     lock: Io.Mutex = .init,
     /// True while a worker holds `lock` for a request, so others can look for other work instead of waiting.
     busy: std.atomic.Value(bool) = .init(false),
+    /// Whether the name resolves to a private, loopback or link-local address; asked once, under `lock`.
+    resolves_private: ?bool = null,
 };
 
 /// What the workers of one run share. `mutex` guards the host table, the visited set and the position
@@ -967,6 +1020,12 @@ const Run = struct {
             defer {
                 host.busy.store(false, .monotonic);
                 host.lock.unlock(self.conn.io);
+            }
+            // A site the administrator did not list must not lead into the private network, whatever its name says:
+            // every address the name resolves to is checked (once per host).
+            if (!self.conn.allow_private and !sameSite(u.host, site_host)) {
+                if (host.resolves_private == null) host.resolves_private = resolvesToPrivate(self.conn.io, u.host);
+                if (host.resolves_private.?) return self.skip(.limit);
             }
             if (!host.rules.allowed(try targetOf(a, u))) return self.skip(.robots);
             if (!self.waitTurn(host)) return .stopped;
@@ -1463,6 +1522,16 @@ test "fetches seeds, obeys robots.txt, converts HTML, identifies itself" {
     try testing.expectEqual(@as(usize, 0), srv.count("/private/b")); // never requested
     try testing.expectEqual(@as(usize, 1), srv.count("/robots.txt")); // once per host
     for (srv.agents.items) |ag| try testing.expectEqualStrings("dksearch-test/1.0 (+https://example.org/bot)", ag);
+}
+
+test "addresses in private ranges are recognised in both IP versions, including IPv4 mapped into IPv6" {
+    const Ip = std.Io.net.IpAddress;
+    const private = [_][]const u8{ "127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1", "198.18.0.1", "192.0.2.5", "203.0.113.9", "::1", "::", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:192.168.0.1", "2001:db8::1" };
+    for (private) |t| try testing.expect(addressIsPrivate(try Ip.parse(t, 80)));
+    const public = [_][]const u8{ "8.8.8.8", "1.1.1.1", "93.184.216.34", "172.32.0.1", "172.15.0.1", "100.63.0.1", "100.128.0.1", "2606:4700:4700::1111", "2a00:1450:4001::1", "::ffff:8.8.8.8" };
+    for (public) |t| try testing.expect(!addressIsPrivate(try Ip.parse(t, 80)));
+    // A name that the system resolves to the loopback address is private whatever it is called.
+    try testing.expect(resolvesToPrivate(testing.io, "localhost"));
 }
 
 test "pages at the depth limit are asked for conditionally on the next run, and a 304 is not stored again" {
