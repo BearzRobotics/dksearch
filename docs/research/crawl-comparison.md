@@ -35,4 +35,19 @@ After adding workers to the crawler (16 workers, same seeds, 6 minutes, per-host
 
 **Reading:** dksearch now fetches about three times as many real pages as YaCy in the same time, but it is *narrower*: its workers went deep into the first seeds (the list is alphabetical; 310 pages from one site, 297 from the next) while YaCy took one step from many seeds first (breadth-first across the whole list). Nothing suggests a page that YaCy could fetch and dksearch could not: the pages dksearch missed were on sites it had not reached yet, and the other way round dksearch fetched 10 pages for which YaCy had recorded failures. Both obey robots.txt (YaCy recorded 140 denials; dksearch counted 455 in its larger crawl). So for the same seeds it is speed and ordering, not reach, that differs. What was not compared yet: text quality of the extraction, and what each does after the first six minutes (YaCy's count stopped growing after four).
 
-**Next step (proposed, not built):** schedule breadth-first. The simple form is to crawl each tree level by level across a window of seeds (so that every seed gets its first pages before any gets its deep ones) and move the resume position per window; a cheaper stop-gap is a limit on pages per seed.
+## Third run: breadth-first (built)
+
+The crawler now takes seeds in windows (`window`, 200 here), crawls each window level by level, spreads each level over 16 workers with consecutive pages on different sites, and lets a worker set aside a page whose site is being asked and take other work. Same seeds, 6 minutes, per-site delay 500 ms:
+
+| | YaCy (real pages) | dksearch, depth-first, 16 workers | dksearch, breadth-first |
+|---|---|---|---|
+| Pages | 855 | 2,441 | **3,085** |
+| Sites | 541 | 119 | 389 |
+| Seed addresses indexed | 131 | 19 | **123** |
+| Seed sites reached | 118 | 26 | 70 |
+| Sites reached by following links | 423 | 93 | 319 |
+| Largest site's share | n/a | 310 pages | 159 pages |
+
+Two intermediate versions showed what matters: with plain levels and no setting-aside, 16 workers piled up behind the lock of one popular site (254 of 679 pages came from one site, 1.9 pages per second); setting such pages aside restored the speed (8.6 pages per second at the end of the third run).
+
+**Reading:** dksearch now fetches about 3.6 times as many real pages as YaCy in the same time and takes in about as many of the listed addresses (123 against 131). It reaches fewer distinct sites (389 against 541), because YaCy takes one step from every seed in the whole list first and dksearch only from the 200 seeds of its first window; a larger window or one window for the whole list would close that, at the price of resuming from the start of a bigger window. Both obey robots.txt. Still not compared: the text each extracts, and later behaviour (YaCy's count flattened after four minutes).
