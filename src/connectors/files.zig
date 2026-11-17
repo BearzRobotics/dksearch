@@ -863,7 +863,7 @@ fn hasExtension(path: []const u8, ext: []const u8) bool {
 }
 
 /// The first Markdown "# heading", else the file name without its extension.
-fn titleOf(text: []const u8, rel: []const u8, is_md: bool) []const u8 {
+pub fn titleOf(text: []const u8, rel: []const u8, is_md: bool) []const u8 {
     if (is_md) {
         var lines = std.mem.splitScalar(u8, text, '\n');
         var seen: usize = 0;

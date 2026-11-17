@@ -2162,6 +2162,13 @@ const kind_infos = [_]KindInfo{
         .template = "path = \"/data/wikipedia_en_all_maxi.zim\"   # the downloaded .zim file (change this)\n# url_base = \"http://localhost:8080/content/wikipedia_en_all_maxi/\"   # optional: makes each result link to a kiwix-serve\n",
     },
     .{
+        .kind = "dump",
+        .title = "Archives and data dumps",
+        .blurb = "Indexes ZIP archives, WARC web archives (including Common Crawl files), Stack Exchange data dumps and Reddit dumps that you already have on disk.",
+        .needs = "The file or folder and the format: zip, warc, stackexchange or reddit.",
+        .template = "path = \"/data/dumps\"   # a file, or a folder of files (change this)\nformat = \"warc\"       # zip, warc, stackexchange (Posts.xml) or reddit (.jsonl / .zst)\n# site_url = \"https://cooking.stackexchange.com\"   # stackexchange: for links\n# subreddits = \"linux, programming\"                # reddit: keep only these\n# min_score = 1                                    # stackexchange and reddit\n",
+    },
+    .{
         .kind = "gutenberg",
         .title = "Project Gutenberg books",
         .blurb = "Indexes Project Gutenberg books from its catalog file and a folder of book files you have downloaded.",

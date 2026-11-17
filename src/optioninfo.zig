@@ -68,6 +68,18 @@ const zim = [_]Option{
     .{ .key = "max_cluster_bytes", .label = "Largest cluster (bytes)", .type = .number, .min = 1, .max = 1073741824, .default = "134217728", .help = "Largest decompressed block accepted." },
 };
 
+const dump = [_]Option{
+    .{ .key = "path", .label = "File or folder", .type = .path, .required = true, .placeholder = "/data/dumps", .help = "One file, or a folder searched (with its subfolders) for files of the format." },
+    .{ .key = "format", .label = "Format", .type = .text, .required = true, .placeholder = "warc", .help = "zip (text, Markdown and HTML files inside .zip), warc (.warc and .warc.gz web archives), stackexchange (a Stack Exchange dump's Posts.xml) or reddit (JSON lines, .jsonl, .json or .zst)." },
+    lang,
+    .{ .key = "max_file_bytes", .label = "Largest document text (bytes)", .type = .number, .min = 1, .max = 67108864, .default = "4194304", .help = "Larger entries, pages and posts are skipped." },
+    .{ .key = "site_url", .label = "Stack Exchange site address", .type = .text, .placeholder = "https://cooking.stackexchange.com", .help = "stackexchange only: where the site is, for links. Without it a dump in a folder named like the site (cooking.stackexchange.com) is linked automatically." },
+    .{ .key = "subreddits", .label = "Subreddits to keep", .type = .text, .placeholder = "linux, programming", .help = "reddit only: comma separated; empty keeps all." },
+    .{ .key = "min_score", .label = "Lowest score", .type = .number, .min = -1000000, .max = 100000000, .help = "stackexchange and reddit: posts below this score are left out." },
+    .{ .key = "include_nsfw", .label = "Include adult posts", .type = .flag, .help = "reddit only." },
+    .{ .key = "zstd_window_mb", .label = "Zstandard window (MiB)", .type = .number, .min = 1, .max = 2048, .default = "128", .help = "reddit .zst files: memory for the decompression window. Dumps made with --long need up to 2048." },
+};
+
 const feeds = [_]Option{
     .{ .key = "path", .label = "Feed file or folder", .type = .path, .required = true, .placeholder = "/srv/feeds", .help = "An RSS or Atom file, or a folder of them (fetch them yourself, for example with a scheduled curl)." },
     .{ .key = "language", .label = "Language", .type = .text, .placeholder = "en", .help = "Overrides the language a feed declares." },
@@ -110,6 +122,7 @@ pub fn forKind(kind: []const u8) []const Option {
     if (std.mem.eql(u8, kind, "gutenberg")) return &gutenberg;
     if (std.mem.eql(u8, kind, "wikipedia")) return &wikipedia;
     if (std.mem.eql(u8, kind, "zim")) return &zim;
+    if (std.mem.eql(u8, kind, "dump")) return &dump;
     if (std.mem.eql(u8, kind, "feeds")) return &feeds;
     if (std.mem.eql(u8, kind, "crawl")) return &crawl;
     if (std.mem.eql(u8, kind, "archive")) return &archive;
@@ -251,7 +264,7 @@ const FakeParams = struct {
 };
 
 test "every kind has fields, every key appears once, and required ones are marked" {
-    for ([_][]const u8{ "files", "gutenberg", "wikipedia", "zim", "feeds", "crawl", "archive" }) |k| {
+    for ([_][]const u8{ "files", "gutenberg", "wikipedia", "zim", "dump", "feeds", "crawl", "archive" }) |k| {
         const opts = forKind(k);
         try testing.expect(opts.len >= 3);
         var required: usize = 0;

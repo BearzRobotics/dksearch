@@ -97,6 +97,7 @@ test {
     _ = secrets;
     _ = jobs;
     _ = connectors.zim;
+    _ = connectors.dump;
     if (connectors.have_wikipedia) _ = connectors.wikipedia;
     if (connectors.have_feeds) _ = connectors.feeds;
     _ = @import("htmltext.zig");

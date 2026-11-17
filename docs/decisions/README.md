@@ -52,3 +52,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0034 | Peers and federated search |
 | 0035 | Opening office files in a document server |
 | 0036 | Conditional requests when crawling again |
+| 0037 | One connector for archives and dumps |

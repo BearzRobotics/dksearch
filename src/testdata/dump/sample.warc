@@ -1,0 +1,65 @@
+WARC/1.0
+WARC-Type: warcinfo
+WARC-Target-URI: 
+WARC-Date: 2026-03-04T10:00:00Z
+Content-Type: application/warc-fields
+Content-Length: 16
+
+software: test
+
+
+WARC/1.0
+WARC-Type: response
+WARC-Target-URI: https://example.org/harbour
+WARC-Date: 2026-03-04T10:00:00Z
+Content-Type: application/http; msgtype=response
+Content-Length: 160
+
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+
+<html><head><title>Archived Harbour</title></head><body><p>The ferry leaves at dawn</p></body></html>
+
+WARC/1.0
+WARC-Type: response
+WARC-Target-URI: https://example.org/missing
+WARC-Date: 2026-03-04T10:00:00Z
+Content-Type: application/http; msgtype=response
+Content-Length: 70
+
+HTTP/1.1 404 Not Found
+Content-Type: text/html
+
+<p>missing page</p>
+
+WARC/1.0
+WARC-Type: request
+WARC-Target-URI: https://example.org/harbour
+WARC-Date: 2026-03-04T10:00:00Z
+Content-Type: application/http; msgtype=request
+Content-Length: 37
+
+GET / HTTP/1.1
+Host: example.org
+
+
+
+WARC/1.0
+WARC-Type: response
+WARC-Target-URI: https://example.org/chunk
+WARC-Date: 2026-03-04T10:00:00Z
+Content-Type: application/http; msgtype=response
+Content-Length: 100
+
+HTTP/1.1 200 OK
+Content-Type: text/plain
+Transfer-Encoding: chunked
+
+5
+hello
+7
+ chunky
+0
+
+
+

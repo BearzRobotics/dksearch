@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<posts>
+  <row Id="1" PostTypeId="1" AcceptedAnswerId="3" CreationDate="2021-05-06T07:08:09.100" Score="12" Body="&lt;p&gt;How do I keep a lantern lit in wind?&lt;/p&gt;" OwnerDisplayName="Ada" Title="Keeping a lantern lit" Tags="&lt;lamps&gt;&lt;wind&gt;" />
+  <row Id="2" PostTypeId="2" ParentId="1" CreationDate="2021-05-06T08:00:00.000" Score="3" Body="&lt;p&gt;Shield it with a glass chimney.&lt;/p&gt;" />
+  <row Id="3" PostTypeId="2" ParentId="1" CreationDate="2021-05-06T09:00:00.000" Score="9" Body="&lt;p&gt;Use a storm lantern with a &lt;code&gt;double wick&lt;/code&gt;.&lt;/p&gt;" OwnerDisplayName="Bo" />
+  <row Id="4" PostTypeId="1" CreationDate="2022-01-01T00:00:00.000" Score="-2" Body="&lt;p&gt;Spam question&lt;/p&gt;" Title="Cheap watches" Tags="|spam|" />
+  <row Id="5" PostTypeId="3" CreationDate="2022-01-01T00:00:00.000" Score="0" Body="wiki excerpt" />
+</posts>

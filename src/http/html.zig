@@ -78,6 +78,7 @@ fn kindLabel(kind: []const u8) []const u8 {
         .{ "gutenberg", "Project Gutenberg" },
         .{ "wikipedia", "Wikipedia" },
         .{ "zim", "ZIM files" },
+        .{ "dump", "Archives and dumps" },
         .{ "feeds", "Feeds" },
         .{ "crawl", "Web crawls" },
         .{ "archive", "Internet Archive" },
