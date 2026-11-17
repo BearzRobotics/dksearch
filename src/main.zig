@@ -871,6 +871,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         };
     }
     defer if (peer_service) |p| p.deinit();
+    if (peer_service) |p| p.cache_ttl_seconds = cfg.search.peer_cache_seconds;
     defer source_store.deinit();
     var job_manager: dk.jobs.Manager = undefined;
     var job_manager_ready = false;

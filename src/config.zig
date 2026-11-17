@@ -248,6 +248,8 @@ pub const SearchSettings = struct {
     chunk_index_min_kb: u32 = 64,
     /// Memory for the chunks of recently retrieved documents (MiB). 0 turns the cache off.
     retrieve_cache_mb: u32 = 128,
+    /// How long a peer's good answer is reused for the same question (seconds). 0 turns it off.
+    peer_cache_seconds: u32 = 30,
     stop_words_file: ?[]const u8 = null,
     synonyms_file: ?[]const u8 = null,
     /// "advanced": the query language (OR, NOT, grouping, prefix*, word~, "a b"~5, +, -);
@@ -354,7 +356,7 @@ const server_keys = [_][]const u8{
 const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions", "backup_dir", "zim_dir" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
-const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
+const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "peer_cache_seconds", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
 const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver" };
 
 /// Parses and validates configuration text. `source_name` is only used in
@@ -488,6 +490,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
         }
         if (try intIn(src, "search", t, "chunk_index_min_kb", 0, 1024 * 1024, diag)) |n| cfg.search.chunk_index_min_kb = @intCast(n);
         if (try intIn(src, "search", t, "retrieve_cache_mb", 0, 65536, diag)) |n| cfg.search.retrieve_cache_mb = @intCast(n);
+        if (try intIn(src, "search", t, "peer_cache_seconds", 0, 3600, diag)) |n| cfg.search.peer_cache_seconds = @intCast(n);
         if (try intIn(src, "search", t, "recency_boost", 0, 1000, diag)) |n| cfg.search.recency_boost = @intCast(n);
         if (try intIn(src, "search", t, "recency_half_life_days", 1, 36500, diag)) |n| cfg.search.recency_half_life_days = @intCast(n);
         if (try intIn(src, "search", t, "query_timeout_ms", 0, 60_000, diag)) |n| cfg.search.query_timeout_ms = @intCast(n);

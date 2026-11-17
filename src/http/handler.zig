@@ -388,7 +388,7 @@ const ApiHit = struct {
     /// has the same one); null when there is neither an address nor stored text to make it from.
     ident: ?[]const u8 = null,
 };
-const PeerNote = struct { peer: []const u8, status: []const u8, ms: u32, results: u32, http_status: ?u16 = null };
+const PeerNote = struct { peer: []const u8, status: []const u8, ms: u32, results: u32, http_status: ?u16 = null, cached: bool = false };
 const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null };
 
 const Federated = struct { hits: []const dk.search.Hit, notes: []const PeerNote };
@@ -436,7 +436,7 @@ fn federate(arena: Allocator, services: Services, params: query.Params, q: dk.se
     const extra = try std.fmt.allocPrint(arena, "&limit={d}", .{limit});
     const replies = try svc.ask(arena, .search, text, extra);
     const notes = try arena.alloc(PeerNote, replies.len);
-    for (replies, notes) |r, *n| n.* = .{ .peer = r.peer, .status = @tagName(r.status), .ms = r.ms, .results = @intCast(r.hits.len), .http_status = if (r.http_status != 0) r.http_status else null };
+    for (replies, notes) |r, *n| n.* = .{ .peer = r.peer, .status = @tagName(r.status), .ms = r.ms, .results = @intCast(r.hits.len), .http_status = if (r.http_status != 0) r.http_status else null, .cached = r.cached };
     return .{ .hits = try dk.peers.fuse(arena, local, replies, limit), .notes = notes };
 }
 
@@ -880,7 +880,7 @@ fn federateRetrieval(arena: Allocator, services: Services, params: query.Params,
     for ([_][]const u8{ "chunk_chars", "overlap" }) |name| if (params.get(name)) |v| if (v.len > 0 and v.len < 8 and std.mem.indexOfNone(u8, v, "0123456789") == null) extra.writer.print("&{s}={s}", .{ name, v }) catch return error.OutOfMemory;
     const replies = try svc.ask(arena, .retrieve, text, extra.written());
     const notes = try arena.alloc(PeerNote, replies.len);
-    for (replies, notes) |r, *n| n.* = .{ .peer = r.peer, .status = @tagName(r.status), .ms = r.ms, .results = @intCast(r.chunks.len), .http_status = if (r.http_status != 0) r.http_status else null };
+    for (replies, notes) |r, *n| n.* = .{ .peer = r.peer, .status = @tagName(r.status), .ms = r.ms, .results = @intCast(r.chunks.len), .http_status = if (r.http_status != 0) r.http_status else null, .cached = r.cached };
 
     const Entry = struct { chunk: RetrievedChunk, score: f64, order: usize, also: std.ArrayList([]const u8) = .empty };
     var entries: std.ArrayList(Entry) = .empty;
@@ -1270,7 +1270,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         const notes = try arena.alloc(html.PeerNote, f.notes.len);
         for (f.notes, notes) |src, *dst| {
             const status: dk.peers.Status = std.meta.stringToEnum(dk.peers.Status, src.status).?;
-            dst.* = .{ .name = src.peer, .ok = status == .ok, .text = if (status == .ok) try std.fmt.allocPrint(arena, "{d} {s} in {d} ms", .{ src.results, if (src.results == 1) "result" else "results", src.ms }) else statusText(status) };
+            dst.* = .{ .name = src.peer, .ok = status == .ok, .text = if (status == .ok) (if (src.cached) try std.fmt.allocPrint(arena, "{d} {s} (from a moment ago)", .{ src.results, if (src.results == 1) "result" else "results" }) else try std.fmt.allocPrint(arena, "{d} {s} in {d} ms", .{ src.results, if (src.results == 1) "result" else "results", src.ms })) else statusText(status) };
         }
         form.peer_notes = notes;
     } else if (wantsPeers(params)) form.peers_on = true;

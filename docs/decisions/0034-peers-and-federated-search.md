@@ -28,4 +28,5 @@ Status: implemented for search, retrieval and a peer status and test panel; peer
 
 - A node needs a key for each peer and the peer's operator must issue it; revoking the key ends the sharing at once.
 - Links to a peer's pages need browser access to that peer (no key in a browser); a proxy that adds the key is a later, explicit option.
-- Still to do: editing peers from the administration interface, caching of remote answers.
+- Good answers are reused for `search.peer_cache_seconds` (default 30) per peer, query kind, query and page size, at most 200 entries; failures are never cached. Latency is traded against freshness of at most that long.
+- Still to do: editing peers from the administration interface.

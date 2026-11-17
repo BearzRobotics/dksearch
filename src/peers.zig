@@ -84,7 +84,18 @@ pub const Reply = struct {
     skipped: u32 = 0,
     /// The status code of a refusal.
     http_status: u16 = 0,
+    /// Answered from the cache of recent answers, without asking the peer.
+    cached: bool = false,
 };
+
+/// A recent good answer, kept for `Service.cache_ttl_seconds`.
+const Cached = struct {
+    arena: std.heap.ArenaAllocator,
+    reply: Reply,
+    expires_ns: i64,
+};
+
+const max_cached_answers = 200;
 
 const PeerState = struct {
     cfg: config.Peer,
@@ -123,6 +134,10 @@ pub const Service = struct {
     node: []const u8,
     peers: []PeerState,
     client: if (have_http) std.http.Client else void,
+    /// How long a good answer is reused for the same question (0: never). Set after `init`.
+    cache_ttl_seconds: u32 = 0,
+    cache_mutex: Io.Mutex = .init,
+    cache: std.StringHashMapUnmanaged(*Cached) = .empty,
 
     /// `cfgs` as configured; keys given by `key_file` are read here (a file that cannot be read leaves the peer
     /// without a key, which its server will refuse).
@@ -170,6 +185,12 @@ pub const Service = struct {
 
     pub fn deinit(self: *Service) void {
         const gpa = self.gpa;
+        var it = self.cache.valueIterator();
+        while (it.next()) |c| {
+            c.*.arena.deinit();
+            gpa.destroy(c.*);
+        }
+        self.cache.deinit(gpa);
         if (have_http) self.client.deinit();
         for (self.peers) |p| freeState(gpa, p);
         gpa.free(self.peers);
@@ -205,28 +226,97 @@ pub const Service = struct {
         const slots = try arena.alloc(Slot, self.peers.len);
         var n: usize = 0;
         var group: Io.Group = .init;
+        const prefilled = try arena.alloc(?Reply, self.peers.len);
         for (self.peers) |*p| {
             if (!p.cfg.enabled) continue;
+            prefilled[n] = try self.cachedAnswer(arena, p, kind, q, extra);
             slots[n] = .{ .svc = self, .peer = p, .q = q, .kind = kind, .extra = extra, .arena = .init(self.gpa), .reply = .{ .peer = p.cfg.name, .status = .down } };
             n += 1;
         }
-        for (slots[0..n]) |*s| {
+        for (slots[0..n], prefilled[0..n]) |*s, pre| {
+            if (pre != null) continue;
             group.concurrent(self.io, runSlot, .{s}) catch runSlot(s); // no thread to spare: ask in turn
         }
         group.await(self.io) catch {};
         const out = try arena.alloc(Reply, n);
-        for (slots[0..n], out) |*s, *o| {
+        for (slots[0..n], prefilled[0..n], out) |*s, pre, *o| {
             defer s.arena.deinit();
-            o.* = s.reply;
-            o.peer = try arena.dupe(u8, s.reply.peer);
-            const hits = try arena.alloc(search.Hit, s.reply.hits.len);
-            for (s.reply.hits, hits) |h, *dst| dst.* = try copyHit(arena, h);
-            o.hits = hits;
-            const chunks = try arena.alloc(RemoteChunk, s.reply.chunks.len);
-            for (s.reply.chunks, chunks) |c, *dst| dst.* = try copyChunk(arena, c);
-            o.chunks = chunks;
+            if (pre) |r| {
+                o.* = r;
+                continue;
+            }
+            o.* = try cloneReply(arena, s.reply);
+            if (o.status == .ok) self.remember(s.peer, kind, q, extra, o.*);
         }
         return out;
+    }
+
+    fn cacheKey(a: Allocator, peer: []const u8, kind: Kind, q: []const u8, extra: []const u8) Allocator.Error![]u8 {
+        return std.fmt.allocPrint(a, "{s}\x00{s}\x00{s}\x00{s}", .{ peer, @tagName(kind), q, extra });
+    }
+
+    /// A copy (in `arena`) of a recent answer to this question from this peer, if there is a fresh one.
+    fn cachedAnswer(self: *Service, arena: Allocator, p: *PeerState, kind: Kind, q: []const u8, extra: []const u8) Allocator.Error!?Reply {
+        if (self.cache_ttl_seconds == 0) return null;
+        const key = try cacheKey(arena, p.cfg.name, kind, q, extra);
+        self.cache_mutex.lockUncancelable(self.io);
+        defer self.cache_mutex.unlock(self.io);
+        const c = self.cache.get(key) orelse return null;
+        if (nowNs(self.io) > c.expires_ns) return null;
+        var r = try cloneReply(arena, c.reply);
+        r.cached = true;
+        r.ms = 0;
+        return r;
+    }
+
+    /// Keeps a good answer for reuse. Silently skips on any failure: the cache is only an optimisation.
+    fn remember(self: *Service, p: *PeerState, kind: Kind, q: []const u8, extra: []const u8, r: Reply) void {
+        if (self.cache_ttl_seconds == 0) return;
+        const c = self.gpa.create(Cached) catch return;
+        c.arena = .init(self.gpa);
+        const a = c.arena.allocator();
+        const key = cacheKey(a, p.cfg.name, kind, q, extra) catch {
+            c.arena.deinit();
+            self.gpa.destroy(c);
+            return;
+        };
+        c.reply = cloneReply(a, r) catch {
+            c.arena.deinit();
+            self.gpa.destroy(c);
+            return;
+        };
+        c.expires_ns = nowNs(self.io) + @as(i64, self.cache_ttl_seconds) * std.time.ns_per_s;
+        self.cache_mutex.lockUncancelable(self.io);
+        defer self.cache_mutex.unlock(self.io);
+        if (self.cache.count() >= max_cached_answers) self.dropOldestLocked();
+        const old = self.cache.fetchPut(self.gpa, key, c) catch {
+            c.arena.deinit();
+            self.gpa.destroy(c);
+            return;
+        };
+        if (old) |kv| {
+            kv.value.arena.deinit();
+            self.gpa.destroy(kv.value);
+        }
+    }
+
+    /// Makes room: expired answers first, otherwise the one that expires soonest.
+    fn dropOldestLocked(self: *Service) void {
+        const now = nowNs(self.io);
+        var victim: ?[]const u8 = null;
+        var soonest: i64 = std.math.maxInt(i64);
+        var it = self.cache.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.*.expires_ns < soonest) {
+                soonest = e.value_ptr.*.expires_ns;
+                victim = e.key_ptr.*;
+            }
+            if (e.value_ptr.*.expires_ns < now) break;
+        }
+        if (victim) |k| if (self.cache.fetchRemove(k)) |kv| {
+            kv.value.arena.deinit();
+            self.gpa.destroy(kv.value);
+        };
     }
 
     fn runSlot(s: *Slot) void {
@@ -362,6 +452,19 @@ fn writeEncoded(w: *Io.Writer, text: []const u8) Io.Writer.Error!void {
 
 fn nowNs(io: Io) i64 {
     return @intCast(Io.Timestamp.now(io, .awake).nanoseconds);
+}
+
+/// A deep copy of a reply, everything in `a`.
+fn cloneReply(a: Allocator, r: Reply) Allocator.Error!Reply {
+    var o = r;
+    o.peer = try a.dupe(u8, r.peer);
+    const hits = try a.alloc(search.Hit, r.hits.len);
+    for (r.hits, hits) |h, *dst| dst.* = try copyHit(a, h);
+    o.hits = hits;
+    const chunks = try a.alloc(RemoteChunk, r.chunks.len);
+    for (r.chunks, chunks) |c, *dst| dst.* = try copyChunk(a, c);
+    o.chunks = chunks;
+    return o;
 }
 
 fn copyHit(a: Allocator, h: search.Hit) Allocator.Error!search.Hit {
@@ -896,4 +999,35 @@ test "identity: the same page or the same text is the same on every node, and a 
     const parsed = try parseAnswer(a, body, "n", "http://h");
     try testing.expect(parsed.hits[0].ident == null);
     try testing.expectEqualStrings("00112233445566778899aabbccddeeff", parsed.hits[1].ident.?);
+}
+
+test "a good answer is reused for the same question for a while, a different question is asked again" {
+    if (!have_http) return error.SkipZigTest;
+    var srv: nettest.TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/api/v1/search?q=odin&limit=10", .content_type = "application/json", .body = "{\"hits\":[{\"id\":\"0102030405060708090a0b0c0d0e0f10\",\"connector\":\"b\",\"title\":\"Odin\"}]}" },
+        .{ .path = "/api/v1/search?q=thor&limit=10", .status = 500, .content_type = "application/json", .body = "{}" },
+    });
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    const peers = [_]config.Peer{.{ .name = "p", .url = srv.url(&ub, "") }};
+    const svc = try Service.init(testing.allocator, testing.io, "home", &peers);
+    defer svc.deinit();
+    svc.cache_ttl_seconds = 60;
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const first = try svc.ask(a, .search, "odin", "&limit=10");
+    try testing.expect(!first[0].cached);
+    const second = try svc.ask(a, .search, "odin", "&limit=10");
+    try testing.expect(second[0].cached and second[0].status == .ok);
+    try testing.expectEqualStrings("Odin", second[0].hits[0].title.?);
+    try testing.expectEqual(@as(usize, 1), srv.count("/api/v1/search?q=odin&limit=10")); // the peer was asked once
+    // Another question, or another page size, is another answer; failures are never kept.
+    _ = try svc.ask(a, .search, "odin", "&limit=20");
+    try testing.expect(!(try svc.ask(a, .search, "thor", "&limit=10"))[0].cached);
+    try testing.expect(!(try svc.ask(a, .search, "thor", "&limit=10"))[0].cached);
+    // With the cache off every question goes to the peer.
+    svc.cache_ttl_seconds = 0;
+    try testing.expect(!(try svc.ask(a, .search, "odin", "&limit=10"))[0].cached);
 }
