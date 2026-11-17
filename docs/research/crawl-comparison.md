@@ -19,4 +19,20 @@ A short head-to-head, not a benchmark. Both crawlers ran at the same time on the
 
 What was not compared: quality of extracted text, duplicate handling, how many distinct hosts were reached, and what YaCy's plateau means (its frontier running dry, a per-host cap, or load limits). Those need a longer run and the same measurements taken from both indexes.
 
-**What to do about it** (not yet done): fetch with several workers while keeping the guarantees that matter, in this order: one request at a time per host and the delay between requests to a host stay as they are (a lock and a timestamp per host); several seeds' trees are crawled at once (a `workers` option, default 8), sharing the host table, the visited set and the page budget; documents still go to the pipeline through one lock; the resume position stays "the last seed line before which every seed is finished". See ADR work to follow.
+## Correction: what YaCy's count means, and a second run with concurrency
+
+YaCy's "documents" include records of failed fetches. Of its 1,795 entries after the six minutes, **855 were real pages** (HTTP 200; 796 HTML, the rest PDF) on 541 hosts; the other 940 were failure records (robots.txt denials 140, HTTP 403 156, 404 126, 429 21, and about 500 timeouts and other load errors). So the first comparison overstated YaCy by about two times, and dksearch was about 25 times slower, not 50.
+
+After adding workers to the crawler (16 workers, same seeds, 6 minutes, per-host delay 500 ms, run on its own while YaCy's crawl was paused):
+
+| | YaCy (global mode) | dksearch, 1 worker | dksearch, 16 workers |
+|---|---|---|---|
+| Real pages in 6 minutes | 855 | 35 | **2,441** |
+| Hosts reached | 541 | about 10 | 119 |
+| Seed addresses indexed | 131 of 784 | 1 | 19 of 784 |
+| Seed hosts reached | 118 of 448 | n/a | 26 of 448 |
+| Pages that came from hosts the other crawler also reached | | | 18 of YaCy's 828 not found by dksearch were on such hosts; 810 were on hosts dksearch never got to |
+
+**Reading:** dksearch now fetches about three times as many real pages as YaCy in the same time, but it is *narrower*: its workers went deep into the first seeds (the list is alphabetical; 310 pages from one site, 297 from the next) while YaCy took one step from many seeds first (breadth-first across the whole list). Nothing suggests a page that YaCy could fetch and dksearch could not: the pages dksearch missed were on sites it had not reached yet, and the other way round dksearch fetched 10 pages for which YaCy had recorded failures. Both obey robots.txt (YaCy recorded 140 denials; dksearch counted 455 in its larger crawl). So for the same seeds it is speed and ordering, not reach, that differs. What was not compared yet: text quality of the extraction, and what each does after the first six minutes (YaCy's count stopped growing after four).
+
+**Next step (proposed, not built):** schedule breadth-first. The simple form is to crawl each tree level by level across a window of seeds (so that every seed gets its first pages before any gets its deep ones) and move the resume position per window; a cheaper stop-gap is a limit on pages per seed.
