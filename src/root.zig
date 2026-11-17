@@ -29,6 +29,7 @@ pub const docserver = @import("docserver.zig");
 pub const sourcestats = @import("sourcestats.zig");
 pub const embed = @import("embed.zig");
 pub const identity = @import("identity.zig");
+pub const fallback = @import("fallback.zig");
 pub const optioninfo = @import("optioninfo.zig");
 pub const settinginfo = @import("settinginfo.zig");
 pub const officetext = @import("officetext.zig");
@@ -81,6 +82,7 @@ test {
     _ = sourcestats;
     _ = embed;
     _ = identity;
+    _ = fallback;
     _ = optioninfo;
     _ = settinginfo;
     _ = officetext;

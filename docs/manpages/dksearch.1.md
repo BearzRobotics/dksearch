@@ -545,6 +545,33 @@ A node can have an identity: an Ed25519 key pair. **dksearch node-key** makes it
 
 Give your node id to the owners of peers that should recognise you, and ask for theirs. A replica source needs `identity_file` pointing at the identity file (for bound keys) and, to pin, `node`. The Access page shows this node's id.
 
+FALLBACK TO OTHER SEARCH ENGINES
+Off by default. When the local search finds few results (or none) the page can offer other engines, in two independent ways. The second sends your visitors' words to a third party, which is why the whole feature is opt-in and says so on the page:
+
+    [fallback]
+    enabled = true
+    min_results = 3            # offer it when fewer local results than this were found (0: always)
+    engines = ["duckduckgo", "brave", "google", "bing"]   # link-out buttons
+    # auto = false             # true: ask the providers by itself when results are few (otherwise on request)
+    # max_per_minute = 30      # most requests this server makes to providers in a minute, all visitors together
+
+    [[fallback.engine]]        # your own link-out; the address has exactly one %s where the words go
+    name = "kagi"
+    label = "Kagi"
+    url = "https://kagi.com/search?q=%s"
+
+    [[fallback.provider]]      # web results this server asks for itself
+    kind = "searxng"           # brave, searxng or marginalia
+    url = "https://searx.example.org"    # searxng: your instance, with JSON output enabled
+    # key_file = "/etc/dksearch/brave.key"   # brave: a Brave Search API token; marginalia: its API key (default "public")
+    # timeout_ms = 4000   count = 5
+
+**Link-out buttons** (`engines`): the page shows "Search elsewhere: DuckDuckGo · Brave Search · ..." as plain links that open the engine with the words (`rel="noopener noreferrer nofollow"`). This server sends nothing; the visitor's browser goes to the engine only if they click. Built in: `duckduckgo`, `brave`, `google`, `bing`, `startpage`, `ecosia`, `qwant`, `mojeek`, `marginalia`, `kagi`, `yandex`, `wikipedia`, `archive`, `github`, `stackoverflow`; add your own with `[[fallback.engine]]`.
+
+**Providers**: the page offers *Also search the web through NAME* (a link with `web=1`); with `auto = true` it asks without being asked. The answers appear under the local results, as *From the web*, each marked external with the provider's name; they are never ranked with the local results and never stored. Their text and addresses are untrusted: sizes are bounded, only `http` and `https` links are kept, everything is escaped. The API takes `fallback=1` (see **dksearch-api**(7)). Brave Search API (`kind = "brave"`) needs a subscription token from Brave; a SearXNG instance (`kind = "searxng"`) is yours or one you trust, and must allow `format=json`; Marginalia (`kind = "marginalia"`) has a public API. Scraping Google or Bing result pages is not offered: it breaks their terms and changes without notice; their link-outs are.
+
+Nothing is shown to a caller who cannot search at all (an empty anonymous scope), and no provider is asked on pages after the first. Because requests go out on behalf of anonymous visitors, `max_per_minute` limits them for the whole server, and the server prints a note at start when providers are on.
+
 PEERS AND FEDERATED SEARCH
 A *peer* is another dksearch node you may ask. Peers are configured by hand, never discovered:
 

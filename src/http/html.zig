@@ -118,7 +118,17 @@ pub const Form = struct {
     default_note: ?[]const u8 = null,
     /// The visitor asked for every source although a default collection is set (`sources=all`); kept when paging.
     all_sources: bool = false,
+    /// Other search engines the visitor can open with these words (opt-in fallback; nothing is sent by this server).
+    fallback_links: []const FallbackLink = &.{},
+    /// Web results this server asked for from the providers, and who answered; shown below the local results.
+    external: []const dk.fallback.External = &.{},
+    external_notes: []const []const u8 = &.{},
+    /// Where to go to ask the providers (`web=1`) when that is not done by itself; null: not offered.
+    web_href: ?[]const u8 = null,
+    web_names: []const u8 = "",
 };
+
+pub const FallbackLink = struct { label: []const u8, href: []const u8 };
 
 /// `12345` as `12,345`.
 pub fn writeCount(w: *Writer, n: u64) Writer.Error!void {
@@ -397,6 +407,7 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
         try w.writeAll("</ol>\n");
     }
 
+    try writeFallback(w, f);
     if (offset > 0 or page.has_more) {
         try w.writeAll("<nav class=\"pager\" aria-label=\"Pages\"><span>");
         if (offset > 0) try writePagerLink(w, f, offset -| page_size, "&larr; Previous");
@@ -405,6 +416,55 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
         try w.writeAll("</span></nav>\n");
     }
     try w.writeAll("</main></body></html>\n");
+}
+
+/// The opt-in fallback: a way to ask the providers, their results (labelled external), and links to other engines.
+fn writeFallback(w: *Writer, f: Form) Writer.Error!void {
+    if (f.web_href) |href| {
+        try w.writeAll("<p class=\"muted small\"><a href=\"");
+        try writeEscaped(w, href);
+        try w.writeAll("\">Also search the web through ");
+        try writeEscaped(w, f.web_names);
+        try w.writeAll("</a> (your words are sent to that service)</p>\n");
+    }
+    if (f.external.len > 0) {
+        try w.writeAll("<h2 class=\"external-heading\">From the web</h2><p class=\"muted small\">Results from other services, asked for by this server with your words; they are not part of this index and not ranked with it.</p><ol class=\"results external\">\n");
+        for (f.external) |e| {
+            try w.writeAll("<li><a class=\"title\" href=\"");
+            try writeEscaped(w, e.url);
+            try w.writeAll("\" rel=\"noopener noreferrer nofollow\">");
+            try writeEscaped(w, e.title);
+            try w.writeAll("</a><div class=\"url\">");
+            try writeEscaped(w, e.url);
+            try w.writeAll("</div>");
+            if (e.snippet) |s| {
+                try w.writeAll("<p class=\"snippet\">");
+                try writeEscaped(w, s);
+                try w.writeAll("</p>");
+            }
+            try w.writeAll("<div class=\"source\">via ");
+            try writeEscaped(w, e.provider);
+            try w.writeAll(" &middot; external</div></li>\n");
+        }
+        try w.writeAll("</ol>\n");
+    }
+    for (f.external_notes) |n| {
+        try w.writeAll("<p class=\"muted small\">");
+        try writeEscaped(w, n);
+        try w.writeAll("</p>\n");
+    }
+    if (f.fallback_links.len > 0) {
+        try w.writeAll("<p class=\"muted small\">Search elsewhere: ");
+        for (f.fallback_links, 0..) |l, i| {
+            if (i > 0) try w.writeAll(" &middot; ");
+            try w.writeAll("<a href=\"");
+            try writeEscaped(w, l.href);
+            try w.writeAll("\" rel=\"noopener noreferrer nofollow\">");
+            try writeEscaped(w, l.label);
+            try w.writeAll("</a>");
+        }
+        try w.writeAll("</p>\n");
+    }
 }
 
 /// How the query was read, and whether similar spellings were included.

@@ -97,6 +97,8 @@ pub const Services = struct {
     default_collection: ?[]const u8 = null,
     /// A document server that office files can be opened in (`[docserver]`).
     docserver: ?*const dk.docserver.Service = null,
+    /// Other search engines as a fallback (opt-in; null when `[fallback]` is off).
+    fallback: ?*const dk.fallback.Settings = null,
     /// This node's identity (signs answers to callers that sent a nonce) and the nonces already seen (so a signed
     /// request cannot be used twice). Both null when the node has no identity.
     identity: ?*const dk.identity.Identity = null,
@@ -542,7 +544,8 @@ const ApiHit = struct {
 const SemanticNote = struct { used: bool, model: ?[]const u8 = null, compared: u32 = 0, reason: ?[]const u8 = null };
 
 const PeerNote = struct { peer: []const u8, status: []const u8, ms: u32, results: u32, http_status: ?u16 = null, cached: bool = false };
-const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null, semantic: ?SemanticNote = null };
+const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null, semantic: ?SemanticNote = null, external: ?[]const dk.fallback.External = null, external_status: ?[]const ExternalStatus = null };
+const ExternalStatus = struct { provider: []const u8, status: []const u8 };
 
 const Federated = struct { hits: []const dk.search.Hit, notes: []const PeerNote };
 
@@ -773,6 +776,22 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
         for (r.page.hits, hits) |h, *out| out.* = try apiHit(arena, try withIdent(arena, services, h));
         return jsonResponse(arena, .ok, .{ .hits = hits, .has_more = r.page.has_more, .interpreted = r.page.interpreted, .fuzzy = r.page.fuzzy, .regex = .{ .examined = r.examined, .truncated = r.truncated } });
     }
+    // `fallback=1`: web results from the providers of `[fallback]` (this server sends the words to them).
+    var ext_results: ?[]const dk.fallback.External = null;
+    var ext_status: ?[]const ExternalStatus = null;
+    if (if (params.get("fallback")) |v| std.mem.eql(u8, v, "1") else false) {
+        if (services.fallback) |fb| if (fb.service) |svc| if (!services.scope.none() and q.offset == 0 and q.text.len > 0) {
+            const replies = try svc.ask(arena, params.get("q") orelse "");
+            var all: std.ArrayList(dk.fallback.External) = .empty;
+            const st = try arena.alloc(ExternalStatus, replies.len);
+            for (replies, st) |r, *s| {
+                s.* = .{ .provider = r.provider, .status = @tagName(r.status) };
+                try all.appendSlice(arena, r.results);
+            }
+            ext_results = all.items;
+            ext_status = st;
+        };
+    }
     var semantic: ?SemanticNote = null;
     const page = blk: {
         if (wantsSemantic(params)) {
@@ -793,7 +812,7 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
     const shown = if (fed) |f| f.hits else grouped;
     const hits = try arena.alloc(ApiHit, shown.len);
     for (shown, hits) |h, *out| out.* = try apiHit(arena, h);
-    return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null, .semantic = semantic });
+    return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null, .semantic = semantic, .external = ext_results, .external_status = ext_status });
 }
 
 /// `h` with its node-independent identity filled in (from its address, or the hash of its stored text).
@@ -1591,9 +1610,45 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         }
         form.peer_notes = notes;
     } else if (wantsPeers(params)) form.peers_on = true;
+    try applyFallback(arena, services, params, &form, shown.hits.len, q.offset);
     var aw: std.Io.Writer.Allocating = .init(arena);
     html.writeResults(&aw.writer, form, shown, q.offset, html_page_size) catch return error.OutOfMemory;
     return htmlResponse(arena, .ok, aw.written());
+}
+
+/// The opt-in fallback for the page: when the local search found few results, links to other engines and, if
+/// providers are configured, a way to ask them (or their results, with `web=1` or `fallback.auto`).
+fn applyFallback(arena: Allocator, services: Services, params: query.Params, form: *html.Form, local: usize, offset: u32) error{OutOfMemory}!void {
+    const fb = services.fallback orelse return;
+    if (services.scope.none() or offset != 0 or form.q.len == 0) return;
+    if (!fb.wanted(local)) return;
+    const links = try arena.alloc(html.FallbackLink, fb.engines.len);
+    for (fb.engines, links) |e, *l| l.* = .{ .label = e.label, .href = try dk.fallback.linkFor(arena, e.url, form.q) };
+    form.fallback_links = links;
+    const svc = fb.service orelse return;
+    const asked = if (params.get("web")) |v| std.mem.eql(u8, v, "1") else false;
+    if (!asked and !fb.auto) {
+        var names: std.ArrayList(u8) = .empty;
+        for (svc.providers, 0..) |p, i| {
+            if (i > 0) try names.appendSlice(arena, ", ");
+            try names.appendSlice(arena, p.name);
+        }
+        var enc: std.Io.Writer.Allocating = .init(arena);
+        query.writeEncoded(&enc.writer, form.q) catch return error.OutOfMemory;
+        form.web_href = try std.fmt.allocPrint(arena, "/search?q={s}&web=1", .{enc.written()});
+        form.web_names = names.items;
+        return;
+    }
+    const replies = try svc.ask(arena, form.q);
+    var ext: std.ArrayList(dk.fallback.External) = .empty;
+    var notes: std.ArrayList([]const u8) = .empty;
+    for (replies) |r| switch (r.status) {
+        .ok => try ext.appendSlice(arena, r.results),
+        .limited => try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: this server has reached its limit of web requests for this minute; try again shortly.", .{r.provider})),
+        .failed, .unavailable => try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: no answer.", .{r.provider})),
+    };
+    form.external = ext.items;
+    form.external_notes = notes.items;
 }
 
 fn renderHtml(arena: Allocator, status: http.Status, comptime f: fn (*std.Io.Writer) anyerror!void) error{OutOfMemory}!Response {
@@ -2739,6 +2794,51 @@ test "a key bound to a node works only with that node's signature on that very r
         has_sig = true;
     };
     try testing.expect(has_sig);
+}
+
+test "the fallback: nothing without it, links when local results are few, web results only when asked, labelled external" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const hit: dk.search.Hit = .{ .id = .{ 0x31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .connector = "n", .url = null, .title = "Lamp", .snippet = null, .score = 1 };
+    const one = [_]dk.search.Hit{hit};
+    var few: FakeSearch = .{ .result = .{ .hits = &one, .has_more = false } };
+    var none: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    // Off: no mention of other engines at all.
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, few.searcher(), .{}, .GET, "/search?q=lamp").body, "Search elsewhere") == null);
+    const engines = [_]dk.fallback.Engine{ dk.fallback.builtin("duckduckgo").?, .{ .name = "mine", .label = "Mine <b>", .url = "https://s.example.org/?q=%s" } };
+    var settings: dk.fallback.Settings = .{ .engines = &engines, .min_results = 3 };
+    const services: Services = .{ .fallback = &settings };
+    const page = handleServices(a, few.searcher(), services, .GET, "/search?q=odin+%26+ravens");
+    try testing.expect(std.mem.indexOf(u8, page.body, "Search elsewhere") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "https://duckduckgo.com/?q=odin+%26+ravens") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "Mine &lt;b&gt;") != null); // the label is escaped
+    try testing.expect(std.mem.indexOf(u8, page.body, "rel=\"noopener noreferrer nofollow\"") != null);
+    // Enough local results: the links are not shown; with the minimum at 0 they always are.
+    settings.min_results = 1;
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, few.searcher(), services, .GET, "/search?q=lamp").body, "Search elsewhere") == null);
+    settings.min_results = 0;
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, few.searcher(), services, .GET, "/search?q=lamp").body, "Search elsewhere") != null);
+    settings.min_results = 3;
+    // Nothing found at all: the links are there.
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, none.searcher(), services, .GET, "/search?q=zzz").body, "Search elsewhere") != null);
+    // Providers: offered, not asked by default; asked on request, a failure is said, the limit is said.
+    const provs = [_]dk.fallback.Provider{.{ .name = "mine", .kind = .searxng, .url = "http://127.0.0.1:1", .timeout_ms = 300 }};
+    const svc = try dk.fallback.Service.init(testing.allocator, testing.io, &provs, 2);
+    defer svc.deinit();
+    settings.service = svc;
+    const offered = handleServices(a, few.searcher(), services, .GET, "/search?q=lamp");
+    try testing.expect(std.mem.indexOf(u8, offered.body, "Also search the web through mine") != null);
+    try testing.expect(std.mem.indexOf(u8, offered.body, "From the web") == null);
+    const asked = handleServices(a, few.searcher(), services, .GET, "/search?q=lamp&web=1");
+    try testing.expect(std.mem.indexOf(u8, asked.body, "mine: no answer") != null);
+    // The API only with fallback=1, and not for a caller who cannot search.
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, few.searcher(), services, .GET, "/api/v1/search?q=lamp").body, "\"external\":null") != null);
+    const api = handleServices(a, few.searcher(), services, .GET, "/api/v1/search?q=lamp&fallback=1");
+    try testing.expect(std.mem.indexOf(u8, api.body, "\"external_status\":[{\"provider\":\"mine\"") != null);
+    const colls = [_]dk.config.Collection{.{ .name = "c", .sources = &.{"n"} }};
+    const closed: Services = .{ .fallback = &settings, .collections = &colls, .anonymous = &.{} };
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, few.searcher(), closed, .GET, "/search?q=lamp").body, "Search elsewhere") == null);
 }
 
 test "retrieval cache: the same answer twice, served from the cache, and a changed document is read again" {

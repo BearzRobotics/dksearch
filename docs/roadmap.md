@@ -6,7 +6,6 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 ## Next
 
-- **Fallback to other search engines (opt-in, off by default).** Link-out buttons for Brave, Google, Bing, DuckDuckGo and others, and server-side fallback through APIs (Brave Search API, a SearXNG instance, Marginalia) when local results are few, labelled as external. See the privacy notes in the decision record when it is written.
 - **Ollama, found and managed.** Detect a local Ollama, list, pull and remove models from the administration interface and the command line (never started silently, always confirmed), use it for embeddings and for an optional answer add-on over retrieved passages (the core stays retrieval only).
 - **Vector index.** A persistent index of every document's vector so semantic search can find documents the words missed, not only reorder lexical candidates.
 - **Known limits to remove:** recrawl by schedule per page (adaptive interval, conditional requests), regular expressions on characters instead of bytes, ZIM support tested on large real files.

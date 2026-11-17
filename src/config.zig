@@ -9,6 +9,7 @@
 const std = @import("std");
 const toml = @import("toml");
 const document = @import("document.zig");
+const fallback_mod = @import("fallback.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{
@@ -322,6 +323,30 @@ pub const Embeddings = struct {
     batch: u32 = 16,
 };
 
+/// Other search engines as a fallback (`[fallback]`), off unless `enabled`.
+pub const Fallback = struct {
+    enabled: bool = false,
+    min_results: u32 = 3,
+    /// Names of link-out engines to show: built in (see fallback.zig) or defined in `custom`.
+    engines: []const []const u8 = &.{},
+    custom: []const FallbackEngine = &.{},
+    providers: []const FallbackProvider = &.{},
+    auto: bool = false,
+    max_per_minute: u32 = 30,
+};
+
+pub const FallbackEngine = struct { name: []const u8, label: []const u8, url: []const u8 };
+
+pub const FallbackProvider = struct {
+    name: []const u8,
+    kind: []const u8,
+    url: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    key_file: ?[]const u8 = null,
+    timeout_ms: u32 = 4000,
+    count: u32 = 5,
+};
+
 /// A document server (OnlyOffice or Collabora) that office files can be opened in from the viewer.
 pub const DocServer = struct {
     /// `onlyoffice` or `collabora`.
@@ -361,6 +386,7 @@ pub const Config = struct {
     peers: []const Peer = &.{},
     docserver: ?DocServer = null,
     embeddings: ?Embeddings = null,
+    fallback: Fallback = .{},
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -379,7 +405,7 @@ const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_m
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
 const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
-const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings" };
+const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings", "fallback" };
 
 /// Parses and validates configuration text. `source_name` is only used in
 /// diagnostics (normally the file path).
@@ -549,6 +575,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     }
     cfg.docserver = try readDocServer(a, src, root, diag);
     cfg.embeddings = try readEmbeddings(a, src, root, diag);
+    cfg.fallback = try readFallback(a, src, root, diag);
     cfg.peers = try readPeers(a, src, root, diag);
     if (cfg.peers.len > 0 and cfg.node_name.len == 0) {
         diag.set(src, "node.name", "is required when peers are configured (peers show this name beside the results they get from here)", .{});
@@ -617,6 +644,127 @@ fn baseAddress(a: Allocator, src: []const u8, key: []const u8, text: []const u8,
         return error.InvalidValue;
     }
     return a.dupe(u8, url);
+}
+
+fn readFallback(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!Fallback {
+    const t = (try subTable(src, root, "fallback", diag)) orelse return .{};
+    try checkKeys(src, "fallback", t, &[_][]const u8{ "enabled", "min_results", "engines", "auto", "max_per_minute", "engine", "provider" }, diag);
+    var f: Fallback = .{};
+    if (try optBool(src, "fallback", t, "enabled", diag)) |b| f.enabled = b;
+    if (try optBool(src, "fallback", t, "auto", diag)) |b| f.auto = b;
+    if (try intIn(src, "fallback", t, "min_results", 0, 100, diag)) |n| f.min_results = @intCast(n);
+    if (try intIn(src, "fallback", t, "max_per_minute", 1, 10000, diag)) |n| f.max_per_minute = @intCast(n);
+    var nbuf: [128]u8 = undefined;
+    // Your own link-outs.
+    if (t.get("engine")) |v| {
+        const arr = switch (v) {
+            .array => |x| x,
+            else => {
+                diag.set(src, "fallback.engine", "expected an array of tables ([[fallback.engine]])", .{});
+                return error.WrongType;
+            },
+        };
+        const out = try a.alloc(FallbackEngine, arr.items.items.len);
+        for (arr.items.items, 0..) |item, i| {
+            const where = std.fmt.bufPrint(&nbuf, "fallback.engine[{d}]", .{i}) catch "fallback.engine";
+            const et = switch (item) {
+                .table => |x| x,
+                else => {
+                    diag.set(src, where, "expected a table", .{});
+                    return error.WrongType;
+                },
+            };
+            try checkKeys(src, where, et, &[_][]const u8{ "name", "label", "url" }, diag);
+            const name = try reqStr(src, where, et, "name", diag);
+            if (!validSourceName(name)) {
+                diag.set(src, where, "name must be letters, digits, - and _", .{});
+                return error.InvalidValue;
+            }
+            const url = try reqStr(src, where, et, "url", diag);
+            if (!fallback_mod.validTemplate(url)) {
+                diag.set(src, where, "url must be an http(s) address with exactly one %s where the words go, and no quotes or spaces", .{});
+                return error.InvalidValue;
+            }
+            out[i] = .{ .name = try a.dupe(u8, name), .label = if (try str(src, where, et, "label", diag)) |l| try a.dupe(u8, l) else try a.dupe(u8, name), .url = try a.dupe(u8, url) };
+        }
+        f.custom = out;
+    }
+    // Which link-outs to show.
+    if (t.get("engines")) |v| {
+        const list = try stringList(a, src, "fallback.engines", v, diag);
+        for (list) |name| {
+            var known = fallback_mod.builtin(name) != null;
+            for (f.custom) |c| if (std.mem.eql(u8, c.name, name)) {
+                known = true;
+            };
+            if (!known) {
+                diag.set(src, "fallback.engines", "unknown engine \"{s}\" (built in: see the manual; or define it as [[fallback.engine]])", .{name});
+                return error.InvalidValue;
+            }
+        }
+        f.engines = list;
+    }
+    // Providers this server asks itself.
+    if (t.get("provider")) |v| {
+        const arr = switch (v) {
+            .array => |x| x,
+            else => {
+                diag.set(src, "fallback.provider", "expected an array of tables ([[fallback.provider]])", .{});
+                return error.WrongType;
+            },
+        };
+        const out = try a.alloc(FallbackProvider, arr.items.items.len);
+        for (arr.items.items, 0..) |item, i| {
+            const where = std.fmt.bufPrint(&nbuf, "fallback.provider[{d}]", .{i}) catch "fallback.provider";
+            const pt = switch (item) {
+                .table => |x| x,
+                else => {
+                    diag.set(src, where, "expected a table", .{});
+                    return error.WrongType;
+                },
+            };
+            try checkKeys(src, where, pt, &[_][]const u8{ "name", "kind", "url", "key", "key_file", "timeout_ms", "count" }, diag);
+            const kind = try reqStr(src, where, pt, "kind", diag);
+            if (!std.mem.eql(u8, kind, "brave") and !std.mem.eql(u8, kind, "searxng") and !std.mem.eql(u8, kind, "marginalia")) {
+                diag.set(src, where, "kind must be \"brave\", \"searxng\" or \"marginalia\", got \"{s}\"", .{kind});
+                return error.InvalidValue;
+            }
+            const name = if (try str(src, where, pt, "name", diag)) |n| n else kind;
+            if (!validSourceName(name)) {
+                diag.set(src, where, "name must be letters, digits, - and _", .{});
+                return error.InvalidValue;
+            }
+            for (out[0..i]) |prev| if (std.mem.eql(u8, prev.name, name)) {
+                diag.set(src, where, "duplicate provider name \"{s}\"", .{name});
+                return error.InvalidValue;
+            };
+            var p: FallbackProvider = .{ .name = try a.dupe(u8, name), .kind = try a.dupe(u8, kind) };
+            if (try str(src, where, pt, "url", diag)) |u| p.url = try baseAddress(a, src, "fallback.provider.url", u, diag);
+            if (try str(src, where, pt, "key", diag)) |k| p.key = try a.dupe(u8, k);
+            if (try str(src, where, pt, "key_file", diag)) |k| p.key_file = try a.dupe(u8, k);
+            if (p.key != null and p.key_file != null) {
+                diag.set(src, where, "give either key or key_file, not both", .{});
+                return error.InvalidValue;
+            }
+            if (std.mem.eql(u8, kind, "searxng") and p.url == null) {
+                diag.set(src, where, "a searxng provider needs url (the instance, with JSON output enabled)", .{});
+                return error.InvalidValue;
+            }
+            if (std.mem.eql(u8, kind, "brave") and p.key == null and p.key_file == null) {
+                diag.set(src, where, "a brave provider needs key or key_file (a Brave Search API subscription token)", .{});
+                return error.InvalidValue;
+            }
+            if (try intIn(src, where, pt, "timeout_ms", 200, 30000, diag)) |n| p.timeout_ms = @intCast(n);
+            if (try intIn(src, where, pt, "count", 1, 20, diag)) |n| p.count = @intCast(n);
+            out[i] = p;
+        }
+        f.providers = out;
+    }
+    if (f.enabled and f.engines.len == 0 and f.providers.len == 0) {
+        diag.set(src, "fallback.enabled", "is true but there is nothing to show: list engines or add a [[fallback.provider]]", .{});
+        return error.InvalidValue;
+    }
+    return f;
 }
 
 fn readEmbeddings(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!?Embeddings {
@@ -1248,6 +1396,33 @@ test "collections and the anonymous access setting are read and checked" {
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = [\"a\"]\n[[collection]]\nname = \"x\"\nsources = [\"b\"]\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[access]\nanonymous_collections = [\"ghost\"]\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[[collection]]\nname = \"x\"\nsources = []\n", &d));
+}
+
+test "the fallback engines are read and checked, and are off unless asked for" {
+    var d: Diagnostic = .{};
+    var off = try loadFromSlice(testing.allocator, "t.toml", "", &d);
+    defer off.deinit();
+    try testing.expect(!off.fallback.enabled);
+    const ok = "[fallback]\nenabled = true\nmin_results = 5\nengines = [\"duckduckgo\", \"brave\", \"mine\"]\n[[fallback.engine]]\nname = \"mine\"\nlabel = \"My engine\"\nurl = \"https://s.example.org/?q=%s\"\n[[fallback.provider]]\nkind = \"searxng\"\nurl = \"https://searx.example.org/\"\ncount = 3\n[[fallback.provider]]\nkind = \"brave\"\nkey_file = \"/etc/brave.key\"\n";
+    var c = try loadFromSlice(testing.allocator, "t.toml", ok, &d);
+    defer c.deinit();
+    try testing.expect(c.fallback.enabled);
+    try testing.expectEqual(@as(u32, 5), c.fallback.min_results);
+    try testing.expectEqual(@as(usize, 3), c.fallback.engines.len);
+    try testing.expectEqualStrings("My engine", c.fallback.custom[0].label);
+    try testing.expectEqualStrings("searxng", c.fallback.providers[0].name);
+    try testing.expectEqualStrings("https://searx.example.org", c.fallback.providers[0].url.?);
+    const bad = [_][]const u8{
+        "[fallback]\nenabled = true\n", // nothing to show
+        "[fallback]\nengines = [\"nosuch\"]\n",
+        "[fallback]\nengines = []\n[[fallback.engine]]\nname = \"x\"\nurl = \"https://s/?q=\"\n",
+        "[fallback]\nengines = []\n[[fallback.engine]]\nname = \"x\"\nurl = \"javascript:%s\"\n",
+        "[fallback]\n[[fallback.provider]]\nkind = \"searxng\"\n",
+        "[fallback]\n[[fallback.provider]]\nkind = \"brave\"\n",
+        "[fallback]\n[[fallback.provider]]\nkind = \"bing\"\n",
+        "[fallback]\n[[fallback.provider]]\nkind = \"brave\"\nkey = \"a\"\nkey_file = \"b\"\n",
+    };
+    for (bad) |text| try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", text, &d));
 }
 
 test "embeddings are read and checked" {

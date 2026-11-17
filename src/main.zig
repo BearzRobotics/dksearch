@@ -1078,11 +1078,44 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         embed_service = .{ .client = embed_client.?, .vectors_path = vec_path };
     }
     defer if (embed_client) |c| c.deinit();
+    // Other search engines as a fallback: only with `[fallback] enabled = true`.
+    var fallback_service: ?*dk.fallback.Service = null;
+    var fallback_settings: dk.fallback.Settings = .{ .engines = &.{} };
+    var fallback_on = false;
+    if (cfg.fallback.enabled) {
+        const fa = arena_state.allocator();
+        var engines: std.ArrayList(dk.fallback.Engine) = .empty;
+        for (cfg.fallback.engines) |name| {
+            var found: ?dk.fallback.Engine = null;
+            for (cfg.fallback.custom) |c| if (std.mem.eql(u8, c.name, name)) {
+                found = .{ .name = c.name, .label = c.label, .url = c.url };
+            };
+            if (found == null) found = dk.fallback.builtin(name);
+            if (found) |e| engines.append(fa, e) catch return exit_io;
+        }
+        if (cfg.fallback.providers.len > 0) {
+            const provs = fa.alloc(dk.fallback.Provider, cfg.fallback.providers.len) catch return exit_io;
+            for (cfg.fallback.providers, provs) |p, *o| o.* = .{
+                .name = p.name,
+                .kind = std.meta.stringToEnum(dk.fallback.ProviderKind, p.kind).?,
+                .url = p.url,
+                .key = p.key,
+                .key_file = p.key_file,
+                .timeout_ms = p.timeout_ms,
+                .count = p.count,
+            };
+            fallback_service = dk.fallback.Service.init(gpa, io, provs, cfg.fallback.max_per_minute) catch return exit_io;
+        }
+        fallback_settings = .{ .engines = engines.items, .min_results = cfg.fallback.min_results, .auto = cfg.fallback.auto, .service = fallback_service };
+        fallback_on = true;
+        out(io, "note: fallback to other search engines is ON: the visitors' words can be sent to {d} service(s) (see [fallback])\n", .{cfg.fallback.providers.len});
+    }
+    defer if (fallback_service) |s| s.deinit();
     var source_stats = dk.sourcestats.Cache.init(gpa, io);
     defer source_stats.deinit();
     var retrieve_cache = dk.retrievecache.Cache.init(gpa, io, @as(usize, cfg.search.retrieve_cache_mb) * 1024 * 1024);
     defer retrieve_cache.deinit();
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .fallback = if (fallback_on) &fallback_settings else null, .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };
