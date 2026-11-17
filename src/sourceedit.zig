@@ -171,6 +171,106 @@ pub fn apply(gpa: Allocator, text: []const u8, edit: Edit, problem: *Problem) Er
     return out;
 }
 
+/// What the Add-a-peer form collects.
+pub const PeerSpec = struct {
+    name: []const u8,
+    url: []const u8,
+    /// The file the peer's key is read from; null keeps what the peer has (a key given inline stays too).
+    key_file: ?[]const u8 = null,
+    timeout_ms: u32 = 1500,
+    enabled: bool = true,
+};
+
+pub const PeerEdit = union(enum) {
+    /// Add a peer (`original` null) or replace the peer named `original`.
+    save: struct { original: ?[]const u8, spec: PeerSpec },
+    delete: []const u8,
+    set_enabled: struct { name: []const u8, enabled: bool },
+};
+
+/// Applies `edit` to the `[[peer]]` tables of the configuration text, like `apply` does for sources: the result is
+/// validated as a whole (so a peer without a `[node] name`, a bad address, a duplicate name are refused with the
+/// reason) and comments elsewhere are kept. A key written inline in the file is kept when a peer is saved.
+pub fn applyPeer(gpa: Allocator, text: []const u8, edit: PeerEdit, problem: *Problem) Error![]u8 {
+    var tdiag: toml.Diagnostic = .{};
+    var doc = toml.Document.parse(gpa, text, .{}, &tdiag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return problem.set("the configuration file has a syntax error (line {d}: {s}) and cannot be edited here; fix it by hand first", .{ tdiag.line, tdiag.message }),
+    };
+    defer doc.deinit();
+    const a = doc.allocator();
+    const array: *toml.Array = blk: {
+        if (doc.root.getPtr("peer")) |v| switch (v.*) {
+            .array => |arr| {
+                if (!arr.is_table_array) return problem.set("this file defines its peers in a form the editor cannot change (not [[peer]] tables); edit it by hand", .{});
+                break :blk arr;
+            },
+            else => return problem.set("`peer` in this file is not a list of [[peer]] tables; edit it by hand", .{}),
+        };
+        const arr = try a.create(toml.Array);
+        arr.* = .{ .is_table_array = true };
+        try doc.root.entries.put(a, try doc.dupe("peer"), .{ .array = arr });
+        break :blk arr;
+    };
+    switch (edit) {
+        .delete => |name| {
+            const i = indexOf(array, name) orelse return problem.set("there is no peer named \"{s}\"", .{name});
+            _ = array.items.orderedRemove(i);
+        },
+        .set_enabled => |se| {
+            const i = indexOf(array, se.name) orelse return problem.set("there is no peer named \"{s}\"", .{se.name});
+            const t = array.items.items[i].table;
+            if (se.enabled) {
+                _ = t.entries.orderedRemove("enabled");
+            } else {
+                try t.entries.put(a, try doc.dupe("enabled"), .{ .boolean = false });
+            }
+        },
+        .save => |sv| {
+            const spec = sv.spec;
+            if (!config.validSourceName(spec.name)) return problem.set("the name must be 1-64 characters of a-z, 0-9, '-' and '_', starting with a letter or digit", .{});
+            const existing = if (sv.original) |o| (indexOf(array, o) orelse return problem.set("there is no peer named \"{s}\"", .{o})) else null;
+            if (indexOf(array, spec.name)) |same| {
+                if (existing == null or existing.? != same) return problem.set("a peer named \"{s}\" already exists", .{spec.name});
+            }
+            // What a saved peer keeps from before: an inline key and a key file (unless a new key file is given).
+            var keep_key: ?toml.Value = null;
+            var keep_key_file: ?toml.Value = null;
+            const t: *toml.Table = if (existing) |i| blk: {
+                const old = array.items.items[i].table;
+                keep_key = old.get("key");
+                keep_key_file = old.get("key_file");
+                old.entries.clearRetainingCapacity();
+                old.key_comments.clearRetainingCapacity();
+                break :blk old;
+            } else blk: {
+                const nt = try a.create(toml.Table);
+                nt.* = .{ .kind = .explicit };
+                try array.items.append(a, .{ .table = nt });
+                break :blk nt;
+            };
+            try t.entries.put(a, try doc.dupe("name"), .{ .string = try doc.dupe(spec.name) });
+            try t.entries.put(a, try doc.dupe("url"), .{ .string = try doc.dupe(spec.url) });
+            if (spec.key_file) |kf| {
+                if (kf.len > 0) try t.entries.put(a, try doc.dupe("key_file"), .{ .string = try doc.dupe(kf) });
+            } else {
+                if (keep_key) |k| try t.entries.put(a, try doc.dupe("key"), k);
+                if (keep_key_file) |k| try t.entries.put(a, try doc.dupe("key_file"), k);
+            }
+            if (spec.timeout_ms != 1500) try t.entries.put(a, try doc.dupe("timeout_ms"), .{ .integer = @intCast(spec.timeout_ms) });
+            if (!spec.enabled) try t.entries.put(a, try doc.dupe("enabled"), .{ .boolean = false });
+        },
+    }
+    if (array.items.items.len == 0) _ = doc.root.entries.orderedRemove("peer");
+    const out = doc.toOwnedString(gpa) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return problem.set("the new configuration could not be written", .{}),
+    };
+    errdefer gpa.free(out);
+    try validate(gpa, out, problem);
+    return out;
+}
+
 /// Applies changes to settings (outside the `[[source]]` tables) and returns the new configuration
 /// text, validated as a whole like `apply`. Comments elsewhere in the file are kept.
 pub fn applySettings(gpa: Allocator, text: []const u8, changes: []const Setting, problem: *Problem) Error![]u8 {
@@ -484,4 +584,43 @@ test "settings are set, changed and removed; the rest of the file survives; bad 
     defer arena.deinit();
     try testing.expectEqualStrings("off", (try settingText(arena.allocator(), original, "search", "fuzzy")).?);
     try testing.expect((try settingText(arena.allocator(), original, "search", "nothing")) == null);
+}
+
+test "peers are added, kept when saved again, switched, removed, and refused with the reason" {
+    var problem: Problem = .{};
+    const a = testing.allocator;
+    // A peer needs a node name.
+    try testing.expectError(error.Invalid, applyPeer(a, "", .{ .save = .{ .original = null, .spec = .{ .name = "office", .url = "https://s.example.org" } } }, &problem));
+    try testing.expect(std.mem.indexOf(u8, problem.message(), "node.name") != null);
+    const node_cfg = "# my config\n[node]\nname = \"home\"\n";
+    const one = try applyPeer(a, node_cfg, .{ .save = .{ .original = null, .spec = .{ .name = "office", .url = "https://s.example.org", .key_file = "/etc/office.key", .timeout_ms = 800 } } }, &problem);
+    defer a.free(one);
+    try testing.expect(std.mem.indexOf(u8, one, "# my config") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "key_file = \"/etc/office.key\"") != null);
+    try testing.expect(std.mem.indexOf(u8, one, "timeout_ms = 800") != null);
+    // A second peer, a duplicate name refused, a bad address refused.
+    const two = try applyPeer(a, one, .{ .save = .{ .original = null, .spec = .{ .name = "lan", .url = "http://192.168.1.5:8080" } } }, &problem);
+    defer a.free(two);
+    try testing.expectError(error.Invalid, applyPeer(a, two, .{ .save = .{ .original = null, .spec = .{ .name = "lan", .url = "http://x:1" } } }, &problem));
+    try testing.expect(std.mem.indexOf(u8, problem.message(), "already exists") != null);
+    try testing.expectError(error.Invalid, applyPeer(a, two, .{ .save = .{ .original = null, .spec = .{ .name = "bad", .url = "ftp://x" } } }, &problem));
+    // Saving again keeps the key file; a new one replaces it; an inline key stays.
+    const again = try applyPeer(a, two, .{ .save = .{ .original = "office", .spec = .{ .name = "office", .url = "https://s2.example.org" } } }, &problem);
+    defer a.free(again);
+    try testing.expect(std.mem.indexOf(u8, again, "s2.example.org") != null and std.mem.indexOf(u8, again, "key_file = \"/etc/office.key\"") != null);
+    const inline_key = "[node]\nname = \"h\"\n[[peer]]\nname = \"p\"\nurl = \"http://h:1\"\nkey = \"dkk_secret\"\n";
+    const kept = try applyPeer(a, inline_key, .{ .save = .{ .original = "p", .spec = .{ .name = "p", .url = "http://h:2" } } }, &problem);
+    defer a.free(kept);
+    try testing.expect(std.mem.indexOf(u8, kept, "key = \"dkk_secret\"") != null);
+    // Off, on, removed (and the empty array goes).
+    const off = try applyPeer(a, two, .{ .set_enabled = .{ .name = "lan", .enabled = false } }, &problem);
+    defer a.free(off);
+    try testing.expect(std.mem.indexOf(u8, off, "enabled = false") != null);
+    const on = try applyPeer(a, off, .{ .set_enabled = .{ .name = "lan", .enabled = true } }, &problem);
+    defer a.free(on);
+    try testing.expect(std.mem.indexOf(u8, on, "enabled") == null);
+    const gone = try applyPeer(a, one, .{ .delete = "office" }, &problem);
+    defer a.free(gone);
+    try testing.expect(std.mem.indexOf(u8, gone, "peer") == null);
+    try testing.expectError(error.Invalid, applyPeer(a, one, .{ .delete = "nobody" }, &problem));
 }

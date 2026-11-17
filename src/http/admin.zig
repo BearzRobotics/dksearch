@@ -139,7 +139,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/zim", "/actions/zim", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -147,7 +147,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, access_page, action_peer_test, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, access_page, action_peer_test, action_peer_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -166,6 +166,7 @@ pub const App = struct {
             .{ "/access", .access_page },
             .{ "/actions/key-add", .action_key_add },
             .{ "/actions/peer-test", .action_peer_test },
+            .{ "/actions/peer-edit", .action_peer_edit },
             .{ "/actions/key-remove", .action_key_remove },
             .{ "/zim", .zim_page },
             .{ "/actions/zim", .action_zim },
@@ -219,7 +220,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_peer_test or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_peer_test or route == .action_peer_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -247,6 +248,7 @@ pub const App = struct {
             .zim_page => self.pageZim(arena, csrf, t.params),
             .access_page => self.pageAccess(arena, csrf, null, null),
             .action_peer_test => self.testPeer(arena, req, auth),
+            .action_peer_edit => self.editPeer(arena, req, auth),
             .action_key_add => self.addKey(arena, req, auth),
             .action_key_remove => self.removeKey(arena, req, auth),
             .action_zim => self.startZimDownload(arena, req, auth),
@@ -1190,12 +1192,14 @@ pub const App = struct {
     fn writePeers(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8) !void {
         try w.writeAll("<section class=\"card\"><h2>Peers</h2>");
         const svc = self.opts.peers orelse {
-            try w.writeAll("<p class=\"muted\">No peers. Other dksearch nodes you may ask are written as <code>[[peer]]</code> tables (name, url, key or key_file) next to <code>[node] name</code> in the configuration file, and are read at start. See the manual, <em>Peers and federated search</em>.</p></section>");
+            try w.writeAll("<p class=\"muted\">No peers yet. Peers are other dksearch nodes you may ask (see the manual, <em>Peers and federated search</em>). They are saved in the configuration file and start working after a restart.</p>");
+            try self.writePeerForm(w, csrf);
+            try w.writeAll("</section>");
             return;
         };
         try w.writeAll("<p class=\"muted\">This node is <strong>");
         try html.writeEscaped(w, self.opts.node_name);
-        try w.writeAll("</strong>. The search page and the API ask the peers when <code>peers=1</code> is given. Peers are set in the configuration file (read at start); <em>Test</em> asks a peer a small question now, which shows whether its address answers and it accepts the key.</p>");
+        try w.writeAll("</strong>. The search page and the API ask the peers when <code>peers=1</code> is given. Peers are set in the configuration file (read at start); <em>Test</em> asks a peer a small question now, which shows whether its address answers and it accepts the key. Changes made here are saved to the configuration file and apply after a restart.</p>");
         const infos = try svc.info(arena);
         try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Name</th><th>Address</th><th>Key</th><th>Last try</th><th>Last answered</th><th>Trouble</th><th></th></tr></thead><tbody>");
         const now = unixNow(self.io);
@@ -1225,10 +1229,102 @@ pub const App = struct {
                 try w.writeAll("\"><input type=\"hidden\" name=\"peer\" value=\"");
                 try html.writeEscaped(w, p.name);
                 try w.writeAll("\"><button type=\"submit\" class=\"btn\">Test</button></form>");
+                if (self.canEditConfig()) {
+                    for ([_][3][]const u8{ .{ "toggle", if (p.enabled) "Turn off" else "Turn on", if (p.enabled) "0" else "1" }, .{ "delete", "Remove", "" } }) |b| {
+                        try w.writeAll(" <form class=\"inline\" action=\"/actions/peer-edit\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+                        try html.writeEscaped(w, token);
+                        try w.print("\"><input type=\"hidden\" name=\"op\" value=\"{s}\"><input type=\"hidden\" name=\"enabled\" value=\"{s}\"><input type=\"hidden\" name=\"name\" value=\"", .{ b[0], b[2] });
+                        try html.writeEscaped(w, p.name);
+                        try w.print("\"><button type=\"submit\" class=\"btn{s}\">{s}</button></form>", .{ if (std.mem.eql(u8, b[0], "delete")) " danger" else "", b[1] });
+                    }
+                }
             }
             try w.writeAll("</td></tr>");
         }
-        try w.writeAll("</tbody></table></div></section>");
+        try w.writeAll("</tbody></table></div>");
+        try self.writePeerForm(w, csrf);
+        try w.writeAll("</section>");
+    }
+
+    fn canEditConfig(self: *App) bool {
+        return self.opts.config_path != null and self.opts.jobs != null;
+    }
+
+    fn writePeerForm(self: *App, w: *Io.Writer, csrf: ?[]const u8) !void {
+        if (csrf == null or !self.canEditConfig()) {
+            try w.writeAll("<p class=\"muted\">Adding peers here needs <code>admin.actions = true</code> and a server started with <code>--config</code>; otherwise write <code>[[peer]]</code> tables in the configuration file.</p>");
+            return;
+        }
+        try w.writeAll("<h3>Add a peer</h3><form class=\"stack\" action=\"/actions/peer-edit\" method=\"post\"><input type=\"hidden\" name=\"op\" value=\"save\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        try html.writeEscaped(w, csrf.?);
+        try w.writeAll("\"><label>This node's name <input name=\"node_name\" maxlength=\"64\" value=\"");
+        try html.writeEscaped(w, self.opts.node_name);
+        try w.writeAll("\" placeholder=\"home\"><small>Shown beside results other nodes get from here. Needed once.</small></label>");
+        try w.writeAll("<label>Peer name <input name=\"name\" maxlength=\"64\" required placeholder=\"office\"></label>");
+        try w.writeAll("<label>Address <input name=\"url\" maxlength=\"200\" required placeholder=\"https://search.example.org\"><small>The peer's address with no path.</small></label>");
+        try w.writeAll("<label>Key file <input name=\"key_file\" maxlength=\"300\" placeholder=\"/etc/dksearch/office.key\"><small>A file on this server holding the key the peer made for you (<code>dksearch api-key add</code> on the peer), readable only by you. Keys are not typed here.</small></label>");
+        try w.writeAll("<label>Time limit (ms) <input name=\"timeout_ms\" type=\"number\" min=\"100\" max=\"30000\" value=\"1500\"></label>");
+        try w.writeAll("<p><button type=\"submit\" class=\"btn\">Add the peer</button></p></form>");
+    }
+
+    fn editPeer(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const path = self.opts.config_path orelse return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "the server was started without --config, so there is no configuration file to edit" });
+        if (!self.canEditConfig()) return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "editing peers is not available here" });
+        const op = params.get("op") orelse "save";
+        const name = std.mem.trim(u8, params.get("name") orelse "", " ");
+        const edit: dk.sourceedit.PeerEdit = if (std.mem.eql(u8, op, "save")) blk: {
+            const timeout = std.fmt.parseInt(u32, std.mem.trim(u8, params.get("timeout_ms") orelse "1500", " "), 10) catch 1500;
+            const kf = std.mem.trim(u8, params.get("key_file") orelse "", " ");
+            break :blk .{ .save = .{ .original = null, .spec = .{ .name = name, .url = std.mem.trim(u8, params.get("url") orelse "", " "), .key_file = if (kf.len > 0) kf else null, .timeout_ms = timeout } } };
+        } else if (std.mem.eql(u8, op, "delete"))
+            .{ .delete = name }
+        else if (std.mem.eql(u8, op, "toggle"))
+            .{ .set_enabled = .{ .name = name, .enabled = if (params.get("enabled")) |v| std.mem.eql(u8, v, "1") else false } }
+        else
+            return actionFailure(arena, false, .{ .status = .bad_request, .code = "unknown_operation", .message = "op must be save, delete or toggle" });
+
+        self.edit_mutex.lockUncancelable(self.io);
+        defer self.edit_mutex.unlock(self.io);
+        const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_unreadable", .message = "cannot read the configuration file" }),
+        };
+        const csrf = try csrfCopy(arena, auth);
+        var problem: dk.sourceedit.Problem = .{};
+        // The node name first, when one was typed that differs from the file's (a peer cannot be saved without one).
+        var current = text;
+        if (std.mem.eql(u8, op, "save")) {
+            const nn = std.mem.trim(u8, params.get("node_name") orelse "", " ");
+            if (nn.len > 0) {
+                const have = try dk.sourceedit.settingText(arena, text, "node", "name");
+                if (have == null or !std.mem.eql(u8, have.?, nn)) {
+                    // Set without validating a half-done state: a node name alone is always valid.
+                    current = dk.sourceedit.applySettings(arena, text, &.{.{ .table = "node", .key = "name", .value = .{ .string = nn } }}, &problem) catch |e| switch (e) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.Invalid => return self.pageAccessWith(arena, csrf, try arena.dupe(u8, problem.message()), .bad_request),
+                    };
+                }
+            }
+        }
+        const new_text = dk.sourceedit.applyPeer(arena, current, edit, &problem) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => return self.pageAccessWith(arena, csrf, try arena.dupe(u8, problem.message()), .bad_request),
+        };
+        dk.sourceedit.writeFile(self.io, arena, path, new_text) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Io => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_not_writable", .message = "the configuration file could not be written (check its permissions); nothing was changed" }),
+        };
+        return self.pageAccessWith(arena, csrf, "Saved to the configuration file. Restart dksearch for the change to take effect.", .ok);
+    }
+
+    fn pageAccessWith(self: *App, arena: Allocator, csrf: ?[]const u8, notice: []const u8, status: http.Status) error{OutOfMemory}!Response {
+        var r = try self.pageAccess(arena, csrf, null, notice);
+        r.status = status;
+        return r;
     }
 
     fn testPeer(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
@@ -3431,4 +3527,53 @@ test "query testing page and API show scores, escape everything, and need sign-i
     // Without a searcher the page is absent.
     f.app.opts.searcher = null;
     try testing.expectEqual(http.Status.not_found, (try f.call(a, .GET, "/search?q=x", .{ .cookie = cookie })).status);
+}
+
+test "Access: peers are added to the configuration file, switched and removed from the page, with the reasons for refusals" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.toml", .data = "# mine\n" });
+    var pb: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}/c.toml", .{tmp.sub_path});
+    f.app.opts.config_path = path;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const page = try f.call(a, .GET, "/access", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, page.body, "Add a peer") != null);
+    const csrf = csrfOf(page.body);
+    const post = struct {
+        fn go(fx: *Fixture, ar: Allocator, ck: []const u8, token: []const u8, rest: []const u8) !Response {
+            return fx.call(ar, .POST, "/actions/peer-edit", .{ .cookie = ck, .body = try std.fmt.allocPrint(ar, "csrf={s}&{s}", .{ token, rest }) });
+        }
+    }.go;
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/peer-edit", .{ .cookie = cookie, .body = "csrf=wrong&op=save&name=x&url=http%3A%2F%2Fh" })).status);
+    // Refused with the reason: no node name, then a bad address.
+    const no_node = try post(&f, a, cookie, csrf, "op=save&name=office&url=https%3A%2F%2Fs.example.org");
+    try testing.expectEqual(http.Status.bad_request, no_node.status);
+    try testing.expect(std.mem.indexOf(u8, no_node.body, "node.name") != null);
+    const bad = try post(&f, a, cookie, csrf, "op=save&node_name=home&name=office&url=ftp%3A%2F%2Fx");
+    try testing.expectEqual(http.Status.bad_request, bad.status);
+    try testing.expect(std.mem.indexOf(u8, bad.body, "peer[0].url") != null);
+    try testing.expect(std.mem.indexOf(u8, try tmp.dir.readFileAlloc(testing.io, "c.toml", a, .limited(4096)), "peer") == null); // nothing was written
+    // Added.
+    const ok = try post(&f, a, cookie, csrf, "op=save&node_name=home&name=office&url=https%3A%2F%2Fs.example.org%2F&key_file=%2Fetc%2Foffice.key&timeout_ms=900");
+    try testing.expectEqual(http.Status.ok, ok.status);
+    try testing.expect(std.mem.indexOf(u8, ok.body, "Restart dksearch") != null);
+    const file = try tmp.dir.readFileAlloc(testing.io, "c.toml", a, .limited(4096));
+    try testing.expect(std.mem.indexOf(u8, file, "# mine") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "name = \"home\"") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "url = \"https://s.example.org") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "timeout_ms = 900") != null);
+    // Off, on, removed.
+    _ = try post(&f, a, cookie, csrf, "op=toggle&name=office&enabled=0");
+    try testing.expect(std.mem.indexOf(u8, try tmp.dir.readFileAlloc(testing.io, "c.toml", a, .limited(4096)), "enabled = false") != null);
+    _ = try post(&f, a, cookie, csrf, "op=delete&name=office");
+    try testing.expect(std.mem.indexOf(u8, try tmp.dir.readFileAlloc(testing.io, "c.toml", a, .limited(4096)), "office") == null);
+    try testing.expectEqual(http.Status.bad_request, (try post(&f, a, cookie, csrf, "op=delete&name=nobody")).status);
 }

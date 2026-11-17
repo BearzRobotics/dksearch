@@ -1,6 +1,6 @@
 # 0034: Peers and federated search
 
-Status: implemented for search, retrieval and a peer status and test panel; peers are edited in the configuration file.
+Status: implemented: search, retrieval, node-independent identity, answer cache, and a peer status, test and edit panel.
 
 ## Context
 
@@ -29,4 +29,4 @@ Status: implemented for search, retrieval and a peer status and test panel; peer
 - A node needs a key for each peer and the peer's operator must issue it; revoking the key ends the sharing at once.
 - Links to a peer's pages need browser access to that peer (no key in a browser); a proxy that adds the key is a later, explicit option.
 - Good answers are reused for `search.peer_cache_seconds` (default 30) per peer, query kind, query and page size, at most 200 entries; failures are never cached. Latency is traded against freshness of at most that long.
-- Still to do: editing peers from the administration interface.
+- Peers are added, switched and removed on the Access page, through the same validated, comment-preserving edit of the configuration file as sources; they apply after a restart. Keys are never entered in the browser: only a key file path.
