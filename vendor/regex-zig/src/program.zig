@@ -45,6 +45,8 @@ pub const Program = struct {
     group_count: u32,
     reg_count: u32,
     names: []const parse.Name,
+    /// Patterns over characters: a byte that is part of a non-ASCII character counts as a word byte for `\b`.
+    utf8: bool = false,
 
     pub fn deinit(prog: Program, gpa: std.mem.Allocator) void {
         gpa.free(prog.insts);
@@ -346,5 +348,6 @@ pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limit
         .group_count = parsed.group_count,
         .reg_count = 2 * (parsed.group_count + 1) + c.loop_slots,
         .names = names,
+        .utf8 = parsed.utf8,
     };
 }

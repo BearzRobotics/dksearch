@@ -320,3 +320,80 @@ test "posix_ere dialect" {
     // Case folding applies as in the other dialects.
     try expectSpanOpts("COPY", "a copy", .{ 2, 6 }, .{ .dialect = .posix_ere, .ignore_case = true });
 }
+
+// ---- UTF-8 mode: characters, not bytes ---------------------------------
+
+const u8mode: regex.Options = .{ .utf8 = true };
+
+test "utf8: a literal character is one unit, so a quantifier repeats the whole character" {
+    // In byte mode `é+` repeats the last byte; over characters it repeats é.
+    try expectSpanOpts("caf\u{e9}+", "caf\u{e9}\u{e9}\u{e9}!", .{ 0, 9 }, u8mode);
+    try expectSpanOpts("(?:\u{e9}\u{e8})+", "x\u{e9}\u{e8}\u{e9}\u{e8}y", .{ 1, 9 }, u8mode);
+    try expectSpanOpts("\u{65e5}{2}", "\u{65e5}\u{65e5}\u{65e5}", .{ 0, 6 }, u8mode);
+    try expectSpanOpts("\u{1F600}+", "a\u{1F600}\u{1F600}", .{ 1, 9 }, u8mode);
+}
+
+test "utf8: dot matches one whole character, never half of one" {
+    try expectSpanOpts("a.b", "a\u{e9}b", .{ 0, 4 }, u8mode);
+    try expectSpanOpts("a.b", "a\u{65e5}b", .{ 0, 5 }, u8mode);
+    try expectSpanOpts("a.b", "a\u{1F600}b", .{ 0, 6 }, u8mode);
+    try expectSpanOpts("^.$", "\u{e9}", .{ 0, 2 }, u8mode);
+    // Without the mode a two-byte character is two dots.
+    try expectSpanOpts("^.$", "\u{e9}", null, .{});
+    try expectSpanOpts("^..$", "\u{e9}", .{ 0, 2 }, .{});
+    // A newline is not matched by dot, as before.
+    try expectSpanOpts("a.b", "a\nb", null, u8mode);
+}
+
+test "utf8: classes hold characters, ranges and negations included" {
+    try expectSpanOpts("[\u{e0}-\u{ff}]+", "x\u{e9}\u{e8}\u{f1}y", .{ 1, 7 }, u8mode);
+    try expectSpanOpts("[\u{3b1}-\u{3c9}]+", "abc\u{3b1}\u{3b2}\u{3b3}d", .{ 3, 9 }, u8mode); // Greek letters
+    try expectSpanOpts("[a\u{e9}z]+", "xa\u{e9}zx", .{ 1, 5 }, u8mode);
+    try expectSpanOpts("[^a]", "\u{e9}", .{ 0, 2 }, u8mode); // a whole character, not half
+    try expectSpanOpts("^[^a]$", "\u{e9}", .{ 0, 2 }, u8mode);
+    try expectSpanOpts("^[^a]$", "\u{65e5}", .{ 0, 3 }, u8mode);
+    try expectSpanOpts("^[^\u{e9}]$", "\u{e9}", null, u8mode);
+    try expectSpanOpts("^[^\u{e9}]$", "\u{e8}", .{ 0, 2 }, u8mode);
+    try expectSpanOpts("[\u{1F600}-\u{1F64F}]", "x\u{1F602}", .{ 1, 5 }, u8mode); // four-byte characters
+    // A range across the one- to two-byte boundary.
+    try expectSpanOpts("[x-\u{e9}]+", "w xy\u{e9}\u{ea}", .{ 2, 6 }, u8mode);
+}
+
+test "utf8: escapes name code points" {
+    try expectSpanOpts("\\x{e9}", "caf\u{e9}", .{ 3, 5 }, u8mode);
+    try expectSpanOpts("\\x{65e5}", "\u{65e5}", .{ 0, 3 }, u8mode);
+    try expectSpanOpts("\\x{1F600}", "\u{1F600}", .{ 0, 4 }, u8mode);
+    try expectSpanOpts("[\\x{e0}-\\x{ff}]", "\u{e9}", .{ 0, 2 }, u8mode);
+    // In byte mode a code point above 0xFF is refused, as before.
+    try std.testing.expectError(error.Unsupported, regex.Regex.compile(gpa, "\\x{65e5}", .{}, null));
+    try std.testing.expectError(error.InvalidPattern, regex.Regex.compile(gpa, "\\x{D800}", u8mode, null));
+    try std.testing.expectError(error.InvalidPattern, regex.Regex.compile(gpa, "\\x{110000}", u8mode, null));
+}
+
+test "utf8: word characters include letters outside ASCII, word boundaries follow" {
+    try expectSpanOpts("^\\w+$", "caf\u{e9}", .{ 0, 5 }, u8mode);
+    try expectSpanOpts("^\\w+$", "\u{65e5}\u{672c}", .{ 0, 6 }, u8mode);
+    try expectSpanOpts("^\\W$", "\u{e9}", null, u8mode);
+    try expectSpanOpts("\\bcaf\u{e9}\\b", "un caf\u{e9} noir", .{ 3, 8 }, u8mode);
+    try expectSpanOpts("\\bcaf\\b", "caf\u{e9}", null, u8mode); // "caf" is part of a longer word
+    try expectSpanOpts("^\\d+$", "12\u{e9}", null, u8mode); // digits stay ASCII
+    try expectSpanOpts("^\\D$", "\u{e9}", .{ 0, 2 }, u8mode);
+    try expectSpanOpts("[\\w-]+", "caf\u{e9}-bar x", .{ 0, 9 }, u8mode);
+}
+
+test "utf8: bytes that are not valid UTF-8 are never matched by a character pattern and never crash" {
+    try expectSpanOpts("a.b", "a\xffb", null, u8mode);
+    try expectSpanOpts("a[^x]b", "a\x80b", null, u8mode);
+    try expectSpanOpts(".+", "\xff\xfe", null, u8mode);
+    try expectSpanOpts("ab", "\xff\xfeab\xc3", .{ 2, 4 }, u8mode); // ASCII text inside garbage is still found
+    // A truncated character at the end is not half-matched.
+    try expectSpanOpts("^.$", "\xc3", null, u8mode);
+    // The pattern itself must be valid UTF-8.
+    try std.testing.expectError(error.InvalidPattern, regex.Regex.compile(gpa, "a\xffb", u8mode, null));
+}
+
+test "utf8: POSIX ERE and case-insensitivity over ASCII still work" {
+    try expectSpanOpts("caf\u{e9}+", "caf\u{e9}\u{e9}", .{ 0, 7 }, .{ .utf8 = true, .dialect = .posix_ere });
+    try expectSpanOpts("CAF\u{e9}", "caf\u{e9}", .{ 0, 5 }, .{ .utf8 = true, .ignore_case = true }); // the ASCII part folds
+    try expectSpanOpts("a.c", "a\u{e9}c", .{ 0, 4 }, .{ .utf8 = true, .dialect = .posix_ere });
+}

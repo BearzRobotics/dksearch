@@ -65,3 +65,5 @@ Each record states the context, the options considered, the decision and who mad
 | 0047 | Cursor paging |
 | 0048 | Domain lists and safe search |
 | 0049 | Safe search that adults can turn off |
+| 0050 | Regular expressions over characters |
+| 0051 | Adaptive recrawl of pages |

@@ -187,7 +187,7 @@ pub const Searcher = struct {
                     try s.setReg(r, pos);
                     pc += 1;
                 },
-                .assertion => |a| if (check(a, hay, pos, search_start)) {
+                .assertion => |a| if (check(a, hay, pos, search_start, s.prog.utf8)) {
                     pc += 1;
                 } else {
                     ok = false;
@@ -249,25 +249,25 @@ pub const Searcher = struct {
     }
 };
 
-fn check(a: @import("ast.zig").Assertion, hay: []const u8, pos: usize, search_start: usize) bool {
+fn check(a: @import("ast.zig").Assertion, hay: []const u8, pos: usize, search_start: usize, utf8: bool) bool {
     return switch (a) {
         .line_start => pos == 0 or hay[pos - 1] == '\n',
         .line_end => pos == hay.len or hay[pos] == '\n',
         .text_start => pos == 0,
         .text_end => pos == hay.len,
         .text_end_or_final_newline => pos == hay.len or (pos + 1 == hay.len and hay[pos] == '\n'),
-        .word_boundary => wordBefore(hay, pos) != wordAfter(hay, pos),
-        .not_word_boundary => wordBefore(hay, pos) == wordAfter(hay, pos),
+        .word_boundary => wordBefore(hay, pos, utf8) != wordAfter(hay, pos, utf8),
+        .not_word_boundary => wordBefore(hay, pos, utf8) == wordAfter(hay, pos, utf8),
         .search_start => pos == search_start,
     };
 }
 
-fn wordBefore(hay: []const u8, pos: usize) bool {
-    return pos > 0 and ByteSet.isWordByte(hay[pos - 1]);
+fn wordBefore(hay: []const u8, pos: usize, utf8: bool) bool {
+    return pos > 0 and (ByteSet.isWordByte(hay[pos - 1]) or (utf8 and hay[pos - 1] >= 0x80));
 }
 
-fn wordAfter(hay: []const u8, pos: usize) bool {
-    return pos < hay.len and ByteSet.isWordByte(hay[pos]);
+fn wordAfter(hay: []const u8, pos: usize, utf8: bool) bool {
+    return pos < hay.len and (ByteSet.isWordByte(hay[pos]) or (utf8 and hay[pos] >= 0x80));
 }
 
 fn eqlBytes(a: []const u8, b: []const u8, ignore_case: bool) bool {

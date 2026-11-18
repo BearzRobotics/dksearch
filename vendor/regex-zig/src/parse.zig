@@ -59,7 +59,118 @@ pub const Parsed = struct {
     root: *const Node,
     group_count: u32,
     names: []const Name,
+    utf8: bool = false,
 };
+
+/// A range of code points.
+const Range = struct { lo: u32, hi: u32 };
+
+const max_cp: u32 = 0x10FFFF;
+
+/// The bytes of one UTF-8 sequence class: each position has a range of bytes.
+const ByteRange = struct { lo: u8, hi: u8 };
+
+/// Splits the code point range lo..hi into sequences of byte ranges, so that a byte-matching engine matches exactly the
+/// characters in it (the classic UTF-8 range splitting; surrogates are left out).
+fn utf8Sequences(arena: std.mem.Allocator, lo_in: u32, hi_in: u32, out: *std.ArrayList([]const ByteRange)) std.mem.Allocator.Error!void {
+    var lo = lo_in;
+    var hi = hi_in;
+    if (lo > hi) return;
+    // Never encode surrogates.
+    if (lo <= 0xDFFF and hi >= 0xD800) {
+        if (lo < 0xD800) try utf8Sequences(arena, lo, 0xD7FF, out);
+        if (hi > 0xDFFF) try utf8Sequences(arena, 0xE000, hi, out);
+        return;
+    }
+    // Split at the limits of one-, two- and three-byte sequences.
+    const limits = [_]u32{ 0x7F, 0x7FF, 0xFFFF };
+    for (limits) |m| {
+        if (lo <= m and hi > m) {
+            try utf8Sequences(arena, lo, m, out);
+            try utf8Sequences(arena, m + 1, hi, out);
+            return;
+        }
+    }
+    if (hi < 0x80) {
+        const seq = try arena.alloc(ByteRange, 1);
+        seq[0] = .{ .lo = @intCast(lo), .hi = @intCast(hi) };
+        try out.append(arena, seq);
+        return;
+    }
+    // Make the ranges of the continuation bytes full ranges where they can be.
+    var i: u5 = 1;
+    while (i < 4) : (i += 1) {
+        const m: u32 = (@as(u32, 1) << (6 * i)) - 1;
+        if ((lo & ~m) != (hi & ~m)) {
+            if ((lo & m) != 0) {
+                try utf8Sequences(arena, lo, lo | m, out);
+                try utf8Sequences(arena, (lo | m) + 1, hi, out);
+                return;
+            }
+            if ((hi & m) != m) {
+                try utf8Sequences(arena, lo, (hi & ~m) - 1, out);
+                try utf8Sequences(arena, hi & ~m, hi, out);
+                return;
+            }
+        }
+    }
+    var a: [4]u8 = undefined;
+    var b: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(@intCast(lo), &a) catch return;
+    _ = std.unicode.utf8Encode(@intCast(hi), &b) catch return;
+    const seq = try arena.alloc(ByteRange, n);
+    for (seq, 0..) |*r, k| r.* = .{ .lo = a[k], .hi = b[k] };
+    try out.append(arena, seq);
+    lo = 0;
+    hi = 0;
+}
+
+fn rangeLessThan(_: void, a: Range, b: Range) bool {
+    return a.lo < b.lo;
+}
+
+/// Sorted, merged ranges.
+fn mergeRanges(arena: std.mem.Allocator, ranges: []const Range) std.mem.Allocator.Error![]const Range {
+    const copy = try arena.dupe(Range, ranges);
+    std.mem.sort(Range, copy, {}, rangeLessThan);
+    var out: std.ArrayList(Range) = .empty;
+    for (copy) |r| {
+        if (out.items.len > 0 and r.lo <= out.items[out.items.len - 1].hi +| 1) {
+            if (r.hi > out.items[out.items.len - 1].hi) out.items[out.items.len - 1].hi = r.hi;
+        } else try out.append(arena, r);
+    }
+    return out.items;
+}
+
+/// The code points of 0x80..0x10FFFF that `ranges` (sorted, merged) do not contain.
+fn complementRanges(arena: std.mem.Allocator, ranges: []const Range) std.mem.Allocator.Error![]const Range {
+    var out: std.ArrayList(Range) = .empty;
+    var next: u32 = 0x80;
+    for (ranges) |r| {
+        if (r.hi < 0x80) continue;
+        const lo = @max(r.lo, 0x80);
+        if (lo > next) try out.append(arena, .{ .lo = next, .hi = lo - 1 });
+        next = @max(next, r.hi + 1);
+    }
+    if (next <= max_cp) try out.append(arena, .{ .lo = next, .hi = max_cp });
+    return out.items;
+}
+
+fn asciiPart(s: ByteSet) ByteSet {
+    return .{ .bits = .{ s.bits[0], s.bits[1], 0, 0 } };
+}
+
+fn invertAscii(s: ByteSet) ByteSet {
+    return .{ .bits = .{ ~s.bits[0], ~s.bits[1], 0, 0 } };
+}
+
+fn seqLen(lead: u8) usize {
+    if (lead < 0x80) return 1;
+    if (lead >= 0xC2 and lead <= 0xDF) return 2;
+    if (lead >= 0xE0 and lead <= 0xEF) return 3;
+    if (lead >= 0xF0 and lead <= 0xF4) return 4;
+    return 0;
+}
 
 const Flags = struct {
     ignore_case: bool = false,
@@ -82,6 +193,8 @@ const Parser = struct {
     max_backref: u32 = 0,
     backref_pos: usize = 0,
     diag: *Diagnostic,
+    /// Characters, not bytes: `.`, classes, escapes and literals work on whole UTF-8 characters.
+    utf8: bool = false,
 
     fn fail(p: *Parser, err: Error, pos: usize, msg: []const u8) Error {
         p.diag.* = .{ .pos = pos, .message = msg };
@@ -263,10 +376,12 @@ const Parser = struct {
             '(' => return p.parseGroup(),
             '[' => {
                 p.pos += 1;
+                if (p.utf8) return try p.parseClassUtf8();
                 return try p.node(.{ .set = try p.parseClass() });
             },
             '.' => {
                 p.pos += 1;
+                if (p.utf8) return try p.anyCharNode(p.flags.dot_all);
                 return try p.node(.{ .any = p.flags.dot_all });
             },
             '^' => {
@@ -288,10 +403,167 @@ const Parser = struct {
                 return try p.literal('{');
             },
             else => {
+                if (p.utf8 and c >= 0x80) return try p.charNode(try p.readCp());
                 p.pos += 1;
                 return try p.literal(c);
             },
         }
+    }
+
+    // ---- UTF-8 mode ------------------------------------------------------
+
+    /// Reads one character of the pattern (the cursor is on its first byte).
+    fn readCp(p: *Parser) Error!u32 {
+        const start = p.pos;
+        const n = seqLen(p.src[p.pos]);
+        if (n == 0 or p.pos + n > p.src.len) return p.fail(error.InvalidPattern, start, "the pattern is not valid UTF-8");
+        const cp = std.unicode.utf8Decode(p.src[p.pos .. p.pos + n]) catch return p.fail(error.InvalidPattern, start, "the pattern is not valid UTF-8");
+        p.pos += n;
+        return cp;
+    }
+
+    /// A character as a node: a byte for ASCII, otherwise a group of its bytes (so a quantifier applies to all of them).
+    fn charNode(p: *Parser, cp: u32) Error!*const Node {
+        if (cp < 0x80) return p.literal(@intCast(cp));
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(cp), &buf) catch return p.fail(error.InvalidPattern, p.pos, "not a valid code point");
+        const parts = try p.arena.alloc(*const Node, n);
+        for (parts, buf[0..n]) |*part, b| part.* = try p.node(.{ .byte = b });
+        const seq = try p.node(.{ .concat = parts });
+        return p.node(.{ .group = .{ .sub = seq, .index = null } });
+    }
+
+    fn seqNode(p: *Parser, seq: []const ByteRange) Error!*const Node {
+        const parts = try p.arena.alloc(*const Node, seq.len);
+        for (parts, seq) |*part, r| {
+            var s: ByteSet = .{};
+            s.addRange(r.lo, r.hi);
+            part.* = try p.node(.{ .set = s });
+        }
+        if (parts.len == 1) return parts[0];
+        return p.node(.{ .concat = parts });
+    }
+
+    /// A class over characters: `ascii` for the bytes below 0x80, `ranges` for the code points above. Negation covers
+    /// all characters.
+    fn classNode(p: *Parser, ascii_in: ByteSet, ranges_in: []const Range, negate: bool) Error!*const Node {
+        var ascii = asciiPart(ascii_in);
+        var ranges = try mergeRanges(p.arena, ranges_in);
+        if (negate) {
+            ascii = invertAscii(ascii);
+            ranges = try complementRanges(p.arena, ranges);
+        }
+        var alts: std.ArrayList(*const Node) = .empty;
+        if (ascii.bits[0] != 0 or ascii.bits[1] != 0) try alts.append(p.arena, try p.node(.{ .set = ascii }));
+        var seqs: std.ArrayList([]const ByteRange) = .empty;
+        for (ranges) |r| try utf8Sequences(p.arena, @max(r.lo, 0x80), r.hi, &seqs);
+        for (seqs.items) |seq| try alts.append(p.arena, try p.seqNode(seq));
+        if (alts.items.len == 0) return p.node(.{ .set = .{} }); // matches nothing
+        if (alts.items.len == 1) return alts.items[0];
+        return p.node(.{ .alt = alts.items });
+    }
+
+    /// `.` over characters: any ASCII byte (not a newline unless `dot_all`) or any whole multi-byte character.
+    fn anyCharNode(p: *Parser, dot_all: bool) Error!*const Node {
+        var ascii: ByteSet = .{};
+        ascii.addRange(0, 0x7F);
+        if (!dot_all) ascii.bits[0] &= ~(@as(u64, 1) << '\n');
+        return p.classNode(ascii, &.{.{ .lo = 0x80, .hi = max_cp }}, false);
+    }
+
+    /// `\d \w \s \h` and their capitals over characters: digits, spaces and hex digits are ASCII; every non-ASCII
+    /// character counts as a word character, and so as a non-digit, non-space.
+    fn classEscapeNode(p: *Parser, c: u8) Error!?*const Node {
+        const base = p.classEscape(std.ascii.toLower(c)) orelse return null;
+        const upper = std.ascii.isUpper(c);
+        const word = std.ascii.toLower(c) == 'w';
+        const nonascii = if (upper) !word else word;
+        const ascii = if (upper) invertAscii(base) else asciiPart(base);
+        if (nonascii) return try p.classNode(ascii, &.{.{ .lo = 0x80, .hi = max_cp }}, false);
+        return try p.classNode(ascii, &.{}, false);
+    }
+
+    /// A class `[...]` over characters (the cursor is just past '[').
+    fn parseClassUtf8(p: *Parser) Error!*const Node {
+        const open = p.pos - 1;
+        try p.enter();
+        defer p.leave();
+        var ascii: ByteSet = .{};
+        var ranges: std.ArrayList(Range) = .empty;
+        const negate = p.eat('^');
+        var first = true;
+        while (true) {
+            const c = p.peek() orelse return p.fail(error.InvalidPattern, open, "unterminated character class");
+            if (c == ']' and !first) {
+                p.pos += 1;
+                break;
+            }
+            first = false;
+            if (c == '[') {
+                if (p.startsWith("[:")) {
+                    if (try p.posixClass()) |s| {
+                        ascii.unionWith(asciiPart(s));
+                        continue;
+                    }
+                }
+                p.pos += 1;
+                // A nested class: its characters join this one (a negated nested class is not supported over characters).
+                const inner = p.pos;
+                _ = inner;
+                return p.fail(error.Unsupported, open, "nested character classes over characters");
+            }
+            if (c == '&' and p.startsWith("&&")) return p.fail(error.Unsupported, p.pos, "class intersection &&");
+            const lo = (try p.classItemUtf8(&ascii, &ranges)) orelse continue;
+            if (p.peek() == '-' and p.pos + 1 < p.src.len and p.src[p.pos + 1] != ']') {
+                const save = p.pos;
+                p.pos += 1;
+                if (p.peek().? == '[') {
+                    p.pos = save;
+                    p.addCp(&ascii, &ranges, lo, lo);
+                    continue;
+                }
+                var scratch_ascii: ByteSet = .{};
+                var scratch_ranges: std.ArrayList(Range) = .empty;
+                const hi = (try p.classItemUtf8(&scratch_ascii, &scratch_ranges)) orelse {
+                    p.addCp(&ascii, &ranges, lo, lo);
+                    p.addCp(&ascii, &ranges, '-', '-');
+                    ascii.unionWith(scratch_ascii);
+                    try ranges.appendSlice(p.arena, scratch_ranges.items);
+                    continue;
+                };
+                if (hi < lo) return p.fail(error.InvalidPattern, save, "character class range is reversed");
+                p.addCp(&ascii, &ranges, lo, hi);
+            } else p.addCp(&ascii, &ranges, lo, lo);
+        }
+        if (p.flags.ignore_case) ascii.addAsciiCaseCounterparts();
+        return p.classNode(ascii, ranges.items, negate);
+    }
+
+    fn addCp(p: *Parser, ascii: *ByteSet, ranges: *std.ArrayList(Range), lo: u32, hi: u32) void {
+        if (lo < 0x80) ascii.addRange(@intCast(lo), @intCast(@min(hi, 0x7F)));
+        if (hi >= 0x80) ranges.append(p.arena, .{ .lo = @max(lo, 0x80), .hi = hi }) catch {};
+    }
+
+    /// One element of a class over characters: its code point, or null after adding a class escape (\d, \w, ...).
+    fn classItemUtf8(p: *Parser, ascii: *ByteSet, ranges: *std.ArrayList(Range)) Error!?u32 {
+        const c = p.src[p.pos];
+        if (c != '\\' or p.dialect == .posix_ere) return try p.readCp();
+        const at = p.pos;
+        p.pos += 1;
+        const e = p.peek() orelse return p.fail(error.InvalidPattern, at, "pattern ends with a backslash");
+        p.pos += 1;
+        if (p.classEscape(std.ascii.toLower(e))) |base| {
+            const upper = std.ascii.isUpper(e);
+            const word = std.ascii.toLower(e) == 'w';
+            const nonascii = if (upper) !word else word;
+            ascii.unionWith(if (upper) invertAscii(base) else asciiPart(base));
+            if (nonascii) try ranges.append(p.arena, .{ .lo = 0x80, .hi = max_cp });
+            return null;
+        }
+        if (e == 'b') return 0x08;
+        if (e == 'p' or e == 'P') return p.fail(error.Unsupported, at, "Unicode property \\p{...}");
+        if (try p.byteEscape(e, at)) |b| return b;
+        return p.fail(error.InvalidPattern, at, "unknown escape sequence in class");
     }
 
     fn literal(p: *Parser, c: u8) Error!*const Node {
@@ -467,7 +739,7 @@ const Parser = struct {
 
     /// A single-byte escape (after the backslash): \n \t \xHH \0oo and escaped
     /// punctuation. The cursor is just past the escape letter.
-    fn byteEscape(p: *Parser, c: u8, at: usize) Error!?u8 {
+    fn byteEscape(p: *Parser, c: u8, at: usize) Error!?u32 {
         switch (c) {
             'n' => return '\n',
             't' => return '\t',
@@ -485,7 +757,7 @@ const Parser = struct {
                     v = v * 8 + (d - '0');
                     p.pos += 1;
                 }
-                return @intCast(v);
+                return v;
             },
             'x' => {
                 var digits: []const u8 = undefined;
@@ -501,8 +773,10 @@ const Parser = struct {
                 }
                 const v = std.fmt.parseInt(u32, digits, 16) catch
                     return p.fail(error.InvalidPattern, at, "invalid hexadecimal escape");
-                if (v > 0xff) return p.fail(error.Unsupported, at, "code point above 0xFF (Unicode matching not implemented)");
-                return @intCast(v);
+                if (p.utf8) {
+                    if (v > max_cp or (v >= 0xD800 and v <= 0xDFFF)) return p.fail(error.InvalidPattern, at, "not a valid code point");
+                } else if (v > 0xff) return p.fail(error.Unsupported, at, "code point above 0xFF (needs the UTF-8 mode)");
+                return v;
             },
             else => {
                 if (std.ascii.isAlphanumeric(c)) return null;
@@ -518,7 +792,9 @@ const Parser = struct {
         p.pos += 1;
 
         if (p.dialect == .posix_ere) return p.posixEscape(c, at);
-        if (p.classEscape(c)) |s| return try p.node(.{ .set = s });
+        if (p.utf8) {
+            if (try p.classEscapeNode(c)) |n| return n;
+        } else if (p.classEscape(c)) |s| return try p.node(.{ .set = s });
         switch (c) {
             'b' => return try p.node(.{ .assertion = .word_boundary }),
             'B' => return try p.node(.{ .assertion = .not_word_boundary }),
@@ -556,7 +832,7 @@ const Parser = struct {
             },
             else => {},
         }
-        if (try p.byteEscape(c, at)) |b| return try p.literal(b);
+        if (try p.byteEscape(c, at)) |b| return if (p.utf8) try p.charNode(b) else try p.literal(@intCast(b));
         return p.fail(error.InvalidPattern, at, "unknown escape sequence");
     }
 
@@ -564,7 +840,7 @@ const Parser = struct {
     /// boundaries and back-references; anything else is the character itself.
     fn posixEscape(p: *Parser, c: u8, at: usize) Error!*const Node {
         switch (c) {
-            'w', 'W', 's', 'S' => return try p.node(.{ .set = p.classEscape(c).? }),
+            'w', 'W', 's', 'S' => return if (p.utf8) (try p.classEscapeNode(c)).? else try p.node(.{ .set = p.classEscape(c).? }),
             'b' => return try p.node(.{ .assertion = .word_boundary }),
             'B' => return try p.node(.{ .assertion = .not_word_boundary }),
             '<', '>' => return p.fail(error.Unsupported, at, "word-start and word-end anchors \\< and \\>"),
@@ -576,7 +852,13 @@ const Parser = struct {
                 }
                 return try p.node(.{ .backref = .{ .index = n, .ignore_case = p.flags.ignore_case } });
             },
-            else => return try p.literal(c),
+            else => {
+                if (p.utf8 and c >= 0x80) {
+                    p.pos -= 1;
+                    return try p.charNode(try p.readCp());
+                }
+                return try p.literal(c);
+            },
         }
     }
 
@@ -655,7 +937,7 @@ const Parser = struct {
         }
         if (e == 'b') return 0x08; // \b inside a class is backspace
         if (e == 'p' or e == 'P') return p.fail(error.Unsupported, at, "Unicode property \\p{...}");
-        if (try p.byteEscape(e, at)) |b| return b;
+        if (try p.byteEscape(e, at)) |b| return @intCast(b);
         return p.fail(error.InvalidPattern, at, "unknown escape sequence in class");
     }
 
@@ -725,6 +1007,7 @@ pub fn parse(
     ignore_case: bool,
     limits: Limits,
     diag: *Diagnostic,
+    utf8: bool,
 ) Error!Parsed {
     diag.* = .{};
     if (pattern.len > limits.max_pattern_len) {
@@ -738,10 +1021,11 @@ pub fn parse(
         .limits = limits,
         .flags = .{ .ignore_case = ignore_case, .line_anchors = dialect == .oniguruma, .dot_all = dialect == .posix_ere },
         .diag = diag,
+        .utf8 = utf8,
     };
     const root = try p.parseAlt();
     if (p.pos < pattern.len) return p.fail(error.InvalidPattern, p.pos, "unmatched ')'");
     if (p.max_backref > p.group_count)
         return p.fail(error.InvalidPattern, p.backref_pos, "reference to a group that does not exist");
-    return .{ .root = root, .group_count = p.group_count, .names = p.names.items };
+    return .{ .root = root, .group_count = p.group_count, .names = p.names.items, .utf8 = utf8 };
 }

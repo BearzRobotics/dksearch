@@ -21,6 +21,11 @@ pub const Options = struct {
     dialect: Dialect = .perl,
     ignore_case: bool = false,
     limits: Limits = .{},
+    /// Characters, not bytes: `.`, classes, escapes and literals match whole UTF-8 characters, `\\w` includes every
+    /// non-ASCII character, and a word boundary falls between a word and a non-word character. Case-insensitive matching
+    /// stays ASCII only. A haystack that is not valid UTF-8 never crashes the matcher; bytes that are not part of a valid
+    /// character are matched by nothing but a literal byte pattern.
+    utf8: bool = false,
 };
 
 /// A compiled pattern. Immutable after compile, so it may be shared between
@@ -35,7 +40,7 @@ pub const Regex = struct {
         const d = diag orelse &scratch;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
-        const parsed = try parse.parse(arena_state.allocator(), pattern, options.dialect, options.ignore_case, options.limits, d);
+        const parsed = try parse.parse(arena_state.allocator(), pattern, options.dialect, options.ignore_case, options.limits, d, options.utf8);
         const prog = try program.compile(gpa, parsed, options.limits, d);
         return .{ .prog = prog, .limits = options.limits };
     }

@@ -77,7 +77,7 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days" };
 
 // ------------------------------------------------------------ validation
 
@@ -175,6 +175,13 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     _ = try needString(source, "validators_file", false, diag);
     try boolOption(source, "hidden_links", diag);
     try boolOption(source, "allow_unbanned_onions", diag);
+    try boolOption(source, "recrawl_adaptive", diag);
+    try intOption(source, "recrawl_min_hours", 1, 24 * 30, diag);
+    try intOption(source, "recrawl_max_days", 1, 365, diag);
+    if ((source.optionBool("recrawl_adaptive") orelse false) and source.optionString("validators_file") == null) {
+        diag.set("", key(&kbuf, source, "recrawl_adaptive"), "needs validators_file (where the crawler keeps what it learned about each page)", .{});
+        return error.InvalidValue;
+    }
     _ = try needString(source, "seeds_sections", false, diag);
     _ = try needString(source, "seeds_skip", false, diag);
     inline for (.{ "tor_socks", "i2p_proxy" }) |k| if (try needString(source, k, false, diag)) |v| if (hidden.parseProxy(v) == null) {
@@ -215,6 +222,12 @@ pub const CrawlConnector = struct {
     /// A Tor SOCKS5 proxy and an I2P HTTP proxy, when `.onion` and `.i2p` sites may be crawled (docs/decisions/0044).
     tor: ?std.Io.net.IpAddress,
     i2p: ?std.Io.net.IpAddress,
+    /// Per-page recrawl schedule (needs `validators_file`): a page at the depth limit is asked again only when its own
+    /// interval has passed. The interval grows by a fifth when the page did not change and shrinks by a fifth when it did,
+    /// between `recrawl_min_hours` and `recrawl_max_days`.
+    recrawl_adaptive: bool,
+    recrawl_min_s: u32,
+    recrawl_max_s: u32,
     /// For a TOML seeds file: the sections to take (comma-separated names; empty: all) and the sections to leave out.
     seeds_sections: ?[]const u8,
     seeds_skip: ?[]const u8,
@@ -266,6 +279,9 @@ pub const CrawlConnector = struct {
             .tor = if (source.optionString("tor_socks")) |v| hidden.parseProxy(v) else null,
             .i2p = if (source.optionString("i2p_proxy")) |v| hidden.parseProxy(v) else null,
             .hidden_links = source.optionBool("hidden_links") orelse false,
+            .recrawl_adaptive = source.optionBool("recrawl_adaptive") orelse false,
+            .recrawl_min_s = @intCast((source.optionInt("recrawl_min_hours") orelse 6) * 3600),
+            .recrawl_max_s = @intCast((source.optionInt("recrawl_max_days") orelse 60) * 86400),
             .seeds_sections = if (source.optionString("seeds_sections")) |v| try gpa.dupe(u8, v) else null,
             .seeds_skip = if (source.optionString("seeds_skip")) |v| try gpa.dupe(u8, v) else null,
         };
@@ -570,9 +586,13 @@ pub const CrawlConnector = struct {
             const url = f.next() orelse continue;
             const etag = f.next() orelse continue;
             const lm = f.next() orelse continue;
-            if (url.len == 0 or (etag.len == 0 and lm.len == 0) or parseUrl(url) == null) continue;
+            // Optional schedule fields: the hash of the body (hex), the interval (seconds) and when it is due.
+            const hash = std.fmt.parseInt(u64, f.next() orelse "", 16) catch 0;
+            const interval = std.fmt.parseInt(u32, f.next() orelse "", 10) catch 0;
+            const due = std.fmt.parseInt(i64, f.next() orelse "", 10) catch 0;
+            if (url.len == 0 or (etag.len == 0 and lm.len == 0 and interval == 0) or parseUrl(url) == null) continue;
             if (into.count() >= max_validators) break;
-            into.put(arena, url, .{ .etag = if (etag.len > 0) etag else null, .last_modified = if (lm.len > 0) lm else null }) catch return;
+            into.put(arena, url, .{ .etag = if (etag.len > 0) etag else null, .last_modified = if (lm.len > 0) lm else null, .hash = hash, .interval = interval, .due = due }) catch return;
         }
     }
 
@@ -583,7 +603,7 @@ pub const CrawlConnector = struct {
         defer out.deinit(self.gpa);
         const add = struct {
             fn one(list: *std.ArrayList(u8), gpa: Allocator, url: []const u8, v: Validator) void {
-                list.print(gpa, "{s}\t{s}\t{s}\n", .{ url, v.etag orelse "", v.last_modified orelse "" }) catch {};
+                list.print(gpa, "{s}\t{s}\t{s}\t{x}\t{d}\t{d}\n", .{ url, v.etag orelse "", v.last_modified orelse "", v.hash, v.interval, v.due }) catch {};
             }
         }.one;
         sh.mutex.lockUncancelable(self.io);
@@ -879,7 +899,24 @@ const Host = struct {
 /// What the workers of one run share. `mutex` guards the host table, the visited set and the position
 /// bookkeeping; the counters are atomic.
 /// What a server said about a page that lets us ask "has it changed?" next time.
-const Validator = struct { etag: ?[]const u8, last_modified: ?[]const u8 };
+const Validator = struct {
+    etag: ?[]const u8,
+    last_modified: ?[]const u8,
+    /// Wyhash of the body the last time it was fetched (0: unknown), the page's own recrawl interval in seconds
+    /// (0: not scheduled) and when it is next due (Unix seconds).
+    hash: u64 = 0,
+    interval: u32 = 0,
+    due: i64 = 0,
+};
+
+/// The next interval of a page: the first time it is seen it is `start`; after that a fifth longer when it did not change
+/// and a fifth shorter when it did, always within `lo` and `hi`.
+pub fn nextInterval(previous: u32, changed: bool, first: bool, lo: u32, hi: u32) u32 {
+    const start: u64 = 24 * 3600;
+    var n: u64 = if (first or previous == 0) start else if (changed) previous * 4 / 5 else previous * 6 / 5;
+    n = std.math.clamp(n, lo, hi);
+    return @intCast(n);
+}
 const max_validators = 2_000_000;
 const max_validators_bytes = 512 * 1024 * 1024;
 
@@ -890,6 +927,8 @@ const Shared = struct {
     fresh: std.StringHashMapUnmanaged(Validator) = .empty,
     /// Pages the server said had not changed (answered 304).
     not_modified: std.atomic.Value(u64) = .init(0),
+    /// Pages left alone because their own interval had not passed (`recrawl_adaptive`).
+    not_due: std.atomic.Value(u64) = .init(0),
     hosts: std.StringHashMapUnmanaged(*Host) = .empty,
     /// Every URL fetched or queued this run, so none is requested twice.
     visited: std.StringHashMapUnmanaged(void) = .empty,
@@ -1261,11 +1300,20 @@ const Run = struct {
         // A page at the depth limit has no links to follow, so a server that says it has not changed lets us skip it.
         const leaf = t.depth >= self.conn.max_depth;
         const cond: ?Validator = if (leaf and self.conn.validators_file != null) self.sh.old.get(t.url) else null;
+        const adaptive = leaf and self.conn.recrawl_adaptive and self.conn.validators_file != null;
+        const now_s: i64 = Io.Clock.real.now(self.conn.io).toSeconds();
+        // A scheduled page whose interval has not passed is left alone: no request at all.
+        if (adaptive) if (cond) |c| if (c.due > now_s) {
+            _ = self.sh.not_due.fetchAdd(1, .monotonic);
+            return .skipped;
+        };
         const got = switch (try self.get(a, t.url, t.site, accept_pages, self.conn.max_page_bytes, t.root, cond)) {
             .stopped => return .stopped,
             .skipped => return .skipped,
             .unchanged => {
                 _ = self.sh.not_modified.fetchAdd(1, .monotonic);
+                // Not changed: its interval grows, and it is asked again when that has passed.
+                if (adaptive) if (cond) |c| try self.rememberSchedule(t.url, c, c.hash, nextInterval(c.interval, false, c.interval == 0, self.conn.recrawl_min_s, self.conn.recrawl_max_s), now_s);
                 return .skipped;
             },
             .page => |p| p,
@@ -1278,7 +1326,14 @@ const Run = struct {
             .stopped => return .stopped,
             .stored, .skipped => {},
         }
-        if (leaf and self.conn.validators_file != null and (got.resp.etag != null or got.resp.last_modified != null)) try self.rememberValidators(t.url, got.resp);
+        if (adaptive) {
+            // Compare the body with what it was last time: a different one shortens the interval, the same one lengthens it.
+            const hash = std.hash.Wyhash.hash(0, got.resp.body);
+            const before: Validator = cond orelse .{ .etag = null, .last_modified = null };
+            const changed = cond == null or before.hash == 0 or before.hash != hash;
+            const v: Validator = .{ .etag = got.resp.etag, .last_modified = got.resp.last_modified };
+            try self.rememberSchedule(t.url, v, hash, nextInterval(before.interval, changed, cond == null, self.conn.recrawl_min_s, self.conn.recrawl_max_s), now_s);
+        } else if (leaf and self.conn.validators_file != null and (got.resp.etag != null or got.resp.last_modified != null)) try self.rememberValidators(t.url, got.resp);
         if (t.depth >= self.conn.max_depth) return stored.result;
         for (stored.links) |link| {
             if (out.items.len >= max_level_items) break;
@@ -1289,6 +1344,22 @@ const Run = struct {
             try out.append(gpa, .{ .url = keep, .depth = t.depth + 1, .seed = t.seed, .site = t.site });
         }
         return stored.result;
+    }
+
+    /// Remembers a page's validators and its schedule: when it is next due.
+    fn rememberSchedule(self: *Run, url: []const u8, v: Validator, hash: u64, interval: u32, now_s: i64) error{OutOfMemory}!void {
+        const io = self.conn.io;
+        self.sh.mutex.lockUncancelable(io);
+        defer self.sh.mutex.unlock(io);
+        if (self.sh.fresh.count() >= max_validators) return;
+        const owned_url = try self.arena.dupe(u8, url);
+        try self.sh.fresh.put(self.arena, owned_url, .{
+            .etag = if (v.etag) |e| try self.arena.dupe(u8, e) else null,
+            .last_modified = if (v.last_modified) |l| try self.arena.dupe(u8, l) else null,
+            .hash = hash,
+            .interval = interval,
+            .due = now_s + interval,
+        });
     }
 
     fn rememberValidators(self: *Run, url: []const u8, resp: fetch.Response) error{OutOfMemory}!void {
@@ -1689,6 +1760,100 @@ test "a site on the ban list (given as a hash) is not contacted at all, seed or 
     try testing.expectEqual(@as(usize, 0), got.ids.items.len);
     try testing.expectEqual(@as(usize, 0), proxy.connections); // not even robots.txt
     try testing.expectEqual(@as(u64, 2), ctl.reasonCounts()[@backingInt(api.Reason.banned)]);
+}
+
+test "recrawl on a schedule: pages not due are not asked, unchanged ones wait longer, changed ones sooner" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/robots.txt", .status = 404 },
+        .{ .path = "/a", .body = "<html><head><title>A</title></head><body>page a with an etag</body></html>", .etag = "\"v1\"" },
+        .{ .path = "/b", .body = "<html><head><title>B</title></head><body>page b with no validator</body></html>" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ub: [2][96]u8 = undefined;
+    const seeds = try std.fmt.allocPrint(testing.allocator, "{s}\n{s}\n", .{ srv.url(&ub[0], "/a"), srv.url(&ub[1], "/b") });
+    defer testing.allocator.free(seeds);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "seeds.txt", .data = seeds });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPathFile(testing.io, "seeds.txt", &pbuf);
+    const seeds_path = try testing.allocator.dupe(u8, pbuf[0..n]);
+    defer testing.allocator.free(seeds_path);
+    const vpath = try std.fmt.allocPrint(testing.allocator, "{s}.validators", .{seeds_path});
+    defer testing.allocator.free(vpath);
+    const opts = [_]config.Option{
+        .{ .key = "user_agent", .value = .{ .string = "dksearch-test/1.0 (+https://example.org/bot)" } },
+        .{ .key = "seeds_file", .value = .{ .string = seeds_path } },
+        .{ .key = "validators_file", .value = .{ .string = vpath } },
+        .{ .key = "recrawl_adaptive", .value = .{ .boolean = true } },
+    };
+    var conn = try CrawlConnector.init(testing.allocator, testing.io, .{ .name = "web", .kind = "crawl", .options = &opts });
+    defer conn.deinit();
+    conn.delay_ms = 0;
+    conn.timeout_s = 5;
+    conn.workers = 1;
+    conn.max_depth = 0;
+    const Step = struct {
+        fn run(c: *CrawlConnector) !usize {
+            var got: Collect = .{};
+            defer got.deinit();
+            var ctl: api.Control = .{};
+            _ = try c.connector().run(got.sink(), &ctl, null);
+            return got.ids.items.len;
+        }
+        /// Rewrites field `index` of every line of the file (tab separated) to `value`.
+        fn setField(dir: std.Io.Dir, path_name: []const u8, index: usize, value: []const u8, only_url_part: ?[]const u8) !void {
+            const text = try dir.readFileAlloc(testing.io, path_name, testing.allocator, .limited(1 << 16));
+            defer testing.allocator.free(text);
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(testing.allocator);
+            var lines = std.mem.splitScalar(u8, text, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                const hit = if (only_url_part) |u| std.mem.indexOf(u8, line, u) != null else true;
+                var f = std.mem.splitScalar(u8, line, '\t');
+                var i: usize = 0;
+                while (f.next()) |field| : (i += 1) {
+                    if (i > 0) try out.append(testing.allocator, '\t');
+                    try out.appendSlice(testing.allocator, if (hit and i == index) value else field);
+                }
+                try out.append(testing.allocator, '\n');
+            }
+            try dir.writeFile(testing.io, .{ .sub_path = path_name, .data = out.items });
+        }
+    };
+    // First run: both pages fetched; each gets the first interval (a day) and a due time, /b without any validator.
+    try testing.expectEqual(@as(usize, 2), try Step.run(&conn));
+    const saved = try tmp.dir.readFileAlloc(testing.io, "seeds.txt.validators", testing.allocator, .limited(4096));
+    defer testing.allocator.free(saved);
+    try testing.expect(std.mem.indexOf(u8, saved, "\t86400\t") != null);
+    try testing.expect(std.mem.indexOf(u8, saved, "/b\t") != null);
+    const requests_a = srv.count("/a");
+    // Again at once: nothing is due, so nothing is requested at all.
+    try testing.expectEqual(@as(usize, 0), try Step.run(&conn));
+    try testing.expectEqual(requests_a, srv.count("/a"));
+    // Both come due: /a is asked conditionally (304), /b fetched again with the same text; both intervals grow by a fifth.
+    try Step.setField(tmp.dir, "seeds.txt.validators", 5, "1", null);
+    _ = try Step.run(&conn);
+    try testing.expectEqual(@as(usize, 1), srv.conditional);
+    const grown = try tmp.dir.readFileAlloc(testing.io, "seeds.txt.validators", testing.allocator, .limited(4096));
+    defer testing.allocator.free(grown);
+    var count: usize = 0;
+    var it = std.mem.splitSequence(u8, grown, "\t103680\t");
+    while (it.next()) |_| count += 1;
+    try testing.expectEqual(@as(usize, 3), count); // two entries with 103680 seconds (a day and a fifth)
+    // /b's text is said to have been different last time, and it is due: the interval shortens.
+    try Step.setField(tmp.dir, "seeds.txt.validators", 3, "1234", "/b");
+    try Step.setField(tmp.dir, "seeds.txt.validators", 5, "1", "/b");
+    _ = try Step.run(&conn);
+    const shorter = try tmp.dir.readFileAlloc(testing.io, "seeds.txt.validators", testing.allocator, .limited(4096));
+    defer testing.allocator.free(shorter);
+    try testing.expect(std.mem.indexOf(u8, shorter, "\t82944\t") != null); // 103680 * 4 / 5
+    // The interval is kept within its bounds.
+    try testing.expectEqual(@as(u32, 21600), nextInterval(1000, true, false, 21600, 86400));
+    try testing.expectEqual(@as(u32, 86400), nextInterval(86000, false, false, 21600, 86400));
+    try testing.expectEqual(@as(u32, 86400), nextInterval(0, false, true, 3600, 864000));
 }
 
 test "a TOML seeds file gives its sections' sites; sections can be chosen and left out" {

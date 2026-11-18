@@ -217,6 +217,9 @@ pub const Service = struct {
                 .ere => .posix_ere,
             },
             .ignore_case = req.ignore_case,
+            // Characters, not bytes: `.` and classes match whole characters, `é+` repeats the letter, `\w` includes letters
+            // outside ASCII (ADR 0050).
+            .utf8 = true,
             .limits = .{
                 .max_pattern_len = lim.max_pattern_bytes,
                 .max_depth = lim.max_depth,
@@ -435,6 +438,32 @@ test "the regex keeps matching candidates and marks the match" {
     try testing.expectEqual(@as(u32, 3), r.examined);
     try testing.expect(std.mem.indexOf(u8, r.page.hits[0].snippet.?, "\x02123-456\x03") != null);
     try testing.expect(std.mem.indexOf(u8, r.page.hits[1].snippet.?, "\x0299-100\x03") != null);
+}
+
+test "the regex works on characters: letters outside ASCII, repetition of one, and the marked match is whole" {
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.add("a", "Le caf\u{e9} est ouvert, tr\u{e8}s tard.");
+    try f.add("b", "Le cafe est ferme.");
+    try f.add("c", "Le caf\u{e9}\u{e9}\u{e9} du coin");
+    try f.add("d", "\u{65e5}\u{672c}\u{8a9e} cafe");
+    var svc = f.service(.{});
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: PatternDiag = .{};
+    // One dot is one letter, whether it is two bytes long or one.
+    const dot = try svc.run(a, f.index.searcher(), .{ .text = "caf\u{e9} cafe OR caf\u{e9}\u{e9}\u{e9} OR cafe" }, .{ .pattern = "caf. est" }, &diag);
+    try testing.expectEqual(@as(usize, 2), dot.page.hits.len); // "café est" and "cafe est"
+    // `\u{e9}+` repeats the letter, not its last byte.
+    const rep = try svc.run(a, f.index.searcher(), .{ .text = "du coin" }, .{ .pattern = "caf\u{e9}+ du" }, &diag);
+    try testing.expectEqual(@as(usize, 1), rep.page.hits.len);
+    try testing.expect(std.mem.indexOf(u8, rep.page.hits[0].snippet.?, "\x02caf\u{e9}\u{e9}\u{e9} du\x03") != null);
+    // A word of letters outside ASCII, and a class of them.
+    const word = try svc.run(a, f.index.searcher(), .{ .text = "cafe" }, .{ .pattern = "^\\W*[\u{65e5}-\u{9fff}]+\\s" }, &diag);
+    try testing.expectEqual(@as(usize, 1), word.page.hits.len);
+    // The highlighted match never cuts a character in two.
+    for ([_]search.Page{ dot.page, rep.page, word.page }) |pg| for (pg.hits) |h| try testing.expect(std.unicode.utf8ValidateSlice(h.snippet.?));
 }
 
 test "case-insensitive flag, POSIX ERE dialect and paging by match" {
