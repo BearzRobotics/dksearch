@@ -346,3 +346,13 @@ main.docpage { max-width: none; padding: 1rem 1.5rem 3rem; }
 ol.steps { list-style: none; margin: 0.6rem 0 0; padding: 0; display: grid; gap: 0.7rem; }
 ol.steps li { padding-left: 0; }
 ol.steps li > strong:first-of-type { margin-left: 0.15rem; }
+
+/* The image gallery of the Images button. */
+.gallery { list-style: none; margin: 1.2rem 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); gap: 0.7rem; }
+.gallery li { margin: 0; }
+.gallery a { display: block; color: inherit; text-decoration: none; border: 1px solid var(--border); border-radius: 0.5rem; overflow: hidden; }
+.gallery img, .gallery .nopic { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: var(--card, #f6f8fa); }
+.gallery .nopic { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 0.8rem; }
+.gallery .cap { display: block; padding: 0.3rem 0.5rem; font-size: 0.78rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gallery a:hover, .gallery a:focus-visible { border-color: var(--accent); }
+form.search button.secondary { background: none; color: var(--fg); border: 1px solid var(--border); }

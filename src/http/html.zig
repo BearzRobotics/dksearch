@@ -130,6 +130,11 @@ pub const Form = struct {
     did_you_mean: ?[]const u8 = null,
     /// Excerpts shown per result (1 to 5); kept by the page links.
     snippets: u8 = 1,
+    /// The Images button was used: only pictures, as a gallery. `gallery_ok` says per result whether the picture itself can
+    /// be shown (its original is served); `page_size` is the number of results a page holds.
+    images: bool = false,
+    gallery_ok: []const bool = &.{},
+    page_size: u32 = 10,
     /// What to say about safe search (nothing when it is not in use on this server).
     safe_note: SafeNote = .none,
     /// Search by meaning: offered when the server has an embedding model; ticked when this search used it; and what to
@@ -338,9 +343,9 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
     try w.writeAll("<form class=\"search\" action=\"/search\" method=\"get\" role=\"search\">" ++
         "<input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Search\" autofocus value=\"");
     try writeEscaped(w, f.q);
-    try w.writeAll("\"><button type=\"submit\">Search</button>");
+    try w.writeAll("\"><button type=\"submit\">Search</button><button type=\"submit\" name=\"images\" value=\"1\" class=\"secondary\">Images</button>");
     const open = if (f.language.len > 0 or f.picked.len > 0 or f.sort.len > 0 or f.peers_on) " open" else "";
-    try w.print("<details{s}><summary><span>Filters</span><a class=\"tips\" href=\"/help/search\">Search tips</a></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
+    try w.print("<details{s}><summary><span>Filters</span></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
     try writeEscaped(w, f.language);
     try w.writeAll("\"></label>");
     try writeSourcePicker(w, f);
@@ -481,6 +486,8 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
             try writeEscaped(w, d);
             try w.writeAll("</strong></a>?</p>");
         }
+    } else if (f.images) {
+        try writeGallery(w, f, page.hits);
     } else {
         try w.writeAll("<ol class=\"results\" start=\"");
         try w.print("{d}", .{offset + 1});
@@ -616,6 +623,31 @@ fn writeHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
         try w.writeAll("</div>");
     }
     try finishHit(w, h);
+}
+
+/// Pictures as a grid: the picture itself from this server when its original is served (the browser scales it; nothing is
+/// stored or resized here), otherwise the file name; each links to the document page.
+fn writeGallery(w: *Writer, f: Form, hits: []const dk.search.Hit) Writer.Error!void {
+    try w.writeAll("<ul class=\"gallery\">\n");
+    for (hits, 0..) |h, i| {
+        const label = h.title orelse h.url orelse "(untitled)";
+        try w.writeAll("<li><a href=\"");
+        try writeViewHref(w, h);
+        try w.writeAll("\" title=\"");
+        try writeEscaped(w, label);
+        try w.writeAll("\">");
+        if (i < f.gallery_ok.len and f.gallery_ok[i]) {
+            try w.writeAll("<img loading=\"lazy\" decoding=\"async\" alt=\"");
+            try writeEscaped(w, label);
+            try w.writeAll("\" src=\"");
+            try writeViewHref(w, h);
+            try w.writeAll("/file\">");
+        } else try w.writeAll("<span class=\"nopic\">no preview</span>");
+        try w.writeAll("<span class=\"cap\">");
+        try writeEscaped(w, label);
+        try w.writeAll("</span></a></li>\n");
+    }
+    try w.writeAll("</ul>\n");
 }
 
 fn finishHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
@@ -849,6 +881,7 @@ fn writePagerLink(w: *Writer, f: Form, offset: u32, label_html: []const u8) Writ
     if (f.exact_only) try w.writeAll("&amp;fuzzy=0");
     if (f.snippets > 1) try w.print("&amp;snippets={d}", .{f.snippets});
     if (f.semantic_checked) try w.writeAll("&amp;semantic=1");
+    if (f.images) try w.writeAll("&amp;images=1");
     if (offset > 0) try w.print("&amp;offset={d}", .{offset});
     try w.writeAll("\">");
     try w.writeAll(label_html);
@@ -937,7 +970,7 @@ pub fn writeHelpRegex(w: *Writer, limits: ?dk.regexsearch.Limits) Writer.Error!v
         .{ "\\b[A-Z]{2,}\\b", "an ALL-CAPS word of two or more letters" },
     };
     for (ex) |r| try w.print("<tr><td><code>{s}</code></td><td>{s}</td></tr>", .{ r[0], r[1] });
-    try w.writeAll("</tbody></table></div>\n<h3>Limits to know about</h3><ul><li>The pattern is matched on bytes, not characters, so <code>.</code> matches one byte of a character like &eacute; and Unicode classes such as <code>\\p{L}</code> are not available.</li><li>A pattern that takes too long on the documents it is tried on is refused with an explanation: make it simpler, for example avoid nesting <code>(a+)+</code>.</li><li>The pattern is part of the query, so the words and filters next to it can still use quotes, OR, NOT and so on (see <a href=\"/help/search\">search tips</a>).</li></ul><p><a href=\"/\">&larr; Back to search</a></p></main></body></html>\n");
+    try w.writeAll("</tbody></table></div>\n<h3>Limits to know about</h3><ul><li>The pattern is matched on characters: <code>.</code> is one letter such as &eacute;, <code>[&agrave;-&yuml;]</code> is a range of letters and <code>\\w</code> includes letters outside ASCII. Unicode properties such as <code>\\p{L}</code> are not available, and case-insensitive matching only folds ASCII letters.</li><li>A pattern that takes too long on the documents it is tried on is refused with an explanation: make it simpler, for example avoid nesting <code>(a+)+</code>.</li><li>The pattern is part of the query, so the words and filters next to it can still use quotes, OR, NOT and so on (see <a href=\"/help/search\">search tips</a>).</li></ul><p><a href=\"/\">&larr; Back to search</a></p></main></body></html>\n");
 }
 
 pub fn writeError(w: *Writer, status_text: []const u8, message: []const u8) Writer.Error!void {

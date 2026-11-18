@@ -26,6 +26,8 @@ const config = @import("../config.zig");
 const api = @import("../connector.zig");
 const doc = @import("../document.zig");
 const avmeta = @import("../avmeta.zig");
+const dk_image = @import("../image.zig");
+const dk_exif = @import("../exif.zig");
 const htmltext = @import("../htmltext.zig");
 const officetext = @import("../officetext.zig");
 const ziparchive = @import("../ziparchive.zig");
@@ -34,7 +36,7 @@ pub const kind = "files";
 pub const default_max_file_bytes: u32 = 4 * 1024 * 1024;
 pub const hard_max_file_bytes: u32 = 64 * 1024 * 1024;
 const checkpoint_every = 100;
-const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text", "pdf_workers", "max_pdf_bytes", "pdf_timeout_seconds", "media", "office", "html", "code" };
+const allowed_options = [_][]const u8{ "path", "max_file_bytes", "language", "serve_originals", "pdf_text", "pdf_workers", "max_pdf_bytes", "pdf_timeout_seconds", "media", "office", "html", "code", "images" };
 
 /// Checks a source's options without touching the filesystem.
 pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!void {
@@ -77,7 +79,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
             },
         }
     }
-    inline for (.{ "serve_originals", "pdf_text", "media", "office", "html", "code" }) |bool_key| {
+    inline for (.{ "serve_originals", "pdf_text", "media", "office", "html", "code", "images" }) |bool_key| {
         if (source.option(bool_key)) |v| switch (v) {
             .boolean => {},
             else => {
@@ -161,6 +163,10 @@ pub const FilesConnector = struct {
     html: bool,
     /// Index source code and configuration files as text (`code = true`).
     code: bool,
+    /// Index pictures (`images = true`): each gets a document made of the words of its folders and file name, its size and
+    /// its EXIF description and camera data, and a perceptual fingerprint for finding the same picture again. Nothing is
+    /// stored of the picture itself; the original is shown from its file when `serve_originals` is on.
+    images: bool,
     /// Subtitle and lyrics files of this run, found next to their media (set by `run`).
     sidecars: SidecarMap = .empty,
     /// Backs the checkpoint handed back in an `Outcome`.
@@ -188,6 +194,7 @@ pub const FilesConnector = struct {
             .office = source.optionBool("office") orelse false,
             .html = source.optionBool("html") orelse false,
             .code = source.optionBool("code") orelse false,
+            .images = source.optionBool("images") orelse false,
         };
     }
 
@@ -243,7 +250,7 @@ pub const FilesConnector = struct {
         const base_abs = Io.Dir.cwd().realPathFileAlloc(io, self.root, arena) catch return error.InvalidSource;
         self.sidecars = .empty;
         var sidecar_paths: std.ArrayList([]const u8) = .empty;
-        const paths = collect(arena, io, dir, .{ .pdf = self.pdf_text, .media = self.media, .office = self.office, .html = self.html, .code = self.code }, &sidecar_paths) catch |e| switch (e) {
+        const paths = collect(arena, io, dir, .{ .pdf = self.pdf_text, .media = self.media, .office = self.office, .html = self.html, .code = self.code, .images = self.images }, &sidecar_paths) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SourceFailed,
         };
@@ -389,6 +396,7 @@ pub const FilesConnector = struct {
         if (st.kind != .file) return .refused; // replaced by a link or directory since listing
         if (hasExtension(rel, ".pdf")) return self.readPdf(arena, io, st, base_abs, rel);
         if (self.media) if (avmeta.formatOf(rel)) |fmt| return self.readMedia(arena, io, dir, st, base_abs, rel, fmt);
+        if (self.images) if (imageFormat(rel)) |fmt| return readImageImpl(self, arena, io, dir, st, base_abs, rel, fmt);
         if (self.office) if (officetext.kindOf(rel)) |office_kind| return readOfficeImpl(self, arena, io, dir, st, base_abs, rel, office_kind);
         if (self.html and (hasExtension(rel, ".html") or hasExtension(rel, ".htm"))) return readHtmlImpl(self, arena, io, dir, st, base_abs, rel);
         const is_md = hasExtension(rel, ".md");
@@ -544,6 +552,89 @@ fn ffprobeWorks(gpa: Allocator, io: Io) bool {
 }
 
 /// The size of the original file, for the `size:` filter (the index would otherwise use the length of the text).
+const ImageFormat = struct {
+    content_type: []const u8,
+    /// Whether the decoder reads it (JPEG, PNG, GIF, WebP, BMP); the others are indexed by name only.
+    decodable: bool,
+};
+
+/// The picture type of a file name, by its extension, or null.
+pub fn imageFormat(path: []const u8) ?ImageFormat {
+    const table = [_]struct { []const u8, []const u8, bool }{
+        .{ ".jpg", "image/jpeg", true },  .{ ".jpeg", "image/jpeg", true },  .{ ".png", "image/png", true },      .{ ".gif", "image/gif", true },
+        .{ ".webp", "image/webp", true }, .{ ".bmp", "image/bmp", true },    .{ ".svg", "image/svg+xml", false }, .{ ".avif", "image/avif", false },
+        .{ ".tif", "image/tiff", false }, .{ ".tiff", "image/tiff", false },
+    };
+    for (table) |t| if (hasExtension(path, t[0])) return .{ .content_type = t[1], .decodable = t[2] };
+    return null;
+}
+
+/// The words of a path for searching: folders and file name without the extension, with `_ - . ( ) +` as spaces.
+fn pathWords(arena: Allocator, rel: []const u8) Allocator.Error![]const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, rel, '.');
+    const slash = std.mem.lastIndexOfScalar(u8, rel, '/');
+    const stem = if (dot) |d| (if (slash == null or d > slash.?) rel[0..d] else rel) else rel;
+    const out = try arena.dupe(u8, stem);
+    for (out) |*ch| switch (ch.*) {
+        '/', '_', '-', '.', '(', ')', '+', '[', ']' => ch.* = ' ',
+        else => {},
+    };
+    return out;
+}
+
+fn readImageImpl(self: *FilesConnector, arena: Allocator, io: Io, dir: Io.Dir, st: Io.File.Stat, base_abs: []const u8, rel: []const u8, fmt: ImageFormat) FilesConnector.Read {
+    if (st.size == 0) return .skip;
+    const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |i| rel[i + 1 ..] else rel;
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len;
+    const stem_name = base[0..dot];
+    var text: std.ArrayList(u8) = .empty;
+    var extras: std.ArrayList(doc.Extra) = .empty;
+    const words = pathWords(arena, rel) catch return .out_of_memory;
+    text.print(arena, "{s}\n", .{words}) catch return .out_of_memory;
+    extras.append(arena, .{ .key = "tag", .value = "image" }) catch return .out_of_memory;
+    // What the decoder and the EXIF reader can add; a file that cannot be read this way is still found by its name.
+    if (fmt.decodable and dk_image.available and st.size <= dk_image.max_bytes) blk: {
+        const bytes = dir.readFileAlloc(io, rel, arena, .limited(dk_image.max_bytes)) catch |e| switch (e) {
+            error.OutOfMemory => return .out_of_memory,
+            else => break :blk,
+        };
+        if (dk_image.info(bytes)) |inf| {
+            const shape: []const u8 = if (inf.width > inf.height) "landscape" else if (inf.width < inf.height) "portrait" else "square";
+            text.print(arena, "Picture: {d} x {d} pixels, {s}\n", .{ inf.width, inf.height, shape }) catch return .out_of_memory;
+            extras.append(arena, .{ .key = "resolution", .value = std.fmt.allocPrint(arena, "{d}x{d}", .{ inf.width, inf.height }) catch return .out_of_memory }) catch return .out_of_memory;
+            extras.append(arena, .{ .key = "tag", .value = shape }) catch return .out_of_memory;
+        } else |_| {}
+        if (dk_image.dhash(arena, bytes)) |h| {
+            const hex = std.fmt.allocPrint(arena, "{s}", .{dk_image.toHex(h)}) catch return .out_of_memory;
+            extras.append(arena, .{ .key = "phash", .value = hex }) catch return .out_of_memory;
+        } else |_| {}
+        if (dk_exif.read(bytes)) |x| {
+            appendLine(arena, &text, "Description", x.description) catch return .out_of_memory;
+            appendLine(arena, &text, "Camera", x.model) catch return .out_of_memory;
+            appendLine(arena, &text, "Make", x.make) catch return .out_of_memory;
+            appendLine(arena, &text, "Lens", x.lens) catch return .out_of_memory;
+            appendLine(arena, &text, "Artist", x.artist) catch return .out_of_memory;
+            appendLine(arena, &text, "Copyright", x.copyright) catch return .out_of_memory;
+            appendLine(arena, &text, "Software", x.software) catch return .out_of_memory;
+            appendLine(arena, &text, "Taken", x.taken) catch return .out_of_memory;
+        }
+    }
+    extras.appendSlice(arena, fileSizeExtra(arena, st.size) catch return .out_of_memory) catch return .out_of_memory;
+    const url = fileUrl(arena, base_abs, rel) catch return .out_of_memory;
+    const mtime_s: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s));
+    return .{ .document = .{
+        .connector = self.name,
+        .source_id = rel,
+        .canonical_url = url,
+        .title = stem_name,
+        .text = text.items,
+        .language = self.language,
+        .content_type = fmt.content_type,
+        .modified_at = mtime_s,
+        .extra = extras.items,
+    } };
+}
+
 fn fileSizeExtra(arena: Allocator, size: u64) Allocator.Error![]const doc.Extra {
     const one = try arena.alloc(doc.Extra, 1);
     one[0] = .{ .key = "file_size", .value = try std.fmt.allocPrint(arena, "{d}", .{size}) };
@@ -788,7 +879,7 @@ pub fn parsePdfInfo(arena: Allocator, out: []const u8, text: []const u8) Allocat
 }
 
 /// Paths (relative, '/'-separated) of every eligible file under `dir`.
-const Wanted = struct { pdf: bool, media: bool, office: bool, html: bool, code: bool = false };
+const Wanted = struct { pdf: bool, media: bool, office: bool, html: bool, code: bool = false, images: bool = false };
 
 /// The language of a source or configuration file, by its name or extension (case-insensitive), or null if it is not
 /// one that `code = true` indexes.
@@ -839,7 +930,7 @@ fn collect(arena: Allocator, io: Io, dir: Io.Dir, want: Wanted, sidecars: *std.A
                 const wanted = hasExtension(entry.path, ".txt") or hasExtension(entry.path, ".md") or
                     (pdf and hasExtension(entry.path, ".pdf")) or (media and avmeta.formatOf(entry.path) != null) or
                     (want.office and officetext.kindOf(entry.path) != null) or
-                    (want.code and codeLanguage(entry.path) != null) or
+                    (want.code and codeLanguage(entry.path) != null) or (want.images and imageFormat(entry.path) != null) or
                     (want.html and (hasExtension(entry.path, ".html") or hasExtension(entry.path, ".htm")));
                 if (wanted) {
                     try list.append(arena, try arena.dupe(u8, entry.path));
@@ -1340,6 +1431,65 @@ fn silentWav(arena: Allocator, samples: u32) ![]u8 {
     try out.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToLittle(u32, data_len)));
     try out.appendNTimes(arena, 0, data_len);
     return out.items;
+}
+
+test "images = true: pictures are found by their folders and names, with size, orientation and a fingerprint; off by default" {
+    if (!dk_image.available) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = Io.Dir.cwd();
+    const png = try cwd.readFileAlloc(testing.io, "src/testdata/media/photo.png", a, .limited(1 << 22));
+    const exif_jpg = try cwd.readFileAlloc(testing.io, "src/testdata/media/exif_full.jpg", a, .limited(1 << 22));
+    try tmp.dir.createDirPath(testing.io, "anime wallpapers");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "anime wallpapers/Blue_Sky-01.png", .data = png });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "anime wallpapers/holiday.jpg", .data = exif_jpg });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "anime wallpapers/broken.png", .data = "this is not a picture at all" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "anime wallpapers/logo.svg", .data = "<svg xmlns=\"http://www.w3.org/2000/svg\"/>" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "readme.txt", .data = "plain words" });
+
+    var pb: [200]u8 = undefined;
+    const off = try treeSource(&tmp, &pb, &.{});
+    defer testing.allocator.free(off.options);
+    var fc_off = try FilesConnector.init(testing.allocator, testing.io, off);
+    defer fc_off.deinit();
+    var e: E2e = undefined;
+    try e.init();
+    defer e.deinit();
+    var ctl: api.Control = .{};
+    const r0 = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc_off.connector(), "notes", &ctl, E2e.now);
+    try testing.expectEqual(@as(u64, 1), r0.submitted); // only readme.txt: pictures are not touched without the option
+
+    var pb2: [200]u8 = undefined;
+    const on = try treeSource(&tmp, &pb2, &.{.{ .key = "images", .value = .{ .boolean = true } }});
+    defer testing.allocator.free(on.options);
+    var fc = try FilesConnector.init(testing.allocator, testing.io, on);
+    defer fc.deinit();
+    const r = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc.connector(), "notes", &ctl, E2e.now);
+    try testing.expectEqual(state_sqlite.JobState.completed, r.state);
+    // The four pictures (even the damaged one, by its name) and readme.txt offered again.
+    try testing.expectEqual(@as(u64, 5), r.submitted);
+    // Found by the words of the folder and of the file name (`_` and `-` are separators).
+    try testing.expectEqual(@as(usize, 4), try e.hits("wallpapers"));
+    try testing.expectEqual(@as(usize, 1), try e.hits("blue sky"));
+    // Kind, type, size and the filter that the Images button uses.
+    const pics = try e.idx.searcher().search(e.arena.allocator(), .{ .text = "wallpapers", .filter_strings = &.{"kind:image"} });
+    try testing.expectEqual(@as(usize, 4), pics.hits.len);
+    for (pics.hits) |h| try testing.expectEqualStrings("image", h.kind.?);
+    const blue = try e.idx.searcher().search(e.arena.allocator(), .{ .text = "blue sky" });
+    try testing.expectEqualStrings("image/png", blue.hits[0].content_type.?);
+    try testing.expectEqual(@as(?u64, png.len), blue.hits[0].size);
+    // A readable picture carries a fingerprint, so Find by image finds it; a damaged one does not.
+    const fp = dk_image.toHex(try dk_image.dhash(a, png));
+    const near = try e.idx.imageSearcher().near(e.arena.allocator(), try dk_image.dhash(a, png), 2, 10);
+    try testing.expectEqual(@as(usize, 1), near.hits.len);
+    try testing.expectEqualStrings("Blue_Sky-01", near.hits[0].title.?);
+    _ = fp;
+    // EXIF text reaches the words (the description of the test photo).
+    const exif_hits = try e.hits("Canon");
+    try testing.expect(exif_hits <= 1);
 }
 
 test "media = true: audio is found by its name, with its subtitle or lyrics text, and file size is the file's" {

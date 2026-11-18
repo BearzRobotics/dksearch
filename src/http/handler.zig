@@ -23,6 +23,8 @@ pub const Response = struct {
 const max_filter_bytes = 64;
 /// Results per page on the HTML page.
 pub const html_page_size: u32 = 10;
+/// Pictures per page of the image gallery.
+pub const gallery_page_size: u32 = 40;
 
 const csp = "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self'; form-action 'self'; " ++
     "base-uri 'none'; frame-ancestors 'none'";
@@ -1474,12 +1476,14 @@ fn originalFile(arena: Allocator, svc: *const dk.originals.Service, hit: dk.sear
     };
     // No script policy beyond "nothing may frame this": the browser's own PDF viewer needs room, and
     // what is served inline (PDF, images, plain text) cannot run script on this origin.
-    const headers = try arena.alloc(Header, 5);
+    const headers = try arena.alloc(Header, 6);
     headers[0] = .{ .name = "x-content-type-options", .value = "nosniff" };
     headers[1] = .{ .name = "referrer-policy", .value = "no-referrer" };
     headers[2] = .{ .name = "content-security-policy", .value = "frame-ancestors 'none'" };
     headers[3] = .{ .name = "cross-origin-resource-policy", .value = "same-origin" };
     headers[4] = .{ .name = "content-disposition", .value = try dk.originals.dispositionFor(arena, served.inline_view, served.filename) };
+    // A picture in a gallery is asked for again whenever the page is shown: let the browser keep it for a while.
+    headers[5] = .{ .name = "cache-control", .value = if (std.mem.startsWith(u8, served.content_type, "image/")) "private, max-age=600" else "no-store" };
     return .{ .status = .ok, .content_type = served.content_type, .body = served.bytes, .headers = headers };
 }
 
@@ -1930,6 +1934,15 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
     };
     var q = parsed.q;
     q.boosts = boosts;
+    // The Images button: only pictures, shown as a gallery.
+    const gallery = if (params.get("images")) |v| std.mem.eql(u8, v, "1") else false;
+    if (gallery) {
+        const more = try arena.alloc([]const u8, q.filter_strings.len + 1);
+        @memcpy(more[0..q.filter_strings.len], q.filter_strings);
+        more[q.filter_strings.len] = "kind:image";
+        q.filter_strings = more;
+        q.limit = gallery_page_size;
+    }
     try limitQuery(arena, &q, services);
     // The ticked sources (`source`, repeatable) and the older single `connector`: each is a source name or
     // `kind:NAME` for every source of a kind. They are alternatives (`kind:zim` is all its sources).
@@ -2025,6 +2038,13 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         }
     }
     form.snippets = snippetCount(params);
+    if (gallery) {
+        form.images = true;
+        form.page_size = gallery_page_size;
+        const ok = try arena.alloc(bool, shown.hits.len);
+        for (shown.hits, ok) |h, *o| o.* = if (services.originals) |orig| (if (h.url) |u| h.node == null and orig.serves(h.connector, u) else false) else false;
+        form.gallery_ok = ok;
+    }
     form.semantic_offered = services.embed != null;
     form.semantic_checked = semantic_note != null;
     if (semantic_note) |n| form.semantic_text = if (n.used)
@@ -2035,7 +2055,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
     try applyFallback(arena, services, params, &form, shown.hits.len, q.offset);
     if (shown.hits.len == 0 and q.offset == 0) form.did_you_mean = try didYouMean(arena, searcher, q);
     var aw: std.Io.Writer.Allocating = .init(arena);
-    html.writeResults(&aw.writer, form, shown, q.offset, html_page_size) catch return error.OutOfMemory;
+    html.writeResults(&aw.writer, form, shown, q.offset, if (gallery) gallery_page_size else html_page_size) catch return error.OutOfMemory;
     return htmlResponse(arena, .ok, aw.written());
 }
 
@@ -3553,6 +3573,36 @@ test "trusted first: asked for by the server's default or by a request, and then
     try testing.expect(fake.last.?.trusted_first.? and fake.last.?.trusted_min_percent == 200);
     _ = handleServices(a, fake.searcher(), .{ .trusted_first = true }, .GET, "/api/v1/search?q=odin&trusted=0");
     try testing.expect(!fake.last.?.trusted_first.?);
+}
+
+test "the Images button shows only pictures as a gallery, from this server's own files, and the pager keeps the choice" {
+    var hits = [_]dk.search.Hit{
+        .{ .id = @splat(1), .connector = "pics", .url = "file:///pics/blue-sky.png", .title = "blue-sky", .snippet = null, .score = 2, .kind = "image" },
+        .{ .id = @splat(2), .connector = "pics", .url = "file:///pics/other.svg", .title = "other", .snippet = null, .score = 1, .kind = "image" },
+    };
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = true } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // The form has the button; an ordinary search is the usual list and asks for no kind.
+    try testing.expect(std.mem.indexOf(u8, run(&fake, .GET, "/", &ar).body, "name=\"images\" value=\"1\"") != null);
+    const ordinary = run(&fake, .GET, "/search?q=wallpapers", &ar);
+    try testing.expect(std.mem.indexOf(u8, ordinary.body, "class=\"gallery\"") == null and std.mem.indexOf(u8, ordinary.body, "<ol class=\"results\"") != null);
+    // With the button: the kind filter is added, the page is a grid of 40, and the pager keeps `images=1`.
+    const g = run(&fake, .GET, "/search?q=wallpapers&images=1", &ar);
+    try testing.expectEqual(http.Status.ok, g.status);
+    var has_kind = false;
+    for (fake.last.?.filter_strings) |f| if (std.mem.eql(u8, f, "kind:image")) {
+        has_kind = true;
+    };
+    try testing.expect(has_kind);
+    try testing.expectEqual(@as(u32, gallery_page_size), fake.last.?.limit);
+    try testing.expect(std.mem.indexOf(u8, g.body, "<ul class=\"gallery\">") != null and std.mem.indexOf(u8, g.body, "<ol class=\"results\"") == null);
+    try testing.expect(std.mem.indexOf(u8, g.body, "images=1") != null); // in the next-page link
+    // Without served originals there is no picture to show, only the names; the pages still open.
+    try testing.expect(std.mem.indexOf(u8, g.body, "no preview") != null and std.mem.indexOf(u8, g.body, "<img") == null);
+    try testing.expect(std.mem.indexOf(u8, g.body, "href=\"/doc/01010101") != null);
+    _ = a;
 }
 
 test "answers: off by default, a question is needed, nothing is asked of the model without passages, and an unreachable model is said" {
