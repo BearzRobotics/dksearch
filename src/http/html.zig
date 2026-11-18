@@ -128,6 +128,8 @@ pub const Form = struct {
     answer_note: ?[]const u8 = null,
     /// A spelling of the query that does find something, offered when it found nothing.
     did_you_mean: ?[]const u8 = null,
+    /// Excerpts shown per result (1 to 5); kept by the page links.
+    snippets: u8 = 1,
     answers_offered: bool = false,
     answer_checked: bool = false,
     /// Where to go to ask the providers (`web=1`) when that is not done by itself; null: not offered.
@@ -349,6 +351,9 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
     for (orders) |o| {
         try w.print("<option value=\"{s}\"{s}>{s}</option>", .{ o[0], if (std.mem.eql(u8, o[0], f.sort)) " selected" else "", o[1] });
     }
+    try w.writeAll("</select></label>");
+    try w.writeAll("<label>Excerpts <select name=\"snippets\">");
+    for ([_]u8{ 1, 2, 3, 5 }) |n| try w.print("<option value=\"{d}\"{s}>{d}</option>", .{ n, if (n == f.snippets) " selected" else "", n });
     try w.writeAll("</select></label>");
     try w.writeAll("</details></form>\n");
     if (f.regex_notice) |n| {
@@ -592,6 +597,11 @@ fn finishHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
         try writeSnippet(w, s);
         try w.writeAll("</p>");
     };
+    for (h.more_snippets) |m| {
+        try w.writeAll("<p class=\"snippet more\">");
+        try writeSnippet(w, m);
+        try w.writeAll("</p>");
+    }
     try w.writeAll("<div class=\"source\">");
     if (h.node) |n| {
         try w.writeAll("<strong>");
@@ -794,6 +804,7 @@ fn writePagerLink(w: *Writer, f: Form, offset: u32, label_html: []const u8) Writ
         if (f.regex_ignore_case) try w.writeAll("&amp;regex_flags=i");
     }
     if (f.exact_only) try w.writeAll("&amp;fuzzy=0");
+    if (f.snippets > 1) try w.print("&amp;snippets={d}", .{f.snippets});
     if (offset > 0) try w.print("&amp;offset={d}", .{offset});
     try w.writeAll("\">");
     try w.writeAll(label_html);

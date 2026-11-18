@@ -175,6 +175,8 @@ pub const Hit = struct {
     ident: ?[]const u8 = null,
     /// Sources (other than this result's) that hold the same text, when results are grouped.
     same_in: []const []const u8 = &.{},
+    /// Further excerpts of the document (`snippets=N`), taken from its stored text; markers like `snippet`.
+    more_snippets: []const []const u8 = &.{},
 };
 
 /// A passage found in the chunk index: the document, the position of the chunk among that document's chunks (as

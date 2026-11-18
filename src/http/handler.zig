@@ -520,6 +520,8 @@ const ApiHit = struct {
     url: ?[]const u8,
     title: ?[]const u8,
     snippet: ?[]const u8,
+    /// Further excerpts, when `snippets=N` asked for them (empty otherwise).
+    more_snippets: []const []const u8,
     score: f64,
     /// A page on this server for the document: its details, stored text and original (`/doc/<id>`).
     view_url: []const u8,
@@ -983,10 +985,38 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
     for (page.hits, local) |h, *dst| dst.* = try withIdent(arena, services, h);
     const fed = try federate(arena, services, params, q, local);
     const grouped = if (fed == null and (if (params.get("group")) |g| std.mem.eql(u8, g, "1") else false)) try groupDuplicates(arena, local) else local;
-    const shown = if (fed) |f| f.hits else grouped;
+    const shown = try withMoreSnippets(arena, services, if (fed) |f| f.hits else grouped, parsed_typed_for_terms(params), snippetCount(params));
     const hits = try arena.alloc(ApiHit, shown.len);
     for (shown, hits) |h, *out| out.* = try apiHit(arena, h);
     return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null, .semantic = semantic, .external = ext_results, .external_status = ext_status });
+}
+
+/// How many excerpts per result were asked for (`snippets=N`): 1 (the usual one) to 5.
+fn snippetCount(params: query.Params) u8 {
+    const v = params.get("snippets") orelse return 1;
+    const n = std.fmt.parseInt(u8, v, 10) catch return 1;
+    return @min(@max(n, 1), 5);
+}
+
+fn parsed_typed_for_terms(params: query.Params) []const u8 {
+    return params.get("q") orelse "";
+}
+
+/// The hits of this node with up to `n - 1` further excerpts from their stored text (nothing when `n` is 1, there is
+/// no content store, or the document is not stored).
+fn withMoreSnippets(arena: Allocator, services: Services, hits: []const dk.search.Hit, typed: []const u8, n: u8) error{OutOfMemory}![]const dk.search.Hit {
+    if (n <= 1) return hits;
+    const store = services.content orelse return hits;
+    const terms = try dk.snippets.queryTerms(arena, typed);
+    if (terms.len == 0) return hits;
+    const out = try arena.alloc(dk.search.Hit, hits.len);
+    for (hits, out) |h, *dst| {
+        dst.* = h;
+        if (h.node != null) continue;
+        const text = store.get(arena, h.id) catch continue;
+        dst.more_snippets = try dk.snippets.more(arena, text, terms, h.snippet, n - 1);
+    }
+    return out;
 }
 
 /// `h` with its node-independent identity filled in (from its address, or the hash of its stored text).
@@ -1005,6 +1035,7 @@ fn apiHit(arena: Allocator, h: dk.search.Hit) error{OutOfMemory}!ApiHit {
         .url = h.url,
         .title = h.title,
         .snippet = h.snippet,
+        .more_snippets = h.more_snippets,
         .score = h.score,
         .view_url = h.remote_view orelse try std.fmt.allocPrint(arena, "/doc/{s}", .{std.fmt.bytesToHex(h.id, .lower)}),
         .node = h.node,
@@ -1802,6 +1833,8 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
             };
         }
     }
+    form.snippets = snippetCount(params);
+    shown.hits = try withMoreSnippets(arena, services, shown.hits, parsed.typed, form.snippets);
     try applyFallback(arena, services, params, &form, shown.hits.len, q.offset);
     if (shown.hits.len == 0 and q.offset == 0) form.did_you_mean = try didYouMean(arena, searcher, q);
     var aw: std.Io.Writer.Allocating = .init(arena);
@@ -3064,6 +3097,38 @@ test "suggestions complete the last word; an empty result offers a spelling that
     // A query that found something, or whose correction finds nothing, offers nothing.
     try testing.expect(std.mem.indexOf(u8, handle(a, s, .GET, "/search?q=elephant").body, "Did you mean") == null);
     try testing.expect(std.mem.indexOf(u8, handle(a, s, .GET, "/search?q=qqqq").body, "Did you mean") == null);
+}
+
+test "snippets=N adds further excerpts from the stored text, in the page and in the API, and the pager keeps the choice" {
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    const id: dk.document.Id = .{ 0x51, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try text.appendSlice(testing.allocator, "The raven opens the tale. ");
+    for (0..30) |_| try text.appendSlice(testing.allocator, "Filler about harvests and the weather in the valley. ");
+    try text.appendSlice(testing.allocator, "A second raven watches from the roof of the hall. ");
+    try mem.store().put(id, text.items);
+    var hits = [_]dk.search.Hit{.{ .id = id, .connector = "books", .url = "https://e.org/saga", .title = "Saga", .snippet = "The \x02raven\x03 opens the tale.", .score = 1 }};
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = true } };
+    const services: Services = .{ .content = mem.store() };
+    // Not asked: nothing more.
+    const unasked = handleServices(a, fake.searcher(), services, .GET, "/api/v1/search?q=raven");
+    try testing.expect(std.mem.indexOf(u8, unasked.body, "\"more_snippets\":[]") != null);
+    // Asked: the second place of the word appears, marked.
+    const api = handleServices(a, fake.searcher(), services, .GET, "/api/v1/search?q=raven&snippets=3");
+    try testing.expect(std.mem.indexOf(u8, api.body, "roof of the hall") != null);
+    try testing.expect(std.mem.indexOf(u8, api.body, "\\u0002raven\\u0003") != null);
+    const page = handleServices(a, fake.searcher(), services, .GET, "/search?q=raven&snippets=3");
+    try testing.expect(std.mem.indexOf(u8, page.body, "<p class=\"snippet more\">") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "snippets=3") != null); // kept by the next-page link
+    // A hit whose text is not stored, or a silly value, is shown as usual.
+    var other = [_]dk.search.Hit{.{ .id = @splat(9), .connector = "books", .url = "https://e.org/x", .title = "X", .snippet = null, .score = 1 }};
+    fake.result = .{ .hits = &other, .has_more = false };
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), services, .GET, "/search?q=raven&snippets=99").body, "snippet more") == null);
 }
 
 test "answers: off by default, a question is needed, nothing is asked of the model without passages, and an unreachable model is said" {

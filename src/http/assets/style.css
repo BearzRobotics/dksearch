@@ -271,3 +271,6 @@ fieldset.options input[type="text"], fieldset.options input[type="number"] { wid
 .docs-body { max-width: 52rem; min-width: 0; overflow-wrap: anywhere; }
 .docs-body pre { overflow: auto; }
 @media (max-width: 40rem) { .docs { grid-template-columns: 1fr; } .docs-nav ul { position: static; max-height: none; } }
+
+/* Further excerpts of a result sit a little apart from the first. */
+.snippet.more { margin-top: 0.15rem; opacity: 0.9; }
