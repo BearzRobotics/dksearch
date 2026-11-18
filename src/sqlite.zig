@@ -97,6 +97,10 @@ pub const Stmt = struct {
             c.sqlite3_bind_null(self.s, i);
         if (rc != c.SQLITE_OK) return mapRc(rc);
     }
+    pub fn real(self: Stmt, i: c_int, v: f64) Error!void {
+        const rc = c.sqlite3_bind_double(self.s, i, v);
+        if (rc != c.SQLITE_OK) return mapRc(rc);
+    }
     pub fn int(self: Stmt, i: c_int, v: ?i64) Error!void {
         const rc = if (v) |x| c.sqlite3_bind_int64(self.s, i, x) else c.sqlite3_bind_null(self.s, i);
         if (rc != c.SQLITE_OK) return mapRc(rc);

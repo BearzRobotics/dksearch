@@ -438,6 +438,9 @@ fn parseQuery(arena: Allocator, params: query.Params, html_mode: bool) error{Out
             q.fuzzy = .off;
         } else return .{ .bad = .{ .name = "fuzzy", .message = "must be 1 (always allow typos), 0 (exact words only), or left out (the server's default)" } };
     };
+    if (params.get("after")) |v| if (v.len > 0) {
+        q.after = dk.search.Cursor.parse(v) orelse return .{ .bad = .{ .name = "after", .message = "must be a next_cursor value from a previous page" } };
+    };
     if (params.get("sort")) |v| if (v.len > 0) {
         q.sort = std.meta.stringToEnum(dk.search.Sort, v) orelse
             return .{ .bad = .{ .name = "sort", .message = "must be relevance, newest, oldest, largest, smallest or title" } };
@@ -554,7 +557,7 @@ const ApiHit = struct {
 const SemanticNote = struct { used: bool, model: ?[]const u8 = null, compared: u32 = 0, reason: ?[]const u8 = null, index: bool = false, from_vectors: u32 = 0 };
 
 const PeerNote = struct { peer: []const u8, status: []const u8, ms: u32, results: u32, http_status: ?u16 = null, cached: bool = false };
-const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null, semantic: ?SemanticNote = null, external: ?[]const dk.fallback.External = null, external_status: ?[]const ExternalStatus = null };
+const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null, semantic: ?SemanticNote = null, external: ?[]const dk.fallback.External = null, external_status: ?[]const ExternalStatus = null, next_cursor: ?[]const u8 = null };
 const ExternalStatus = struct { provider: []const u8, status: []const u8 };
 
 const Federated = struct { hits: []const dk.search.Hit, notes: []const PeerNote };
@@ -1050,7 +1053,13 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
     const shown = try withMoreSnippets(arena, services, if (fed) |f| f.hits else grouped, parsed_typed_for_terms(params), snippetCount(params));
     const hits = try arena.alloc(ApiHit, shown.len);
     for (shown, hits) |h, *out| out.* = try apiHit(arena, h);
-    return jsonResponse(arena, .ok, ApiPage{ .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null, .semantic = semantic, .external = ext_results, .external_status = ext_status });
+    // The cursor of the next page: after the last result of this one, for a relevance-ordered search of words.
+    var cursor_buf: [48]u8 = undefined;
+    const next_cursor: ?[]const u8 = if (page.has_more and page.hits.len > 0 and q.sort == .relevance and q.text.len > 0 and q.offset + page.hits.len < dk.search.max_cursor_window)
+        try arena.dupe(u8, (dk.search.Cursor{ .score = page.hits[page.hits.len - 1].score, .id = page.hits[page.hits.len - 1].id }).format(&cursor_buf))
+    else
+        null;
+    return jsonResponse(arena, .ok, ApiPage{ .next_cursor = next_cursor, .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null, .semantic = semantic, .external = ext_results, .external_status = ext_status });
 }
 
 /// How many excerpts per result were asked for (`snippets=N`): 1 (the usual one) to 5.

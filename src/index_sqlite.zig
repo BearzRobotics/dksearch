@@ -862,6 +862,8 @@ pub const SqliteIndex = struct {
         const limit: u32 = if (q.limit == 0) search.default_limit else q.limit;
         if (limit > search.max_limit) return error.InvalidQuery;
         if (@as(u64, q.offset) + limit > search.max_window) return error.InvalidQuery;
+        // A cursor continues a relevance-ordered search over words; it replaces the offset.
+        if (q.after != null and (q.offset != 0 or q.sort != .relevance)) return error.InvalidQuery;
 
         const now: i64 = if (self.timeout) |t| @intCast(@divTrunc(Io.Timestamp.now(t.io, .real).nanoseconds, std.time.ns_per_s)) else 0;
         if (q.filters.len + q.filter_strings.len > max_filters) return error.InvalidQuery;
@@ -1239,7 +1241,7 @@ pub const SqliteIndex = struct {
             try sql.print(arena,
                 \\SELECT d.id, d.connector, d.url, d.title,
                 \\       snippet(fts, 1, ?1, ?2, '…', 16),
-                \\       -({s}), {s}{s}
+                \\       -({s}) AS col6, {s}{s}
                 \\FROM fts JOIN docs d ON d.rowid = fts.rowid
                 \\WHERE fts MATCH ?3
             , .{ bm, columns, explain_cols });
@@ -1255,6 +1257,15 @@ pub const SqliteIndex = struct {
         try scopeSql(arena, q.scope, &sql, &binds);
         if (q.sort != .relevance and q.sort != .title and !self.has_meta) return error.InvalidQuery; // an old index: `rebuild` upgrades it
         try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm));
+        if (q.after != null) {
+            if (!text_mode) return error.InvalidQuery;
+            // Keyset paging: the best `max_cursor_window` results in order, then those after the cursor. The LIMIT
+            // inside keeps SQLite from folding the outer condition into the inner query, where a full-text ranking
+            // function may not be used in a WHERE.
+            try sql.print(arena, " LIMIT {d}", .{search.max_cursor_window});
+            const inner = try sql.toOwnedSlice(arena);
+            try sql.print(arena, "SELECT * FROM ({s}) WHERE (col6 < ?{d} OR (col6 = ?{d} AND id > ?{d})) ORDER BY col6 DESC, id", .{ inner, 9 + binds.items.len, 9 + binds.items.len, 10 + binds.items.len });
+        }
         try sql.appendSlice(arena, " LIMIT ?7 OFFSET ?8");
         const st = Stmt.prepare(self.db, try arena.dupeSentinel(u8, sql.items, 0)) catch |e| return searchError(e);
         defer st.deinit();
@@ -1275,6 +1286,11 @@ pub const SqliteIndex = struct {
                 .text => |t| st.text(n, t),
                 .int => |v| st.int(n, v),
             }) catch |e| return searchError(e);
+        }
+        if (q.after) |cur| {
+            const n: c_int = @intCast(9 + binds.items.len);
+            st.real(n, cur.score) catch |e| return searchError(e);
+            st.blob(n + 1, &cur.id) catch |e| return searchError(e);
         }
 
         var guard: Deadline = undefined;
@@ -1997,6 +2013,53 @@ test "filters narrow results" {
     try testing.expectEqual(@as(usize, 1), (try s.search(arena.allocator(), .{ .text = "shared", .connector = "wiki" })).hits.len);
     try testing.expectEqual(@as(usize, 1), (try s.search(arena.allocator(), .{ .text = "shared", .content_type = "text/plain" })).hits.len);
     try testing.expectEqual(@as(usize, 0), (try s.search(arena.allocator(), .{ .text = "shared", .language = "fr" })).hits.len);
+}
+
+test "a cursor walks the same results as offsets, in pages, and survives new documents being added" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    for (0..23) |n| {
+        var sid: [8]u8 = undefined;
+        const sname = try std.fmt.bufPrint(&sid, "{d}", .{n});
+        // Different lengths, so the scores differ for most; some are equal (ties are broken by id).
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(testing.allocator);
+        try text.appendSlice(testing.allocator, "raven");
+        for (0..(n % 7)) |_| try text.appendSlice(testing.allocator, " filler words");
+        _ = try put(&idx, "t", sname, null, text.items);
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = idx.searcher();
+    const all = try s.search(a, .{ .text = "raven", .limit = 100 });
+    try testing.expectEqual(@as(usize, 23), all.hits.len);
+    // Walk with a cursor, 5 at a time.
+    var seen: std.ArrayList(doc.Id) = .empty;
+    var after: ?search.Cursor = null;
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        const p = try s.search(a, .{ .text = "raven", .limit = 5, .after = after });
+        for (p.hits) |h| try seen.append(a, h.id);
+        if (!p.has_more) break;
+        const last = p.hits[p.hits.len - 1];
+        after = .{ .score = last.score, .id = last.id };
+        try testing.expect(pages < 10);
+    }
+    try testing.expectEqual(@as(usize, 5), pages + 1);
+    try testing.expectEqual(@as(usize, 23), seen.items.len);
+    for (all.hits, seen.items) |h, id| try testing.expectEqualSlices(u8, &h.id, &id);
+    // The cursor text round-trips, and bad text is refused.
+    var buf: [48]u8 = undefined;
+    const cur = search.Cursor{ .score = 1.25, .id = all.hits[0].id };
+    const back = search.Cursor.parse(cur.format(&buf)).?;
+    try testing.expectEqual(@as(f64, 1.25), back.score);
+    try testing.expectEqualSlices(u8, &cur.id, &back.id);
+    try testing.expect(search.Cursor.parse("nothex") == null);
+    try testing.expect(search.Cursor.parse("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz") == null);
+    // A cursor goes with relevance order and no offset.
+    try testing.expectError(error.InvalidQuery, s.search(a, .{ .text = "raven", .after = cur, .offset = 5 }));
+    try testing.expectError(error.InvalidQuery, s.search(a, .{ .text = "raven", .after = cur, .sort = .newest }));
 }
 
 test "pagination is stable and reports has_more" {

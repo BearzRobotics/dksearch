@@ -62,3 +62,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0044 | Crawling Tor and I2P sites |
 | 0045 | More than one excerpt per result |
 | 0046 | Similar documents |
+| 0047 | Cursor paging |

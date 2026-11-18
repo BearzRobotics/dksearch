@@ -16,6 +16,8 @@ AUTHENTICATION
 
 `snippets=N` on `/api/v1/search` and `/search` (1 to 5, default 1) asks for up to N excerpts per result: the usual `snippet` plus `more_snippets`, further passages of the stored text that contain the query's plain words, apart from the first one, in text order, with the same match markers. Only results of this node whose text is stored have them; the page offers the choice as *Excerpts* in the search options and keeps it when paging.
 
+`after=CURSOR` on `/api/v1/search` continues a search after the last result of the previous page; the previous reply's `next_cursor` (present when more results follow, for a search of words in relevance order) is the value to give. It replaces `offset`, is not limited to the first 10000 results (it walks up to 100000) and does not shift when documents are added between pages. Opaque: 48 hex digits. Not combined with `offset` or another `sort` (400 `invalid_query`); a malformed value is 400 `invalid_parameter`.
+
 GET /api/v1/similar
 Documents like one given. Parameters: `id` (the 32 hex digits of a document id, as in `view_url`), `limit` (1 to 50, default 10). Returns `{"hits": [...]}` like search, never including the document itself, limited to what the caller may see; 404 `not_found` for an unknown document. With a vector index (`[embeddings]`, ADR 0043) holding the document the nearest vectors are used; otherwise the words that set the document apart (frequent in it, rare in the index) are searched for with OR. Empty when the text is not stored. The document page shows five under *Similar documents*.
 

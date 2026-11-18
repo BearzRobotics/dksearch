@@ -11,7 +11,6 @@ Standing rules that shape every item: the core stays lexical and works with no A
 ## Then
 
 - **Against SEO slop:** a domain blocklist (never shown) and demotion list (pushed down, still findable) in the configuration and on the Settings page, applied to indexed, crawled and fallback results; and a "trusted first" ordering that puts results of highly boosted sources before the long tail instead of mixing by text score alone.
-- **Presentation:** cursor paging (did-you-mean, a suggest endpoint, several excerpts per result and similar documents are built).
 - **Search by image everywhere:** a `find-image` command and an admin upload over the perceptual hashes the files connector already stores.
 - **Management:** saved searches and opt-in statistics (no query logging by default).
 - **Playing media in the browser:** an embedded player in the viewer, with HTTP range requests and streaming for original files (today an original is sent whole, up to 64 MiB), and a start time taken from the result.

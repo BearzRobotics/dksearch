@@ -124,6 +124,36 @@ pub const Query = struct {
     collections: []const CollectionDef = &.{},
     /// Fill `Hit.explain` with the parts of each score.
     explain: bool = false,
+    /// Continue after this result of a relevance-ordered search (the `next_cursor` of the previous page) instead of
+    /// at `offset`: stable when the index changes, and not limited by `max_window` (but by `max_cursor_window`).
+    after: ?Cursor = null,
+};
+
+/// How many results a cursor can walk through.
+pub const max_cursor_window = 100_000;
+
+/// A place in a relevance-ordered result list: the score and id of the last result seen. Written as 48 hex digits
+/// (the score's 8 bytes, then the id), which the caller treats as opaque.
+pub const Cursor = struct {
+    score: f64,
+    id: doc.Id,
+
+    pub fn format(self: Cursor, buf: *[48]u8) []const u8 {
+        const bits: u64 = @bitCast(self.score);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, bits, .big);
+        _ = std.fmt.bufPrint(buf, "{x}{x}", .{ &bytes, &self.id }) catch unreachable;
+        return buf;
+    }
+
+    pub fn parse(text: []const u8) ?Cursor {
+        if (text.len != 48) return null;
+        var raw: [24]u8 = undefined;
+        _ = std.fmt.hexToBytes(&raw, text) catch return null;
+        const score: f64 = @bitCast(std.mem.readInt(u64, raw[0..8], .big));
+        if (std.math.isNan(score) or std.math.isInf(score)) return null;
+        return .{ .score = score, .id = raw[8..24].* };
+    }
 };
 
 pub const SourceBoost = struct { source: []const u8, percent: u32 };
