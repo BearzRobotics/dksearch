@@ -707,7 +707,7 @@ pub fn writeArticle(w: *Writer, title: []const u8, source: []const u8, body: []c
     try w.writeAll("</div>\n<p><a href=\"/\">&larr; New search</a></p></main></body></html>\n");
 }
 
-pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, open_links: []const OpenLink, rendered: ?[]const u8, is_markdown: bool) Writer.Error!void {
+pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, open_links: []const OpenLink, rendered: ?[]const u8, is_markdown: bool, similar: []const dk.search.Hit) Writer.Error!void {
     try writeHead(w, h.title orelse h.url orelse "Document");
     try w.writeAll("<body>");
     try writeTopBar(w);
@@ -775,6 +775,19 @@ pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool,
         if (cut) try w.writeAll("<p class=\"muted small\">Only the beginning is shown.</p>\n");
     } else {
         try w.writeAll("<p class=\"notice\">The text of this document is not stored on this server (the source may be set to keep only what it needs for searching), so only what is known about it is shown.</p>\n");
+    }
+    if (similar.len > 0) {
+        try w.writeAll("<section class=\"similar\"><h3>Similar documents</h3><ul>");
+        for (similar) |s| {
+            try w.writeAll("<li><a href=\"");
+            try writeViewHref(w, s);
+            try w.writeAll("\">");
+            try writeEscaped(w, s.title orelse s.url orelse "(untitled)");
+            try w.writeAll("</a> <span class=\"muted\">");
+            try writeEscaped(w, s.connector);
+            try w.writeAll("</span></li>");
+        }
+        try w.writeAll("</ul></section>");
     }
     try w.writeAll("<p><a href=\"/\">&larr; New search</a></p></main></body></html>\n");
 }

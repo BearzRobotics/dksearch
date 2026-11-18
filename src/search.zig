@@ -243,9 +243,17 @@ pub const Searcher = struct {
         source_stats: ?*const fn (ptr: *anyopaque, arena: Allocator) Error![]const SourceStat = null,
         /// The documents of one source after a position, in a stable order. Optional.
         /// Words of the vocabulary: those that start with a prefix, or those a few edits from a word. Optional.
+        /// How many documents contain each word (0 for one that is not in the index). Optional.
+        doc_freq: ?*const fn (ptr: *anyopaque, arena: Allocator, words: []const []const u8) Error![]const u32 = null,
         words: ?*const fn (ptr: *anyopaque, arena: Allocator, word: []const u8, kind: WordKind, limit: u32) Error![]const []const u8 = null,
         export_page: ?*const fn (ptr: *anyopaque, arena: Allocator, connector: []const u8, after: i64, limit: u32) Error![]const ExportRow = null,
     };
+
+    /// How many documents contain each of `words` (empty if the index cannot say).
+    pub fn docFreq(self: Searcher, arena: Allocator, words_in: []const []const u8) Error![]const u32 {
+        const f = self.vtable.doc_freq orelse return &.{};
+        return f(self.ptr, arena, words_in);
+    }
 
     /// Words of the index that start with `prefix` (most common first) or that are within the usual number of edits of
     /// `prefix` taken as a whole word (closest first). Empty if the index cannot say.

@@ -48,7 +48,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_export, api_peers, api_health, style, document, zim, wopi, other };
+const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, api_export, api_peers, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -60,6 +60,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/api/v1/retrieve")) return .api_retrieve;
     if (std.mem.eql(u8, path, "/api/v1/answer")) return .api_answer;
     if (std.mem.eql(u8, path, "/api/v1/suggest")) return .api_suggest;
+    if (std.mem.eql(u8, path, "/api/v1/similar")) return .api_similar;
     if (std.mem.eql(u8, path, "/api/v1/export")) return .api_export;
     if (std.mem.eql(u8, path, "/api/v1/peers")) return .api_peers;
     if (std.mem.eql(u8, path, "/api/v1/health")) return .api_health;
@@ -398,6 +399,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         .api_retrieve => try apiRetrieve(arena, searcher, services, t.params),
         .api_answer => try apiAnswer(arena, searcher, services, t.params),
         .api_suggest => try apiSuggest(arena, searcher, t.params),
+        .api_similar => try apiSimilar(arena, searcher, services, t.params),
         .api_export => try apiExport(arena, searcher, services, t.params),
         .api_peers => try apiPeers(arena, services),
         .search_page => try pageSearch(arena, searcher, regex, services, try sourceChoicesFor(arena, services, searcher), try sourceBoosts(arena, services), t.params),
@@ -858,6 +860,66 @@ fn apiAnswer(arena: Allocator, searcher: dk.search.Searcher, services: Services,
 
 /// `GET /api/v1/peers`: the peers this node is willing to introduce (`introduce = true`), by name and address only.
 /// For a caller with a key; they are suggestions the caller's operator may accept, nothing is added by asking.
+/// Documents like `id`: by vector when the server has a vector index with this document in it, otherwise by the words
+/// that set the document apart (docs/decisions/0046). Never the document itself, and only what the caller may see.
+fn similarTo(arena: Allocator, searcher: dk.search.Searcher, services: Services, id: dk.document.Id, limit: u32) error{OutOfMemory}![]const dk.search.Hit {
+    var out: std.ArrayList(dk.search.Hit) = .empty;
+    if (services.embed) |svc| if (svc.holder) |holder| {
+        if (dk.embed.Store.openReadOnly(svc.vectors_path)) |opened| {
+            var store = opened;
+            defer store.close();
+            if (store.get(arena, id, svc.client.settings.model)) |vec| if (holder.acquire()) |idx| {
+                defer holder.release(idx);
+                for (try idx.search(arena, vec, limit + 1)) |n| {
+                    if (std.mem.eql(u8, &n.id, &id)) continue;
+                    const h = (searcher.info(arena, n.id) catch null) orelse continue;
+                    if (!services.scope.allows(h.connector)) continue;
+                    try out.append(arena, h);
+                    if (out.items.len >= limit) break;
+                }
+                if (out.items.len > 0) return out.items;
+            };
+        }
+    };
+    const store = services.content orelse return &.{};
+    const text = store.get(arena, id) catch return &.{};
+    const cands = try dk.similar.candidates(arena, text, 40, 256 * 1024);
+    if (cands.len == 0) return &.{};
+    const words = try arena.alloc([]const u8, cands.len);
+    for (cands, words) |c, *w| w.* = c.word;
+    const df = searcher.docFreq(arena, words) catch return &.{};
+    if (df.len != cands.len) return &.{};
+    var docs: u64 = 0;
+    for (searcher.sourceStats(arena) catch &.{}) |s| docs += s.docs;
+    const picked = try dk.similar.pick(arena, cands, df, docs, 8);
+    if (picked.len == 0) return &.{};
+    var q: dk.search.Query = .{ .text = try std.mem.join(arena, " OR ", picked), .limit = limit + 1 };
+    try limitQuery(arena, &q, services);
+    const page = searcher.search(arena, q) catch return &.{};
+    for (page.hits) |h| {
+        if (std.mem.eql(u8, &h.id, &id)) continue;
+        try out.append(arena, h);
+        if (out.items.len >= limit) break;
+    }
+    return out.items;
+}
+
+/// `GET /api/v1/similar?id=HEX[&limit=N]`: documents like the one given.
+fn apiSimilar(arena: Allocator, searcher: dk.search.Searcher, services: Services, params: query.Params) error{OutOfMemory}!Response {
+    const hex = params.get("id") orelse "";
+    var id: dk.document.Id = undefined;
+    if (hex.len != 2 * @sizeOf(dk.document.Id)) return apiError(arena, .bad_request, "invalid_parameter", "id must be the 32 hex digits of a document id");
+    _ = std.fmt.hexToBytes(&id, hex) catch return apiError(arena, .bad_request, "invalid_parameter", "id must be the 32 hex digits of a document id");
+    const limit: u32 = if (params.get("limit")) |v| (std.fmt.parseInt(u32, v, 10) catch return apiError(arena, .bad_request, "invalid_parameter", "limit must be a number")) else 10;
+    if (limit == 0 or limit > 50) return apiError(arena, .bad_request, "invalid_parameter", "limit must be 1 to 50");
+    const here = (searcher.info(arena, id) catch null) orelse return apiError(arena, .not_found, "not_found", "no such document");
+    if (!services.scope.allows(here.connector)) return apiError(arena, .not_found, "not_found", "no such document");
+    const found = try similarTo(arena, searcher, services, id, limit);
+    const hits = try arena.alloc(ApiHit, found.len);
+    for (found, hits) |h, *o| o.* = try apiHit(arena, h);
+    return jsonResponse(arena, .ok, .{ .hits = hits });
+}
+
 /// Words that can only be in a plain query word: letters and digits (no operators, quotes or wildcards).
 fn plainWord(w: []const u8) bool {
     if (w.len == 0 or w.len > 40) return false;
@@ -1202,7 +1264,8 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
         };
     };
     var aw: std.Io.Writer.Allocating = .init(arena);
-    html.writeDocument(&aw.writer, hit, text, cut, open_links.items, rendered, is_markdown) catch return error.OutOfMemory;
+    const similar = try similarTo(arena, searcher, services, id, 5);
+    html.writeDocument(&aw.writer, hit, text, cut, open_links.items, rendered, is_markdown, similar) catch return error.OutOfMemory;
     return htmlResponse(arena, .ok, aw.written());
 }
 
@@ -3129,6 +3192,62 @@ test "snippets=N adds further excerpts from the stored text, in the page and in 
     var other = [_]dk.search.Hit{.{ .id = @splat(9), .connector = "books", .url = "https://e.org/x", .title = "X", .snippet = null, .score = 1 }};
     fake.result = .{ .hits = &other, .has_more = false };
     try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), services, .GET, "/search?q=raven&snippets=99").body, "snippet more") == null);
+}
+
+test "similar documents: the words that set a document apart are searched for, the document itself and what the caller may not see are left out" {
+    const Sim = struct {
+        var query_seen: [200]u8 = undefined;
+        var query_len: usize = 0;
+        var hits = [_]dk.search.Hit{
+            .{ .id = @splat(1), .connector = "books", .url = "https://e.org/self", .title = "Self", .snippet = null, .score = 3 },
+            .{ .id = @splat(2), .connector = "books", .url = "https://e.org/a", .title = "Other A", .snippet = null, .score = 2 },
+            .{ .id = @splat(3), .connector = "books", .url = "https://e.org/b", .title = "Other B", .snippet = null, .score = 1 },
+        };
+        fn search(_: *anyopaque, _: Allocator, q: dk.search.Query) dk.search.Error!dk.search.Page {
+            query_len = @min(q.text.len, query_seen.len);
+            @memcpy(query_seen[0..query_len], q.text[0..query_len]);
+            return .{ .hits = &hits, .has_more = false };
+        }
+        fn info(_: *anyopaque, _: Allocator, id: dk.document.Id) dk.search.Error!?dk.search.Hit {
+            for (hits) |h| if (std.mem.eql(u8, &h.id, &id)) return h;
+            return null;
+        }
+        fn docFreq(_: *anyopaque, arena: Allocator, words: []const []const u8) dk.search.Error![]const u32 {
+            const out = try arena.alloc(u32, words.len);
+            for (words, out) |w, *o| o.* = if (std.mem.eql(u8, w, "raven")) 3 else if (std.mem.eql(u8, w, "valley")) 90 else 5;
+            return out;
+        }
+        fn stats(_: *anyopaque, arena: Allocator) dk.search.Error![]const dk.search.SourceStat {
+            const out = try arena.alloc(dk.search.SourceStat, 1);
+            out[0] = .{ .name = "books", .docs = 100, .last_added = null };
+            return out;
+        }
+    };
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    try mem.store().put(@splat(1), "The raven and the valley. Raven again, ravens everywhere, valley valley valley, ancient sagas.");
+    var dummy: u8 = 0;
+    const s: dk.search.Searcher = .{ .ptr = &dummy, .vtable = &.{ .search = Sim.search, .info = Sim.info, .doc_freq = Sim.docFreq, .source_stats = Sim.stats } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const hex = "01010101010101010101010101010101";
+    const r = handleServices(a, s, .{ .content = mem.store() }, .GET, "/api/v1/similar?id=" ++ hex);
+    try testing.expectEqual(http.Status.ok, r.status);
+    try testing.expect(std.mem.indexOf(u8, r.body, "Other A") != null and std.mem.indexOf(u8, r.body, "Other B") != null);
+    try testing.expect(std.mem.indexOf(u8, r.body, "\"Self\"") == null); // not itself
+    try testing.expect(std.mem.indexOf(u8, Sim.query_seen[0..Sim.query_len], "raven") != null);
+    try testing.expect(std.mem.indexOf(u8, Sim.query_seen[0..Sim.query_len], "valley") == null); // too common
+    try testing.expect(std.mem.indexOf(u8, Sim.query_seen[0..Sim.query_len], " OR ") != null);
+    // The document page lists them.
+    const page = handleServices(a, s, .{ .content = mem.store() }, .GET, "/doc/" ++ hex);
+    try testing.expect(std.mem.indexOf(u8, page.body, "Similar documents") != null);
+    // Bad ids and unknown documents.
+    try testing.expectEqual(http.Status.bad_request, handleServices(a, s, .{ .content = mem.store() }, .GET, "/api/v1/similar?id=zz").status);
+    try testing.expectEqual(http.Status.not_found, handleServices(a, s, .{ .content = mem.store() }, .GET, "/api/v1/similar?id=09090909090909090909090909090909").status);
+    try testing.expectEqual(http.Status.bad_request, handleServices(a, s, .{ .content = mem.store() }, .GET, "/api/v1/similar?id=" ++ hex ++ "&limit=0").status);
+    // Without the stored text there is nothing to go on.
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, s, .{}, .GET, "/api/v1/similar?id=" ++ hex).body, "\"hits\":[]") != null);
 }
 
 test "answers: off by default, a question is needed, nothing is asked of the model without passages, and an unreachable model is said" {

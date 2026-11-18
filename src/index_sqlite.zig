@@ -374,7 +374,7 @@ pub const SqliteIndex = struct {
     }
 
     pub fn searcher(self: *SqliteIndex) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = searchImpl, .info = infoImpl, .search_chunks = searchChunksImpl, .source_stats = sourceStatsImpl, .words = wordsImpl, .export_page = exportPageImpl } };
+        return .{ .ptr = self, .vtable = &.{ .search = searchImpl, .info = infoImpl, .search_chunks = searchChunksImpl, .source_stats = sourceStatsImpl, .words = wordsImpl, .doc_freq = docFreqImpl, .export_page = exportPageImpl } };
     }
 
     pub fn imageSearcher(self: *SqliteIndex) search.ImageSearcher {
@@ -694,6 +694,18 @@ pub const SqliteIndex = struct {
             });
         }
         return out.items;
+    }
+    pub fn docFreqImpl(ptr: *anyopaque, arena: Allocator, words_in: []const []const u8) search.Error![]const u32 {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
+        const out = try arena.alloc(u32, words_in.len);
+        @memset(out, 0);
+        for (words_in, out) |w, *o| {
+            const st = Stmt.prepare(self.db, "SELECT doc FROM fts_vocab WHERE term = ?1") catch return out;
+            defer st.deinit();
+            st.text(1, w) catch return out;
+            if (st.step() catch false) o.* = @intCast(@max(0, st.colInt(0)));
+        }
+        return out;
     }
     pub fn wordsImpl(ptr: *anyopaque, arena: Allocator, word: []const u8, kind: search.WordKind, limit: u32) search.Error![]const []const u8 {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
@@ -1373,7 +1385,7 @@ pub const SearchPool = struct {
     }
 
     pub fn searcher(self: *SearchPool) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = poolSearch, .info = poolInfo, .search_chunks = poolSearchChunks, .source_stats = poolSourceStats, .words = poolWords, .export_page = poolExportPage } };
+        return .{ .ptr = self, .vtable = &.{ .search = poolSearch, .info = poolInfo, .search_chunks = poolSearchChunks, .source_stats = poolSourceStats, .words = poolWords, .doc_freq = poolDocFreq, .export_page = poolExportPage } };
     }
 
     pub fn imageSearcher(self: *SearchPool) search.ImageSearcher {
@@ -1401,6 +1413,18 @@ pub const SearchPool = struct {
             if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
                 defer slot.busy.store(false, .release);
                 return SqliteIndex.exportPageImpl(&slot.index, arena, connector, after, limit);
+            }
+        }
+        unreachable;
+    }
+    fn poolDocFreq(ptr: *anyopaque, arena: Allocator, words_in: []const []const u8) search.Error![]const u32 {
+        const self: *SearchPool = @ptrCast(@alignCast(ptr));
+        self.idle.waitUncancelable(self.io);
+        defer self.idle.post(self.io);
+        for (self.slots) |*slot| {
+            if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                defer slot.busy.store(false, .release);
+                return SqliteIndex.docFreqImpl(&slot.index, arena, words_in);
             }
         }
         unreachable;
@@ -1785,6 +1809,10 @@ test "words of the vocabulary: completions of a prefix, most common first, and t
     for (ele) |w| try testing.expect(std.mem.startsWith(u8, w, "ele"));
     try testing.expectEqual(@as(usize, 0), (try s.words(a, "zzz", .prefix, 5)).len);
     try testing.expectEqual(@as(usize, 0), (try s.words(a, "", .prefix, 5)).len);
+    const dfs = try s.docFreq(a, &.{ "elephant", "elevator", "nothere" });
+    try testing.expectEqual(@as(u32, 2), dfs[0]);
+    try testing.expectEqual(@as(u32, 1), dfs[1]);
+    try testing.expectEqual(@as(u32, 0), dfs[2]);
     const sp = try s.words(a, "elefant", .spelling, 1);
     try testing.expectEqual(@as(usize, 1), sp.len);
     try testing.expectEqualStrings("elephant", sp[0]);

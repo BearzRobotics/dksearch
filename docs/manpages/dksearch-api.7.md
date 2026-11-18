@@ -16,6 +16,9 @@ AUTHENTICATION
 
 `snippets=N` on `/api/v1/search` and `/search` (1 to 5, default 1) asks for up to N excerpts per result: the usual `snippet` plus `more_snippets`, further passages of the stored text that contain the query's plain words, apart from the first one, in text order, with the same match markers. Only results of this node whose text is stored have them; the page offers the choice as *Excerpts* in the search options and keeps it when paging.
 
+GET /api/v1/similar
+Documents like one given. Parameters: `id` (the 32 hex digits of a document id, as in `view_url`), `limit` (1 to 50, default 10). Returns `{"hits": [...]}` like search, never including the document itself, limited to what the caller may see; 404 `not_found` for an unknown document. With a vector index (`[embeddings]`, ADR 0043) holding the document the nearest vectors are used; otherwise the words that set the document apart (frequent in it, rare in the index) are searched for with OR. Empty when the text is not stored. The document page shows five under *Similar documents*.
+
 GET /api/v1/suggest
 The query with its last word completed from the index's vocabulary, most common words first (at most 8). Parameters: `q`. Returns `{"query": ..., "suggestions": [...]}`; empty when the last word has operators or wildcards, or nothing starts with it. Public, like search; it reveals only words that are in documents the index holds.
 

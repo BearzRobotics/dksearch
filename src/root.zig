@@ -34,6 +34,7 @@ pub const ollama = @import("ollama.zig");
 pub const answer = @import("answer.zig");
 pub const vindex = @import("vindex.zig");
 pub const snippets = @import("snippets.zig");
+pub const similar = @import("similar.zig");
 pub const optioninfo = @import("optioninfo.zig");
 pub const settinginfo = @import("settinginfo.zig");
 pub const officetext = @import("officetext.zig");
@@ -91,6 +92,7 @@ test {
     _ = answer;
     _ = vindex;
     _ = snippets;
+    _ = similar;
     _ = optioninfo;
     _ = settinginfo;
     _ = officetext;
