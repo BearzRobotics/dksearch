@@ -87,7 +87,7 @@ const feeds = [_]Option{
 };
 
 const crawl = [_]Option{
-    .{ .key = "seeds_file", .label = "Seeds file", .type = .path, .required = true, .placeholder = "/etc/dksearch/seeds.txt", .help = "A text file with one address per line (or: sitemap ADDRESS)." },
+    .{ .key = "seeds_file", .label = "Seeds file", .type = .path, .required = true, .placeholder = "/etc/dksearch/seeds.txt or links.toml", .help = "Where to start: a text file with one address per line (or: sitemap ADDRESS), or a TOML file (a name ending in .toml) with [[site]] entries and sections such as a curated links.toml; then \"Seeds: sections to use\" and \"to leave out\" below choose sections." },
     user_agent,
     .{ .key = "max_depth", .label = "Link depth", .type = .number, .min = 0, .max = 10, .default = "3", .help = "How many links deep to follow from each address. 0 fetches only the listed pages." },
     .{ .key = "max_pages", .label = "Most pages per run", .type = .number, .min = 1, .max = 1000000, .default = "1000", .help = "The run ends normally when this is reached; raise it to crawl more." },

@@ -154,7 +154,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/actions/collection-edit", "/docs", "/findimage", "/actions/findimage", "/safesearch", "/actions/safesearch", "/actions/safesearch-pin", "/actions/safesearch-lists", "/zim", "/actions/zim", "/actions/zim-folder", "/models", "/actions/model-pull", "/actions/model-remove", "/actions/model-use", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/actions/collection-edit", "/docs", "/actions/embed", "/findimage", "/actions/findimage", "/safesearch", "/actions/safesearch", "/actions/safesearch-pin", "/actions/safesearch-lists", "/zim", "/actions/zim", "/actions/zim-folder", "/models", "/actions/model-pull", "/actions/model-remove", "/actions/model-use", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -162,7 +162,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, action_embed, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -190,6 +190,7 @@ pub const App = struct {
             .{ "/actions/key-remove", .action_key_remove },
             .{ "/zim", .zim_page },
             .{ "/docs", .docs_page },
+            .{ "/actions/embed", .action_embed },
             .{ "/findimage", .findimage_page },
             .{ "/actions/findimage", .action_findimage },
             .{ "/safesearch", .safesearch_page },
@@ -248,7 +249,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_findimage or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_embed or route == .action_findimage or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -274,6 +275,7 @@ pub const App = struct {
             .maintenance => self.pageMaintenance(arena, csrf),
             .action_maintenance => self.startOperation(arena, req, auth, false),
             .docs_page => self.pageDocs(arena, csrf, t.params),
+            .action_embed => self.startEmbedding(arena, req, auth),
             .findimage_page => self.pageFindImage(arena, csrf, null, null),
             .action_findimage => self.findImage(arena, req, auth),
             .safesearch_page => self.pageSafe(arena, csrf, null, false),
@@ -2001,6 +2003,61 @@ pub const App = struct {
         return handler.htmlResponse(arena, .ok, aw.written());
     }
 
+    /// The steps to AI search (search by meaning): a model, its vectors, the switch on the search page.
+    fn writeAiSearch(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8) !void {
+        const model = self.opts.embeddings_model;
+        var have: u64 = 0;
+        if (model) |m| {
+            const vec_path = try std.fmt.allocPrintSentinel(arena, "{s}/vectors.db", .{self.opts.data_dir}, 0);
+            if (dk.embed.Store.openReadOnly(vec_path)) |opened| {
+                var st = opened;
+                defer st.close();
+                have = st.count(m);
+            }
+        }
+        var docs: u64 = 0;
+        if (self.opts.searcher) |s| for (s.sourceStats(arena) catch &.{}) |st| {
+            docs += st.docs;
+        };
+        try w.writeAll("<section class=\"card\"><h2>AI search (by meaning)</h2><p class=\"muted\">Search by meaning finds documents that say what you mean even when they do not use your words. It needs an embedding model (below), a vector for each document, and the search page then offers <em>Also search by meaning</em>. Everything stays on this machine.</p><ol class=\"steps\">");
+        try w.print("<li>{s} <strong>Choose an embedding model.</strong> ", .{if (model != null) "&#10003;" else "&#9675;"});
+        if (model) |m| {
+            try w.writeAll("In use: <code>");
+            try html.writeEscaped(w, m);
+            try w.writeAll("</code>.");
+        } else try w.writeAll("Pull one in the list below (for example <code>nomic-embed-text</code>) and press <em>Use for semantic search</em>; then restart dksearch.");
+        try w.writeAll("</li>");
+        try w.print("<li>{s} <strong>Make the vectors.</strong> ", .{if (model != null and have > 0 and have >= docs) "&#10003;" else "&#9675;"});
+        if (model != null) {
+            try w.print("{d} of {d} documents have a vector. ", .{ have, docs });
+            if (csrf) |token| {
+                const can = self.opts.jobs != null;
+                try w.writeAll("<form class=\"inline\" action=\"/actions/embed\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+                try html.writeEscaped(w, token);
+                try w.print("\"><button type=\"submit\" class=\"btn\"{s}>{s}</button></form> ", .{ if (can) "" else " disabled", if (have == 0) "Make vectors" else "Make the missing vectors" });
+            }
+            try w.writeAll("<span class=\"muted small\">Uses your Ollama and takes a while for many documents; progress shows on the Dashboard, you can stop it and it continues where it was. New documents need it again.</span>");
+        } else try w.writeAll("<span class=\"muted\">After step 1.</span>");
+        try w.writeAll("</li>");
+        try w.print("<li>{s} <strong>Search.</strong> ", .{if (model != null and have > 0) "&#10003;" else "&#9675;"});
+        try w.writeAll("Tick <em>Also search by meaning</em> under the search box (or add <code>semantic=1</code> to an API search). Results are the words' matches and the nearest by meaning, merged.</li></ol></section>");
+    }
+
+    fn startEmbedding(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        _ = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const jobs = self.opts.jobs orelse return actionFailure(arena, false, .{ .status = .forbidden, .code = "actions_disabled", .message = "actions are disabled" });
+        jobs.startEmbed() catch |e| return actionFailure(arena, false, switch (e) {
+            error.NotConfigured => .{ .status = .conflict, .code = "not_configured", .message = "no embedding model is set up yet: choose one below, press Use for semantic search and restart dksearch" },
+            error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "another operation is already running" },
+            error.OutOfMemory => return error.OutOfMemory,
+            else => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start it" },
+        });
+        return redirect(arena, "/", null);
+    }
+
     fn writeModels(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, notice: ?[]const u8, confirm_remove: ?[]const u8) !void {
         if (notice) |n| {
             try w.writeAll("<p class=\"notice\" role=\"status\">");
@@ -2008,6 +2065,8 @@ pub const App = struct {
             try w.writeAll("</p>");
         }
         try w.writeAll("<p class=\"muted\">Models for semantic search and written answers run in <a href=\"https://ollama.com\">Ollama</a>, a separate program you install and start yourself; dksearch never starts it and never downloads a model unless you press the button.</p>");
+        // The steps to AI search come first and show whether or not Ollama answers.
+        try self.writeAiSearch(arena, w, csrf);
         const client = dk.ollama.Client.init(self.gpa, self.io, self.opts.ollama_url) catch return error.OutOfMemory;
         defer client.deinit();
         const version = client.version(arena);
@@ -2137,8 +2196,8 @@ pub const App = struct {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Io => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_not_writable", .message = "the configuration file could not be written; nothing was changed" }),
                 };
-                const what: []const u8 = if (std.mem.eql(u8, target, "embeddings")) "semantic search (then run `dksearch embed` to make the vectors)" else "written answers";
-                return self.pageModels(arena, csrf, try std.fmt.allocPrint(arena, "Saved: {s} will use {s}. Restart dksearch for it to take effect.", .{ what, name }), null);
+                const what: []const u8 = if (std.mem.eql(u8, target, "embeddings")) "semantic search" else "written answers";
+                return self.pageModels(arena, csrf, try std.fmt.allocPrint(arena, "Saved: {s} will use {s}. Restart dksearch for it to take effect; for semantic search then press Make vectors above.", .{ what, name }), null);
             },
         }
     }
@@ -2528,6 +2587,7 @@ fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const 
             .remove => try w.writeAll("Removing "),
             .download => try w.writeAll("Downloading "),
             .model_pull => try w.writeAll("Pulling the model "),
+            .embed => try w.writeAll("Making vectors for semantic search"),
         }
         if (c.op == .import or c.op == .remove or c.op == .download or c.op == .model_pull) {
             try w.writeAll("<strong>");
@@ -3069,6 +3129,7 @@ fn opTitle(op: dk.jobs.Op) []const u8 {
         .remove => "Removal",
         .download => "Download",
         .model_pull => "Model pull",
+        .embed => "Making vectors",
     };
 }
 
@@ -4554,6 +4615,12 @@ test "Models: Ollama is looked for, not started; choosing a model for embeddings
     try testing.expect(std.mem.indexOf(u8, file, "model = \"llama3.2:3b\"") != null and std.mem.indexOf(u8, file, "enabled = true") != null);
     // Deleting asks Ollama; with none there it is reported, not pretended.
     try testing.expectEqual(http.Status.bad_gateway, (try post(&f, a, cookie, csrf, "/actions/model-remove", "name=nomic-embed-text")).status);
+    // The AI search steps are shown; making vectors with no model set up is refused with the way forward.
+    try testing.expect(std.mem.indexOf(u8, page.body, "AI search (by meaning)") != null and std.mem.indexOf(u8, page.body, "Choose an embedding model") != null);
+    const no_model = try post(&f, a, cookie, csrf, "/actions/embed", "");
+    try testing.expectEqual(http.Status.conflict, no_model.status);
+    try testing.expect(std.mem.indexOf(u8, no_model.body, "choose one below") != null);
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/embed", .{ .cookie = cookie, .body = "csrf=wrong" })).status);
     // A pull starts as a background task and fails cleanly when Ollama is not there.
     try testing.expectEqual(http.Status.see_other, (try post(&f, a, cookie, csrf, "/actions/model-pull", "name=nomic-embed-text")).status);
     try f.waitIdle();

@@ -26,6 +26,8 @@ const sourcestore = @import("sourcestore.zig");
 const kiwix = @import("kiwix.zig");
 const ollama = @import("ollama.zig");
 const sourceedit = @import("sourceedit.zig");
+const embed = @import("embed.zig");
+const embedjob = @import("embedjob.zig");
 
 /// The runner wants a clock without a context argument; one process runs one
 /// manager, so the clock's `Io` is kept here.
@@ -60,6 +62,8 @@ pub const Options = struct {
     kiwix_options: kiwix.Options = .{},
     /// Documents of at least this many bytes also get their passages indexed (see `index_sqlite.OpenOptions`).
     chunk_min_bytes: u32 = 64 * 1024,
+    /// The embedding server and the vectors file of semantic search; null when `[embeddings]` is not set.
+    embeddings: ?struct { settings: embed.Settings, vectors_path: [:0]const u8 } = null,
     /// Tests only: skip syncing, which is very slow on some disks.
     sync_off: bool = false,
 };
@@ -77,6 +81,8 @@ pub const Op = enum {
     download,
     /// Pull a model into the local Ollama (the model name is the argument).
     model_pull,
+    /// Make the vectors of semantic search for every document that has none yet.
+    embed,
 };
 
 /// What a download needs, copied by the manager.
@@ -287,6 +293,12 @@ pub const Manager = struct {
         return self.begin(.model_pull, name, null);
     }
 
+    /// Starts making the vectors of semantic search in the background (cancellable; run again to continue).
+    pub fn startEmbed(self: *Manager) StartError!void {
+        if (self.opts.embeddings == null) return error.NotConfigured;
+        return self.begin(.embed, "vectors", null);
+    }
+
     fn begin(self: *Manager, op: Op, arg: ?[]const u8, dl: ?Download) StartError!void {
         var source: config.Source = .{ .name = "", .kind = "" };
         switch (op) {
@@ -306,6 +318,7 @@ pub const Manager = struct {
             .check => {},
             .download => source.name = arg orelse return error.BadArgument,
             .model_pull => source.name = arg orelse return error.BadArgument,
+            .embed => source.name = arg orelse return error.BadArgument,
         }
 
         self.mutex.lockUncancelable(self.io);
@@ -315,7 +328,7 @@ pub const Manager = struct {
         // The lock is taken here, so a conflict is reported to the caller,
         // and handed to the task, which releases it when the run ends.
         var lock: ?maintenance.WriterLock = null;
-        if (op != .download and op != .model_pull) {
+        if (op != .download and op != .model_pull and op != .embed) {
             var dir = Io.Dir.cwd().openDir(self.io, self.opts.data_dir, .{}) catch return error.DataDirUnavailable;
             defer dir.close(self.io);
             lock = maintenance.WriterLock.acquire(self.io, dir, "write.lock") catch |e| return switch (e) {
@@ -538,6 +551,32 @@ pub const Manager = struct {
         return name;
     }
 
+    /// Makes the missing vectors with the embedding server of `[embeddings]`; what is made is kept if it stops.
+    fn runEmbed(self: *Manager, control: *connector.Control, out: *Outcome) void {
+        const e = self.opts.embeddings orelse return self.fail(out, "no [embeddings] model is configured");
+        var state = state_sqlite.SqliteStateStore.open(self.gpa, self.opts.state_path, self.opts.sync_off) catch return self.fail(out, "cannot open state.db");
+        defer state.close();
+        var content = content_sqlite.SqliteContentStore.open(self.gpa, self.opts.content_path, self.opts.sync_off) catch return self.fail(out, "cannot open content.db");
+        defer content.close();
+        var store = embed.Store.open(e.vectors_path) catch return self.fail(out, "cannot open vectors.db");
+        defer store.close();
+        const client = embed.Client.init(self.gpa, self.io, e.settings) catch return self.fail(out, "out of memory");
+        defer client.deinit();
+        const r = embedjob.run(.{ .gpa = self.gpa, .io = self.io, .client = client, .store = &store, .settings = e.settings, .documents = state.documents(), .content = content.store(), .control = control });
+        out.submitted = r.made;
+        if (r.failed != null) {
+            self.fail(out, "the embedding server did not answer (is Ollama running, and does it have the model?); what was made is kept, run it again to continue");
+            return;
+        }
+        if (r.cancelled) {
+            out.state = .cancelled;
+            self.summaryPrint(out, "Stopped after making {d} vectors; run it again to continue.", .{r.made});
+            return;
+        }
+        out.state = .completed;
+        self.summaryPrint(out, "Made {d} vectors with {s}; {d} documents already had one or have no retained text. {d} documents now have a vector.", .{ r.made, e.settings.model, r.skipped, store.count(e.settings.model) });
+    }
+
     fn runPull(self: *Manager, name: []const u8, control: *connector.Control, out: *Outcome) void {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -569,6 +608,7 @@ pub const Manager = struct {
             .remove => runRemove(self, source.name, control, &outcome),
             .download => runDownload(self, dl.?, control, &outcome),
             .model_pull => runPull(self, source.name, control, &outcome),
+            .embed => runEmbed(self, control, &outcome),
         }
         if (dl) |d| d.destroy(self.gpa);
         if (lock) |l| l.release(self.io);
@@ -865,6 +905,54 @@ test "refresh all runs every enabled source one after another, and cancelling fo
     try testing.expect(m.cancel());
     try testing.expectEqual(@as(usize, 0), m.queued());
     try waitIdle(&m);
+}
+
+test "making vectors runs as a background job, can be run again, and is refused when no model is set up" {
+    if (!@import("build_options").crawler) return error.SkipZigTest;
+    const nettest = @import("connectors/nettest.zig");
+    var srv: nettest.TestServer = undefined;
+    try srv.start(&.{.{ .path = "/api/embed", .content_type = "application/json", .body = "{\"embeddings\":[[3,4]]}" }});
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    const url = srv.url(&ub, "");
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    var plain = Manager.init(testing.allocator, testing.io, env.options());
+    defer plain.deinit();
+    try testing.expectError(error.NotConfigured, plain.startEmbed());
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var opts = env.options();
+    var vbuf: [200]u8 = undefined;
+    const vec_path = try std.fmt.bufPrintSentinel(&vbuf, "{s}/vectors.db", .{env.data_dir[0..env.data_len]}, 0);
+    opts.embeddings = .{ .settings = .{ .url = url, .model = "m", .timeout_ms = 2000, .batch = 1 }, .vectors_path = vec_path };
+    var m = Manager.init(testing.allocator, testing.io, opts);
+    defer m.deinit();
+    try m.start("notes");
+    try waitIdle(&m);
+    try m.startEmbed();
+    try waitIdle(&m);
+    const last = (try m.lastResult(a)).?;
+    try testing.expectEqual(Op.embed, last.op);
+    try testing.expectEqual(state_sqlite.JobState.completed, last.state);
+    try testing.expectEqual(@as(u64, 2), last.submitted); // the two notes
+    try testing.expect(std.mem.indexOf(u8, last.summary orelse "", "Made 2 vectors") != null);
+    // Again: nothing is missing.
+    try m.startEmbed();
+    try waitIdle(&m);
+    try testing.expectEqual(@as(u64, 0), (try m.lastResult(a)).?.submitted);
+    // A server that is not there fails it with a reason.
+    var down = env.options();
+    down.embeddings = .{ .settings = .{ .url = "http://127.0.0.1:1", .model = "other", .timeout_ms = 300, .batch = 1 }, .vectors_path = vec_path };
+    var m2 = Manager.init(testing.allocator, testing.io, down);
+    defer m2.deinit();
+    try m2.startEmbed();
+    try waitIdle(&m2);
+    const failed = (try m2.lastResult(a)).?;
+    try testing.expectEqual(state_sqlite.JobState.failed, failed.state);
+    try testing.expect(std.mem.indexOf(u8, failed.failure orelse "", "did not answer") != null);
 }
 
 test "unknown and disabled sources, a second start, and a held lock are refused" {

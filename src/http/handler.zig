@@ -406,7 +406,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
     return switch (r) {
         .home => blk: {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHomeForm(&aw.writer, null, .{ .safe_note = safeNote(services), .answers_offered = services.answers != null and !services.scope.none(), .regex_enabled = regex != null, .sources = try sourceChoicesFor(arena, services, searcher), .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, null, .{ .semantic_offered = services.embed != null, .safe_note = safeNote(services), .answers_offered = services.answers != null and !services.scope.none(), .regex_enabled = regex != null, .sources = try sourceChoicesFor(arena, services, searcher), .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
@@ -1970,7 +1970,15 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         }
     }
 
-    const page = searcher.search(arena, q) catch |e| switch (e) {
+    var semantic_note: ?SemanticNote = null;
+    const page = (if (wantsSemantic(params) and services.embed != null and q.text.len > 0) blk: {
+        const r = semanticSearch(arena, searcher, services, params, q) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Search => return searchFailure(arena, error.Io, false),
+        };
+        semantic_note = r.note;
+        break :blk r.page;
+    } else searcher.search(arena, q)) catch |e| switch (e) {
         // An empty box just shows the form again.
         error.EmptyQuery => {
             var aw: std.Io.Writer.Allocating = .init(arena);
@@ -2017,6 +2025,12 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         }
     }
     form.snippets = snippetCount(params);
+    form.semantic_offered = services.embed != null;
+    form.semantic_checked = semantic_note != null;
+    if (semantic_note) |n| form.semantic_text = if (n.used)
+        try std.fmt.allocPrint(arena, "Ordered by meaning with {s}{s}.", .{ n.model orelse "the embedding model", if (n.index) " (documents the words missed are included)" else "" })
+    else
+        try std.fmt.allocPrint(arena, "Not ordered by meaning: {s}.", .{n.reason orelse "no reason given"});
     shown.hits = try withMoreSnippets(arena, services, shown.hits, parsed.typed, form.snippets);
     try applyFallback(arena, services, params, &form, shown.hits.len, q.offset);
     if (shown.hits.len == 0 and q.offset == 0) form.did_you_mean = try didYouMean(arena, searcher, q);
@@ -3032,6 +3046,14 @@ test "semantic=1 says why when it cannot reorder, and the plain results are stil
     try testing.expect(std.mem.indexOf(u8, down.body, "could not be reached") != null);
     // Paging past the first page is not reordered.
     try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), .{ .embed = &svc2 }, .GET, "/api/v1/search?q=lamp&semantic=1&offset=10").body, "first page") != null);
+    // The search page offers the choice when a model is set up (and not otherwise), and says what happened.
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), .{}, .GET, "/").body, "Also search by meaning") == null);
+    try testing.expect(std.mem.indexOf(u8, handleServices(a, fake.searcher(), .{ .embed = &svc2 }, .GET, "/").body, "Also search by meaning (AI)") != null);
+    const page = handleServices(a, fake.searcher(), .{ .embed = &svc2 }, .GET, "/search?q=lamp&semantic=1");
+    try testing.expectEqual(http.Status.ok, page.status);
+    try testing.expect(std.mem.indexOf(u8, page.body, "name=\"semantic\" value=\"1\" checked") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "Not ordered by meaning") != null and std.mem.indexOf(u8, page.body, "could not be reached") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "Lamp") != null); // the plain results are still shown
 }
 
 test "export: only shared sources, only with a key that covers them, paged with a cursor, with their text and rights" {

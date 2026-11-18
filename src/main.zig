@@ -1248,6 +1248,19 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             };
         }
         if (cfg.admin_options.actions) {
+            // The embedding server and the vectors file, for the Make vectors button.
+            const vec_path_for_jobs = std.fmt.allocPrintSentinel(lists_arena.allocator(), "{s}/vectors.db", .{cfg.data_dir}, 0) catch {
+                err(io, "out of memory", .{});
+                return exit_io;
+            };
+            const embed_settings_for_jobs: dk.embed.Settings = if (cfg.embeddings) |ec| .{
+                .url = ec.url,
+                .api = if (std.mem.eql(u8, ec.api, "openai")) .openai else .ollama,
+                .model = ec.model,
+                .timeout_ms = ec.timeout_ms,
+                .max_chars = ec.max_chars,
+                .batch = ec.batch,
+            } else .{ .url = "", .model = "" };
             job_manager = dk.jobs.Manager.init(gpa, io, .{
                 .store = &source_store,
                 .data_dir = cfg.data_dir,
@@ -1263,6 +1276,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
                 .zim_dir = cfg.admin_options.zim_dir,
                 .config_path = config_path,
                 .ollama_url = if (cfg.ollama) |o| o.url else dk.ollama.default_url,
+                .embeddings = if (cfg.embeddings != null) .{ .settings = embed_settings_for_jobs, .vectors_path = vec_path_for_jobs } else null,
                 .chunk_min_bytes = cfg.search.chunk_index_min_kb * 1024,
             });
             job_manager_ready = true;
@@ -1476,67 +1490,27 @@ fn embedCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     const client = dk.embed.Client.init(gpa, io, settings) catch return exit_io;
     defer client.deinit();
 
-    const Work = struct {
-        gpa: std.mem.Allocator,
-        io: Io,
-        client: *dk.embed.Client,
-        store: *dk.embed.Store,
-        content: dk.storage.ContentStore,
-        settings: dk.embed.Settings,
-        batch_arena: std.heap.ArenaAllocator,
-        ids: std.ArrayList(dk.document.Id) = .empty,
-        texts: std.ArrayList([]const u8) = .empty,
-        made: u64 = 0,
-        skipped: u64 = 0,
-        failed: ?dk.embed.Error = null,
-
-        fn visit(ptr: *anyopaque, rec: dk.storage.Record) dk.storage.Error!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.store.has(rec.id, self.settings.model)) {
-                self.skipped += 1;
-                return;
-            }
-            const a = self.batch_arena.allocator();
-            const text = self.content.get(self.gpa, rec.id) catch {
-                self.skipped += 1; // no retained text
-                return;
-            };
-            defer self.gpa.free(text);
-            const t = dk.embed.textFor(a, rec.meta.title, text, self.settings.max_chars) catch return error.OutOfMemory;
-            if (std.mem.trim(u8, t, " \t\r\n").len == 0) return;
-            self.ids.append(a, rec.id) catch return error.OutOfMemory;
-            self.texts.append(a, t) catch return error.OutOfMemory;
-            if (self.ids.items.len >= self.settings.batch) self.flush() catch return error.Io;
-        }
-
-        fn flush(self: *@This()) !void {
-            if (self.ids.items.len == 0) return;
-            const a = self.batch_arena.allocator();
-            const vecs = self.client.embed(a, self.texts.items) catch |e| {
-                self.failed = e;
-                return error.EmbedFailed;
-            };
-            for (self.ids.items, vecs) |id, v| self.store.put(id, self.settings.model, v) catch return error.EmbedFailed;
-            self.made += self.ids.items.len;
-            out(io_global.?, "  {d} vectors made\n", .{self.made});
-            _ = self.batch_arena.reset(.retain_capacity);
-            self.ids = .empty;
-            self.texts = .empty;
-        }
-    };
     io_global = io;
-    var work: Work = .{ .gpa = gpa, .io = io, .client = client, .store = &store, .content = content.store(), .settings = settings, .batch_arena = .init(gpa) };
-    defer work.batch_arena.deinit();
     out(io, "making vectors with {s} at {s}\n", .{ settings.model, settings.url });
-    state.documents().forEach(.{ .ptr = &work, .visit = Work.visit }) catch {
-        if (work.failed) |f| err(io, "the embedding server failed ({t}); {d} vectors were saved, run `embed` again to continue", .{ f, work.made });
+    const result = dk.embedjob.run(.{
+        .gpa = gpa,
+        .io = io,
+        .client = client,
+        .store = &store,
+        .settings = settings,
+        .documents = state.documents(),
+        .content = content.store(),
+        .on_batch = struct {
+            fn say(_: ?*anyopaque, made: u64) void {
+                out(io_global.?, "  {d} vectors made\n", .{made});
+            }
+        }.say,
+    });
+    if (result.failed) |f| {
+        err(io, "the embedding server failed ({t}); {d} vectors were saved, run `embed` again to continue", .{ f, result.made });
         return exit_failure;
-    };
-    work.flush() catch {
-        if (work.failed) |f| err(io, "the embedding server failed ({t}); {d} vectors were saved, run `embed` again to continue", .{ f, work.made });
-        return exit_failure;
-    };
-    out(io, "done: {d} vectors made, {d} documents skipped (already done, or no retained text); {d} in the store for this model\n", .{ work.made, work.skipped, store.count(settings.model) });
+    }
+    out(io, "done: {d} vectors made, {d} documents skipped (already done, or no retained text); {d} in the store for this model\n", .{ result.made, result.skipped, store.count(settings.model) });
     return exit_ok;
 }
 

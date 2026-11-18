@@ -132,6 +132,11 @@ pub const Form = struct {
     snippets: u8 = 1,
     /// What to say about safe search (nothing when it is not in use on this server).
     safe_note: SafeNote = .none,
+    /// Search by meaning: offered when the server has an embedding model; ticked when this search used it; and what to
+    /// tell the visitor about how the results were ordered.
+    semantic_offered: bool = false,
+    semantic_checked: bool = false,
+    semantic_text: ?[]const u8 = null,
     answers_offered: bool = false,
     answer_checked: bool = false,
     /// Where to go to ask the providers (`web=1`) when that is not done by itself; null: not offered.
@@ -347,6 +352,7 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
         }
         try w.writeAll(")</label>");
     }
+    if (f.semantic_offered) try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"semantic\" value=\"1\"{s}> Also search by meaning (AI)</label>", .{if (f.semantic_checked) " checked" else ""});
     if (f.answers_offered) try w.print("<label class=\"check\"><input type=\"checkbox\" name=\"answer\" value=\"1\"{s}> Also write an answer with the local AI model (slower)</label>", .{if (f.answer_checked) " checked" else ""});
     try w.writeAll("<label>Order <select name=\"sort\">");
     const orders = [_][2][]const u8{ .{ "", "Best match" }, .{ "newest", "Newest" }, .{ "oldest", "Oldest" }, .{ "largest", "Largest" }, .{ "smallest", "Smallest" }, .{ "title", "Title" } };
@@ -438,6 +444,11 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     try writeForm(w, f);
     try w.writeAll("</div>\n");
     try writeSafeNote(w, f.safe_note);
+    if (f.semantic_text) |t| {
+        try w.writeAll("<p class=\"muted small\">");
+        try writeEscaped(w, t);
+        try w.writeAll("</p>\n");
+    }
     try writeInterpretation(w, f, page, offset);
     try writeAnswer(w, f);
     if (f.default_note) |name| {
@@ -837,6 +848,7 @@ fn writePagerLink(w: *Writer, f: Form, offset: u32, label_html: []const u8) Writ
     }
     if (f.exact_only) try w.writeAll("&amp;fuzzy=0");
     if (f.snippets > 1) try w.print("&amp;snippets={d}", .{f.snippets});
+    if (f.semantic_checked) try w.writeAll("&amp;semantic=1");
     if (offset > 0) try w.print("&amp;offset={d}", .{offset});
     try w.writeAll("\">");
     try w.writeAll(label_html);
