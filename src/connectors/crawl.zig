@@ -32,6 +32,7 @@ const htmltext = @import("../htmltext.zig");
 const robots = @import("crawl/robots.zig");
 const fetch = @import("crawl/fetch.zig");
 const hidden = @import("crawl/hidden.zig");
+const toml = @import("toml");
 const domainlist = @import("../domainlist.zig");
 const cabundle = @import("crawl/cabundle.zig");
 const xml = @import("../xml.zig");
@@ -76,7 +77,7 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip" };
 
 // ------------------------------------------------------------ validation
 
@@ -174,6 +175,8 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     _ = try needString(source, "validators_file", false, diag);
     try boolOption(source, "hidden_links", diag);
     try boolOption(source, "allow_unbanned_onions", diag);
+    _ = try needString(source, "seeds_sections", false, diag);
+    _ = try needString(source, "seeds_skip", false, diag);
     inline for (.{ "tor_socks", "i2p_proxy" }) |k| if (try needString(source, k, false, diag)) |v| if (hidden.parseProxy(v) == null) {
         diag.set("", key(&kbuf, source, k), "must be the address of the proxy as IP:port, e.g. \"127.0.0.1:9050\"", .{});
         return error.InvalidValue;
@@ -212,6 +215,9 @@ pub const CrawlConnector = struct {
     /// A Tor SOCKS5 proxy and an I2P HTTP proxy, when `.onion` and `.i2p` sites may be crawled (docs/decisions/0044).
     tor: ?std.Io.net.IpAddress,
     i2p: ?std.Io.net.IpAddress,
+    /// For a TOML seeds file: the sections to take (comma-separated names; empty: all) and the sections to leave out.
+    seeds_sections: ?[]const u8,
+    seeds_skip: ?[]const u8,
     /// Follow links from other sites into the hidden networks (a source whose seeds are there already stays there).
     hidden_links: bool,
     checkpoint_buf: std.ArrayList(u8) = .empty,
@@ -260,6 +266,8 @@ pub const CrawlConnector = struct {
             .tor = if (source.optionString("tor_socks")) |v| hidden.parseProxy(v) else null,
             .i2p = if (source.optionString("i2p_proxy")) |v| hidden.parseProxy(v) else null,
             .hidden_links = source.optionBool("hidden_links") orelse false,
+            .seeds_sections = if (source.optionString("seeds_sections")) |v| try gpa.dupe(u8, v) else null,
+            .seeds_skip = if (source.optionString("seeds_skip")) |v| try gpa.dupe(u8, v) else null,
         };
     }
 
@@ -283,6 +291,8 @@ pub const CrawlConnector = struct {
         }
         if (self.language) |l| self.gpa.free(l);
         if (self.validators_file) |l| self.gpa.free(l);
+        if (self.seeds_sections) |l| self.gpa.free(l);
+        if (self.seeds_skip) |l| self.gpa.free(l);
         self.checkpoint_buf.deinit(self.gpa);
         self.* = undefined;
     }
@@ -594,8 +604,13 @@ pub const CrawlConnector = struct {
     /// One entry per line: an absolute http(s) URL, or `sitemap URL`. Blank
     /// lines and `#` comments are skipped, lines that are not usable are
     /// ignored.
+    fn readTomlSeeds(self: *CrawlConnector, arena: Allocator, data: []const u8) ![]const Seed {
+        return tomlSeeds(arena, data, self.seeds_sections, self.seeds_skip);
+    }
+
     fn readSeeds(self: *CrawlConnector, arena: Allocator) ![]const Seed {
         const data = try Io.Dir.cwd().readFileAlloc(self.io, self.seeds_file, arena, .limited(max_seeds_file_bytes));
+        if (std.mem.endsWith(u8, self.seeds_file, ".toml")) return self.readTomlSeeds(arena, data);
         var out: std.ArrayList(Seed) = .empty;
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |raw| {
@@ -615,6 +630,56 @@ pub const CrawlConnector = struct {
         return out.items;
     }
 };
+
+/// Whether `name` is in a comma-separated list of section names (case-insensitive).
+fn inNameList(list: ?[]const u8, name: []const u8) bool {
+    const l = list orelse return false;
+    var it = std.mem.tokenizeAny(u8, l, ", \t");
+    while (it.next()) |n| if (std.ascii.eqlIgnoreCase(n, name)) return true;
+    return false;
+}
+
+/// Seeds from a TOML file: sections (`[computers]` with `[[computers.site]]` entries) or plain `[[site]]` entries, each
+/// with a `url` (and `sitemap = true` for a sitemap). `seeds_sections` and `seeds_skip` choose sections.
+fn tomlSeeds(arena: Allocator, data: []const u8, sections: ?[]const u8, skip: ?[]const u8) ![]const Seed {
+    var tdiag: toml.Diagnostic = .{};
+    const tdoc = toml.Document.parse(arena, data, .{}, &tdiag) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.InvalidToml;
+    var out: std.ArrayList(Seed) = .empty;
+    const SiteReader = struct {
+        fn sites(a: Allocator, v: toml.Value, list: *std.ArrayList(Seed)) !void {
+            const arr = switch (v) {
+                .array => |x| x,
+                else => return,
+            };
+            for (arr.items.items) |item| {
+                const t = switch (item) {
+                    .table => |x| x,
+                    else => continue,
+                };
+                const url = t.getString("url") orelse continue;
+                if (parseUrl(url) == null) continue;
+                if (list.items.len >= max_seeds) return;
+                const sm = if (t.get("sitemap")) |s| (switch (s) {
+                    .boolean => |b| b,
+                    else => false,
+                }) else false;
+                try list.append(a, .{ .line = try a.dupe(u8, url), .url = try a.dupe(u8, url), .sitemap = sm });
+            }
+        }
+    };
+    if (tdoc.root.get("site")) |v| try SiteReader.sites(arena, v, &out);
+    for (tdoc.root.entries.keys(), tdoc.root.entries.values()) |name, value| {
+        if (std.mem.eql(u8, name, "site")) continue;
+        const section = switch (value) {
+            .table => |x| x,
+            else => continue,
+        };
+        if (sections != null and !inNameList(sections, name)) continue;
+        if (inNameList(skip, name)) continue;
+        if (section.get("site")) |v| try SiteReader.sites(arena, v, &out);
+    }
+    return out.items;
+}
 
 const Seed = struct {
     /// The whole line, which is also the resume position.
@@ -1624,6 +1689,78 @@ test "a site on the ban list (given as a hash) is not contacted at all, seed or 
     try testing.expectEqual(@as(usize, 0), got.ids.items.len);
     try testing.expectEqual(@as(usize, 0), proxy.connections); // not even robots.txt
     try testing.expectEqual(@as(u64, 2), ctl.reasonCounts()[@backingInt(api.Reason.banned)]);
+}
+
+test "a TOML seeds file gives its sections' sites; sections can be chosen and left out" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const text =
+        \\[[site]]
+        \\url = "https://top.example/"
+        \\[computers]
+        \\title = "Computers"
+        \\[[computers.site]]
+        \\url = "https://c1.example/"
+        \\name = "one"
+        \\[[computers.site]]
+        \\url = "https://c2.example/map.xml"
+        \\sitemap = true
+        \\[Adult]
+        \\[[Adult.site]]
+        \\url = "https://adult.example/"
+        \\[misc]
+        \\[[misc.site]]
+        \\url = "not a url"
+        \\[[misc.site]]
+        \\url = "http://m1.example/"
+    ;
+    const all = try tomlSeeds(a, text, null, null);
+    try testing.expectEqual(@as(usize, 5), all.len); // the bad address is dropped
+    const without_adult = try tomlSeeds(a, text, null, "adult, other");
+    try testing.expectEqual(@as(usize, 4), without_adult.len);
+    for (without_adult) |sd| try testing.expect(std.mem.indexOf(u8, sd.url, "adult.example") == null);
+    const only = try tomlSeeds(a, text, "Computers", null);
+    try testing.expectEqual(@as(usize, 3), only.len); // the section's two and the top-level [[site]]
+    try testing.expect(only[2].sitemap);
+    try testing.expectEqualStrings("https://c2.example/map.xml", only[2].url);
+    try testing.expectError(error.InvalidToml, tomlSeeds(a, "[[site]\nurl =", null, null));
+}
+
+test "a crawl reads its seeds from a TOML file" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/robots.txt", .status = 404 },
+        .{ .path = "/a", .body = "<html><head><title>Seed A</title></head><body>from the toml file</body></html>" },
+        .{ .path = "/b", .body = "<html><head><title>Seed B</title></head><body>skipped section</body></html>" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ub: [2][96]u8 = undefined;
+    const toml_text = try std.fmt.allocPrint(testing.allocator, "[good]\n[[good.site]]\nurl = \"{s}\"\n[Adult]\n[[Adult.site]]\nurl = \"{s}\"\n", .{ srv.url(&ub[0], "/a"), srv.url(&ub[1], "/b") });
+    defer testing.allocator.free(toml_text);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "links.toml", .data = toml_text });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPathFile(testing.io, "links.toml", &pbuf);
+    const opts = [_]config.Option{
+        .{ .key = "user_agent", .value = .{ .string = "dksearch-test/1.0 (+https://example.org/bot)" } },
+        .{ .key = "seeds_file", .value = .{ .string = pbuf[0..n] } },
+        .{ .key = "seeds_skip", .value = .{ .string = "adult" } },
+    };
+    var conn = try CrawlConnector.init(testing.allocator, testing.io, .{ .name = "web", .kind = "crawl", .options = &opts });
+    defer conn.deinit();
+    conn.delay_ms = 0;
+    conn.timeout_s = 5;
+    conn.workers = 1;
+    conn.max_depth = 0;
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    _ = try conn.connector().run(got.sink(), &ctl, null);
+    try testing.expectEqual(@as(usize, 1), got.ids.items.len);
+    try testing.expectEqualStrings("Seed A", got.titles.items[0]);
+    try testing.expectEqual(@as(usize, 0), srv.count("/b")); // the left-out section is never requested
 }
 
 test "the proxy options are checked, and routing follows the network of the name" {
