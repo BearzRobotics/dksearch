@@ -11,6 +11,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 ## Then
 
 - **Against SEO slop:** a domain blocklist (never shown) and demotion list (pushed down, still findable) in the configuration and on the Settings page, applied to indexed, crawled and fallback results; and a "trusted first" ordering that puts results of highly boosted sources before the long tail instead of mixing by text score alone.
+- **Hidden networks (opt-in):** the crawler reaches `.onion` sites through a Tor daemon the owner runs (SOCKS5, `[tor] socks`) and `.i2p` sites through an I2P router's HTTP proxy (`[i2p] http_proxy`). Hostnames of those networks are never resolved locally (no DNS leak) and never sent to the open internet; a clearnet page's links into them are followed only when the source asks for it; dksearch never starts or bundles Tor or I2P. Off unless configured.
 - **Presentation:** several snippets per result, similar documents, cursor paging (did-you-mean and a suggest endpoint are built).
 - **Search by image everywhere:** a `find-image` command and an admin upload over the perceptual hashes the files connector already stores.
 - **Management:** saved searches and opt-in statistics (no query logging by default).
