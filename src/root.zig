@@ -32,6 +32,7 @@ pub const identity = @import("identity.zig");
 pub const fallback = @import("fallback.zig");
 pub const ollama = @import("ollama.zig");
 pub const answer = @import("answer.zig");
+pub const vindex = @import("vindex.zig");
 pub const optioninfo = @import("optioninfo.zig");
 pub const settinginfo = @import("settinginfo.zig");
 pub const officetext = @import("officetext.zig");
@@ -87,6 +88,7 @@ test {
     _ = fallback;
     _ = ollama;
     _ = answer;
+    _ = vindex;
     _ = optioninfo;
     _ = settinginfo;
     _ = officetext;

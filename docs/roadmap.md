@@ -6,7 +6,6 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 ## Next
 
-- **Vector index.** A persistent index of every document's vector so semantic search can find documents the words missed, not only reorder lexical candidates.
 - **Known limits to remove:** recrawl by schedule per page (adaptive interval, conditional requests), regular expressions on characters instead of bytes, ZIM support tested on large real files.
 
 ## Then
@@ -25,4 +24,4 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 ## Known limits (see the manual and the decision records)
 
-A hostname is checked for private addresses before the first request but a DNS answer that changes in between (rebinding) is not stopped; the crawler sends conditional requests only for pages at the depth limit (ADR 0036) and does not recrawl by schedule per page; regex is bytewise; ZIM support is tested on small real files only; Wuffs (image decoding) is alpha upstream; semantic ordering reorders lexical candidates only (ADR 0038).
+A hostname is checked for private addresses before the first request but a DNS answer that changes in between (rebinding) is not stopped; the crawler sends conditional requests only for pages at the depth limit (ADR 0036) and does not recrawl by schedule per page; regex is bytewise; ZIM support is tested on small real files only; Wuffs (image decoding) is alpha upstream; the vector index is an exact scan held in memory (ADR 0043), fine to millions of documents, a graph index would be the step beyond.

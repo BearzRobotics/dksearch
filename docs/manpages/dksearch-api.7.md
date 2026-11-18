@@ -85,7 +85,7 @@ fallback
 : Optional. `1` also asks the `[fallback]` providers (see FALLBACK TO OTHER SEARCH ENGINES in **dksearch**(1)) for web results for `q` and returns them as `external` (`provider`, `title`, `url`, `snippet`) with `external_status` (one `{provider, status}` per provider: `ok`, `failed`, `limited`, `unavailable`). The words are sent to those services. Null when not asked for or not configured; not for callers with no access, and only for `offset=0`. Limited by `max_per_minute` for the whole server.
 
 semantic
-: Optional. `1` re-orders the results by meaning (see SEMANTIC SEARCH in **dksearch**(1)): the lexical results, a wider pool than the page, are fused by reciprocal rank with their similarity to the query as judged by the embedding model of `[embeddings]`. First page only. The response gains `semantic`: `used`, `model`, `compared` (how many results had a vector) and, when not used, `reason`; null when not asked for.
+: Optional. `1` re-orders the results by meaning (see SEMANTIC SEARCH in **dksearch**(1)): the lexical results, a wider pool than the page, are fused by reciprocal rank with their similarity to the query as judged by the embedding model of `[embeddings]`. First page only. The response gains `semantic`: `used`, `model`, `compared` (how many results had a vector, or with the vector index how many nearest documents it returned), `index` (true when the vector index was used), `from_vectors` (results found by the vectors alone) and, when not used, `reason`; null when not asked for.
 
 group
 : Optional. `1` folds results that are the same document (same `ident`) into the first, which lists the other sources that hold it in `same_in`. Not used with `peers=1`.

@@ -18,6 +18,7 @@ const build_options = @import("build_options");
 const sqlite = @import("sqlite.zig");
 const doc = @import("document.zig");
 const search = @import("search.zig");
+const vindex = @import("vindex.zig");
 
 const have_http = build_options.crawler;
 const fetch = if (have_http) @import("connectors/crawl/fetch.zig") else struct {};
@@ -240,7 +241,43 @@ pub const Store = struct {
 pub const Service = struct {
     client: *Client,
     vectors_path: [:0]const u8,
+    /// The in-memory index of every vector, when `index_mb` allows one.
+    holder: ?*vindex.Holder = null,
 };
+
+/// Merges two orderings of documents (best first) by reciprocal rank: a document in both rises, one in only one list
+/// keeps that list's share. `only_second` counts documents that the first list did not have. Ties keep `first`'s order.
+pub fn fuseTwo(arena: Allocator, first: []const search.Hit, second: []const search.Hit) Allocator.Error!struct { hits: []const search.Hit, only_second: usize } {
+    const Entry = struct { hit: search.Hit, score: f64, order: usize };
+    var entries: std.ArrayList(Entry) = .empty;
+    var by_id: std.AutoHashMapUnmanaged(doc.Id, usize) = .empty;
+    for (first, 0..) |h, rank| {
+        try by_id.put(arena, h.id, entries.items.len);
+        try entries.append(arena, .{ .hit = h, .score = 1.0 / (rrf_k + @as(f64, @floatFromInt(rank + 1))), .order = entries.items.len });
+    }
+    const first_n = entries.items.len;
+    for (second, 0..) |h, rank| {
+        const share = 1.0 / (rrf_k + @as(f64, @floatFromInt(rank + 1)));
+        if (by_id.get(h.id)) |at| {
+            entries.items[at].score += share;
+        } else {
+            try by_id.put(arena, h.id, entries.items.len);
+            try entries.append(arena, .{ .hit = h, .score = share, .order = entries.items.len });
+        }
+    }
+    std.mem.sort(Entry, entries.items, {}, struct {
+        fn less(_: void, a: Entry, b: Entry) bool {
+            if (a.score != b.score) return a.score > b.score;
+            return a.order < b.order;
+        }
+    }.less);
+    const out = try arena.alloc(search.Hit, entries.items.len);
+    for (entries.items, out) |e, *o| {
+        o.* = e.hit;
+        o.score = e.score;
+    }
+    return .{ .hits = out, .only_second = entries.items.len - first_n };
+}
 
 pub const Fused = struct {
     hits: []const search.Hit,
@@ -385,4 +422,21 @@ test "the client asks an Ollama-style server and a failing server is an error, n
     const gone = try Client.init(testing.allocator, testing.io, .{ .url = "http://127.0.0.1:1", .model = "m", .timeout_ms = 500 });
     defer gone.deinit();
     try testing.expectError(error.Unreachable, gone.embed(a, &.{"x"}));
+}
+
+test "two orderings are merged by reciprocal rank, and what only the second found is counted" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lexical = [_]search.Hit{ hitOf(1), hitOf(2), hitOf(3) };
+    const vector = [_]search.Hit{ hitOf(3), hitOf(9), hitOf(1) };
+    const r = try fuseTwo(a, &lexical, &vector);
+    try testing.expectEqual(@as(usize, 4), r.hits.len);
+    try testing.expectEqual(@as(usize, 1), r.only_second); // 9 came from the vectors alone
+    // 1 and 3 are in both lists and lead; 2 and 9 each have one share, and 2 (first list) goes before 9.
+    try testing.expect(r.hits[0].id[0] == 1 or r.hits[0].id[0] == 3);
+    try testing.expectEqual(@as(u8, 2), r.hits[2].id[0]);
+    try testing.expectEqual(@as(u8, 9), r.hits[3].id[0]);
+    const alone = try fuseTwo(a, &lexical, &.{});
+    for (alone.hits, 0..) |h, i| try testing.expectEqual(@as(u8, @intCast(i + 1)), h.id[0]);
 }

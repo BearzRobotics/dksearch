@@ -322,6 +322,9 @@ pub const Embeddings = struct {
     timeout_ms: u32 = 30000,
     max_chars: u32 = 2000,
     batch: u32 = 16,
+    /// Memory the in-memory vector index may use (MiB); 0 turns the index off (semantic search then only reorders
+    /// the lexical results).
+    index_mb: u32 = 2048,
 };
 
 /// The Ollama server dksearch may talk to (`[ollama]`); the default address is also tried to detect one.
@@ -811,7 +814,7 @@ fn readFallback(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnos
 
 fn readEmbeddings(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!?Embeddings {
     const t = (try subTable(src, root, "embeddings", diag)) orelse return null;
-    try checkKeys(src, "embeddings", t, &[_][]const u8{ "url", "api", "model", "timeout_ms", "max_chars", "batch" }, diag);
+    try checkKeys(src, "embeddings", t, &[_][]const u8{ "url", "api", "model", "timeout_ms", "max_chars", "batch", "index_mb" }, diag);
     var e: Embeddings = .{
         .url = try baseAddress(a, src, "embeddings.url", try reqStr(src, "embeddings", t, "url", diag), diag),
         .model = try a.dupe(u8, try reqStr(src, "embeddings", t, "model", diag)),
@@ -830,6 +833,7 @@ fn readEmbeddings(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagn
     if (try intIn(src, "embeddings", t, "timeout_ms", 100, 300000, diag)) |n| e.timeout_ms = @intCast(n);
     if (try intIn(src, "embeddings", t, "max_chars", 100, 20000, diag)) |n| e.max_chars = @intCast(n);
     if (try intIn(src, "embeddings", t, "batch", 1, 256, diag)) |n| e.batch = @intCast(n);
+    if (try intIn(src, "embeddings", t, "index_mb", 0, 1048576, diag)) |n| e.index_mb = @intCast(n);
     return e;
 }
 
@@ -1489,6 +1493,7 @@ test "embeddings are read and checked" {
     try testing.expectEqualStrings("http://127.0.0.1:11434", c.embeddings.?.url);
     try testing.expectEqualStrings("ollama", c.embeddings.?.api);
     try testing.expectEqual(@as(u32, 8), c.embeddings.?.batch);
+    try testing.expectEqual(@as(u32, 2048), c.embeddings.?.index_mb);
     var none = try loadFromSlice(testing.allocator, "t.toml", "", &d);
     defer none.deinit();
     try testing.expect(none.embeddings == null);

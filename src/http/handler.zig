@@ -545,7 +545,7 @@ const ApiHit = struct {
     same_in: []const []const u8 = &.{},
 };
 /// What `semantic=1` did: whether the order was changed by meaning, and why not when it was not.
-const SemanticNote = struct { used: bool, model: ?[]const u8 = null, compared: u32 = 0, reason: ?[]const u8 = null };
+const SemanticNote = struct { used: bool, model: ?[]const u8 = null, compared: u32 = 0, reason: ?[]const u8 = null, index: bool = false, from_vectors: u32 = 0 };
 
 const PeerNote = struct { peer: []const u8, status: []const u8, ms: u32, results: u32, http_status: ?u16 = null, cached: bool = false };
 const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null, semantic: ?SemanticNote = null, external: ?[]const dk.fallback.External = null, external_status: ?[]const ExternalStatus = null };
@@ -594,6 +594,33 @@ fn semanticSearch(arena: Allocator, searcher: dk.search.Searcher, services: Serv
     const want: u32 = if (q.limit == 0) 10 else q.limit;
     wide.limit = @min(@max(want * 3, 30), 100);
     const page = searcher.search(arena, wide) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Search;
+    // With the vector index and no filters: the nearest documents of the whole index join the lexical candidates, so
+    // a document the words missed can be found. (A filter or a language needs the lexical side to apply it.)
+    if (svc.holder) |holder| if (q.filters.len == 0 and q.connector == null and q.language == null and q.content_type == null) {
+        if (holder.acquire()) |idx| {
+            defer holder.release(idx);
+            const near = try idx.search(arena, vecs[0], wide.limit);
+            var vector_hits: std.ArrayList(dk.search.Hit) = .empty;
+            for (near) |n| {
+                var found: ?dk.search.Hit = null;
+                for (page.hits) |h| if (std.mem.eql(u8, &h.id, &n.id)) {
+                    found = h;
+                };
+                if (found == null) {
+                    const info = searcher.info(arena, n.id) catch null;
+                    if (info) |h| if (services.scope.allows(h.connector)) {
+                        found = h;
+                    };
+                }
+                if (found) |h| try vector_hits.append(arena, h);
+            }
+            const merged = try dk.embed.fuseTwo(arena, page.hits, vector_hits.items);
+            var out = page;
+            out.hits = merged.hits[0..@min(merged.hits.len, want)];
+            out.has_more = page.has_more or merged.hits.len > want;
+            return .{ .page = out, .note = .{ .used = true, .model = model, .compared = @intCast(near.len), .index = true, .from_vectors = @intCast(merged.only_second) } };
+        }
+    };
     const fused = try dk.embed.fuse(arena, &store, model, vecs[0], page.hits);
     var out = page;
     out.hits = fused.hits[0..@min(fused.hits.len, want)];

@@ -58,3 +58,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0040 | Signed node identity |
 | 0041 | Fallback to other search engines |
 | 0042 | Ollama, models and written answers |
+| 0043 | A vector index over every document |

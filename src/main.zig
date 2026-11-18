@@ -1146,6 +1146,8 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     }
     var embed_client: ?*dk.embed.Client = null;
     var embed_service: dk.embed.Service = undefined;
+    var vector_holder: ?dk.vindex.Holder = null;
+    defer if (vector_holder) |*h| h.deinit();
     if (cfg.embeddings) |ec| {
         const vec_path = std.fmt.allocPrintSentinel(arena_state.allocator(), "{s}/vectors.db", .{cfg.data_dir}, 0) catch return exit_io;
         embed_client = dk.embed.Client.init(gpa, io, .{
@@ -1157,6 +1159,10 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .batch = ec.batch,
         }) catch return exit_io;
         embed_service = .{ .client = embed_client.?, .vectors_path = vec_path };
+        if (ec.index_mb > 0) {
+            vector_holder = dk.vindex.Holder.init(gpa, io, vec_path, ec.model, @as(usize, ec.index_mb) * 1024 * 1024);
+            embed_service.holder = &vector_holder.?;
+        }
     }
     defer if (embed_client) |c| c.deinit();
     // Other search engines as a fallback: only with `[fallback] enabled = true`.
