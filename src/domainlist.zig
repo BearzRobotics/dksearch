@@ -156,6 +156,10 @@ pub fn hiddenNetworkOf(url: ?[]const u8) ?[]const u8 {
     return null;
 }
 
+/// The lists of this process, set by the program once they are read, for code that has no other way to reach them (the
+/// crawler asks it before contacting a site). Null: no lists.
+pub var global: ?*const Lists = null;
+
 /// What is hidden and what is ranked lower, for the whole server.
 pub const Lists = struct {
     /// Never shown, to anyone: the blocklist, plus the ban lists when safe search is on.

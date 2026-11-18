@@ -903,31 +903,12 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     // unreadable file stops the server rather than silently showing what was meant to be hidden.
     var lists_arena = std.heap.ArenaAllocator.init(gpa);
     defer lists_arena.deinit();
-    var domain_lists: dk.domainlist.Lists = .{ .demote_percent = cfg.filters.demote_percent };
-    {
-        const la = lists_arena.allocator();
-        var failed: []const u8 = "";
-        const loads = [_]struct { set: *dk.domainlist.Set, entries: []const []const u8, files: []const []const u8, on: bool }{
-            .{ .set = &domain_lists.blocked, .entries = cfg.filters.blocklist, .files = cfg.filters.blocklist_files, .on = true },
-            .{ .set = &domain_lists.demoted, .entries = cfg.filters.demote, .files = cfg.filters.demote_files, .on = true },
-            .{ .set = &domain_lists.blocked, .entries = cfg.safe_search.ban, .files = cfg.safe_search.ban_files, .on = cfg.safe_search.enabled },
-        };
-        for (loads) |l| {
-            if (!l.on) continue;
-            for (l.entries) |e| _ = l.set.add(la, e) catch {
-                err(io, "out of memory", .{});
-                return exit_config;
-            };
-            dk.domainlist.loadFiles(io, la, l.set, l.files, &failed) catch |e| {
-                err(io, "cannot read the domain list {s}: {t}", .{ failed, e });
-                return exit_config;
-            };
-        }
-        if (cfg.safe_search.enabled) err(io, "safe search is on: {d} domains are blocked ({d} demoted)", .{ domain_lists.blocked.count(), domain_lists.demoted.count() }) else if (!domain_lists.blocked.isEmpty() or !domain_lists.demoted.isEmpty()) err(io, "domain lists: {d} blocked, {d} demoted", .{ domain_lists.blocked.count(), domain_lists.demoted.count() });
-    }
+    var domain_lists = buildDomainLists(io, lists_arena.allocator(), cfg, true) orelse return exit_config;
     const lists_ptr: ?*const dk.domainlist.Lists = if (domain_lists.blocked.isEmpty() and domain_lists.demoted.isEmpty()) null else &domain_lists;
     if (pool) |*p| p.setDomains(lists_ptr);
     index.setDomains(lists_ptr);
+    dk.domainlist.global = lists_ptr;
+    defer dk.domainlist.global = null;
     if (pool) |*p| {
         p.setFuzzyMode(fuzzy_mode);
         p.setSimpleSyntax(!cfg.search.advanced_syntax);
@@ -1376,6 +1357,10 @@ fn rebuildCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+    // The ban lists keep a crawl away from banned sites (they are not contacted at all).
+    var import_lists = buildDomainLists(io, arena_state.allocator(), cfg, false) orelse return exit_config;
+    dk.domainlist.global = if (import_lists.blocked.isEmpty()) null else &import_lists;
+    defer dk.domainlist.global = null;
     const paths = Paths.make(arena_state.allocator(), cfg.data_dir) catch return exit_io;
     const lock = lockWriters(io, cfg.data_dir, "rebuild") orelse return exit_io;
     defer lock.release(io);
@@ -1629,6 +1614,33 @@ fn removeCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, source: []
     };
     out(io, "{s}: removed {d} of {d} document{s}{s}\n", .{ source, r.removed, n, if (n == 1) "" else "s", if (r.complete) "" else " (stopped early; run again to finish)" });
     return if (r.complete) exit_ok else exit_failure;
+}
+
+/// Reads the domain lists named by `[filters]` and (when on) `[safe_search]` into `la`: the blocklist, the demotion list
+/// and the ban lists. An unreadable file is an error, so that what was meant to be hidden is not shown.
+fn buildDomainLists(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, announce: bool) ?dk.domainlist.Lists {
+    var lists: dk.domainlist.Lists = .{ .demote_percent = cfg.filters.demote_percent };
+    var failed: []const u8 = "";
+    const loads = [_]struct { set: *dk.domainlist.Set, entries: []const []const u8, files: []const []const u8, on: bool }{
+        .{ .set = &lists.blocked, .entries = cfg.filters.blocklist, .files = cfg.filters.blocklist_files, .on = true },
+        .{ .set = &lists.demoted, .entries = cfg.filters.demote, .files = cfg.filters.demote_files, .on = true },
+        .{ .set = &lists.blocked, .entries = cfg.safe_search.ban, .files = cfg.safe_search.ban_files, .on = cfg.safe_search.enabled },
+    };
+    for (loads) |l| {
+        if (!l.on) continue;
+        for (l.entries) |e| _ = l.set.add(la, e) catch {
+            err(io, "out of memory", .{});
+            return null;
+        };
+        dk.domainlist.loadFiles(io, la, l.set, l.files, &failed) catch |e| {
+            err(io, "cannot read the domain list {s}: {t}", .{ failed, e });
+            return null;
+        };
+    }
+    if (announce) {
+        if (cfg.safe_search.enabled) err(io, "safe search is on: {d} domains are blocked ({d} demoted)", .{ lists.blocked.count(), lists.demoted.count() }) else if (!lists.blocked.isEmpty() or !lists.demoted.isEmpty()) err(io, "domain lists: {d} blocked, {d} demoted", .{ lists.blocked.count(), lists.demoted.count() });
+    }
+    return lists;
 }
 
 fn importCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, one: ?[]const u8, all: bool, prune: bool) u8 {

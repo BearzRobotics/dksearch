@@ -32,6 +32,7 @@ const htmltext = @import("../htmltext.zig");
 const robots = @import("crawl/robots.zig");
 const fetch = @import("crawl/fetch.zig");
 const hidden = @import("crawl/hidden.zig");
+const domainlist = @import("../domainlist.zig");
 const cabundle = @import("crawl/cabundle.zig");
 const xml = @import("../xml.zig");
 
@@ -1035,6 +1036,8 @@ const Run = struct {
         self.setCurrent(url);
         while (true) {
             const u = parseUrl(url) orelse return self.skip(.limit);
+            // A banned site is not contacted at all (not even for its robots.txt), seed or link.
+            if (domainlist.global) |l| if (l.blocked.matches(u.host)) return self.skip(.banned);
             const host = self.hostFor(u, listed and hops == 0) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return .stopped,
@@ -1592,6 +1595,34 @@ test "an onion seed is crawled through the Tor proxy by name; with no proxy conf
     try testing.expectEqualStrings("Onion page", got.texts.items[0]);
     try testing.expectEqualStrings("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion", proxy.asked_host[0..proxy.asked_len]);
     try testing.expect(proxy.connections >= 2); // robots.txt and the page
+}
+
+test "a site on the ban list (given as a hash) is not contacted at all, seed or not" {
+    var proxy: hidden.FakeProxy = undefined;
+    try proxy.start(.tor, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\n\r\nhello");
+    defer proxy.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var conn = try testConnector(&tmp, "http://abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion/\nhttp://www.abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion/page\n", "dksearch-test/1.0 (+https://example.org/bot)");
+    defer conn.deinit();
+    conn.max_depth = 0;
+    conn.tor = proxy.address();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion", &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    var lists: domainlist.Lists = .{};
+    _ = try lists.blocked.addText(ar.allocator(), &hex);
+    domainlist.global = &lists;
+    defer domainlist.global = null;
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    _ = try conn.connector().run(got.sink(), &ctl, null);
+    try testing.expectEqual(@as(usize, 0), got.ids.items.len);
+    try testing.expectEqual(@as(usize, 0), proxy.connections); // not even robots.txt
+    try testing.expectEqual(@as(u64, 2), ctl.reasonCounts()[@backingInt(api.Reason.banned)]);
 }
 
 test "the proxy options are checked, and routing follows the network of the name" {

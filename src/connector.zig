@@ -70,6 +70,8 @@ pub const Reason = enum {
     redirect,
     /// A limit of the run (pages, sites) was reached, or the URL is unusable.
     limit,
+    /// The site's domain is on the ban list (`[filters]`, `[safe_search]`): it is not contacted at all.
+    banned,
     /// A local file that could not be read or understood: unreadable, damaged, not valid text, over the
     /// file size cap, or an unsupported variant of a format.
     unreadable,
