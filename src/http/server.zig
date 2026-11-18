@@ -94,6 +94,8 @@ pub const Request = struct {
     authorization: ?[]const u8 = null,
     /// The `Cookie` header, if any.
     cookie: ?[]const u8 = null,
+    /// The `Content-Type` header, if any (for a multipart form's boundary).
+    content_type: ?[]const u8 = null,
     /// The `Host` header, if any.
     host: ?[]const u8 = null,
     /// A peer's signature headers (`dk-node`, `dk-time`, `dk-nonce`, `dk-sig`), if all four came.
@@ -403,6 +405,8 @@ fn connection(state: *State, slot: usize, stream: net.Stream) Io.Cancelable!void
                 dreq.authorization = a.dupe(u8, h.value) catch return;
             } else if (std.ascii.eqlIgnoreCase(h.name, "cookie")) {
                 dreq.cookie = a.dupe(u8, h.value) catch return;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "content-type") and h.value.len <= 200) {
+                dreq.content_type = a.dupe(u8, h.value) catch return;
             } else if (std.ascii.eqlIgnoreCase(h.name, "host") and h.value.len <= 300) {
                 dreq.host = a.dupe(u8, h.value) catch return;
             } else if (std.ascii.eqlIgnoreCase(h.name, "dk-node") and h.value.len <= 64) {

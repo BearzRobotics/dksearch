@@ -8,6 +8,7 @@ pub const html = @import("html.zig");
 pub const server = @import("server.zig");
 pub const admin = @import("admin.zig");
 pub const docspage = @import("docspage.zig");
+pub const multipart = @import("multipart.zig");
 pub const accesslog = @import("accesslog.zig");
 
 test {
@@ -18,4 +19,5 @@ test {
     _ = accesslog;
     _ = admin;
     _ = docspage;
+    _ = multipart;
 }

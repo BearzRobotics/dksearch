@@ -177,6 +177,7 @@ fn run(init: std.process.Init) u8 {
     if (eq(first, "api-key")) return apiKeyCmd(io, gpa, &args);
     if (eq(first, "models")) return modelsCmd(io, gpa, &args);
     if (eq(first, "fetch-banlist")) return fetchBanlistCmd(io, gpa, &args);
+    if (eq(first, "find-image")) return findImageCmd(io, gpa, &args);
     if (eq(first, "node-key")) {
         var config_path: ?[]const u8 = null;
         while (args.next()) |a| {
@@ -525,6 +526,72 @@ fn readLine(io: Io, gpa: std.mem.Allocator, prompt: ?[]const u8) ?[]u8 {
 /// `dksearch api-key add NAME (--all | --collection C ...) | list | remove NAME_OR_ID` [--config FILE].
 /// `dksearch models list | pull NAME [--yes] | remove NAME [--yes]`: the models of the Ollama server (found at
 /// `[ollama] url` or the default address). Pulling and removing change what is on disk, so they need `--yes`.
+/// `dksearch find-image FILE`: the indexed pictures that look like the picture in FILE.
+fn findImageCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
+    var config_path: ?[]const u8 = null;
+    var file: ?[]const u8 = null;
+    var distance: u8 = 10;
+    var limit: u32 = 20;
+    while (args.next()) |a| {
+        if (eq(a, "--config")) {
+            config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+        } else if (std.mem.startsWith(u8, a, "--config=")) {
+            config_path = a["--config=".len..];
+        } else if (eq(a, "--distance")) {
+            distance = std.fmt.parseInt(u8, args.next() orelse "", 10) catch return usageError(io, "--distance needs a number of bits, 0 to 32");
+            if (distance > 32) return usageError(io, "--distance needs a number of bits, 0 to 32");
+        } else if (eq(a, "--limit")) {
+            limit = std.fmt.parseInt(u32, args.next() orelse "", 10) catch return usageError(io, "--limit needs a number, 1 to 100");
+            if (limit == 0 or limit > 100) return usageError(io, "--limit needs a number, 1 to 100");
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            err(io, "unknown option for find-image: {s}", .{a});
+            return exit_usage;
+        } else if (file == null) {
+            file = a;
+        } else return usageError(io, "find-image takes one picture FILE");
+    }
+    const path = file orelse return usageError(io, "find-image needs a picture FILE");
+    if (!dk.image.available) {
+        err(io, "this build cannot read pictures (built without -Dmedia)", .{});
+        return exit_failure;
+    }
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(dk.image.max_bytes)) catch |e| {
+        err(io, "cannot read {s}: {t}", .{ path, e });
+        return exit_io;
+    };
+    const hash = dk.image.dhash(arena, bytes) catch |e| {
+        err(io, "{s}: {s}", .{ path, switch (e) {
+            error.TooLarge => "the picture is too large to read",
+            error.OutOfMemory => "out of memory",
+            else => "not a picture this build can read (JPEG, PNG, GIF, WebP or BMP)",
+        } });
+        return exit_failure;
+    };
+    const paths = Paths.make(arena, cfg.data_dir) catch return exit_io;
+    var index = dk.index_sqlite.SqliteIndex.openReadOnly(paths.index) catch |e| {
+        err(io, "cannot open the index {s}: {t}", .{ paths.index, e });
+        return exit_io;
+    };
+    defer index.close();
+    const page = index.imageSearcher().near(arena, hash, distance, limit) catch |e| {
+        err(io, "the search failed: {t}", .{e});
+        return exit_failure;
+    };
+    err(io, "fingerprint {s}; pictures within {d} of 64 bits:", .{ dk.image.toHex(hash), distance });
+    if (page.hits.len == 0) {
+        out(io, "no picture in the index looks like it\n", .{});
+        return exit_ok;
+    }
+    for (page.hits) |h| out(io, "{d}\t{s}\t{s}\t{s}\n", .{ h.distance, h.connector, h.url orelse "-", h.title orelse "-" });
+    return exit_ok;
+}
+
 fn fetchBanlistCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
     var url: ?[]const u8 = null;
     var out_path: ?[]const u8 = null;
@@ -1216,6 +1283,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .node_name = cfg.node_name,
             .node_id = node_id_text,
             .data_dir = cfg.data_dir,
+            .image_searcher = if (pool) |*p| p.imageSearcher() else index.imageSearcher(),
             .lists = lists_ptr,
             .unlock = if (unlock_state != null) &unlock_state.? else null,
             .safe_enabled = cfg.safe_search.enabled,
@@ -1240,7 +1308,8 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .write_timeout_ms = cfg.admin.write_timeout_ms,
             .max_connections = cfg.admin.max_connections,
             .max_requests_per_connection = cfg.admin.max_requests_per_connection,
-            .max_body_bytes = 4096,
+            // The login forms are tiny; the Find by image upload is a picture.
+            .max_body_bytes = 12 * 1024 * 1024,
             .shutdown_grace_ms = cfg.admin.shutdown_grace_ms,
         };
         if (job_manager_ready) {

@@ -18,6 +18,7 @@ const admin_js = @embedFile("assets/admin.js");
 const admin_js_version = html.assetVersion(admin_js);
 const html = @import("html.zig");
 const docspage = @import("docspage.zig");
+const multipart = @import("multipart.zig");
 const query = @import("query.zig");
 
 const Response = handler.Response;
@@ -64,6 +65,8 @@ pub const Options = struct {
     jobs: ?*dk.jobs.Manager = null,
     /// For the query-testing page; null hides it.
     searcher: ?dk.search.Searcher = null,
+    /// Finds pictures by their perceptual hash, for the Find by image page; null hides it.
+    image_searcher: ?dk.search.ImageSearcher = null,
     /// Regular-expression filtering for the query-testing page and API (with
     /// the larger administration limits), if available.
     regex: ?*dk.regexsearch.Service = null,
@@ -151,7 +154,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/actions/collection-edit", "/docs", "/safesearch", "/actions/safesearch", "/actions/safesearch-pin", "/actions/safesearch-lists", "/zim", "/actions/zim", "/actions/zim-folder", "/models", "/actions/model-pull", "/actions/model-remove", "/actions/model-use", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/actions/collection-edit", "/docs", "/findimage", "/actions/findimage", "/safesearch", "/actions/safesearch", "/actions/safesearch-pin", "/actions/safesearch-lists", "/zim", "/actions/zim", "/actions/zim-folder", "/models", "/actions/model-pull", "/actions/model-remove", "/actions/model-use", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -159,7 +162,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -187,6 +190,8 @@ pub const App = struct {
             .{ "/actions/key-remove", .action_key_remove },
             .{ "/zim", .zim_page },
             .{ "/docs", .docs_page },
+            .{ "/findimage", .findimage_page },
+            .{ "/actions/findimage", .action_findimage },
             .{ "/safesearch", .safesearch_page },
             .{ "/actions/safesearch", .action_safe_toggle },
             .{ "/actions/safesearch-pin", .action_safe_pin },
@@ -243,7 +248,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_findimage or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -269,6 +274,8 @@ pub const App = struct {
             .maintenance => self.pageMaintenance(arena, csrf),
             .action_maintenance => self.startOperation(arena, req, auth, false),
             .docs_page => self.pageDocs(arena, csrf, t.params),
+            .findimage_page => self.pageFindImage(arena, csrf, null, null),
+            .action_findimage => self.findImage(arena, req, auth),
             .safesearch_page => self.pageSafe(arena, csrf, null, false),
             .action_safe_toggle => self.safeToggle(arena, req, auth),
             .action_safe_pin => self.safePin(arena, req, auth),
@@ -1588,6 +1595,96 @@ pub const App = struct {
         return std.mem.eql(u8, host, "kiwix.org") or std.mem.endsWith(u8, host, ".kiwix.org");
     }
 
+    // ------------------------------------------------------------ find by image
+
+    const FoundImages = struct { hash: u64, width: u32, height: u32, distance: u8, hits: []const dk.search.ImageHit };
+
+    fn pageFindImage(self: *App, arena: Allocator, csrf: ?[]const u8, found: ?FoundImages, problem: ?[]const u8) error{OutOfMemory}!Response {
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "Find by image", csrf, "findimage") catch return error.OutOfMemory;
+        self.writeFindImage(w, csrf, found, problem) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
+    }
+
+    fn writeFindImage(self: *App, w: *Io.Writer, csrf: ?[]const u8, found: ?FoundImages, problem: ?[]const u8) !void {
+        try w.writeAll("<p class=\"muted\">Upload a picture to find the pictures in the library that look like it: copies, resized, recompressed or slightly recoloured versions. It compares a 64-bit fingerprint of how brightness changes across the picture, so it finds near-duplicates, not pictures of the same kind of thing. Nothing is stored.</p>");
+        if (self.opts.image_searcher == null or !dk.image.available) {
+            try w.writeAll("<p class=\"notice\">Searching by image is not available: this build cannot read pictures, or the library has none yet.</p>");
+            return;
+        }
+        if (problem) |m| {
+            try w.writeAll("<p class=\"notice err\" role=\"alert\">");
+            try html.writeEscaped(w, m);
+            try w.writeAll("</p>");
+        }
+        const token = csrf orelse {
+            try w.writeAll("<p class=\"muted\">Sign in with the password to use this page.</p>");
+            return;
+        };
+        try w.writeAll("<section class=\"card\"><form class=\"stack\" action=\"/actions/findimage\" method=\"post\" enctype=\"multipart/form-data\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        try html.writeEscaped(w, token);
+        try w.writeAll("\"><label>Picture<input type=\"file\" name=\"image\" accept=\"image/jpeg,image/png,image/gif,image/webp,image/bmp\" required><small>JPEG, PNG, GIF, WebP or BMP, up to 10 MiB.</small></label><label>How different may it be? (bits of 64)<input type=\"number\" name=\"distance\" min=\"0\" max=\"32\" value=\"10\"><small>0 is the same fingerprint; up to 10 finds copies and edits of one picture.</small></label><div><button type=\"submit\" class=\"btn\">Find</button></div></form></section>");
+        if (found) |f| {
+            try w.print("<h2>Pictures like yours</h2><p class=\"muted small\">Your picture is {d} by {d} pixels; its fingerprint is <code>{s}</code>. Showing pictures within {d} bits.</p>", .{ f.width, f.height, dk.image.toHex(f.hash), f.distance });
+            if (f.hits.len == 0) {
+                try w.writeAll("<p class=\"notice\">No picture in the library looks like it.</p>");
+            } else {
+                try w.writeAll("<div class=\"tablewrap\"><table class=\"data\"><thead><tr><th>Difference</th><th>Source</th><th>Picture</th></tr></thead><tbody>");
+                for (f.hits) |h| {
+                    try w.print("<tr><td class=\"num\"><span class=\"badge {s}\">{d}</span></td><td>", .{ if (h.distance == 0) "ok" else if (h.distance <= 4) "run" else "warn", h.distance });
+                    try html.writeEscaped(w, h.connector);
+                    try w.writeAll("</td><td>");
+                    try html.writeEscaped(w, h.title orelse h.url orelse "(untitled)");
+                    if (h.url) |u| {
+                        try w.writeAll("<br><span class=\"muted small\">");
+                        try html.writeEscaped(w, u);
+                        try w.writeAll("</span>");
+                    }
+                    try w.writeAll("</td></tr>");
+                }
+                try w.writeAll("</tbody></table></div>");
+            }
+        }
+    }
+
+    fn findImage(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const csrf: ?[]const u8 = switch (auth) {
+            .session => |s| try arena.dupe(u8, &s.csrf),
+            else => null,
+        };
+        const boundary = multipart.boundaryOf(req.content_type orelse "") orelse return actionFailure(arena, false, .{ .status = .bad_request, .code = "bad_form", .message = "the form must be sent as multipart/form-data" });
+        const list = (try multipart.parts(arena, req.body, boundary)) orelse return actionFailure(arena, false, .{ .status = .bad_request, .code = "bad_form", .message = "the form could not be read" });
+        switch (auth) {
+            .session => |s| {
+                const presented = multipart.field(list, "csrf") orelse "";
+                if (presented.len != 32 or !std.crypto.timing_safe.eql([32]u8, s.csrf, presented[0..32].*)) {
+                    return actionFailure(arena, false, .{ .status = .forbidden, .code = "bad_csrf", .message = "the request did not carry a valid form token" });
+                }
+            },
+            else => {},
+        }
+        const images = self.opts.image_searcher orelse return self.pageFindImage(arena, csrf, null, "Searching by image is not available here.");
+        const bytes = multipart.field(list, "image") orelse return self.pageFindImage(arena, csrf, null, "Choose a picture to search with.");
+        if (bytes.len == 0) return self.pageFindImage(arena, csrf, null, "Choose a picture to search with.");
+        const distance: u8 = blk: {
+            const v = std.fmt.parseInt(u8, std.mem.trim(u8, multipart.field(list, "distance") orelse "10", " "), 10) catch 10;
+            break :blk @min(v, 32);
+        };
+        const info = dk.image.info(bytes) catch |e| return self.pageFindImage(arena, csrf, null, switch (e) {
+            error.TooLarge => "That picture is too large to read.",
+            error.Unsupported => "This build cannot read pictures.",
+            else => "That is not a picture this server can read (JPEG, PNG, GIF, WebP or BMP).",
+        });
+        const hash = dk.image.dhash(arena, bytes) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => self.pageFindImage(arena, csrf, null, "That is not a picture this server can read."),
+        };
+        const page = images.near(arena, hash, distance, 50) catch return self.pageFindImage(arena, csrf, null, "The search could not be made.");
+        return self.pageFindImage(arena, csrf, .{ .hash = hash, .width = info.width, .height = info.height, .distance = distance, .hits = page.hits }, null);
+    }
+
     // ----------------------------------------------------------------- safe search
 
     fn pageSafe(self: *App, arena: Allocator, csrf: ?[]const u8, notice: ?[]const u8, is_error: bool) error{OutOfMemory}!Response {
@@ -2206,6 +2303,7 @@ const nav_items = [_]struct { []const u8, []const u8, []const u8, []const u8, []
     .{ "safesearch", "/safesearch", "Safe search", "Search", "shield" },
     .{ "access", "/access", "Access", "Search", "key" },
     .{ "search", "/search", "Search test", "Search", "search" },
+    .{ "findimage", "/findimage", "Find by image", "Search", "image" },
     .{ "maintenance", "/maintenance", "Maintenance", "System", "tool" },
     .{ "models", "/models", "AI models", "System", "cpu" },
     .{ "docs", "/docs", "Docs", "System", "file" },
@@ -2223,6 +2321,7 @@ fn iconPaths(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "search")) return "<circle cx=\"11\" cy=\"11\" r=\"8\"/><line x1=\"21\" y1=\"21\" x2=\"16.65\" y2=\"16.65\"/>";
     if (std.mem.eql(u8, name, "tool")) return "<path d=\"M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94z\"/>";
     if (std.mem.eql(u8, name, "cpu")) return "<rect x=\"4\" y=\"4\" width=\"16\" height=\"16\" rx=\"2\"/><rect x=\"9\" y=\"9\" width=\"6\" height=\"6\"/><line x1=\"9\" y1=\"1\" x2=\"9\" y2=\"4\"/><line x1=\"15\" y1=\"1\" x2=\"15\" y2=\"4\"/><line x1=\"9\" y1=\"20\" x2=\"9\" y2=\"23\"/><line x1=\"15\" y1=\"20\" x2=\"15\" y2=\"23\"/><line x1=\"20\" y1=\"9\" x2=\"23\" y2=\"9\"/><line x1=\"20\" y1=\"14\" x2=\"23\" y2=\"14\"/><line x1=\"1\" y1=\"9\" x2=\"4\" y2=\"9\"/><line x1=\"1\" y1=\"14\" x2=\"4\" y2=\"14\"/>";
+    if (std.mem.eql(u8, name, "image")) return "<rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\"/><circle cx=\"8.5\" cy=\"8.5\" r=\"1.5\"/><polyline points=\"21 15 16 10 5 21\"/>";
     if (std.mem.eql(u8, name, "file")) return "<path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><polyline points=\"14 2 14 8 20 8\"/><line x1=\"16\" y1=\"13\" x2=\"8\" y2=\"13\"/><line x1=\"16\" y1=\"17\" x2=\"8\" y2=\"17\"/>";
     return "";
 }
@@ -3162,8 +3261,8 @@ const Fixture = struct {
         return error.TestTimedOut;
     }
 
-    fn call(f: *Fixture, arena: Allocator, method: http.Method, target: []const u8, opts: struct { auth: ?[]const u8 = null, cookie: ?[]const u8 = null, body: []const u8 = "" }) !Response {
-        return f.app.handle(arena, .{ .method = method, .target = target, .authorization = opts.auth, .cookie = opts.cookie, .body = opts.body });
+    fn call(f: *Fixture, arena: Allocator, method: http.Method, target: []const u8, opts: struct { auth: ?[]const u8 = null, cookie: ?[]const u8 = null, body: []const u8 = "", content_type: ?[]const u8 = null }) !Response {
+        return f.app.handle(arena, .{ .method = method, .target = target, .authorization = opts.auth, .cookie = opts.cookie, .body = opts.body, .content_type = opts.content_type });
     }
 
     fn bearer(f: *Fixture, arena: Allocator) ![]const u8 {
@@ -4297,6 +4396,52 @@ test "Refresh all sources: the dashboard offers it and it queues every enabled s
     const go = try f.call(a, .POST, "/actions/import", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&all=1", .{csrf}) });
     try testing.expectEqual(http.Status.see_other, go.status);
     try f.waitIdle();
+}
+
+test "Find by image: a picture is uploaded, its fingerprint compared, near copies listed; bad uploads are explained" {
+    if (!dk.image.available) return error.SkipZigTest;
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = Io.Dir.cwd();
+    const png = try cwd.readFileAlloc(testing.io, "src/testdata/media/photo.png", a, .limited(1 << 22));
+    const jpg = try cwd.readFileAlloc(testing.io, "src/testdata/media/photo.jpg", a, .limited(1 << 22));
+    const other = try cwd.readFileAlloc(testing.io, "src/testdata/media/other.png", a, .limited(1 << 22));
+    // A library with the PNG in it (its hash stored the way the files connector stores it).
+    var idx = try dk.index_sqlite.SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const hex = dk.image.toHex(try dk.image.dhash(a, png));
+    const d: dk.document.Document = .{ .connector = "pictures", .source_id = "cat.png", .canonical_url = "file:///pics/cat.png", .title = "cat.png", .text = "a picture", .extra = &.{.{ .key = "phash", .value = &hex }} };
+    try idx.indexer().add(d.id(), d);
+    f.app.opts.image_searcher = idx.imageSearcher();
+    const cookie = try f.signIn(a);
+    const page = try f.call(a, .GET, "/findimage", .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.ok, page.status);
+    try testing.expect(std.mem.indexOf(u8, page.body, "enctype=\"multipart/form-data\"") != null);
+    const csrf = csrfOf(page.body);
+    const Up = struct {
+        fn body(ar: Allocator, token: []const u8, picture: []const u8, distance: []const u8) ![]const u8 {
+            return std.fmt.allocPrint(ar, "--B0\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n{s}\r\n--B0\r\nContent-Disposition: form-data; name=\"distance\"\r\n\r\n{s}\r\n--B0\r\nContent-Disposition: form-data; name=\"image\"; filename=\"p.img\"\r\nContent-Type: image/png\r\n\r\n{s}\r\n--B0--\r\n", .{ token, distance, picture });
+        }
+    };
+    const ct = "multipart/form-data; boundary=B0";
+    // The same picture in another format: found, with a small difference.
+    const found = try f.call(a, .POST, "/actions/findimage", .{ .cookie = cookie, .content_type = ct, .body = try Up.body(a, csrf, jpg, "10") });
+    try testing.expectEqual(http.Status.ok, found.status);
+    try testing.expect(std.mem.indexOf(u8, found.body, "cat.png") != null and std.mem.indexOf(u8, found.body, "pictures") != null);
+    // A different picture is not found; a wrong token, a text file and a missing file are refused or explained.
+    const none = try f.call(a, .POST, "/actions/findimage", .{ .cookie = cookie, .content_type = ct, .body = try Up.body(a, csrf, other, "4") });
+    try testing.expect(std.mem.indexOf(u8, none.body, "No picture in the library looks like it") != null);
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/findimage", .{ .cookie = cookie, .content_type = ct, .body = try Up.body(a, "0123456789abcdef0123456789abcdef", png, "10") })).status);
+    const text = try f.call(a, .POST, "/actions/findimage", .{ .cookie = cookie, .content_type = ct, .body = try Up.body(a, csrf, "just some text", "10") });
+    try testing.expect(std.mem.indexOf(u8, text.body, "not a picture") != null);
+    try testing.expectEqual(http.Status.bad_request, (try f.call(a, .POST, "/actions/findimage", .{ .cookie = cookie, .body = "csrf=x" })).status);
+    // Without a library of pictures the page says so.
+    f.app.opts.image_searcher = null;
+    try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/findimage", .{ .cookie = cookie })).body, "not available") != null);
 }
 
 test "Safe search page: status, the switch in the configuration, the PIN (live), the lists, and adult keys" {

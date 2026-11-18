@@ -74,6 +74,21 @@ pub const commands = [_]Command{
         ,
     },
     .{
+        .name = "find-image",
+        .synopsis = "find-image FILE [--distance BITS] [--limit N] [--config FILE]",
+        .summary = "Find the indexed pictures that look like a picture",
+        .detail =
+        \\Reads the picture FILE (JPEG, PNG, GIF, WebP or BMP), computes its perceptual
+        \\fingerprint and lists the pictures in the index whose fingerprint differs in at most
+        \\BITS of 64 bits (default 10), nearest first, as: difference, source, address, title.
+        \\It finds copies, resized, recompressed or slightly recoloured versions of one
+        \\picture, not pictures of the same kind of thing. The index must have been made with
+        \\sources that hash pictures (the files connector does). The administration interface
+        \\has the same search under Find by image.
+        \\
+        ,
+    },
+    .{
         .name = "fetch-banlist",
         .synopsis = "fetch-banlist --url URL --out FILE --yes",
         .summary = "Download a list of banned domains from an address you name",
