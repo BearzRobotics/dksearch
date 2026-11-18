@@ -1314,6 +1314,13 @@ pub const SqliteIndex = struct {
         try sql.appendSlice(arena, self.banClause());
         if (q.sort != .relevance and q.sort != .title and !self.has_meta) return error.InvalidQuery; // an old index: `rebuild` upgrades it
         try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm));
+        if (q.per_domain > 0 and text_mode and self.has_meta and q.sort == .relevance) {
+            // Keep the best `per_domain` results of each domain (a document without a domain stands alone), in the
+            // order of the full ranking. The LIMIT inside keeps the ranking function out of the outer query.
+            try sql.print(arena, " LIMIT {d}", .{search.max_cursor_window});
+            const ranked = try sql.toOwnedSlice(arena);
+            try sql.print(arena, "SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY COALESCE(domain, hex(id)) ORDER BY col6 DESC, id) AS dk_rn FROM ({s})) WHERE dk_rn <= {d} ORDER BY col6 DESC, id", .{ ranked, q.per_domain });
+        }
         if (q.after != null) {
             if (!text_mode) return error.InvalidQuery;
             // Keyset paging: the best `max_cursor_window` results in order, then those after the cursor. The LIMIT
@@ -2174,6 +2181,51 @@ test "blocked domains never appear in searches or exports; demoted ones rank low
     // Taking the lists away restores everything.
     idx.setDomains(null);
     try testing.expectEqual(@as(usize, 5), (try s.search(a, .{ .text = "raven" })).hits.len);
+}
+
+test "per_domain keeps the best results of each domain in ranking order, with paging and cursors" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const Entry = struct { sid: []const u8, url: []const u8, text: []const u8 };
+    const entries = [_]Entry{
+        .{ .sid = "1", .url = "https://a.example/1", .text = "raven raven raven raven" },
+        .{ .sid = "2", .url = "https://a.example/2", .text = "raven raven raven" },
+        .{ .sid = "3", .url = "https://a.example/3", .text = "raven raven" },
+        .{ .sid = "4", .url = "https://b.example/1", .text = "raven raven raven raven raven" },
+        .{ .sid = "5", .url = "https://b.example/2", .text = "raven filler words here" },
+        .{ .sid = "6", .url = "https://c.example/1", .text = "raven alone in the text with filler" },
+    };
+    for (entries) |e| {
+        const d: doc.Document = .{ .connector = "web", .source_id = e.sid, .canonical_url = e.url, .title = e.sid, .text = e.text };
+        try idx.indexer().add(d.id(), d);
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = idx.searcher();
+    try testing.expectEqual(@as(usize, 6), (try s.search(a, .{ .text = "raven" })).hits.len);
+    const one = try s.search(a, .{ .text = "raven", .per_domain = 1 });
+    try testing.expectEqual(@as(usize, 3), one.hits.len); // the best of a, b and c
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    for (one.hits) |h| {
+        const host = h.url.?["https://".len..][0..9];
+        try testing.expect(!seen.contains(host));
+        try seen.put(a, host, {});
+    }
+    // The order is the full ranking's: b's best (most mentions) first, then a's best.
+    try testing.expectEqualStrings("https://b.example/1", one.hits[0].url.?);
+    try testing.expectEqualStrings("https://a.example/1", one.hits[1].url.?);
+    try testing.expectEqual(@as(usize, 5), (try s.search(a, .{ .text = "raven", .per_domain = 2 })).hits.len);
+    // Paging and cursors walk the limited list.
+    const p1 = try s.search(a, .{ .text = "raven", .per_domain = 2, .limit = 2 });
+    try testing.expect(p1.has_more);
+    const p2 = try s.search(a, .{ .text = "raven", .per_domain = 2, .limit = 2, .offset = 2 });
+    try testing.expectEqual(@as(usize, 2), p2.hits.len);
+    const last = p1.hits[1];
+    const c1 = try s.search(a, .{ .text = "raven", .per_domain = 2, .limit = 2, .after = .{ .score = last.score, .id = last.id } });
+    try testing.expectEqualSlices(u8, &p2.hits[0].id, &c1.hits[0].id);
+    // Other sort orders are left alone.
+    try testing.expectEqual(@as(usize, 6), (try s.search(a, .{ .text = "raven", .per_domain = 1, .sort = .title })).hits.len);
 }
 
 test "pagination is stable and reports has_more" {

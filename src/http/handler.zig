@@ -99,6 +99,9 @@ pub const Services = struct {
     /// Domains never shown (the blocklist, and safe search's ban lists when on); null for none. The index applies it
     /// to searches; the handler to documents opened by id, peers' results and the like.
     lists: ?*const dk.domainlist.Lists = null,
+    /// The most results one domain may have in a search (`[search] per_domain`; 0: no limit); a request's own
+    /// `per_domain` overrides it.
+    per_domain: u32 = 0,
     /// The collection the search page searches when nothing is picked (`search.default_collection`).
     default_collection: ?[]const u8 = null,
     /// A document server that office files can be opened in (`[docserver]`).
@@ -133,6 +136,7 @@ pub const Services = struct {
 /// Limits `q` to what the caller may see and tells it what the `collection:` names mean.
 fn limitQuery(arena: Allocator, q: *dk.search.Query, services: Services) error{OutOfMemory}!void {
     q.scope = services.scope.sources;
+    if (q.per_domain == 0) q.per_domain = services.per_domain;
     const defs = try arena.alloc(dk.search.CollectionDef, services.collections.len);
     for (services.collections, defs) |c, *d| d.* = .{ .name = c.name, .sources = c.sources };
     q.collections = defs;
@@ -441,6 +445,11 @@ fn parseQuery(arena: Allocator, params: query.Params, html_mode: bool) error{Out
             q.fuzzy = .off;
         } else return .{ .bad = .{ .name = "fuzzy", .message = "must be 1 (always allow typos), 0 (exact words only), or left out (the server's default)" } };
     };
+    if (params.get("per_domain")) |v| if (v.len > 0) {
+        const n = std.fmt.parseInt(u32, v, 10) catch return .{ .bad = .{ .name = "per_domain", .message = "must be a number from 0 to 50" } };
+        if (n > 50) return .{ .bad = .{ .name = "per_domain", .message = "must be a number from 0 to 50" } };
+        q.per_domain = n;
+    };
     if (params.get("after")) |v| if (v.len > 0) {
         q.after = dk.search.Cursor.parse(v) orelse return .{ .bad = .{ .name = "after", .message = "must be a next_cursor value from a previous page" } };
     };
@@ -530,6 +539,8 @@ const ApiHit = struct {
     snippet: ?[]const u8,
     /// Further excerpts, when `snippets=N` asked for them (empty otherwise).
     more_snippets: []const []const u8,
+    /// "onion" or "i2p" for a result on a hidden network (a normal browser cannot open it), else null.
+    network: ?[]const u8,
     score: f64,
     /// A page on this server for the document: its details, stored text and original (`/doc/<id>`).
     view_url: []const u8,
@@ -1126,6 +1137,7 @@ fn apiHit(arena: Allocator, h: dk.search.Hit) error{OutOfMemory}!ApiHit {
         .title = h.title,
         .snippet = h.snippet,
         .more_snippets = h.more_snippets,
+        .network = dk.domainlist.hiddenNetworkOf(h.url),
         .score = h.score,
         .view_url = h.remote_view orelse try std.fmt.allocPrint(arena, "/doc/{s}", .{std.fmt.bytesToHex(h.id, .lower)}),
         .node = h.node,
@@ -3325,6 +3337,31 @@ test "blocked domains: their documents are not found by id, not offered as simil
     var bare = hits[0];
     bare.domain = null;
     try testing.expect(hitBlocked(services, bare));
+}
+
+test "results on hidden networks are marked, and per_domain is checked" {
+    var hits = [_]dk.search.Hit{
+        .{ .id = @splat(1), .connector = "web", .url = "http://abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion/", .title = "Hidden", .snippet = null, .score = 2 },
+        .{ .id = @splat(2), .connector = "web", .url = "https://example.org/", .title = "Plain", .snippet = null, .score = 1 },
+    };
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const api = run(&fake, .GET, "/api/v1/search?q=hidden", &ar);
+    try testing.expect(std.mem.indexOf(u8, api.body, "\"network\":\"onion\"") != null);
+    try testing.expect(std.mem.indexOf(u8, api.body, "\"network\":null") != null);
+    const page = run(&fake, .GET, "/search?q=hidden", &ar);
+    try testing.expect(std.mem.indexOf(u8, page.body, ">Tor</span>") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "Tor Browser") != null);
+    // per_domain reaches the search; silly values are refused.
+    _ = run(&fake, .GET, "/api/v1/search?q=hidden&per_domain=2", &ar);
+    try testing.expectEqual(@as(u32, 2), fake.last.?.per_domain);
+    try testing.expectEqual(http.Status.bad_request, run(&fake, .GET, "/api/v1/search?q=hidden&per_domain=99", &ar).status);
+    try testing.expectEqual(http.Status.bad_request, run(&fake, .GET, "/api/v1/search?q=hidden&per_domain=x", &ar).status);
+    // The server's default applies when the request says nothing.
+    _ = handleServices(a, fake.searcher(), .{ .per_domain = 3 }, .GET, "/api/v1/search?q=hidden");
+    try testing.expectEqual(@as(u32, 3), fake.last.?.per_domain);
 }
 
 test "answers: off by default, a question is needed, nothing is asked of the model without passages, and an unreachable model is said" {

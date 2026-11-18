@@ -127,6 +127,9 @@ pub const Query = struct {
     /// Continue after this result of a relevance-ordered search (the `next_cursor` of the previous page) instead of
     /// at `offset`: stable when the index changes, and not limited by `max_window` (but by `max_cursor_window`).
     after: ?Cursor = null,
+    /// At most this many results from one domain (0: no limit), keeping the best of each; for a relevance-ordered
+    /// search of words. Paging and counts follow the limited list.
+    per_domain: u32 = 0,
 };
 
 /// How many results a cursor can walk through.

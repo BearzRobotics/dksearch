@@ -32,6 +32,21 @@ pub fn networkOf(host: []const u8) ?Network {
     return null;
 }
 
+/// Whether an `.onion` name is a version 3 address: the label before `.onion` is 56 characters of a-z and 2-7, with at most
+/// two more labels in front (deeper names are loops and traps). Older 16-character addresses no longer exist on the
+/// network, and anything else is a typo or junk that would only cost a connection to Tor. Not onion names: true.
+pub fn validOnion(host: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    if (host.len == 0 or host.len > buf.len) return false;
+    const h = std.mem.trimEnd(u8, std.ascii.lowerString(&buf, host), ".");
+    if (!std.mem.endsWith(u8, h, ".onion")) return true;
+    const without = h[0 .. h.len - ".onion".len];
+    const service = if (std.mem.lastIndexOfScalar(u8, without, '.')) |i| without[i + 1 ..] else without;
+    if (service.len != 56) return false;
+    for (service) |c| if (!((c >= 'a' and c <= 'z') or (c >= '2' and c <= '7'))) return false;
+    return std.mem.count(u8, without, ".") <= 2;
+}
+
 /// `host:port` of a proxy as an address; only literal IP addresses (the proxy is on this machine or on a network the
 /// owner names by address).
 pub fn parseProxy(text: []const u8) ?net.IpAddress {
@@ -331,4 +346,20 @@ test "hosts of the hidden networks are told apart, and proxies are literal addre
     try testing.expect(parseProxy("127.0.0.1") == null);
     try testing.expect(parseProxy("tor.local:9050") == null);
     try testing.expect(parseProxy("127.0.0.1:0") == null);
+}
+
+test "only version 3 onion addresses are valid, with a few subdomains at most" {
+    const v3 = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx"; // 56 characters
+    try testing.expectEqual(@as(usize, 56), v3.len);
+    try testing.expect(validOnion(v3 ++ ".onion"));
+    try testing.expect(validOnion("www." ++ v3 ++ ".onion"));
+    try testing.expect(validOnion("a.b." ++ v3 ++ ".onion"));
+    try testing.expect(validOnion(v3 ++ ".onion."));
+    try testing.expect(!validOnion("a.b.c." ++ v3 ++ ".onion")); // too many labels in front
+    try testing.expect(!validOnion("expyuzz4wqqyqhjn.onion")); // a version 2 address (16 characters)
+    try testing.expect(!validOnion("abcdefghijklmnopqrstuvwxyz234561abcdefghijklmnopqrstuvwx.onion")); // 1 is not base32
+    try testing.expect(!validOnion("ABC.onion"));
+    try testing.expect(!validOnion(".onion"));
+    try testing.expect(validOnion("example.org")); // not an onion name: not this check's business
+    try testing.expect(validOnion("forum.i2p"));
 }

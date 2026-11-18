@@ -253,6 +253,8 @@ pub const SearchSettings = struct {
     chunk_index_min_kb: u32 = 64,
     /// Memory for the chunks of recently retrieved documents (MiB). 0 turns the cache off.
     retrieve_cache_mb: u32 = 128,
+    /// The most results one domain may have in a search (0: no limit).
+    per_domain: u32 = 0,
     /// How long a peer's good answer is reused for the same question (seconds). 0 turns it off.
     peer_cache_seconds: u32 = 30,
     /// A collection the search page searches when the visitor has not picked any source (the page offers "search
@@ -445,7 +447,7 @@ const server_keys = [_][]const u8{
 const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions", "backup_dir", "zim_dir" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
-const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
+const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "per_domain", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
 const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings", "fallback", "ollama", "answers", "filters", "safe_search" };
 
 /// Parses and validates configuration text. `source_name` is only used in
@@ -580,6 +582,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
         if (try str(src, "search", t, "default_collection", diag)) |v| cfg.search.default_collection = try a.dupe(u8, v);
         if (try intIn(src, "search", t, "chunk_index_min_kb", 0, 1024 * 1024, diag)) |n| cfg.search.chunk_index_min_kb = @intCast(n);
         if (try intIn(src, "search", t, "retrieve_cache_mb", 0, 65536, diag)) |n| cfg.search.retrieve_cache_mb = @intCast(n);
+        if (try intIn(src, "search", t, "per_domain", 0, 50, diag)) |n| cfg.search.per_domain = @intCast(n);
         if (try intIn(src, "search", t, "peer_cache_seconds", 0, 3600, diag)) |n| cfg.search.peer_cache_seconds = @intCast(n);
         if (try intIn(src, "search", t, "recency_boost", 0, 1000, diag)) |n| cfg.search.recency_boost = @intCast(n);
         if (try intIn(src, "search", t, "recency_half_life_days", 1, 36500, diag)) |n| cfg.search.recency_half_life_days = @intCast(n);

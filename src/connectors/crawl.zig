@@ -266,7 +266,7 @@ pub const CrawlConnector = struct {
     fn routeFor(self: *const CrawlConnector, host: []const u8) ?hidden.Via {
         const net_of = hidden.networkOf(host) orelse return .direct;
         return switch (net_of) {
-            .onion => if (self.tor) |a| .{ .tor = a } else null,
+            .onion => if (self.tor) |a| (if (hidden.validOnion(host)) hidden.Via{ .tor = a } else null) else null,
             .i2p => if (self.i2p) |a| .{ .i2p = a } else null,
         };
     }
@@ -1569,7 +1569,7 @@ test "an onion seed is crawled through the Tor proxy by name; with no proxy conf
     defer proxy.stop();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var conn = try testConnector(&tmp, "http://abcdefghij234567.onion/\n", "dksearch-test/1.0 (+https://example.org/bot)");
+    var conn = try testConnector(&tmp, "http://abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion/\n", "dksearch-test/1.0 (+https://example.org/bot)");
     defer conn.deinit();
     conn.max_depth = 0;
     // No proxy: nothing is contacted, and the seed is refused.
@@ -1590,7 +1590,7 @@ test "an onion seed is crawled through the Tor proxy by name; with no proxy conf
     try testing.expectEqual(@as(usize, 1), got.ids.items.len);
     try testing.expectEqualStrings("Hidden", got.titles.items[0]);
     try testing.expectEqualStrings("Onion page", got.texts.items[0]);
-    try testing.expectEqualStrings("abcdefghij234567.onion", proxy.asked_host[0..proxy.asked_len]);
+    try testing.expectEqualStrings("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion", proxy.asked_host[0..proxy.asked_len]);
     try testing.expect(proxy.connections >= 2); // robots.txt and the page
 }
 
@@ -1608,7 +1608,9 @@ test "the proxy options are checked, and routing follows the network of the name
     var c = try CrawlConnector.init(testing.allocator, testing.io, .{ .name = "c", .kind = "crawl", .options = &good });
     defer c.deinit();
     try testing.expect(c.routeFor("example.org").? == .direct);
-    try testing.expect(c.routeFor("x.onion").? == .tor);
+    try testing.expect(c.routeFor("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion").? == .tor);
+    try testing.expect(c.routeFor("x.onion") == null); // not a version 3 address: never contacted
+    try testing.expect(c.routeFor("expyuzz4wqqyqhjn.onion") == null);
     try testing.expect(c.routeFor("x.i2p").? == .i2p);
     c.i2p = null;
     try testing.expect(c.routeFor("x.i2p") == null);

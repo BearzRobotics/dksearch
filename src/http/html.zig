@@ -603,6 +603,9 @@ fn finishHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
         try w.writeAll("</p>");
     }
     try w.writeAll("<div class=\"source\">");
+    if (dk.domainlist.hiddenNetworkOf(h.url)) |net| {
+        try w.writeAll(if (std.mem.eql(u8, net, "onion")) "<span class=\"badge\" title=\"A Tor onion address: it opens only in Tor Browser or another Tor-enabled browser\">Tor</span> " else "<span class=\"badge\" title=\"An I2P address: it opens only through an I2P router\">I2P</span> ");
+    }
     if (h.node) |n| {
         try w.writeAll("<strong>");
         try writeEscaped(w, n);

@@ -11,13 +11,25 @@ const Io = std.Io;
 
 pub const Set = struct {
     map: std.StringHashMapUnmanaged(void) = .empty,
+    /// Entries given as the MD5 of a domain (32 hex digits), as banned-domain lists of some services are published:
+    /// they match a host whose name (or whose parent domain) has that hash, without the list naming the domain.
+    hashes: std.AutoHashMapUnmanaged([16]u8, void) = .empty,
 
     pub fn isEmpty(self: *const Set) bool {
-        return self.map.count() == 0;
+        return self.map.count() == 0 and self.hashes.count() == 0;
     }
 
     pub fn count(self: *const Set) usize {
-        return self.map.count();
+        return self.map.count() + self.hashes.count();
+    }
+
+    /// Adds the MD5 of a domain, as 32 hex digits. False when the text is not that.
+    pub fn addHash(self: *Set, arena: Allocator, hex: []const u8) Allocator.Error!bool {
+        if (hex.len != 32) return false;
+        var raw: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&raw, hex) catch return false;
+        try self.hashes.put(arena, raw, {});
+        return true;
     }
 
     /// Adds `domain` (any case, no scheme or path). Returns false when it is not a usable domain.
@@ -32,11 +44,16 @@ pub const Set = struct {
 
     /// Whether `host` is in the set or under a domain of it.
     pub fn matches(self: *const Set, host_in: []const u8) bool {
-        if (self.map.count() == 0 or host_in.len == 0 or host_in.len > 253) return false;
+        if (self.isEmpty() or host_in.len == 0 or host_in.len > 253) return false;
         var buf: [253]u8 = undefined;
         var host = std.ascii.lowerString(&buf, std.mem.trimEnd(u8, host_in, "."));
         while (true) {
             if (self.map.contains(host)) return true;
+            if (self.hashes.count() > 0) {
+                var digest: [16]u8 = undefined;
+                std.crypto.hash.Md5.hash(host, &digest, .{});
+                if (self.hashes.contains(digest)) return true;
+            }
             const dot = std.mem.indexOfScalar(u8, host, '.') orelse return false;
             host = host[dot + 1 ..];
         }
@@ -48,6 +65,12 @@ pub const Set = struct {
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |raw| {
             const d = entryOf(raw) orelse continue;
+            if (d.len == 32) {
+                if (try self.addHash(arena, d)) {
+                    used += 1;
+                    continue;
+                }
+            }
             if (try self.add(arena, d)) used += 1;
         }
         return used;
@@ -121,6 +144,16 @@ pub fn hostOf(buf: *[253]u8, url: []const u8) ?[]const u8 {
     if (std.mem.lastIndexOfScalar(u8, rest, ':')) |i| rest = rest[0..i];
     if (rest.len == 0 or rest.len > 253) return null;
     return std.ascii.lowerString(buf, rest);
+}
+
+/// "onion" or "i2p" for an address on one of those networks (a normal browser cannot open it), else null.
+pub fn hiddenNetworkOf(url: ?[]const u8) ?[]const u8 {
+    const u = url orelse return null;
+    var buf: [253]u8 = undefined;
+    const host = hostOf(&buf, u) orelse return null;
+    if (std.mem.endsWith(u8, host, ".onion")) return "onion";
+    if (std.mem.endsWith(u8, host, ".i2p")) return "i2p";
+    return null;
 }
 
 /// What is hidden and what is ranked lower, for the whole server.
@@ -212,4 +245,32 @@ test "the host of an address" {
     try testing.expect(l.blocksUrl("https://www.bad.example/x"));
     try testing.expect(!l.blocksUrl("https://good.example/x"));
     try testing.expect(!l.blocksUrl(null));
+}
+
+test "entries given as MD5 hashes match the domain and what is under it, and say nothing about the domain" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash("hidden.example", &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    var s: Set = .{};
+    const used = try s.addText(a, "# hashes of banned domains\n" ++ "plain.example\n" ++ hex ++ "\n" ++ "0123456789abcdef0123456789abcdeg\n");
+    try testing.expectEqual(@as(usize, 2), used); // the last line is neither a hash nor a domain
+    try testing.expect(s.matches("hidden.example"));
+    try testing.expect(s.matches("WWW.Hidden.Example"));
+    try testing.expect(s.matches("a.b.hidden.example"));
+    try testing.expect(!s.matches("nothidden.example"));
+    try testing.expect(!s.matches("example"));
+    try testing.expect(s.matches("plain.example"));
+    try testing.expectEqual(@as(usize, 2), s.count());
+    try testing.expect(!s.isEmpty());
+}
+
+test "addresses on hidden networks are recognised" {
+    try testing.expectEqualStrings("onion", hiddenNetworkOf("http://abc.onion/x").?);
+    try testing.expectEqualStrings("i2p", hiddenNetworkOf("http://forum.i2p/").?);
+    try testing.expect(hiddenNetworkOf("https://example.org/onion") == null);
+    try testing.expect(hiddenNetworkOf("https://notonion.com/") == null);
+    try testing.expect(hiddenNetworkOf(null) == null);
 }
