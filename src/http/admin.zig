@@ -384,19 +384,33 @@ pub const App = struct {
             .refused => |r| return r,
         };
         const name = params.get("source") orelse "";
-        self.opts.jobs.?.start(name) catch |e| return actionFailure(arena, is_api, switch (e) {
-            error.UnknownSource => .{ .status = .not_found, .code = "unknown_source", .message = "no such source" },
-            error.SourceDisabled => .{ .status = .conflict, .code = "source_disabled", .message = "that source is disabled in the configuration" },
-            error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "an import or other operation is already running" },
-            error.LockHeld => .{ .status = .conflict, .code = "locked", .message = "another import, rebuild or removal is running on this data directory" },
-            error.DataDirUnavailable => .{ .status = .internal_server_error, .code = "data_dir_unavailable", .message = "the data directory or its lock file cannot be used; see the server's error output" },
-            error.OutOfMemory => return error.OutOfMemory,
-            error.NoConcurrency => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start a background task" },
-            error.NotConfigured, error.BadArgument => .{ .status = .bad_request, .code = "bad_request", .message = "a source name is required" },
-            error.NoSpace => .{ .status = .conflict, .code = "no_space", .message = "not enough room" },
-        });
+        const all = if (params.get("all")) |v| std.mem.eql(u8, v, "1") else false;
+        const started: union(enum) { one, many: usize } = blk: {
+            if (all) {
+                const n = self.opts.jobs.?.refreshAll() catch |e| return actionFailure(arena, is_api, switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot queue the sources" },
+                });
+                break :blk .{ .many = n };
+            }
+            self.opts.jobs.?.start(name) catch |e| return actionFailure(arena, is_api, switch (e) {
+                error.UnknownSource => .{ .status = .not_found, .code = "unknown_source", .message = "no such source" },
+                error.SourceDisabled => .{ .status = .conflict, .code = "source_disabled", .message = "that source is disabled in the configuration" },
+                error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "an import or other operation is already running" },
+                error.LockHeld => .{ .status = .conflict, .code = "locked", .message = "another import, rebuild or removal is running on this data directory" },
+                error.DataDirUnavailable => .{ .status = .internal_server_error, .code = "data_dir_unavailable", .message = "the data directory or its lock file cannot be used; see the server's error output" },
+                error.OutOfMemory => return error.OutOfMemory,
+                error.NoConcurrency => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start a background task" },
+                error.NotConfigured, error.BadArgument => .{ .status = .bad_request, .code = "bad_request", .message = "a source name is required" },
+                error.NoSpace => .{ .status = .conflict, .code = "no_space", .message = "not enough room" },
+            });
+            break :blk .one;
+        };
         if (is_api) {
-            var r = try handler.jsonResponse(arena, .accepted, .{ .started = name });
+            var r = switch (started) {
+                .one => try handler.jsonResponse(arena, .accepted, .{ .started = name }),
+                .many => |n| try handler.jsonResponse(arena, .accepted, .{ .started = "all", .queued = n }),
+            };
             r.status = .accepted;
             return r;
         }
@@ -2234,7 +2248,13 @@ fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const 
             try html.writeEscaped(w, s.name);
             try w.writeAll("</button></form> ");
         }
-        if (!any) try w.writeAll("<p class=\"muted\">No enabled sources.</p>");
+        if (!any) try w.writeAll("<p class=\"muted\">No enabled sources.</p>") else {
+            try w.writeAll("<form class=\"inline\" action=\"/actions/import\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+            try html.writeEscaped(w, token);
+            try w.writeAll("\"><input type=\"hidden\" name=\"all\" value=\"1\"><button type=\"submit\" class=\"btn secondary\">Refresh all sources</button></form> ");
+        }
+        const waiting = m.queued();
+        if (waiting > 0) try w.print("<p class=\"muted\">{d} more {s} waiting for their turn; cancelling the running import also cancels these.</p>", .{ waiting, if (waiting == 1) "source" else "sources" });
     } else {
         try w.writeAll("<p class=\"muted\">Sign in with the password to use the buttons, or use the API.</p>");
     }
@@ -4041,6 +4061,24 @@ test "Access: suggestions are asked for only on request, and a peer that cannot 
     const asked = try f.call(a, .GET, "/access?suggest=1", .{ .cookie = cookie });
     try testing.expect(std.mem.indexOf(u8, asked.body, "Suggested by your peers") != null);
     try testing.expect(std.mem.indexOf(u8, asked.body, "<strong>office</strong> did not answer") != null);
+}
+
+test "Refresh all sources: the dashboard offers it and it queues every enabled source" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const dash = try f.call(a, .GET, "/", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, dash.body, "Refresh all sources") != null);
+    const csrf = csrfOf(dash.body);
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/import", .{ .cookie = cookie, .body = "csrf=wrong&all=1" })).status);
+    const go = try f.call(a, .POST, "/actions/import", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&all=1", .{csrf}) });
+    try testing.expectEqual(http.Status.see_other, go.status);
+    try f.waitIdle();
 }
 
 test "Models: Ollama is looked for, not started; choosing a model for embeddings or answers edits the configuration" {

@@ -250,6 +250,8 @@ GET /api/v1/admin/imports
 POST /api/v1/admin/imports
 : Starts an import of the source named by the form field `source` (`application/x-www-form-urlencoded` body). Returns 202 with `started`. Errors: 404 `unknown_source`, 409 `source_disabled`, `already_running` or `locked` (another import, rebuild or removal holds the data directory), 403 `actions_disabled`.
 
+With `all=1` instead of `source`, every enabled source is imported one after another ("refresh all": the first starts at once, the others wait their turn, and cancelling the running import drops the waiting ones); returns 202 with `started: "all"` and `queued`, the number still waiting. The dashboard has the same as a *Refresh all sources* button and shows how many wait.
+
 POST /api/v1/admin/imports/cancel
 : Asks the running import or maintenance operation to stop at its next safe point (an import's position is saved). Returns 200 with `cancelling` (false if nothing was running).
 

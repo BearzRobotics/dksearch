@@ -142,6 +142,10 @@ pub const Manager = struct {
     group: Io.Group = .init,
     running: ?Running = null,
     last: ?OwnedFinished = null,
+    /// Sources waiting for their turn after "refresh all" (names, owned); run one after another.
+    queue: std.ArrayList([]u8) = .empty,
+    /// Set when the manager is shutting down: nothing new is started.
+    closing: bool = false,
 
     const Running = struct {
         op: Op,
@@ -170,9 +174,12 @@ pub const Manager = struct {
     /// Cancels a running import and waits for it to stop.
     pub fn deinit(self: *Manager) void {
         self.mutex.lockUncancelable(self.io);
+        self.closing = true;
         if (self.running) |r| r.control.cancel();
         self.mutex.unlock(self.io);
         self.group.await(self.io) catch {};
+        for (self.queue.items) |n| self.gpa.free(n);
+        self.queue.deinit(self.gpa);
         if (self.last) |l| self.freeFinished(l);
         self.* = undefined;
     }
@@ -186,6 +193,58 @@ pub const Manager = struct {
     /// The current sources.
     pub fn sources(self: *Manager) []const config.Source {
         return if (self.opts.store) |st| st.snapshot() else self.opts.sources;
+    }
+
+    /// "Refresh all": every enabled source is imported, one after another. The first starts now if nothing is
+    /// running; the others wait their turn (and are forgotten if the running import is cancelled). Returns how many
+    /// are queued in all. A source already waiting is not queued twice.
+    pub fn refreshAll(self: *Manager) StartError!usize {
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            for (self.sources()) |s| {
+                if (!s.enabled) continue;
+                var have = false;
+                for (self.queue.items) |q| if (std.mem.eql(u8, q, s.name)) {
+                    have = true;
+                };
+                if (have or (if (self.running) |r| (r.op == .import and std.mem.eql(u8, r.source, s.name)) else false)) continue;
+                const copy = self.gpa.dupe(u8, s.name) catch return error.OutOfMemory;
+                self.queue.append(self.gpa, copy) catch {
+                    self.gpa.free(copy);
+                    return error.OutOfMemory;
+                };
+            }
+        }
+        self.startNext();
+        return self.queued();
+    }
+
+    /// How many sources wait for their turn.
+    pub fn queued(self: *Manager) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.queue.items.len;
+    }
+
+    /// Starts the first waiting source if nothing is running. A source that cannot be started (it was removed or
+    /// disabled meanwhile, or another program holds the data directory) is dropped and the next one tried.
+    fn startNext(self: *Manager) void {
+        while (true) {
+            var name: []u8 = undefined;
+            {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+                if (self.closing or self.running != null or self.queue.items.len == 0) return;
+                name = self.queue.orderedRemove(0);
+            }
+            defer self.gpa.free(name);
+            self.start(name) catch |e| {
+                if (e == error.AlreadyRunning) return; // something else started in between: its end starts the next
+                continue;
+            };
+            return;
+        }
     }
 
     /// Starts importing `name` in the background and returns at once.
@@ -288,6 +347,9 @@ pub const Manager = struct {
         defer self.mutex.unlock(self.io);
         const r = self.running orelse return false;
         r.control.cancel();
+        // Stopping the running import also stops the refresh that was queued behind it.
+        for (self.queue.items) |n| self.gpa.free(n);
+        self.queue.clearRetainingCapacity();
         return true;
     }
 
@@ -511,6 +573,7 @@ pub const Manager = struct {
         if (dl) |d| d.destroy(self.gpa);
         if (lock) |l| l.release(self.io);
         self.record(op, source.name, outcome);
+        self.startNext();
     }
 
     fn summaryPrint(self: *Manager, out: *Outcome, comptime fmt: []const u8, args: anytype) void {
@@ -766,6 +829,42 @@ test "an import runs in the background, finishes, and is remembered" {
     try m.start("notes");
     try waitIdle(&m);
     try testing.expectEqual(@as(u64, 2), (try m.lastResult(arena.allocator())).?.submitted);
+}
+
+test "refresh all runs every enabled source one after another, and cancelling forgets the rest" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    env.opts_sources[1].enabled = true;
+    env.opts_sources[1].name = "second";
+    var m = Manager.init(testing.allocator, testing.io, env.options());
+    defer m.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The first starts at once, the other waits; asking again while it waits does not queue it twice.
+    try testing.expectEqual(@as(usize, 1), try m.refreshAll());
+    try testing.expectEqual(@as(usize, 1), try m.refreshAll());
+    // Wait until both have run (there is a moment between them when nothing is "running").
+    var waited: u32 = 0;
+    while (waited < 3000) : (waited += 1) {
+        if ((try m.current(a)) == null) if (try m.lastResult(a)) |l| if (std.mem.eql(u8, l.source, "second")) break;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try testing.expect(waited < 3000);
+    try testing.expectEqual(@as(usize, 0), m.queued());
+    try testing.expectEqual(state_sqlite.JobState.completed, (try m.lastResult(a)).?.state);
+    // Both really ran: each source stored the two files under its own name.
+    var index = try index_sqlite.SqliteIndex.open(env.options().index_path, .{ .sync = .off });
+    defer index.close();
+    try testing.expectEqual(@as(u64, 4), try index.count());
+
+    // Cancel while one runs: what waits is dropped.
+    try testing.expectEqual(@as(usize, 1), try m.refreshAll());
+    try testing.expect(m.cancel());
+    try testing.expectEqual(@as(usize, 0), m.queued());
+    try waitIdle(&m);
 }
 
 test "unknown and disabled sources, a second start, and a held lock are refused" {
