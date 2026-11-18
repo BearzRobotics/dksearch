@@ -9,6 +9,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const http = std.http;
+const hidden = @import("hidden.zig");
 
 pub const Failure = error{
     /// Could not connect or the connection broke.
@@ -55,6 +56,8 @@ pub const Request = struct {
     extra_headers: []const http.Header = &.{},
     /// The method, when it is neither the default GET nor the POST that a body implies (DELETE for Ollama).
     method: ?http.Method = null,
+    /// Reached through a Tor or I2P proxy instead of directly (hidden.zig): `.onion` and `.i2p` sites.
+    via: hidden.Via = .direct,
 };
 
 /// Fetches `req.url`. Everything returned is allocated from `arena`; on
@@ -64,7 +67,7 @@ pub fn get(client: *http.Client, arena: Allocator, req: Request, timeout: Io.Dur
     const io = client.io;
     var buffer: [2]Task = undefined;
     var select: Io.Select(Task) = .init(io, &buffer);
-    select.concurrent(.done, run, .{ client, arena, req }) catch return error.Network;
+    if (req.via != .direct) select.concurrent(.done, runHidden, .{ io, arena, req }) catch return error.Network else select.concurrent(.done, run, .{ client, arena, req }) catch return error.Network;
     select.concurrent(.timeout, sleep, .{ io, timeout }) catch {
         select.cancelDiscard();
         return error.Network;
@@ -78,6 +81,10 @@ pub fn get(client: *http.Client, arena: Allocator, req: Request, timeout: Io.Dur
         .done => |r| r,
         .timeout => error.Timeout,
     };
+}
+
+fn runHidden(io: Io, arena: Allocator, req: Request) Failure!Response {
+    return hidden.run(io, arena, req, req.via);
 }
 
 const Task = union(enum) {

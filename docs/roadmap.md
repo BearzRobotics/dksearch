@@ -11,7 +11,6 @@ Standing rules that shape every item: the core stays lexical and works with no A
 ## Then
 
 - **Against SEO slop:** a domain blocklist (never shown) and demotion list (pushed down, still findable) in the configuration and on the Settings page, applied to indexed, crawled and fallback results; and a "trusted first" ordering that puts results of highly boosted sources before the long tail instead of mixing by text score alone.
-- **Hidden networks (opt-in):** the crawler reaches `.onion` sites through a Tor daemon the owner runs (SOCKS5, `[tor] socks`) and `.i2p` sites through an I2P router's HTTP proxy (`[i2p] http_proxy`). Hostnames of those networks are never resolved locally (no DNS leak) and never sent to the open internet; a clearnet page's links into them are followed only when the source asks for it; dksearch never starts or bundles Tor or I2P. Off unless configured.
 - **Presentation:** several snippets per result, similar documents, cursor paging (did-you-mean and a suggest endpoint are built).
 - **Search by image everywhere:** a `find-image` command and an admin upload over the perceptual hashes the files connector already stores.
 - **Management:** saved searches and opt-in statistics (no query logging by default).
@@ -21,6 +20,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 ## Later, optional
 
 - **A public network:** discovery, reputation and abuse handling for nodes that do not know each other. Needs the signed node identity (ADR 0040) to have been used first.
+- **Serving dksearch as a hidden service** (crawling Tor and I2P sites is built, ADR 0044): an onion service (Tor) and an I2P tunnel pointing at the search or admin address; configured in the router, with dksearch refusing to expose the admin interface that way unless asked.
 - **Replication details:** removing from a copy the documents the owner removed (a deletion feed).
 - **OCR for scanned PDFs** through Docling or MinerU (started by the owner, never by dksearch).
 

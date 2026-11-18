@@ -507,6 +507,21 @@ When a search finds nothing, the page offers **Did you mean**: each plain word i
 
 The administration interface has a **Docs** page with this manual and the HTTP API reference, one section at a time. On the **ZIM files** page, when no folder is set, a form asks for one: it is created, saved as `[admin] zim_dir` in the configuration and used at once, with no restart. `dksearch serve` refuses to start when something already listens on its search or administration address (a stale server sharing the port would answer some requests with its own sessions and data).
 
+TOR AND I2P
+A `crawl` source can index sites of the hidden networks, through a Tor daemon and an I2P router that you run yourself (dksearch never starts, installs or bundles either, and the feature is off until a proxy is named):
+
+    [[source]]
+    name = "onions"
+    kind = "crawl"
+    user_agent = "mysearch/1.0"
+    seeds_file = "onion-seeds.txt"
+    tor_socks = "127.0.0.1:9050"     # a Tor daemon's SOCKS5 port: .onion sites
+    i2p_proxy = "127.0.0.1:4444"     # an I2P router's HTTP proxy: .i2p sites
+    # hidden_links = true            # also follow links into them from ordinary sites
+    timeout_seconds = 60             # hidden services are slow
+
+The name of a hidden site is given to the proxy as a name and is never looked up locally, so it neither reaches your resolver nor the open internet; with no proxy set for a network, its addresses are not contacted at all. Only `http://` is used: an onion or I2P address already authenticates and encrypts the connection. Everything else about a crawl is unchanged: `robots.txt` is read, the delay applies, the crawler identifies itself with your `user_agent` (a site can see it; choose one you are willing to show there). A crawl that begins on a hidden site stays in the hidden networks and does not follow links to the open internet; links from ordinary sites into them are followed only with `hidden_links = true`. The addresses are indexed and shown like any other, so a result may be a `.onion` link that your browser needs Tor to open. What you crawl and keep is your responsibility under the law where you live.
+
 SOURCE LIST AND DUPLICATES
 The search page's source list shows how many documents each source holds, and `/sources` lists the sources the visitor may search with their kind, document count, when a document was last added, and the collections each is in, with a link that searches just that source. The numbers are counted at most every five minutes (counting groups the whole index). On the search page the same text found in several sources (or the same web page by its address) is shown once, naming the others ("same text in ..."); `group=0` shows every copy. The API folds them only with `group=1` (`same_in` lists the other sources).
 

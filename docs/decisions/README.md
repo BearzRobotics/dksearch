@@ -59,3 +59,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0041 | Fallback to other search engines |
 | 0042 | Ollama, models and written answers |
 | 0043 | A vector index over every document |
+| 0044 | Crawling Tor and I2P sites |

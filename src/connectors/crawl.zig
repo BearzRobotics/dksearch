@@ -31,6 +31,7 @@ const files = @import("files.zig");
 const htmltext = @import("../htmltext.zig");
 const robots = @import("crawl/robots.zig");
 const fetch = @import("crawl/fetch.zig");
+const hidden = @import("crawl/hidden.zig");
 const cabundle = @import("crawl/cabundle.zig");
 const xml = @import("../xml.zig");
 
@@ -74,7 +75,7 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links" };
 
 // ------------------------------------------------------------ validation
 
@@ -170,6 +171,11 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     try intOption(source, "window", 0, max_window, diag);
     _ = try needString(source, "ca_bundle", false, diag);
     _ = try needString(source, "validators_file", false, diag);
+    try boolOption(source, "hidden_links", diag);
+    inline for (.{ "tor_socks", "i2p_proxy" }) |k| if (try needString(source, k, false, diag)) |v| if (hidden.parseProxy(v) == null) {
+        diag.set("", key(&kbuf, source, k), "must be the address of the proxy as IP:port, e.g. \"127.0.0.1:9050\"", .{});
+        return error.InvalidValue;
+    };
     if (try needString(source, "language", false, diag)) |l| if (!files.validLanguageTag(l)) {
         diag.set("", key(&kbuf, source, "language"), "must be a language tag such as \"en\" (letters, digits and '-', at most 35 characters)", .{});
         return error.InvalidValue;
@@ -201,6 +207,11 @@ pub const CrawlConnector = struct {
     /// Where to keep the `ETag` and `Last-Modified` of the pages at the depth limit between runs (none: no
     /// conditional requests).
     validators_file: ?[]const u8,
+    /// A Tor SOCKS5 proxy and an I2P HTTP proxy, when `.onion` and `.i2p` sites may be crawled (docs/decisions/0044).
+    tor: ?std.Io.net.IpAddress,
+    i2p: ?std.Io.net.IpAddress,
+    /// Follow links from other sites into the hidden networks (a source whose seeds are there already stays there).
+    hidden_links: bool,
     checkpoint_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(gpa: Allocator, io: Io, source: config.Source) Allocator.Error!CrawlConnector {
@@ -244,6 +255,19 @@ pub const CrawlConnector = struct {
             .ca = ca,
             .language = language,
             .validators_file = validators_file,
+            .tor = if (source.optionString("tor_socks")) |v| hidden.parseProxy(v) else null,
+            .i2p = if (source.optionString("i2p_proxy")) |v| hidden.parseProxy(v) else null,
+            .hidden_links = source.optionBool("hidden_links") orelse false,
+        };
+    }
+
+    /// How to reach `host`: directly, through the configured Tor or I2P proxy for a name of those networks, or null
+    /// when it belongs to a hidden network that has no proxy here (it must then not be contacted at all).
+    fn routeFor(self: *const CrawlConnector, host: []const u8) ?hidden.Via {
+        const net_of = hidden.networkOf(host) orelse return .direct;
+        return switch (net_of) {
+            .onion => if (self.tor) |a| .{ .tor = a } else null,
+            .i2p => if (self.i2p) |a| .{ .i2p = a } else null,
         };
     }
 
@@ -954,11 +978,13 @@ const Run = struct {
         var hops: u32 = 0;
         while (true) {
             if (!self.waitTurn(host)) return error.Canceled;
+            const via = self.conn.routeFor((parseUrl(url) orelse return .disallow_all).host) orelse return .disallow_all;
             const resp = fetch.get(self.client, a, .{
                 .url = url,
                 .user_agent = self.conn.user_agent,
                 .accept = accept_robots,
                 .max_body_bytes = robots.max_bytes,
+                .via = via,
             }, self.timeout());
             host.last = Io.Timestamp.now(self.conn.io, .awake);
             const got = resp catch |e| switch (e) {
@@ -1021,9 +1047,13 @@ const Run = struct {
                 host.busy.store(false, .monotonic);
                 host.lock.unlock(self.conn.io);
             }
+            // A name of a hidden network goes to the proxy by name, over http only, and is never resolved here; with no
+            // proxy for it, it is not contacted at all.
+            const via = self.conn.routeFor(u.host) orelse return self.skip(.limit);
+            if (via != .direct and u.https) return self.skip(.limit);
             // A site the administrator did not list must not lead into the private network, whatever its name says:
             // every address the name resolves to is checked (once per host).
-            if (!self.conn.allow_private and !sameSite(u.host, site_host)) {
+            if (via == .direct and !self.conn.allow_private and !sameSite(u.host, site_host)) {
                 if (host.resolves_private == null) host.resolves_private = resolvesToPrivate(self.conn.io, u.host);
                 if (host.resolves_private.?) return self.skip(.limit);
             }
@@ -1035,6 +1065,7 @@ const Run = struct {
                 .user_agent = self.conn.user_agent,
                 .accept = accept,
                 .max_body_bytes = max_bytes,
+                .via = via,
                 // Only the first request of the chain: after a redirect the validators are for another address.
                 .if_none_match = if (hops == 0) (if (cond) |c| c.etag else null) else null,
                 .if_modified_since = if (hops == 0) (if (cond) |c| c.last_modified else null) else null,
@@ -1074,6 +1105,10 @@ const Run = struct {
     /// unless `allow_private_addresses` says so.
     fn mayVisit(self: *Run, site: []const u8, host: []const u8) bool {
         if (sameSite(host, site)) return true;
+        // The hidden networks are entered only on request, and never left again from inside: a crawl that began on an
+        // onion or I2P site does not wander onto the open internet.
+        if (hidden.networkOf(host) != null) return self.conn.hidden_links and self.conn.routeFor(host) != null;
+        if (hidden.networkOf(site) != null) return false;
         if (!self.conn.follow_external) return false;
         return self.conn.allow_private or !isPrivateHost(host);
     }
@@ -1388,6 +1423,10 @@ fn toUtf8(a: Allocator, body_in: []const u8, charset: ?[]const u8) Allocator.Err
 const testing = std.testing;
 const net = Io.net;
 
+test {
+    _ = hidden;
+}
+
 test "validate requires a user agent and a seeds file, and checks ranges" {
     var d: config.Diagnostic = .{};
     const ok_opts = [_]config.Option{
@@ -1522,6 +1561,57 @@ test "fetches seeds, obeys robots.txt, converts HTML, identifies itself" {
     try testing.expectEqual(@as(usize, 0), srv.count("/private/b")); // never requested
     try testing.expectEqual(@as(usize, 1), srv.count("/robots.txt")); // once per host
     for (srv.agents.items) |ag| try testing.expectEqualStrings("dksearch-test/1.0 (+https://example.org/bot)", ag);
+}
+
+test "an onion seed is crawled through the Tor proxy by name; with no proxy configured it is not contacted" {
+    var proxy: hidden.FakeProxy = undefined;
+    try proxy.start(.tor, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 70\r\n\r\n<html><head><title>Hidden</title></head><body>Onion page</body></html>");
+    defer proxy.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var conn = try testConnector(&tmp, "http://abcdefghij234567.onion/\n", "dksearch-test/1.0 (+https://example.org/bot)");
+    defer conn.deinit();
+    conn.max_depth = 0;
+    // No proxy: nothing is contacted, and the seed is refused.
+    {
+        var got: Collect = .{};
+        defer got.deinit();
+        var ctl: api.Control = .{};
+        _ = try conn.connector().run(got.sink(), &ctl, null);
+        try testing.expectEqual(@as(usize, 0), got.ids.items.len);
+        try testing.expectEqual(@as(u64, 1), ctl.rejected.load(.monotonic));
+        try testing.expectEqual(@as(usize, 0), proxy.connections);
+    }
+    conn.tor = proxy.address();
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    _ = try conn.connector().run(got.sink(), &ctl, null);
+    try testing.expectEqual(@as(usize, 1), got.ids.items.len);
+    try testing.expectEqualStrings("Hidden", got.titles.items[0]);
+    try testing.expectEqualStrings("Onion page", got.texts.items[0]);
+    try testing.expectEqualStrings("abcdefghij234567.onion", proxy.asked_host[0..proxy.asked_len]);
+    try testing.expect(proxy.connections >= 2); // robots.txt and the page
+}
+
+test "the proxy options are checked, and routing follows the network of the name" {
+    var d: config.Diagnostic = .{};
+    const base = [_]config.Option{
+        .{ .key = "user_agent", .value = .{ .string = "mysearch/1.0 (+https://example.org/about)" } },
+        .{ .key = "seeds_file", .value = .{ .string = "seeds.txt" } },
+    };
+    const good = base ++ [_]config.Option{ .{ .key = "tor_socks", .value = .{ .string = "127.0.0.1:9050" } }, .{ .key = "i2p_proxy", .value = .{ .string = "127.0.0.1:4444" } }, .{ .key = "hidden_links", .value = .{ .boolean = true } } };
+    try validate(.{ .name = "c", .kind = "crawl", .options = &good }, &d);
+    const bad = base ++ [_]config.Option{.{ .key = "tor_socks", .value = .{ .string = "tor.example:9050" } }};
+    try testing.expectError(error.InvalidValue, validate(.{ .name = "c", .kind = "crawl", .options = &bad }, &d));
+    try testing.expectEqualStrings("source[c].tor_socks", d.key());
+    var c = try CrawlConnector.init(testing.allocator, testing.io, .{ .name = "c", .kind = "crawl", .options = &good });
+    defer c.deinit();
+    try testing.expect(c.routeFor("example.org").? == .direct);
+    try testing.expect(c.routeFor("x.onion").? == .tor);
+    try testing.expect(c.routeFor("x.i2p").? == .i2p);
+    c.i2p = null;
+    try testing.expect(c.routeFor("x.i2p") == null);
 }
 
 test "addresses in private ranges are recognised in both IP versions, including IPv4 mapped into IPv6" {
