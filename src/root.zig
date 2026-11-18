@@ -39,6 +39,7 @@ pub const domainlist = @import("domainlist.zig");
 pub const listfetch = @import("listfetch.zig");
 pub const safesearch = @import("safesearch.zig");
 pub const embedjob = @import("embedjob.zig");
+pub const imagerelay = @import("imagerelay.zig");
 pub const optioninfo = @import("optioninfo.zig");
 pub const settinginfo = @import("settinginfo.zig");
 pub const officetext = @import("officetext.zig");
@@ -101,6 +102,7 @@ test {
     _ = listfetch;
     _ = safesearch;
     _ = embedjob;
+    _ = imagerelay;
     _ = optioninfo;
     _ = settinginfo;
     _ = officetext;

@@ -241,14 +241,29 @@ pub const Scan = struct {
     /// `href` of `<a>` and `<area>` elements, entities decoded, in page order.
     /// Links marked `rel="nofollow"` are left out. Empty if the page is nofollow.
     links: []const []const u8 = &.{},
+    /// Pictures of the page (`<img>` and the `og:image` of the page), when asked for (`scanWith`).
+    images: []const PageImage = &.{},
 };
+
+/// A picture of a page: where it is (as written in the page: it may be relative), what the page says it shows.
+pub const PageImage = struct { src: []const u8, alt: []const u8, title: []const u8 };
+
+/// The smallest side (pixels, when the page says it) that makes a picture worth recording: icons and tracking pixels are not.
+pub const min_image_side: u32 = 100;
 
 /// One pass over `html`: robots meta directives and up to `max_links` links.
 /// Like `toText` it is linear, ignores comments, `<script>` and `<style>`, and
 /// never fails on malformed markup.
 pub fn scan(arena: Allocator, html: []const u8, max_links: usize) Allocator.Error!Scan {
+    return scanWith(arena, html, max_links, 0);
+}
+
+/// Like `scan`, and also up to `max_images` pictures: `<img>` with a `src` (or a lazy-loading `data-src`) that is not an inline
+/// `data:` address and is not marked smaller than `min_image_side`, and the page's `og:image`.
+pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images: usize) Allocator.Error!Scan {
     var out: Scan = .{};
     var links: std.ArrayList([]const u8) = .empty;
+    var images: std.ArrayList(PageImage) = .empty;
     var missing_end: [dropped_tags.len]bool = @splat(false);
     var budget: Budget = .{};
     var i: usize = 0;
@@ -281,6 +296,32 @@ pub fn scan(arena: Allocator, html: []const u8, max_links: usize) Allocator.Erro
             continue;
         }
         const body = html[lt..t.end];
+        if (max_images > 0 and images.items.len < max_images and std.ascii.eqlIgnoreCase(t.name, "img")) {
+            const raw = attr(body, "src") orelse (attr(body, "data-src") orelse continue);
+            const src = std.mem.trim(u8, raw, " \t\r\n");
+            if (src.len == 0 or src.len > 2000 or std.ascii.startsWithIgnoreCase(src, "data:") or std.ascii.startsWithIgnoreCase(src, "javascript:")) continue;
+            if (attr(body, "width")) |w| if (std.fmt.parseInt(u32, std.mem.trim(u8, w, " px"), 10)) |n| {
+                if (n < min_image_side) continue;
+            } else |_| {};
+            if (attr(body, "height")) |h| if (std.fmt.parseInt(u32, std.mem.trim(u8, h, " px"), 10)) |n| {
+                if (n < min_image_side) continue;
+            } else |_| {};
+            try images.append(arena, .{
+                .src = try decodeEntities(arena, src),
+                .alt = try decodeEntities(arena, std.mem.trim(u8, attr(body, "alt") orelse "", " \t\r\n")),
+                .title = try decodeEntities(arena, std.mem.trim(u8, attr(body, "title") orelse "", " \t\r\n")),
+            });
+            continue;
+        }
+        if (max_images > 0 and images.items.len < max_images and std.ascii.eqlIgnoreCase(t.name, "meta")) {
+            if (attr(body, "property")) |prop| if (std.ascii.eqlIgnoreCase(prop, "og:image")) {
+                if (attr(body, "content")) |c| {
+                    const src = std.mem.trim(u8, c, " \t\r\n");
+                    if (src.len > 0 and src.len <= 2000 and !std.ascii.startsWithIgnoreCase(src, "data:")) try images.append(arena, .{ .src = try decodeEntities(arena, src), .alt = "", .title = "" });
+                }
+                continue;
+            };
+        }
         if (std.ascii.eqlIgnoreCase(t.name, "meta")) {
             const name = attr(body, "name") orelse continue;
             if (!std.ascii.eqlIgnoreCase(name, "robots") and !std.ascii.eqlIgnoreCase(name, "dksearch")) continue;
@@ -296,6 +337,7 @@ pub fn scan(arena: Allocator, html: []const u8, max_links: usize) Allocator.Erro
         }
     }
     if (!out.nofollow) out.links = links.items;
+    out.images = images.items;
     return out;
 }
 
@@ -480,4 +522,30 @@ test "scan never fails on junk" {
         for (&buf) |*b| b.* = "<>a href=\"'=/ &;!-meta robots\n"[prng.random().uintLessThan(usize, 30)];
         _ = try scan(arena.allocator(), &buf, 50);
     }
+}
+
+test "pictures of a page: img and og:image, relative addresses kept as written, icons and inline data left out" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const html =
+        \\<html><head><meta property="og:image" content="https://cdn.example/cover.jpg"><title>Gallery</title></head><body>
+        \\<img src="/pics/blue-sky.jpg" alt="Blue &amp; sky" title="A sky" width="1200" height="800">
+        \\<img src="icon.png" width="16" height="16" alt="icon">
+        \\<img src="data:image/png;base64,AAAA" alt="inline">
+        \\<img data-src="lazy.webp" alt="Lazy one">
+        \\<img alt="no source">
+        \\<img src="tracker.gif" width="1" height="1">
+        \\</body></html>
+    ;
+    const s = try scanWith(a, html, 10, 10);
+    try testing.expectEqual(@as(usize, 3), s.images.len); // og:image, the sky, the lazy one
+    try testing.expectEqualStrings("https://cdn.example/cover.jpg", s.images[0].src);
+    try testing.expectEqualStrings("/pics/blue-sky.jpg", s.images[1].src);
+    try testing.expectEqualStrings("Blue & sky", s.images[1].alt);
+    try testing.expectEqualStrings("A sky", s.images[1].title);
+    try testing.expectEqualStrings("lazy.webp", s.images[2].src);
+    // Not asked for: none; the limit is kept.
+    try testing.expectEqual(@as(usize, 0), (try scan(a, html, 10)).images.len);
+    try testing.expectEqual(@as(usize, 1), (try scanWith(a, html, 10, 1)).images.len);
 }

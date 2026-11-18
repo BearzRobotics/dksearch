@@ -360,6 +360,14 @@ pub const Filters = struct {
     demote_percent: u32 = 30,
 };
 
+/// Pictures of the web in the gallery (`[images]`): the relay that fetches one when it is looked at, storing nothing.
+pub const Images = struct {
+    remote: bool = false,
+    /// The largest picture the relay hands on (MiB), and how many it fetches at once.
+    relay_max_mb: u32 = 8,
+    relay_concurrency: u32 = 6,
+};
+
 /// Safe search (`[safe_search]`): when `enabled`, the ban lists are added to the blocklist for everyone.
 pub const SafeSearch = struct {
     /// On for visitors unless they unlock it (a PIN, or an API key marked adult).
@@ -439,6 +447,7 @@ pub const Config = struct {
     fallback: Fallback = .{},
     filters: Filters = .{},
     safe_search: SafeSearch = .{},
+    images: Images = .{},
     ollama: ?Ollama = null,
     answers: Answers = .{},
 
@@ -459,7 +468,7 @@ const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_m
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
 const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "per_domain", "trusted_first", "trusted_min_boost", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
-const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings", "fallback", "ollama", "answers", "filters", "safe_search" };
+const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings", "fallback", "ollama", "answers", "filters", "safe_search", "images" };
 
 /// Parses and validates configuration text. `source_name` is only used in
 /// diagnostics (normally the file path).
@@ -635,6 +644,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     cfg.fallback = try readFallback(a, src, root, diag);
     cfg.filters = try readFilters(a, src, root, diag);
     cfg.safe_search = try readSafeSearch(a, src, root, diag);
+    cfg.images = try readImages(src, root, diag);
     // A crawl that reaches Tor needs a ban list: crawling onion sites with none is a choice that must be written down.
     {
         // Only the blocklist counts: the safe-search list can be turned off by whoever unlocks it.
@@ -762,6 +772,16 @@ fn readFilters(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnost
     if (try intIn(src, "filters", t, "demote_percent", 1, 99, diag)) |n| f.demote_percent = @intCast(n);
     if (try str(src, "filters", t, "ban", diag)) |v| f.ban = try a.dupe(u8, v);
     return f;
+}
+
+fn readImages(src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!Images {
+    const t = (try subTable(src, root, "images", diag)) orelse return .{};
+    try checkKeys(src, "images", t, &[_][]const u8{ "remote", "relay_max_mb", "relay_concurrency" }, diag);
+    var i: Images = .{};
+    if (try optBool(src, "images", t, "remote", diag)) |b| i.remote = b;
+    if (try intIn(src, "images", t, "relay_max_mb", 1, 64, diag)) |n| i.relay_max_mb = @intCast(n);
+    if (try intIn(src, "images", t, "relay_concurrency", 1, 64, diag)) |n| i.relay_concurrency = @intCast(n);
+    return i;
 }
 
 fn readSafeSearch(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!SafeSearch {
@@ -1889,4 +1909,17 @@ test "a source that crawls Tor needs a ban list, or a written-down choice not to
     plain.deinit();
     var off = try loadFromSlice(testing.allocator, "t.toml", base ++ src ++ "enabled = false\n", &d);
     off.deinit();
+}
+
+test "the picture relay settings are read and checked" {
+    var d: Diagnostic = .{};
+    const base = "[storage]\ndata_dir = \"/tmp/x\"\n";
+    var c = try loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nremote = true\nrelay_max_mb = 4\nrelay_concurrency = 3\n", &d);
+    defer c.deinit();
+    try testing.expect(c.images.remote and c.images.relay_max_mb == 4 and c.images.relay_concurrency == 3);
+    var plain = try loadFromSlice(testing.allocator, "t.toml", base, &d);
+    defer plain.deinit();
+    try testing.expect(!plain.images.remote and plain.images.relay_max_mb == 8);
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nrelay_max_mb = 0\n", &d));
+    try testing.expectError(error.UnknownKey, loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nproxy = true\n", &d));
 }

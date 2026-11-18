@@ -105,6 +105,8 @@ pub const Services = struct {
     lists: ?*const dk.domainlist.Lists = null,
     /// Safe search (ADR 0049): on for visitors by default; `unlock` holds the PIN and the unlocked browsers. `safe` is
     /// set for each request: whether safe search applies to the one being answered.
+    /// Fetches the pictures of the web for the gallery (`[images] remote`); null: the gallery shows only local pictures.
+    relay: ?*dk.imagerelay.Relay = null,
     safe_default: bool = false,
     unlock: ?*dk.safesearch.Unlock = null,
     safe: bool = false,
@@ -1326,6 +1328,7 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     var hex = path["/doc/".len..];
     var want_file = false;
     var want_open = false;
+    var want_relay = false;
     var want_image: ?usize = null;
     if (std.mem.endsWith(u8, hex, "/open")) {
         want_open = true;
@@ -1333,6 +1336,9 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     } else if (std.mem.endsWith(u8, hex, "/file")) {
         want_file = true;
         hex = hex[0 .. hex.len - "/file".len];
+    } else if (std.mem.endsWith(u8, hex, "/image")) {
+        want_relay = true;
+        hex = hex[0 .. hex.len - "/image".len];
     } else if (std.mem.indexOf(u8, hex, "/image/")) |at| {
         want_image = std.fmt.parseInt(usize, hex[at + "/image/".len ..], 10) catch return htmlError(arena, .not_found, "Not found", "No such picture.");
         hex = hex[0..at];
@@ -1344,6 +1350,7 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     const hit = info orelse return htmlError(arena, .not_found, "Not found", "No such document.");
     // A document outside the caller's scope, or of a blocked domain, is as good as absent.
     if (!services.scope.allows(hit.connector) or hitBlocked(services, hit)) return htmlError(arena, .not_found, "Not found", "No such document.");
+    if (want_relay) return relayedImage(arena, services, id, hit);
     const can_open = if (services.originals) |o| (if (hit.url) |u| o.serves(hit.connector, u) else false) else false;
     if (want_file) return if (can_open) originalFile(arena, services.originals.?, hit) else htmlError(arena, .not_found, "Not found", "The original file of this document is not available here.");
     if (want_image) |n| return if (can_open) documentImage(arena, services.originals.?, hit, n) else htmlError(arena, .not_found, "Not found", "The pictures of this document are not available here.");
@@ -1467,6 +1474,39 @@ fn wopiPage(arena: Allocator, searcher: dk.search.Searcher, services: Services, 
 }
 
 /// The original file of a document, for the browser to show or download.
+/// `/doc/ID/image`: the picture of a web picture record, fetched now from where it is and passed on, nothing kept. Only
+/// for documents of kind image that the crawler recorded (the address comes from the stored text, never from the request).
+fn relayedImage(arena: Allocator, services: Services, id: dk.document.Id, hit: dk.search.Hit) error{OutOfMemory}!Response {
+    const gone = try htmlError(arena, .not_found, "Not found", "No picture here.");
+    const relay = services.relay orelse return gone;
+    const store = services.content orelse return gone;
+    if (!(if (hit.kind) |k| std.mem.eql(u8, k, "image") else false)) return gone;
+    const page_url = hit.url orelse return gone;
+    if (!std.mem.startsWith(u8, page_url, "http")) return gone;
+    const text = store.get(arena, id) catch return gone;
+    const prefix = "Image: ";
+    if (!std.mem.startsWith(u8, text, prefix)) return gone;
+    const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    const address = std.mem.trim(u8, text[prefix.len..line_end], " \r");
+    const img = relay.fetchImage(arena, address) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Busy => {
+            var r = try htmlError(arena, .service_unavailable, "Busy", "Too many pictures are being fetched; try again in a moment.");
+            r.headers = headersWith(arena, &.{ .{ .name = "retry-after", .value = "2" }, no_store });
+            return r;
+        },
+        else => return gone,
+    };
+    const headers = try arena.alloc(Header, 5);
+    headers[0] = .{ .name = "x-content-type-options", .value = "nosniff" };
+    headers[1] = .{ .name = "content-security-policy", .value = "default-src 'none'; sandbox" };
+    headers[2] = .{ .name = "cross-origin-resource-policy", .value = "same-origin" };
+    headers[3] = .{ .name = "referrer-policy", .value = "no-referrer" };
+    // The browser may keep it for a while (this server keeps nothing).
+    headers[4] = .{ .name = "cache-control", .value = "private, max-age=3600" };
+    return .{ .status = .ok, .content_type = img.content_type, .body = img.bytes, .headers = headers };
+}
+
 fn originalFile(arena: Allocator, svc: *const dk.originals.Service, hit: dk.search.Hit) error{OutOfMemory}!Response {
     const served = svc.read(arena, hit.connector, hit.url.?) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
@@ -2042,7 +2082,16 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         form.images = true;
         form.page_size = gallery_page_size;
         const ok = try arena.alloc(bool, shown.hits.len);
-        for (shown.hits, ok) |h, *o| o.* = if (services.originals) |orig| (if (h.url) |u| h.node == null and orig.serves(h.connector, u) else false) else false;
+        for (shown.hits, ok) |h, *o| {
+            const u = h.url orelse {
+                o.* = false;
+                continue;
+            };
+            o.* = if (std.mem.startsWith(u8, u, "file://"))
+                (if (services.originals) |orig| h.node == null and orig.serves(h.connector, u) else false)
+            else
+                services.relay != null and h.node == null and std.mem.startsWith(u8, u, "http");
+        }
         form.gallery_ok = ok;
     }
     form.semantic_offered = services.embed != null;
@@ -3603,6 +3652,55 @@ test "the Images button shows only pictures as a gallery, from this server's own
     try testing.expect(std.mem.indexOf(u8, g.body, "no preview") != null and std.mem.indexOf(u8, g.body, "<img") == null);
     try testing.expect(std.mem.indexOf(u8, g.body, "href=\"/doc/01010101") != null);
     _ = a;
+}
+
+test "web pictures: the gallery shows them through the relay, which fetches the recorded address and stores nothing" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = "http://127.0.0.1:1";
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    const id_ok: dk.document.Id = @splat(0x71);
+    const id_bad: dk.document.Id = @splat(0x72);
+    const id_page: dk.document.Id = @splat(0x73);
+    try mem.store().put(id_ok, try std.fmt.allocPrint(a, "Image: {s}/pic.png\nPage: https://gallery.example/p\nBlue sky\n", .{base}));
+    try mem.store().put(id_bad, try std.fmt.allocPrint(a, "Image: {s}/not.html\nPage: https://gallery.example/p\n", .{base}));
+    try mem.store().put(id_page, "A page of words, not a picture record");
+    var hits = [_]dk.search.Hit{
+        .{ .id = id_ok, .connector = "web", .url = "https://gallery.example/p", .title = "Blue sky", .snippet = null, .score = 3, .kind = "image" },
+        .{ .id = id_bad, .connector = "web", .url = "https://gallery.example/p", .title = "Not a picture", .snippet = null, .score = 2, .kind = "image" },
+        .{ .id = id_page, .connector = "web", .url = "https://gallery.example/q", .title = "A page", .snippet = null, .score = 1, .kind = "page" },
+    };
+    const Info = struct {
+        var all: []const dk.search.Hit = &.{};
+        fn info(_: *anyopaque, _: Allocator, id: dk.document.Id) dk.search.Error!?dk.search.Hit {
+            for (all) |h| if (std.mem.eql(u8, &h.id, &id)) return h;
+            return null;
+        }
+        fn search(_: *anyopaque, _: Allocator, _: dk.search.Query) dk.search.Error!dk.search.Page {
+            return .{ .hits = all, .has_more = false };
+        }
+    };
+    Info.all = &hits;
+    var dummy: u8 = 0;
+    const s: dk.search.Searcher = .{ .ptr = &dummy, .vtable = &.{ .search = Info.search, .info = Info.info } };
+    var relay: dk.imagerelay.Relay = .{ .gpa = testing.allocator, .io = testing.io, .allow_private = true };
+    const services: Services = .{ .content = mem.store(), .relay = &relay };
+    // An address that cannot be reached (the fetch itself is tested in imagerelay.zig), a document that is not a picture
+    // record, and a server with no relay: not found.
+    try testing.expectEqual(http.Status.not_found, handleServices(a, s, services, .GET, "/doc/72727272727272727272727272727272/image").status);
+    try testing.expectEqual(http.Status.not_found, handleServices(a, s, services, .GET, "/doc/73737373737373737373737373737373/image").status);
+    try testing.expectEqual(http.Status.not_found, handleServices(a, s, .{ .content = mem.store() }, .GET, "/doc/71717171717171717171717171717171/image").status);
+    // Too many at once: told to wait.
+    var busy: dk.imagerelay.Relay = .{ .gpa = testing.allocator, .io = testing.io, .allow_private = true, .max_concurrent = 0 };
+    const waiting = handleServices(a, s, .{ .content = mem.store(), .relay = &busy }, .GET, "/doc/71717171717171717171717171717171/image");
+    try testing.expectEqual(http.Status.service_unavailable, waiting.status);
+    // The gallery shows web pictures from the relay, and only the names when there is none.
+    const gallery = handleServices(a, s, services, .GET, "/search?q=sky&images=1");
+    try testing.expect(std.mem.indexOf(u8, gallery.body, "src=\"/doc/71717171717171717171717171717171/image\"") != null);
+    const none = handleServices(a, s, .{ .content = mem.store() }, .GET, "/search?q=sky&images=1");
+    try testing.expect(std.mem.indexOf(u8, none.body, "<img") == null and std.mem.indexOf(u8, none.body, "no preview") != null);
 }
 
 test "answers: off by default, a question is needed, nothing is asked of the model without passages, and an unreachable model is said" {

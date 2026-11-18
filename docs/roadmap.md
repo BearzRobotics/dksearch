@@ -10,7 +10,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 ## Then
 
-- **Pictures from the web:** the crawler records the pictures it sees on pages (address, alt text, page) as small records and the gallery shows them through an on-demand relay that stores nothing; an opt-in thumbnail cache later.
+- **Thumbnail cache (opt-in):** web pictures are built (ADR 0052) and stored nothing; a cache of small copies for speed, off by default, later.
 - **Management:** saved searches and opt-in statistics (no query logging by default).
 - **Playing media in the browser:** an embedded player in the viewer, with HTTP range requests and streaming for original files (today an original is sent whole, up to 64 MiB), and a start time taken from the result.
 - **Speech-to-text (opt-in):** transcribe spoken-word audio and video with an external program (whisper.cpp or faster-whisper), producing timestamped chunks so a result can start playback at the right moment. Off by default; slow on a CPU, so tried on a sample first.

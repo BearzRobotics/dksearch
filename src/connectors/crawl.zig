@@ -77,7 +77,7 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page" };
 
 // ------------------------------------------------------------ validation
 
@@ -176,6 +176,8 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     try boolOption(source, "hidden_links", diag);
     try boolOption(source, "allow_unbanned_onions", diag);
     try boolOption(source, "recrawl_adaptive", diag);
+    try boolOption(source, "index_images", diag);
+    try intOption(source, "max_images_per_page", 1, 50, diag);
     try intOption(source, "recrawl_min_hours", 1, 24 * 30, diag);
     try intOption(source, "recrawl_max_days", 1, 365, diag);
     if ((source.optionBool("recrawl_adaptive") orelse false) and source.optionString("validators_file") == null) {
@@ -225,6 +227,10 @@ pub const CrawlConnector = struct {
     /// Per-page recrawl schedule (needs `validators_file`): a page at the depth limit is asked again only when its own
     /// interval has passed. The interval grows by a fifth when the page did not change and shrinks by a fifth when it did,
     /// between `recrawl_min_hours` and `recrawl_max_days`.
+    /// Record the pictures of each stored page as small documents (address, alt text, page), not the pictures themselves
+    /// (`index_images`); at most `max_images_per_page` of each page.
+    index_images: bool,
+    max_images_per_page: u32,
     recrawl_adaptive: bool,
     recrawl_min_s: u32,
     recrawl_max_s: u32,
@@ -279,6 +285,8 @@ pub const CrawlConnector = struct {
             .tor = if (source.optionString("tor_socks")) |v| hidden.parseProxy(v) else null,
             .i2p = if (source.optionString("i2p_proxy")) |v| hidden.parseProxy(v) else null,
             .hidden_links = source.optionBool("hidden_links") orelse false,
+            .index_images = source.optionBool("index_images") orelse false,
+            .max_images_per_page = @intCast(source.optionInt("max_images_per_page") orelse 12),
             .recrawl_adaptive = source.optionBool("recrawl_adaptive") orelse false,
             .recrawl_min_s = @intCast((source.optionInt("recrawl_min_hours") orelse 6) * 3600),
             .recrawl_max_s = @intCast((source.optionInt("recrawl_max_days") orelse 60) * 86400),
@@ -918,6 +926,7 @@ pub fn nextInterval(previous: u32, changed: bool, first: bool, lo: u32, hi: u32)
     return @intCast(n);
 }
 const max_validators = 2_000_000;
+const max_images_seen = 2_000_000;
 const max_validators_bytes = 512 * 1024 * 1024;
 
 const Shared = struct {
@@ -927,6 +936,8 @@ const Shared = struct {
     fresh: std.StringHashMapUnmanaged(Validator) = .empty,
     /// Pages the server said had not changed (answered 304).
     not_modified: std.atomic.Value(u64) = .init(0),
+    /// Pictures already recorded this run (by address), so one on many pages is recorded once (under `mutex`).
+    images_seen: std.StringHashMapUnmanaged(void) = .empty,
     /// Pages left alone because their own interval had not passed (`recrawl_adaptive`).
     not_due: std.atomic.Value(u64) = .init(0),
     hosts: std.StringHashMapUnmanaged(*Host) = .empty,
@@ -1374,6 +1385,75 @@ const Run = struct {
         });
     }
 
+    /// The picture type a file name suggests (`image/*` when it says nothing).
+    fn imageType(src: []const u8) []const u8 {
+        const end = std.mem.indexOfAny(u8, src, "?#") orelse src.len;
+        const path = src[0..end];
+        const table = [_]struct { []const u8, []const u8 }{
+            .{ ".jpg", "image/jpeg" },  .{ ".jpeg", "image/jpeg" }, .{ ".png", "image/png" }, .{ ".gif", "image/gif" },
+            .{ ".webp", "image/webp" }, .{ ".avif", "image/avif" }, .{ ".bmp", "image/bmp" }, .{ ".svg", "image/svg+xml" },
+        };
+        for (table) |t| if (std.ascii.endsWithIgnoreCase(path, t[0])) return t[1];
+        return "image/*";
+    }
+
+    /// Records the pictures of a stored page as documents of their own: the text is where the picture is, which page shows
+    /// it and the words the page gives it; the picture is not fetched or kept. The document's address is the page, so
+    /// results open the page and the page's domain decides what the ban and safe-search lists hide. False if the run was stopped.
+    fn submitImages(self: *Run, a: Allocator, page_url: []const u8, page_host: []const u8, page_title: ?[]const u8, images: []const htmltext.PageImage) error{OutOfMemory}!bool {
+        const io = self.conn.io;
+        for (images) |img| {
+            const abs = (try resolveRedirect(a, page_url, img.src)) orelse continue;
+            const iu = parseUrl(abs) orelse continue;
+            // Only http(s) pictures the relay can fetch: not those of hidden networks, not of banned domains.
+            if (hidden.networkOf(iu.host) != null) continue;
+            if (domainlist.global) |l| if (l.blocked.matches(iu.host)) continue;
+            self.sh.mutex.lockUncancelable(io);
+            const gop = self.sh.images_seen.getOrPut(self.arena, abs) catch {
+                self.sh.mutex.unlock(io);
+                return error.OutOfMemory;
+            };
+            const fresh = !gop.found_existing and self.sh.images_seen.count() <= max_images_seen;
+            if (!gop.found_existing) gop.key_ptr.* = self.arena.dupe(u8, abs) catch {
+                self.sh.mutex.unlock(io);
+                return error.OutOfMemory;
+            };
+            self.sh.mutex.unlock(io);
+            if (!fresh) continue;
+            const stem = blk: {
+                const end = std.mem.indexOfAny(u8, abs, "?#") orelse abs.len;
+                const slash = std.mem.lastIndexOfScalar(u8, abs[0..end], '/') orelse 0;
+                const dot = std.mem.lastIndexOfScalar(u8, abs[slash..end], '.');
+                break :blk abs[slash + @min(1, abs.len - slash) .. if (dot) |d| slash + d else end];
+            };
+            const label = if (img.alt.len > 0) img.alt else if (img.title.len > 0) img.title else stem;
+            const text = try std.fmt.allocPrint(a, "Image: {s}\nPage: {s}\n{s}\n{s}\nFrom the page: {s}\n", .{ abs, page_url, img.alt, img.title, page_title orelse "" });
+            const d: doc.Document = .{
+                .connector = self.conn.name,
+                .source_id = abs,
+                .canonical_url = page_url,
+                .source_dataset = page_host,
+                .title = label,
+                .text = text,
+                .language = self.conn.language,
+                .content_type = imageType(abs),
+                .extra = &.{.{ .key = "tag", .value = "image" }},
+                .rights = .{
+                    .attribution = try std.fmt.allocPrint(a, "A picture on a page of {s}", .{page_host}),
+                    .access_notes = "Only the picture's address and words are kept; it belongs to its publisher.",
+                    .redistribution = .unknown,
+                },
+            };
+            self.sink.submit(d) catch |e| switch (e) {
+                error.Rejected => continue,
+                error.Stopped => return false,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            _ = self.control.submitted.fetchAdd(1, .monotonic);
+        }
+        return true;
+    }
+
     const Stored = struct { result: Result, links: []const []const u8 = &.{} };
 
     fn store(self: *Run, a: Allocator, url: []const u8, got: fetch.Response) error{OutOfMemory}!Stored {
@@ -1382,7 +1462,7 @@ const Run = struct {
         if (!is_html and !std.mem.eql(u8, ct.media, "text/plain")) return .{ .result = self.reject(.wrong_type) };
 
         const utf8 = (try toUtf8(a, got.body, ct.charset)) orelse return .{ .result = self.reject(.encoding) };
-        const scanned: htmltext.Scan = if (is_html) try htmltext.scan(a, utf8, max_links_per_page) else .{};
+        const scanned: htmltext.Scan = if (is_html) try htmltext.scanWith(a, utf8, max_links_per_page, if (self.conn.index_images) self.conn.max_images_per_page else 0) else .{};
         // The page may say "do not index" yet still lead to pages that are fine.
         if (scanned.noindex) return .{ .result = self.reject(.no_text), .links = scanned.links };
         const text = if (is_html) try htmltext.toText(a, utf8) else std.mem.trim(u8, utf8, " \t\r\n");
@@ -1412,6 +1492,7 @@ const Run = struct {
         };
         _ = self.control.submitted.fetchAdd(1, .monotonic);
         _ = self.sh.stored.fetchAdd(1, .monotonic);
+        if (scanned.images.len > 0) if (!try self.submitImages(a, url, u.host, title, scanned.images)) return .{ .result = .stopped };
         const io = self.conn.io;
         var save_at: ?[]const u8 = null;
         self.sh.mutex.lockUncancelable(io);

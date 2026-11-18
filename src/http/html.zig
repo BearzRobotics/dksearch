@@ -641,7 +641,8 @@ fn writeGallery(w: *Writer, f: Form, hits: []const dk.search.Hit) Writer.Error!v
             try writeEscaped(w, label);
             try w.writeAll("\" src=\"");
             try writeViewHref(w, h);
-            try w.writeAll("/file\">");
+            // A picture of a file is shown from the file, one of the web through the relay.
+            try w.writeAll(if (h.url) |u| (if (std.mem.startsWith(u8, u, "file://")) "/file\">" else "/image\">") else "/file\">");
         } else try w.writeAll("<span class=\"nopic\">no preview</span>");
         try w.writeAll("<span class=\"cap\">");
         try writeEscaped(w, label);
