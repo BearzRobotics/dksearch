@@ -10,7 +10,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 ## Then
 
-- **Trusted first:** an ordering that puts results of highly boosted sources before the long tail instead of mixing by text score alone (the domain blocklist, demotion list and safe search are built, ADR 0048). A way to edit the domain lists and set the safe-search PIN from the administration interface.
+- **Domain lists in the administration interface:** edit the ban, demotion and safe-search lists and set the safe-search PIN from the admin panel (today: configuration files and `dksearch safesearch-pin`).
 - **Search by image everywhere:** a `find-image` command and an admin upload over the perceptual hashes the files connector already stores.
 - **Management:** saved searches and opt-in statistics (no query logging by default).
 - **Playing media in the browser:** an embedded player in the viewer, with HTTP range requests and streaming for original files (today an original is sent whole, up to 64 MiB), and a start time taken from the result.

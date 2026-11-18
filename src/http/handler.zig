@@ -106,6 +106,10 @@ pub const Services = struct {
     safe_default: bool = false,
     unlock: ?*dk.safesearch.Unlock = null,
     safe: bool = false,
+    /// Results of highly boosted sources first (`[search] trusted_first`, from `trusted_min_boost` percent); a request's
+    /// own `trusted=1` or `trusted=0` overrides it.
+    trusted_first: bool = false,
+    trusted_min_boost: u32 = 150,
     /// The most results one domain may have in a search (`[search] per_domain`; 0: no limit); a request's own
     /// `per_domain` overrides it.
     per_domain: u32 = 0,
@@ -144,6 +148,8 @@ pub const Services = struct {
 fn limitQuery(arena: Allocator, q: *dk.search.Query, services: Services) error{OutOfMemory}!void {
     q.scope = services.scope.sources;
     q.safe_search = services.safe;
+    if (q.trusted_first == null and services.trusted_first) q.trusted_first = true;
+    q.trusted_min_percent = services.trusted_min_boost;
     if (q.per_domain == 0) q.per_domain = services.per_domain;
     const defs = try arena.alloc(dk.search.CollectionDef, services.collections.len);
     for (services.collections, defs) |c, *d| d.* = .{ .name = c.name, .sources = c.sources };
@@ -459,6 +465,13 @@ fn parseQuery(arena: Allocator, params: query.Params, html_mode: bool) error{Out
         } else if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "exact")) {
             q.fuzzy = .off;
         } else return .{ .bad = .{ .name = "fuzzy", .message = "must be 1 (always allow typos), 0 (exact words only), or left out (the server's default)" } };
+    };
+    if (params.get("trusted")) |v| if (v.len > 0) {
+        if (std.mem.eql(u8, v, "1")) {
+            q.trusted_first = true;
+        } else if (std.mem.eql(u8, v, "0")) {
+            q.trusted_first = false;
+        } else return .{ .bad = .{ .name = "trusted", .message = "must be 1 (sources you trust first) or 0" } };
     };
     if (params.get("per_domain")) |v| if (v.len > 0) {
         const n = std.fmt.parseInt(u32, v, 10) catch return .{ .bad = .{ .name = "per_domain", .message = "must be a number from 0 to 50" } };
@@ -1136,7 +1149,7 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
     for (shown, hits) |h, *out| out.* = try apiHit(arena, h);
     // The cursor of the next page: after the last result of this one, for a relevance-ordered search of words.
     var cursor_buf: [48]u8 = undefined;
-    const next_cursor: ?[]const u8 = if (page.has_more and page.hits.len > 0 and q.sort == .relevance and q.text.len > 0 and q.offset + page.hits.len < dk.search.max_cursor_window)
+    const next_cursor: ?[]const u8 = if (page.has_more and page.hits.len > 0 and q.sort == .relevance and q.text.len > 0 and !(q.trusted_first orelse false) and q.offset + page.hits.len < dk.search.max_cursor_window)
         try arena.dupe(u8, (dk.search.Cursor{ .score = page.hits[page.hits.len - 1].score, .id = page.hits[page.hits.len - 1].id }).format(&cursor_buf))
     else
         null;
@@ -3497,6 +3510,27 @@ test "safe search: on for visitors, a PIN unlocks a browser for a while, an adul
     try testing.expectEqual(http.Status.not_found, handleSigned(a, fake.searcher(), no_unlock, .GET, "/unlock", null, .{}).status);
     _ = handleSigned(a, fake.searcher(), .{ .lists = &lists }, .GET, "/api/v1/search?q=odin", null, .{});
     try testing.expect(!fake.last.?.safe_search);
+}
+
+test "trusted first: asked for by the server's default or by a request, and then no cursor is offered" {
+    var hits = [_]dk.search.Hit{.{ .id = @splat(1), .connector = "books", .url = "https://e.org/a", .title = "A", .snippet = null, .score = 2 }};
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = true } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    _ = run(&fake, .GET, "/api/v1/search?q=odin", &ar);
+    try testing.expect(fake.last.?.trusted_first == null);
+    const with_cursor = run(&fake, .GET, "/api/v1/search?q=odin", &ar);
+    try testing.expect(std.mem.indexOf(u8, with_cursor.body, "next_cursor\":\"") != null);
+    _ = run(&fake, .GET, "/api/v1/search?q=odin&trusted=1", &ar);
+    try testing.expect(fake.last.?.trusted_first.?);
+    const trusted = run(&fake, .GET, "/api/v1/search?q=odin&trusted=1", &ar);
+    try testing.expect(std.mem.indexOf(u8, trusted.body, "next_cursor\":null") != null);
+    try testing.expectEqual(http.Status.bad_request, run(&fake, .GET, "/api/v1/search?q=odin&trusted=maybe", &ar).status);
+    _ = handleServices(a, fake.searcher(), .{ .trusted_first = true, .trusted_min_boost = 200 }, .GET, "/api/v1/search?q=odin");
+    try testing.expect(fake.last.?.trusted_first.? and fake.last.?.trusted_min_percent == 200);
+    _ = handleServices(a, fake.searcher(), .{ .trusted_first = true }, .GET, "/api/v1/search?q=odin&trusted=0");
+    try testing.expect(!fake.last.?.trusted_first.?);
 }
 
 test "answers: off by default, a question is needed, nothing is asked of the model without passages, and an unreachable model is said" {

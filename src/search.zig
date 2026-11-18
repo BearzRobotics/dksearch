@@ -133,6 +133,11 @@ pub const Query = struct {
     /// Safe search applies to this request: documents of the safe-search list's domains are left out too (set by the
     /// server from who is asking, never from the request itself).
     safe_search: bool = false,
+    /// Results of the sources with a `boost` of at least `trusted_min_percent` come before all others (each group in
+    /// the order of the full ranking), for a relevance-ordered search of words. Null: not asked (the index treats it as
+    /// off). Not combined with a cursor.
+    trusted_first: ?bool = null,
+    trusted_min_percent: u32 = 150,
 };
 
 /// How many results a cursor can walk through.

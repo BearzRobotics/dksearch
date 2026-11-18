@@ -1295,16 +1295,37 @@ pub const SqliteIndex = struct {
             try std.fmt.allocPrint(arena, ", -bm25(fts, {d}.0, {d}.0), -bm25(fts, 1.0, 0.0), -bm25(fts, 0.0, 1.0), {s}, {s}", .{ self.title_weight, self.body_weight, src_expr, rec_expr })
         else
             "";
+        // Trusted first: the sources boosted at least `trusted_min_percent` form the first group.
+        var tier_expr: ?[]const u8 = null;
+        if ((q.trusted_first orelse false) and text_mode and q.sort == .relevance) {
+            var cs: std.ArrayList(u8) = .empty;
+            try cs.appendSlice(arena, "(CASE d.connector");
+            var any = false;
+            for (q.boosts) |b| if (b.percent >= q.trusted_min_percent) {
+                try cs.appendSlice(arena, " WHEN '");
+                for (b.source) |ch| {
+                    if (ch == '\'') try cs.append(arena, '\'');
+                    try cs.append(arena, ch);
+                }
+                try cs.appendSlice(arena, "' THEN 0");
+                any = true;
+            };
+            try cs.appendSlice(arena, " ELSE 1 END)");
+            if (any) tier_expr = cs.items;
+        }
+        if (tier_expr != null and q.after != null) return error.InvalidQuery; // a cursor follows the score alone
+        const tier_col: []const u8 = if (tier_expr) |t| try std.fmt.allocPrint(arena, ", {s} AS col_tier", .{t}) else "";
+        const outer_order: []const u8 = if (tier_expr != null) "col_tier, col6 DESC, id" else "col6 DESC, id";
         var sql: std.ArrayList(u8) = .empty;
         var binds: std.ArrayList(Bind) = .empty;
         if (text_mode) {
             try sql.print(arena,
                 \\SELECT d.id, d.connector, d.url, d.title,
                 \\       snippet(fts, 1, ?1, ?2, '…', 16),
-                \\       -({s}) AS col6, {s}{s}
+                \\       -({s}) AS col6, {s}{s}{s}
                 \\FROM fts JOIN docs d ON d.rowid = fts.rowid
                 \\WHERE fts MATCH ?3
-            , .{ bm, columns, explain_cols });
+            , .{ bm, columns, explain_cols, tier_col });
         } else {
             try sql.print(arena, "SELECT d.id, d.connector, d.url, d.title, NULL, 0.0, {s} FROM docs d WHERE 1", .{columns});
         }
@@ -1317,13 +1338,15 @@ pub const SqliteIndex = struct {
         try scopeSql(arena, q.scope, &sql, &binds);
         try sql.appendSlice(arena, self.banClause(q.safe_search));
         if (q.sort != .relevance and q.sort != .title and !self.has_meta) return error.InvalidQuery; // an old index: `rebuild` upgrades it
-        try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm));
+        if (tier_expr) |t| {
+            try sql.print(arena, " ORDER BY {s}, {s}, d.id", .{ t, bm });
+        } else try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm));
         if (q.per_domain > 0 and text_mode and self.has_meta and q.sort == .relevance) {
             // Keep the best `per_domain` results of each domain (a document without a domain stands alone), in the
             // order of the full ranking. The LIMIT inside keeps the ranking function out of the outer query.
             try sql.print(arena, " LIMIT {d}", .{search.max_cursor_window});
             const ranked = try sql.toOwnedSlice(arena);
-            try sql.print(arena, "SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY COALESCE(domain, hex(id)) ORDER BY col6 DESC, id) AS dk_rn FROM ({s})) WHERE dk_rn <= {d} ORDER BY col6 DESC, id", .{ ranked, q.per_domain });
+            try sql.print(arena, "SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY COALESCE(domain, hex(id)) ORDER BY {s}) AS dk_rn FROM ({s})) WHERE dk_rn <= {d} ORDER BY {s}", .{ outer_order, ranked, q.per_domain, outer_order });
         }
         if (q.after != null) {
             if (!text_mode) return error.InvalidQuery;
@@ -2258,6 +2281,55 @@ test "the safe-search list is applied only to searches that ask for it; the bloc
     idx.setDomains(&only_safe);
     try testing.expectEqual(@as(usize, 3), (try s.search(a, .{ .text = "raven" })).hits.len);
     try testing.expectEqual(@as(usize, 2), (try s.search(a, .{ .text = "raven", .safe_search = true })).hits.len);
+}
+
+test "trusted first: the highly boosted sources come before the rest, each group in relevance order" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const Entry = struct { connector: []const u8, sid: []const u8, url: []const u8, text: []const u8 };
+    const entries = [_]Entry{
+        .{ .connector = "tail", .sid = "1", .url = "https://t1.example/a", .text = "raven raven raven raven raven" },
+        .{ .connector = "tail", .sid = "2", .url = "https://t2.example/a", .text = "raven raven raven raven" },
+        .{ .connector = "books", .sid = "3", .url = "https://b1.example/a", .text = "raven filler words more filler words" },
+        .{ .connector = "wiki", .sid = "4", .url = "https://w1.example/a", .text = "raven raven" },
+        .{ .connector = "tail", .sid = "5", .url = "https://t3.example/a", .text = "raven raven raven" },
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (entries) |e| {
+        // The trusted sources' documents are long, with the word once or twice: they score low by text alone.
+        var text: std.ArrayList(u8) = .empty;
+        try text.appendSlice(a, e.text);
+        if (!std.mem.eql(u8, e.connector, "tail")) for (0..80) |_| try text.appendSlice(a, " filler words about other things");
+        const d: doc.Document = .{ .connector = e.connector, .source_id = e.sid, .canonical_url = e.url, .title = e.sid, .text = text.items };
+        try idx.indexer().add(d.id(), d);
+    }
+    const s = idx.searcher();
+    const boosts = [_]search.SourceBoost{ .{ .source = "books", .percent = 200 }, .{ .source = "wiki", .percent = 150 }, .{ .source = "tail", .percent = 100 } };
+    // Plain ranking: the long tail's many mentions lead (a boost only multiplies).
+    const plain = try s.search(a, .{ .text = "raven", .boosts = &boosts });
+    try testing.expectEqualStrings("tail", plain.hits[0].connector);
+    // Trusted first: books and wiki (boost 150 and over) lead, in their own order, then the tail in its.
+    const trusted = try s.search(a, .{ .text = "raven", .boosts = &boosts, .trusted_first = true });
+    try testing.expectEqual(@as(usize, 5), trusted.hits.len);
+    for (trusted.hits[0..2]) |h| try testing.expect(!std.mem.eql(u8, h.connector, "tail"));
+    for (trusted.hits[2..]) |h| try testing.expectEqualStrings("tail", h.connector);
+    try testing.expectEqualStrings("https://t1.example/a", trusted.hits[2].url.?);
+    // A higher bar leaves only the books in front.
+    const strict = try s.search(a, .{ .text = "raven", .boosts = &boosts, .trusted_first = true, .trusted_min_percent = 200 });
+    try testing.expectEqualStrings("books", strict.hits[0].connector);
+    try testing.expectEqualStrings("tail", strict.hits[1].connector); // wiki (150) is no longer in front
+    // Paging follows the grouped order; a cursor does not combine with it; with per_domain the groups stay.
+    const p2 = try s.search(a, .{ .text = "raven", .boosts = &boosts, .trusted_first = true, .limit = 2, .offset = 2 });
+    try testing.expectEqualStrings("https://t1.example/a", p2.hits[0].url.?);
+    try testing.expectError(error.InvalidQuery, s.search(a, .{ .text = "raven", .boosts = &boosts, .trusted_first = true, .after = .{ .score = 1.0, .id = plain.hits[0].id } }));
+    const dom = try s.search(a, .{ .text = "raven", .boosts = &boosts, .trusted_first = true, .per_domain = 1 });
+    try testing.expectEqual(@as(usize, 5), dom.hits.len);
+    try testing.expect(!std.mem.eql(u8, dom.hits[0].connector, "tail"));
+    // No source reaches the bar: nothing changes.
+    const none = try s.search(a, .{ .text = "raven", .boosts = &boosts, .trusted_first = true, .trusted_min_percent = 900 });
+    try testing.expectEqualStrings("tail", none.hits[0].connector);
 }
 
 test "pagination is stable and reports has_more" {
