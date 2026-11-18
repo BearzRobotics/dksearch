@@ -28,6 +28,7 @@ const idx_api = @import("indexer.zig");
 const search = @import("search.zig");
 const image_mod = @import("image.zig");
 const queryparse = @import("queryparse.zig");
+const domainlist = @import("domainlist.zig");
 const lexicon_mod = @import("lexicon.zig");
 const retrieve = @import("retrieve.zig");
 const editdistance = @import("editdistance.zig");
@@ -139,6 +140,8 @@ pub const SqliteIndex = struct {
     has_meta: bool = false,
     /// True if the vocabulary table exists (typo tolerance then uses the words that are really in the index).
     has_vocab: bool = false,
+    /// Domains never shown and domains ranked lower (must outlive the index); null for none.
+    domains: ?*const domainlist.Lists = null,
 
     /// Opens (creating if needed) the index at `path`; ":memory:" gives a
     /// throwaway index.
@@ -183,6 +186,39 @@ pub const SqliteIndex = struct {
 
     pub fn setLexicon(self: *SqliteIndex, l: ?*const lexicon_mod.Lexicon) void {
         self.lexicon = l;
+    }
+
+    /// The domain lists searches apply: results of blocked domains never appear and demoted ones rank lower.
+    pub fn setDomains(self: *SqliteIndex, l: ?*const domainlist.Lists) void {
+        self.domains = l;
+        _ = c.sqlite3_create_function(self.db, "dk_banned", 1, c.SQLITE_UTF8, @ptrCast(@constCast(l)), bannedFn, null, null);
+        _ = c.sqlite3_create_function(self.db, "dk_demote", 1, c.SQLITE_UTF8, @ptrCast(@constCast(l)), demoteFn, null, null);
+    }
+
+    /// `dk_banned(domain)`: 1 when the domain (or one above it) is on the blocked list.
+    fn bannedFn(ctx: ?*c.sqlite3_context, argc: c_int, argv: [*c]?*c.sqlite3_value) callconv(.c) void {
+        _ = argc;
+        const l: *const domainlist.Lists = @ptrCast(@alignCast(c.sqlite3_user_data(ctx) orelse return c.sqlite3_result_int(ctx, 0)));
+        const p = c.sqlite3_value_text(argv[0]);
+        if (p == null) return c.sqlite3_result_int(ctx, 0);
+        c.sqlite3_result_int(ctx, if (l.blocked.matches(p[0..@intCast(c.sqlite3_value_bytes(argv[0]))])) 1 else 0);
+    }
+
+    /// `dk_demote(domain)`: the factor a demoted domain's score is multiplied by (1.0 for the others).
+    fn demoteFn(ctx: ?*c.sqlite3_context, argc: c_int, argv: [*c]?*c.sqlite3_value) callconv(.c) void {
+        _ = argc;
+        const l: *const domainlist.Lists = @ptrCast(@alignCast(c.sqlite3_user_data(ctx) orelse return c.sqlite3_result_double(ctx, 1.0)));
+        const p = c.sqlite3_value_text(argv[0]);
+        if (p == null) return c.sqlite3_result_double(ctx, 1.0);
+        const hit = l.demoted.matches(p[0..@intCast(c.sqlite3_value_bytes(argv[0]))]);
+        c.sqlite3_result_double(ctx, if (hit) @as(f64, @floatFromInt(l.demote_percent)) / 100.0 else 1.0);
+    }
+
+    /// The condition that hides blocked domains, for queries over `docs d`; empty when there is no blocklist.
+    fn banClause(self: *const SqliteIndex) []const u8 {
+        const l = self.domains orelse return "";
+        if (l.blocked.isEmpty() or !self.has_meta) return "";
+        return " AND NOT dk_banned(d.domain)";
     }
 
     pub fn setRecency(self: *SqliteIndex, percent: u32, half_life_days: u32) void {
@@ -410,6 +446,7 @@ pub const SqliteIndex = struct {
             if (c.sqlite3_column_bytes(st.s, 0) != @sizeOf(doc.Id)) return error.Io;
             var id: doc.Id = undefined;
             @memcpy(&id, @as([*]const u8, @ptrCast(idb))[0..@sizeOf(doc.Id)]);
+            if (self.domains) |l| if (l.blocksUrl(st.colText(2))) continue;
             try hits.append(arena, .{
                 .id = id,
                 .connector = try arena.dupe(u8, st.colText(1) orelse ""),
@@ -661,6 +698,19 @@ pub const SqliteIndex = struct {
 
     /// What the index records about one document.
     pub fn exportPageImpl(ptr: *anyopaque, arena: Allocator, connector: []const u8, after: i64, limit: u32) search.Error![]const search.ExportRow {
+        // A whole page of blocked documents must not look like the end of the list: carry on after it (a bounded
+        // number of times, so a source that is almost all blocked cannot hold a request for long).
+        var from = after;
+        var rounds: u32 = 0;
+        while (true) : (rounds += 1) {
+            const page = try exportPageRaw(ptr, arena, connector, from, limit);
+            const last = page.last orelse return page.rows;
+            if (page.rows.len > 0 or rounds >= 200) return page.rows;
+            from = last;
+        }
+    }
+
+    fn exportPageRaw(ptr: *anyopaque, arena: Allocator, connector: []const u8, after: i64, limit: u32) search.Error!struct { rows: []const search.ExportRow, last: ?i64 } {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
         const sql = if (self.has_meta)
             "SELECT rowid, id, url, title, language, content_type, modified_at, published_at, author FROM docs WHERE connector = ?1 AND rowid > ?2 ORDER BY rowid LIMIT ?3"
@@ -678,9 +728,13 @@ pub const SqliteIndex = struct {
                 return try a.dupe(u8, t);
             }
         }.one;
+        var last_cursor: ?i64 = null;
         while (st.step() catch |e| return searchError(e)) {
             const blob = st.colBlob(1) orelse continue;
             if (blob.len != @sizeOf(doc.Id)) continue;
+            last_cursor = st.colInt(0);
+            // A blocked domain's documents are not handed to peers either.
+            if (self.domains) |l| if (l.blocksUrl(st.colText(2))) continue;
             try out.append(arena, .{
                 .cursor = st.colInt(0),
                 .id = blob[0..@sizeOf(doc.Id)].*,
@@ -693,7 +747,7 @@ pub const SqliteIndex = struct {
                 .author = try dup(arena, st, 8),
             });
         }
-        return out.items;
+        return .{ .rows = out.items, .last = last_cursor };
     }
     pub fn docFreqImpl(ptr: *anyopaque, arena: Allocator, words_in: []const []const u8) search.Error![]const u32 {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
@@ -824,6 +878,7 @@ pub const SqliteIndex = struct {
         );
         try filterSql(arena, filters, q.collections, &sql, &binds);
         try scopeSql(arena, q.scope, &sql, &binds);
+        try sql.appendSlice(arena, self.banClause());
         try sql.appendSlice(arena, " ORDER BY bm25(chunks_fts, 2.0, 1.0), d.id, m.idx LIMIT ?7");
         const st = Stmt.prepare(self.db, try arena.dupeSentinel(u8, sql.items, 0)) catch return &.{}; // no chunk index here
         defer st.deinit();
@@ -1229,7 +1284,8 @@ pub const SqliteIndex = struct {
         if (self.recency_percent > 0 and self.has_meta) {
             rec_expr = try std.fmt.allocPrint(arena, "(1.0 + {d}.{d:0>2} / (1.0 + MAX(0, CAST(strftime('%s','now') AS INTEGER) - COALESCE(d.modified_at, d.published_at, d.indexed_at, 0)) / 86400.0 / {d}.0))", .{ self.recency_percent / 100, self.recency_percent % 100, self.recency_days });
         }
-        try factors.print(arena, "{s} * {s}", .{ src_expr, rec_expr });
+        const demote_expr: []const u8 = if (self.domains) |l| (if (!l.demoted.isEmpty() and self.has_meta) " * dk_demote(d.domain)" else "") else "";
+        try factors.print(arena, "{s} * {s}{s}", .{ src_expr, rec_expr, demote_expr });
         const bm = try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0) * {s}", .{ self.title_weight, self.body_weight, factors.items });
         const explain_cols = if (q.explain and text_mode)
             try std.fmt.allocPrint(arena, ", -bm25(fts, {d}.0, {d}.0), -bm25(fts, 1.0, 0.0), -bm25(fts, 0.0, 1.0), {s}, {s}", .{ self.title_weight, self.body_weight, src_expr, rec_expr })
@@ -1255,6 +1311,7 @@ pub const SqliteIndex = struct {
         );
         try filterSql(arena, filters, q.collections, &sql, &binds);
         try scopeSql(arena, q.scope, &sql, &binds);
+        try sql.appendSlice(arena, self.banClause());
         if (q.sort != .relevance and q.sort != .title and !self.has_meta) return error.InvalidQuery; // an old index: `rebuild` upgrades it
         try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm));
         if (q.after != null) {
@@ -1385,6 +1442,10 @@ pub const SearchPool = struct {
 
     pub fn setWeights(self: *SearchPool, title: u32, body: u32) void {
         for (self.slots) |*sl| sl.index.setWeights(title, body);
+    }
+
+    pub fn setDomains(self: *SearchPool, l: ?*const domainlist.Lists) void {
+        for (self.slots) |*sl| sl.index.setDomains(l);
     }
 
     pub fn setLexicon(self: *SearchPool, l: ?*const lexicon_mod.Lexicon) void {
@@ -2060,6 +2121,59 @@ test "a cursor walks the same results as offsets, in pages, and survives new doc
     // A cursor goes with relevance order and no offset.
     try testing.expectError(error.InvalidQuery, s.search(a, .{ .text = "raven", .after = cur, .offset = 5 }));
     try testing.expectError(error.InvalidQuery, s.search(a, .{ .text = "raven", .after = cur, .sort = .newest }));
+}
+
+test "blocked domains never appear in searches or exports; demoted ones rank lower; nothing changes without lists" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const Entry = struct { sid: []const u8, url: []const u8, text: []const u8 };
+    const entries = [_]Entry{
+        .{ .sid = "1", .url = "https://www.bad.example/a", .text = "raven raven raven tale" },
+        .{ .sid = "2", .url = "https://sub.bad.example/b", .text = "raven tale from the sub domain" },
+        .{ .sid = "3", .url = "https://notbad.example/c", .text = "raven tale on a look-alike name" },
+        .{ .sid = "4", .url = "https://slow.example/d", .text = "raven raven raven raven tale demoted" },
+        .{ .sid = "5", .url = "https://good.example/e", .text = "raven tale" },
+    };
+    for (entries) |e| {
+        const d: doc.Document = .{ .connector = "web", .source_id = e.sid, .canonical_url = e.url, .title = e.sid, .text = e.text };
+        try idx.indexer().add(d.id(), d);
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = idx.searcher();
+    try testing.expectEqual(@as(usize, 5), (try s.search(a, .{ .text = "raven" })).hits.len);
+
+    var lists: domainlist.Lists = .{ .demote_percent = 10 };
+    _ = try lists.blocked.add(a, "bad.example");
+    _ = try lists.demoted.add(a, "slow.example");
+    idx.setDomains(&lists);
+    const after = try s.search(a, .{ .text = "raven" });
+    try testing.expectEqual(@as(usize, 3), after.hits.len); // bad.example and its subdomain are gone; notbad.example is not
+    for (after.hits) |h| try testing.expect(std.mem.indexOf(u8, h.url.?, "bad.example") == null or std.mem.indexOf(u8, h.url.?, "notbad") != null);
+    // The demoted domain had the most mentions and led; now it comes last.
+    try testing.expectEqualStrings("https://slow.example/d", after.hits[2].url.?);
+    // Asking for the blocked domain by name finds nothing either, with or without words.
+    const by_domain = s.search(a, .{ .text = "raven", .filter_strings = &.{"domain:bad.example"} }) catch search.Page{ .hits = &.{}, .has_more = false };
+    try testing.expectEqual(@as(usize, 0), by_domain.hits.len);
+    const only_filter = s.search(a, .{ .text = "domain:bad.example" }) catch search.Page{ .hits = &.{}, .has_more = false };
+    try testing.expectEqual(@as(usize, 0), only_filter.hits.len);
+    // Exports skip them, and a page that is only blocked documents does not end the list early.
+    const rows = try s.exportPage(a, "web", 0, 2);
+    try testing.expect(rows.len > 0);
+    for (rows) |r| try testing.expect(std.mem.indexOf(u8, r.url.?, "//www.bad.example") == null and std.mem.indexOf(u8, r.url.?, "//sub.bad.example") == null);
+    var after_cursor: i64 = 0;
+    var total: usize = 0;
+    while (true) {
+        const page = try s.exportPage(a, "web", after_cursor, 1);
+        if (page.len == 0) break;
+        total += page.len;
+        after_cursor = page[page.len - 1].cursor;
+    }
+    try testing.expectEqual(@as(usize, 3), total);
+    // Taking the lists away restores everything.
+    idx.setDomains(null);
+    try testing.expectEqual(@as(usize, 5), (try s.search(a, .{ .text = "raven" })).hits.len);
 }
 
 test "pagination is stable and reports has_more" {

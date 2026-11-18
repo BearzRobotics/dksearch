@@ -343,6 +343,23 @@ pub const Answers = struct {
     max_per_minute: u32 = 10,
 };
 
+/// Domain lists (`[filters]`): domains never shown and domains ranked lower, from the entries and the files named.
+pub const Filters = struct {
+    blocklist: []const []const u8 = &.{},
+    blocklist_files: []const []const u8 = &.{},
+    demote: []const []const u8 = &.{},
+    demote_files: []const []const u8 = &.{},
+    /// A demoted domain's score is multiplied by this many percent.
+    demote_percent: u32 = 30,
+};
+
+/// Safe search (`[safe_search]`): when `enabled`, the ban lists are added to the blocklist for everyone.
+pub const SafeSearch = struct {
+    enabled: bool = false,
+    ban: []const []const u8 = &.{},
+    ban_files: []const []const u8 = &.{},
+};
+
 /// Other search engines as a fallback (`[fallback]`), off unless `enabled`.
 pub const Fallback = struct {
     enabled: bool = false,
@@ -407,6 +424,8 @@ pub const Config = struct {
     docserver: ?DocServer = null,
     embeddings: ?Embeddings = null,
     fallback: Fallback = .{},
+    filters: Filters = .{},
+    safe_search: SafeSearch = .{},
     ollama: ?Ollama = null,
     answers: Answers = .{},
 
@@ -427,7 +446,7 @@ const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_m
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
 const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
-const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings", "fallback", "ollama", "answers" };
+const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings", "fallback", "ollama", "answers", "filters", "safe_search" };
 
 /// Parses and validates configuration text. `source_name` is only used in
 /// diagnostics (normally the file path).
@@ -598,6 +617,8 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     cfg.docserver = try readDocServer(a, src, root, diag);
     cfg.embeddings = try readEmbeddings(a, src, root, diag);
     cfg.fallback = try readFallback(a, src, root, diag);
+    cfg.filters = try readFilters(a, src, root, diag);
+    cfg.safe_search = try readSafeSearch(a, src, root, diag);
     if (try subTable(src, root, "ollama", diag)) |t| {
         try checkKeys(src, "ollama", t, &[_][]const u8{"url"}, diag);
         cfg.ollama = .{ .url = try baseAddress(a, src, "ollama.url", try reqStr(src, "ollama", t, "url", diag), diag) };
@@ -689,6 +710,39 @@ fn baseAddress(a: Allocator, src: []const u8, key: []const u8, text: []const u8,
         return error.InvalidValue;
     }
     return a.dupe(u8, url);
+}
+
+fn optStrings(a: Allocator, src: []const u8, section: []const u8, t: *toml.Table, name: []const u8, diag: *Diagnostic) Error![]const []const u8 {
+    const v = t.get(name) orelse return &.{};
+    var kbuf: [96]u8 = undefined;
+    const list = try stringList(a, src, std.fmt.bufPrint(&kbuf, "{s}.{s}", .{ section, name }) catch name, v, diag);
+    if (list.len > 100000) {
+        diag.set(src, name, "at most 100000 entries (put long lists in a file)", .{});
+        return error.InvalidValue;
+    }
+    return list;
+}
+
+fn readFilters(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!Filters {
+    const t = (try subTable(src, root, "filters", diag)) orelse return .{};
+    try checkKeys(src, "filters", t, &[_][]const u8{ "blocklist", "blocklist_files", "demote", "demote_files", "demote_percent" }, diag);
+    var f: Filters = .{};
+    f.blocklist = try optStrings(a, src, "filters", t, "blocklist", diag);
+    f.blocklist_files = try optStrings(a, src, "filters", t, "blocklist_files", diag);
+    f.demote = try optStrings(a, src, "filters", t, "demote", diag);
+    f.demote_files = try optStrings(a, src, "filters", t, "demote_files", diag);
+    if (try intIn(src, "filters", t, "demote_percent", 1, 99, diag)) |n| f.demote_percent = @intCast(n);
+    return f;
+}
+
+fn readSafeSearch(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!SafeSearch {
+    const t = (try subTable(src, root, "safe_search", diag)) orelse return .{};
+    try checkKeys(src, "safe_search", t, &[_][]const u8{ "enabled", "ban", "ban_files" }, diag);
+    var s: SafeSearch = .{};
+    if (try optBool(src, "safe_search", t, "enabled", diag)) |b| s.enabled = b;
+    s.ban = try optStrings(a, src, "safe_search", t, "ban", diag);
+    s.ban_files = try optStrings(a, src, "safe_search", t, "ban_files", diag);
+    return s;
 }
 
 fn readFallback(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!Fallback {
@@ -1769,4 +1823,22 @@ test "the starter configuration loads, and the admin interface is off until unco
     try testing.expect(c2.admin_configured);
     try testing.expectEqual(@as(u16, 8081), c2.admin.port);
     try testing.expect(c2.admin_options.actions);
+}
+
+test "domain lists and safe search are read and checked" {
+    var d: Diagnostic = .{};
+    const base = "[storage]\ndata_dir = \"/tmp/x\"\n";
+    var c = try loadFromSlice(testing.allocator, "t.toml", base ++ "[filters]\nblocklist = [\"a.example\"]\nblocklist_files = [\"/l/b.txt\"]\ndemote = [\"c.example\"]\ndemote_percent = 20\n[safe_search]\nenabled = true\nban_files = [\"/l/adult.txt\"]\n", &d);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 1), c.filters.blocklist.len);
+    try testing.expectEqualStrings("/l/b.txt", c.filters.blocklist_files[0]);
+    try testing.expectEqual(@as(u32, 20), c.filters.demote_percent);
+    try testing.expect(c.safe_search.enabled);
+    try testing.expectEqualStrings("/l/adult.txt", c.safe_search.ban_files[0]);
+    var plain = try loadFromSlice(testing.allocator, "t.toml", base, &d);
+    defer plain.deinit();
+    try testing.expect(!plain.safe_search.enabled and plain.filters.blocklist.len == 0 and plain.filters.demote_percent == 30);
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[filters]\ndemote_percent = 100\n", &d));
+    try testing.expectError(error.WrongType, loadFromSlice(testing.allocator, "t.toml", base ++ "[safe_search]\nban = \"x.example\"\n", &d));
+    try testing.expectError(error.UnknownKey, loadFromSlice(testing.allocator, "t.toml", base ++ "[safe_search]\nlevel = \"strict\"\n", &d));
 }

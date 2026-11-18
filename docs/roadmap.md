@@ -10,7 +10,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 ## Then
 
-- **Against SEO slop:** a domain blocklist (never shown) and demotion list (pushed down, still findable) in the configuration and on the Settings page, applied to indexed, crawled and fallback results; and a "trusted first" ordering that puts results of highly boosted sources before the long tail instead of mixing by text score alone.
+- **Trusted first:** an ordering that puts results of highly boosted sources before the long tail instead of mixing by text score alone (the domain blocklist, demotion list and safe search are built, ADR 0048). A way to edit the domain lists from the administration interface.
 - **Search by image everywhere:** a `find-image` command and an admin upload over the perceptual hashes the files connector already stores.
 - **Management:** saved searches and opt-in statistics (no query logging by default).
 - **Playing media in the browser:** an embedded player in the viewer, with HTTP range requests and streaming for original files (today an original is sent whole, up to 64 MiB), and a start time taken from the result.

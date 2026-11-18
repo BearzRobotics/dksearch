@@ -63,3 +63,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0045 | More than one excerpt per result |
 | 0046 | Similar documents |
 | 0047 | Cursor paging |
+| 0048 | Domain lists and safe search |

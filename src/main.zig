@@ -899,6 +899,35 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     const lexicon_ptr: ?*const dk.lexicon.Lexicon = if (lexicon.isEmpty()) null else &lexicon;
     if (pool) |*p| p.setLexicon(lexicon_ptr);
     index.setLexicon(lexicon_ptr);
+    // Domain lists: the blocklist, the demotion list and, with safe search on, the ban lists. Read once now; an
+    // unreadable file stops the server rather than silently showing what was meant to be hidden.
+    var lists_arena = std.heap.ArenaAllocator.init(gpa);
+    defer lists_arena.deinit();
+    var domain_lists: dk.domainlist.Lists = .{ .demote_percent = cfg.filters.demote_percent };
+    {
+        const la = lists_arena.allocator();
+        var failed: []const u8 = "";
+        const loads = [_]struct { set: *dk.domainlist.Set, entries: []const []const u8, files: []const []const u8, on: bool }{
+            .{ .set = &domain_lists.blocked, .entries = cfg.filters.blocklist, .files = cfg.filters.blocklist_files, .on = true },
+            .{ .set = &domain_lists.demoted, .entries = cfg.filters.demote, .files = cfg.filters.demote_files, .on = true },
+            .{ .set = &domain_lists.blocked, .entries = cfg.safe_search.ban, .files = cfg.safe_search.ban_files, .on = cfg.safe_search.enabled },
+        };
+        for (loads) |l| {
+            if (!l.on) continue;
+            for (l.entries) |e| _ = l.set.add(la, e) catch {
+                err(io, "out of memory", .{});
+                return exit_config;
+            };
+            dk.domainlist.loadFiles(io, la, l.set, l.files, &failed) catch |e| {
+                err(io, "cannot read the domain list {s}: {t}", .{ failed, e });
+                return exit_config;
+            };
+        }
+        if (cfg.safe_search.enabled) err(io, "safe search is on: {d} domains are blocked ({d} demoted)", .{ domain_lists.blocked.count(), domain_lists.demoted.count() }) else if (!domain_lists.blocked.isEmpty() or !domain_lists.demoted.isEmpty()) err(io, "domain lists: {d} blocked, {d} demoted", .{ domain_lists.blocked.count(), domain_lists.demoted.count() });
+    }
+    const lists_ptr: ?*const dk.domainlist.Lists = if (domain_lists.blocked.isEmpty() and domain_lists.demoted.isEmpty()) null else &domain_lists;
+    if (pool) |*p| p.setDomains(lists_ptr);
+    index.setDomains(lists_ptr);
     if (pool) |*p| {
         p.setFuzzyMode(fuzzy_mode);
         p.setSimpleSyntax(!cfg.search.advanced_syntax);
@@ -1210,7 +1239,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     defer source_stats.deinit();
     var retrieve_cache = dk.retrievecache.Cache.init(gpa, io, @as(usize, cfg.search.retrieve_cache_mb) * 1024 * 1024);
     defer retrieve_cache.deinit();
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .answers = if (ollama_client != null) &answer_service else null, .fallback = if (fallback_on) &fallback_settings else null, .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .lists = lists_ptr, .answers = if (ollama_client != null) &answer_service else null, .fallback = if (fallback_on) &fallback_settings else null, .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

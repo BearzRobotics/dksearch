@@ -4,3 +4,6 @@ zig-out/
 # Generated or machine-specific state (ai/AGENTS.md section 4)
 /data/
 *.idx
+
+# Personal seed lists live outside the repository (seeds are never committed)
+/curated_crawl_links/

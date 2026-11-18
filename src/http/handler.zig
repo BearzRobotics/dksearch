@@ -96,6 +96,9 @@ pub const Services = struct {
     embed: ?*const dk.embed.Service = null,
     /// Documents per source, counted now and then, for the source list and the page that lists the sources.
     source_stats: ?*dk.sourcestats.Cache = null,
+    /// Domains never shown (the blocklist, and safe search's ban lists when on); null for none. The index applies it
+    /// to searches; the handler to documents opened by id, peers' results and the like.
+    lists: ?*const dk.domainlist.Lists = null,
     /// The collection the search page searches when nothing is picked (`search.default_collection`).
     default_collection: ?[]const u8 = null,
     /// A document server that office files can be opened in (`[docserver]`).
@@ -617,7 +620,7 @@ fn semanticSearch(arena: Allocator, searcher: dk.search.Searcher, services: Serv
                 };
                 if (found == null) {
                     const info = searcher.info(arena, n.id) catch null;
-                    if (info) |h| if (services.scope.allows(h.connector)) {
+                    if (info) |h| if (services.scope.allows(h.connector) and !hitBlocked(services, h)) {
                         found = h;
                     };
                 }
@@ -669,7 +672,7 @@ fn federate(arena: Allocator, services: Services, params: query.Params, q: dk.se
     const replies = try svc.ask(arena, .search, text, extra);
     const notes = try arena.alloc(PeerNote, replies.len);
     for (replies, notes) |r, *n| n.* = .{ .peer = r.peer, .status = @tagName(r.status), .ms = r.ms, .results = @intCast(r.hits.len), .http_status = if (r.http_status != 0) r.http_status else null, .cached = r.cached };
-    return .{ .hits = try dk.peers.fuse(arena, local, replies, limit), .notes = notes };
+    return .{ .hits = try withoutBlocked(arena, services, try dk.peers.fuse(arena, local, replies, limit)), .notes = notes };
 }
 
 pub const RegexNote = struct { status: http.Status, code: []const u8, message: []const u8 };
@@ -876,7 +879,7 @@ fn similarTo(arena: Allocator, searcher: dk.search.Searcher, services: Services,
                 for (try idx.search(arena, vec, limit + 1)) |n| {
                     if (std.mem.eql(u8, &n.id, &id)) continue;
                     const h = (searcher.info(arena, n.id) catch null) orelse continue;
-                    if (!services.scope.allows(h.connector)) continue;
+                    if (!services.scope.allows(h.connector) or hitBlocked(services, h)) continue;
                     try out.append(arena, h);
                     if (out.items.len >= limit) break;
                 }
@@ -916,7 +919,7 @@ fn apiSimilar(arena: Allocator, searcher: dk.search.Searcher, services: Services
     const limit: u32 = if (params.get("limit")) |v| (std.fmt.parseInt(u32, v, 10) catch return apiError(arena, .bad_request, "invalid_parameter", "limit must be a number")) else 10;
     if (limit == 0 or limit > 50) return apiError(arena, .bad_request, "invalid_parameter", "limit must be 1 to 50");
     const here = (searcher.info(arena, id) catch null) orelse return apiError(arena, .not_found, "not_found", "no such document");
-    if (!services.scope.allows(here.connector)) return apiError(arena, .not_found, "not_found", "no such document");
+    if (!services.scope.allows(here.connector) or hitBlocked(services, here)) return apiError(arena, .not_found, "not_found", "no such document");
     const found = try similarTo(arena, searcher, services, id, limit);
     const hits = try arena.alloc(ApiHit, found.len);
     for (found, hits) |h, *o| o.* = try apiHit(arena, h);
@@ -1027,7 +1030,7 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
             const st = try arena.alloc(ExternalStatus, replies.len);
             for (replies, st) |r, *s| {
                 s.* = .{ .provider = r.provider, .status = @tagName(r.status) };
-                try all.appendSlice(arena, r.results);
+                for (r.results) |ext| if (!(if (services.lists) |l| l.blocksUrl(ext.url) else false)) try all.append(arena, ext);
             }
             ext_results = all.items;
             ext_status = st;
@@ -1060,6 +1063,22 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
     else
         null;
     return jsonResponse(arena, .ok, ApiPage{ .next_cursor = next_cursor, .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null, .semantic = semantic, .external = ext_results, .external_status = ext_status });
+}
+
+/// Whether a result belongs to a domain that must not be shown (the blocklist; with safe search, its ban lists too).
+fn hitBlocked(services: Services, h: dk.search.Hit) bool {
+    const l = services.lists orelse return false;
+    if (l.blocked.isEmpty()) return false;
+    if (h.domain) |d| if (l.blocked.matches(d)) return true;
+    return l.blocksUrl(h.url);
+}
+
+fn withoutBlocked(arena: Allocator, services: Services, hits: []const dk.search.Hit) error{OutOfMemory}![]const dk.search.Hit {
+    const l = services.lists orelse return hits;
+    if (l.blocked.isEmpty()) return hits;
+    var out: std.ArrayList(dk.search.Hit) = .empty;
+    for (hits) |h| if (!hitBlocked(services, h)) try out.append(arena, h);
+    return out.items;
 }
 
 /// How many excerpts per result were asked for (`snippets=N`): 1 (the usual one) to 5.
@@ -1230,8 +1249,8 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     _ = std.fmt.hexToBytes(&id, hex) catch return htmlError(arena, .not_found, "Not found", "No such document.");
     const info = searcher.info(arena, id) catch |e| return searchFailure(arena, e, false);
     const hit = info orelse return htmlError(arena, .not_found, "Not found", "No such document.");
-    // A document outside the caller's scope is as good as absent.
-    if (!services.scope.allows(hit.connector)) return htmlError(arena, .not_found, "Not found", "No such document.");
+    // A document outside the caller's scope, or of a blocked domain, is as good as absent.
+    if (!services.scope.allows(hit.connector) or hitBlocked(services, hit)) return htmlError(arena, .not_found, "Not found", "No such document.");
     const can_open = if (services.originals) |o| (if (hit.url) |u| o.serves(hit.connector, u) else false) else false;
     if (want_file) return if (can_open) originalFile(arena, services.originals.?, hit) else htmlError(arena, .not_found, "Not found", "The original file of this document is not available here.");
     if (want_image) |n| return if (can_open) documentImage(arena, services.originals.?, hit, n) else htmlError(arena, .not_found, "Not found", "The pictures of this document are not available here.");
@@ -1492,6 +1511,7 @@ fn federateRetrieval(arena: Allocator, services: Services, params: query.Params,
     for (replies) |r| {
         if (r.status != .ok) continue;
         for (r.chunks, 0..) |c, rank| {
+            if (if (services.lists) |l| l.blocksUrl(c.url) else false) continue;
             const contribution = 1.0 / (dk.peers.rrf_k + @as(f64, @floatFromInt(rank + 1)));
             const key = try retrievalKey(arena, c.ident, c.url, c.start, c.node, c.doc_id, c.index);
             if (seen.get(key)) |at| {
@@ -3257,6 +3277,54 @@ test "similar documents: the words that set a document apart are searched for, t
     try testing.expectEqual(http.Status.bad_request, handleServices(a, s, .{ .content = mem.store() }, .GET, "/api/v1/similar?id=" ++ hex ++ "&limit=0").status);
     // Without the stored text there is nothing to go on.
     try testing.expect(std.mem.indexOf(u8, handleServices(a, s, .{}, .GET, "/api/v1/similar?id=" ++ hex).body, "\"hits\":[]") != null);
+}
+
+test "blocked domains: their documents are not found by id, not offered as similar, not taken from peers or fallbacks" {
+    var lists: dk.domainlist.Lists = .{};
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    _ = try lists.blocked.add(a, "bad.example");
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    const id_bad: dk.document.Id = @splat(0x61);
+    const id_ok: dk.document.Id = @splat(0x62);
+    try mem.store().put(id_bad, "text of a blocked page");
+    try mem.store().put(id_ok, "text of a fine page");
+    var hits = [_]dk.search.Hit{
+        .{ .id = id_bad, .connector = "web", .url = "https://www.bad.example/x", .title = "Bad", .snippet = null, .score = 2, .domain = "www.bad.example" },
+        .{ .id = id_ok, .connector = "web", .url = "https://good.example/y", .title = "Good", .snippet = null, .score = 1, .domain = "good.example" },
+    };
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
+    const Info = struct {
+        var all: []const dk.search.Hit = &.{};
+        fn info(_: *anyopaque, _: Allocator, id: dk.document.Id) dk.search.Error!?dk.search.Hit {
+            for (all) |h| if (std.mem.eql(u8, &h.id, &id)) return h;
+            return null;
+        }
+        fn search(ptr: *anyopaque, _: Allocator, q: dk.search.Query) dk.search.Error!dk.search.Page {
+            _ = q;
+            _ = ptr;
+            return .{ .hits = all, .has_more = false };
+        }
+    };
+    Info.all = &hits;
+    _ = &fake;
+    var dummy: u8 = 0;
+    const s: dk.search.Searcher = .{ .ptr = &dummy, .vtable = &.{ .search = Info.search, .info = Info.info } };
+    const services: Services = .{ .content = mem.store(), .lists = &lists };
+    try testing.expectEqual(http.Status.not_found, handleServices(a, s, services, .GET, "/doc/61616161616161616161616161616161").status);
+    try testing.expectEqual(http.Status.ok, handleServices(a, s, services, .GET, "/doc/62626262626262626262626262626262").status);
+    try testing.expectEqual(http.Status.not_found, handleServices(a, s, services, .GET, "/api/v1/similar?id=61616161616161616161616161616161").status);
+    // Without the lists the same document opens.
+    try testing.expectEqual(http.Status.ok, handleServices(a, s, .{ .content = mem.store() }, .GET, "/doc/61616161616161616161616161616161").status);
+    try testing.expect(hitBlocked(services, hits[0]) and !hitBlocked(services, hits[1]));
+    const kept = try withoutBlocked(a, services, &hits);
+    try testing.expectEqual(@as(usize, 1), kept.len);
+    // A hit with no domain is judged by its address.
+    var bare = hits[0];
+    bare.domain = null;
+    try testing.expect(hitBlocked(services, bare));
 }
 
 test "answers: off by default, a question is needed, nothing is asked of the model without passages, and an unreachable model is said" {

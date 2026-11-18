@@ -522,6 +522,25 @@ A `crawl` source can index sites of the hidden networks, through a Tor daemon an
 
 The name of a hidden site is given to the proxy as a name and is never looked up locally, so it neither reaches your resolver nor the open internet; with no proxy set for a network, its addresses are not contacted at all. Only `http://` is used: an onion or I2P address already authenticates and encrypts the connection. Everything else about a crawl is unchanged: `robots.txt` is read, the delay applies, the crawler identifies itself with your `user_agent` (a site can see it; choose one you are willing to show there). A crawl that begins on a hidden site stays in the hidden networks and does not follow links to the open internet; links from ordinary sites into them are followed only with `hidden_links = true`. The addresses are indexed and shown like any other, so a result may be a `.onion` link that your browser needs Tor to open. What you crawl and keep is your responsibility under the law where you live.
 
+BLOCKLIST, DEMOTION AND SAFE SEARCH
+Three domain lists keep unwanted sites out of the results, however they were indexed or crawled:
+
+    [filters]
+    blocklist = ["slop.example"]            # never shown, to anyone
+    blocklist_files = ["/path/blocked.txt"]
+    demote = ["seo-farm.example"]           # still found, but ranked lower
+    demote_files = ["/path/demoted.txt"]
+    demote_percent = 30                     # a demoted domain's score is multiplied by this (1-99)
+
+    [safe_search]
+    enabled = true                          # adds the ban lists below to the blocklist, for everyone
+    ban = ["adult.example"]
+    ban_files = ["/path/adult-domains.txt"]
+
+A list entry covers the domain and everything under it (`example.com` covers `www.example.com`, not `notexample.com`). Files may hold one domain per line, a hosts file (`0.0.0.0 domain`) or an ad-blocker list (`||domain^`), with `#` comments; public lists in those formats can be used as they are. dksearch ships no list: you choose them, and a file that cannot be read stops the server rather than showing what was meant to be hidden. The lists are read when the server starts.
+
+A blocked domain's documents are removed inside the search itself (so paging, counts, excerpts, similar documents, retrieval and answers never see them) and are also refused where a document is opened by its address (`/doc/ID`, its original file and pictures: not found), left out of what is handed to peers (`/api/v1/export`) and dropped from the results of peers and of fallback search engines. Safe search is forced: a request cannot turn it off, and no setting of a visitor or API key does. Its limits: it works on the domain of a document's address, not on what the text says, so sites that are not on a list are not filtered, a ZIM file's articles are not judged, and a mirror of a blocked site under another domain is a different domain. The server states at start how many domains are blocked.
+
 SOURCE LIST AND DUPLICATES
 The search page's source list shows how many documents each source holds, and `/sources` lists the sources the visitor may search with their kind, document count, when a document was last added, and the collections each is in, with a link that searches just that source. The numbers are counted at most every five minutes (counting groups the whole index). On the search page the same text found in several sources (or the same web page by its address) is shown once, naming the others ("same text in ..."); `group=0` shows every copy. The API folds them only with `group=1` (`same_in` lists the other sources).
 
