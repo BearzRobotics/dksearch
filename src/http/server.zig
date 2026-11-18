@@ -118,7 +118,7 @@ const PublicApp = struct {
 
     fn handle(ptr: *anyopaque, arena: Allocator, req: Request) handler.Response {
         const self: *PublicApp = @ptrCast(@alignCast(ptr));
-        return handler.handleSigned(arena, self.searcher, self.services, req.method, req.target, req.authorization, .{ .host = req.host, .signed = req.signed, .nonce_only = req.nonce_only });
+        return handler.handleSigned(arena, self.searcher, self.services, req.method, req.target, req.authorization, .{ .cookie = req.cookie, .body = req.body, .host = req.host, .signed = req.signed, .nonce_only = req.nonce_only });
     }
 
     var dummy_for_tests: PublicApp = .{ .searcher = FixedSearch.searcher() };

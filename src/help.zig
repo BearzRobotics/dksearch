@@ -89,6 +89,21 @@ pub const commands = [_]Command{
         ,
     },
     .{
+        .name = "safesearch-pin",
+        .synopsis = "safesearch-pin [--config FILE]",
+        .summary = "Set the PIN that unlocks safe search in a browser",
+        .detail =
+        \\With `[safe_search] enabled = true`, visitors get safe search: the domains of the
+        \\safe-search list are left out of their results. This reads a PIN (typed twice
+        \\without echo, or one line from a pipe) and stores only its hash in
+        \\data_dir/safesearch-pin.toml. A visitor who enters it at /unlock sees everything in
+        \\that browser for `unlock_hours` (default 8). API keys made with `api-key add
+        \\--adult` are not subject to safe search at all. Domains in `[filters]` are hidden
+        \\from everyone, whatever the PIN.
+        \\
+        ,
+    },
+    .{
         .name = "node-key",
         .synopsis = "node-key [--config FILE]",
         .summary = "Make this node's identity (a key pair) and print its node id",
@@ -174,7 +189,7 @@ pub const commands = [_]Command{
     },
     .{
         .name = "api-key",
-        .synopsis = "api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] [--node ID] | list | remove NAME_OR_ID  [--config FILE]",
+        .synopsis = "api-key add NAME (--all | --collection NAME ...) [--rate PER_MINUTE] [--node ID] [--adult] | list | remove NAME_OR_ID  [--config FILE]",
         .summary = "Make, list or remove API keys that limit what a caller can see",
         .detail =
         \\An API key lets a program (or another dksearch) use the search API and see only
@@ -190,7 +205,9 @@ pub const commands = [_]Command{
         \\`add` prints the key ONCE and stores only its hash in data_dir/api-keys.toml. Send
         \\it as `Authorization: Bearer KEY`. A key that is added or removed works or stops
         \\within a second on a running server. To require a key for everything, put
-        \\`[access] anonymous_collections = []` in the configuration.
+        \\`[access] anonymous_collections = []` in the configuration. With `--adult` the key
+        \\is not subject to safe search (`[safe_search]`): its holder sees what safe search
+        \\hides from visitors.
         \\
         ,
     },

@@ -130,6 +130,9 @@ pub const Query = struct {
     /// At most this many results from one domain (0: no limit), keeping the best of each; for a relevance-ordered
     /// search of words. Paging and counts follow the limited list.
     per_domain: u32 = 0,
+    /// Safe search applies to this request: documents of the safe-search list's domains are left out too (set by the
+    /// server from who is asking, never from the request itself).
+    safe_search: bool = false,
 };
 
 /// How many results a cursor can walk through.

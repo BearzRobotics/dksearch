@@ -130,6 +130,8 @@ pub const Form = struct {
     did_you_mean: ?[]const u8 = null,
     /// Excerpts shown per result (1 to 5); kept by the page links.
     snippets: u8 = 1,
+    /// What to say about safe search (nothing when it is not in use on this server).
+    safe_note: SafeNote = .none,
     answers_offered: bool = false,
     answer_checked: bool = false,
     /// Where to go to ask the providers (`web=1`) when that is not done by itself; null: not offered.
@@ -400,6 +402,18 @@ pub fn writeHomeWith(w: *Writer, notice: ?[]const u8, regex_enabled: bool) Write
 }
 
 /// The home page with a prepared form (the source list and so on).
+/// Safe search as the visitor meets it: on (with a way to unlock when the server has a PIN), or off in this browser.
+pub const SafeNote = enum { none, on_unlockable, on, unlocked };
+
+fn writeSafeNote(w: *Writer, note: SafeNote) Writer.Error!void {
+    switch (note) {
+        .none => {},
+        .on => try w.writeAll("<p class=\"muted small\">Safe search is on.</p>\n"),
+        .on_unlockable => try w.writeAll("<p class=\"muted small\">Safe search is on. <a href=\"/unlock\">Unlock</a></p>\n"),
+        .unlocked => try w.writeAll("<p class=\"muted small\">Safe search is off in this browser. <form class=\"inline\" action=\"/lock\" method=\"post\"><button type=\"submit\" class=\"btn secondary\">Turn it back on</button></form></p>\n"),
+    }
+}
+
 pub fn writeHomeForm(w: *Writer, notice: ?[]const u8, form: Form) Writer.Error!void {
     const regex_enabled = form.regex_enabled;
     try writeHead(w, "dksearch");
@@ -407,6 +421,7 @@ pub fn writeHomeForm(w: *Writer, notice: ?[]const u8, form: Form) Writer.Error!v
     try writeSidePanel(w, regex_enabled);
     try w.writeAll("<main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
     try writeForm(w, form);
+    try writeSafeNote(w, form.safe_note);
     if (notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
         try writeEscaped(w, n);
@@ -422,6 +437,7 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     try w.writeAll("<main class=\"results-page\"><div class=\"head\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>");
     try writeForm(w, f);
     try w.writeAll("</div>\n");
+    try writeSafeNote(w, f.safe_note);
     try writeInterpretation(w, f, page, offset);
     try writeAnswer(w, f);
     if (f.default_note) |name| {

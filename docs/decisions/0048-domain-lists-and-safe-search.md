@@ -1,6 +1,6 @@
 # 0048: Domain lists and safe search
 
-Status: implemented (blocklist, demotion list, safe search). "Trusted first" ordering is not built.
+Status: implemented (blocklist, demotion list, safe search). Safe search was amended in ADR 0049 (adults can turn it off; the ban stays for everyone). "Trusted first" ordering is not built.
 
 ## Context
 

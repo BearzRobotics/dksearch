@@ -8,6 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const toml = @import("toml");
 
 pub const Set = struct {
     map: std.StringHashMapUnmanaged(void) = .empty,
@@ -162,8 +163,10 @@ pub var global: ?*const Lists = null;
 
 /// What is hidden and what is ranked lower, for the whole server.
 pub const Lists = struct {
-    /// Never shown, to anyone: the blocklist, plus the ban lists when safe search is on.
+    /// Never shown, to anyone (the blocklist).
     blocked: Set = .{},
+    /// Hidden while safe search is on for the request (see safesearch.zig); a viewer who has unlocked it sees them.
+    safe: Set = .{},
     demoted: Set = .{},
     /// A demoted domain's score is multiplied by this many percent (1 to 99).
     demote_percent: u32 = 30,
@@ -176,17 +179,92 @@ pub const Lists = struct {
         const host = hostOf(&buf, u) orelse return false;
         return self.blocked.matches(host);
     }
+
+    /// Whether a host is hidden: on the blocklist, or on the safe-search list when `safe` (safe search applies).
+    pub fn hides(self: *const Lists, host: []const u8, safe: bool) bool {
+        return self.blocked.matches(host) or (safe and self.safe.matches(host));
+    }
+
+    /// Like `hides` for the address of a result.
+    pub fn hidesUrl(self: *const Lists, url: ?[]const u8, safe: bool) bool {
+        const u = url orelse return false;
+        if (self.blocked.isEmpty() and !(safe and !self.safe.isEmpty())) return false;
+        var buf: [253]u8 = undefined;
+        const host = hostOf(&buf, u) orelse return false;
+        return self.hides(host, safe);
+    }
 };
 
-/// Reads the list files into `set` (a file that cannot be read is an error naming it).
+/// Reads the list files into `set` (a file that cannot be read is an error naming it). A path ending in `.toml` is a
+/// TOML list (`domains = [...]`, `import = [...]`, see `loadToml`); anything else is a text list. Relative paths are
+/// taken relative to `base` (the folder of the configuration file) when it is given.
 pub fn loadFiles(io: Io, arena: Allocator, set: *Set, paths: []const []const u8, failed: *[]const u8) error{ OutOfMemory, Unreadable }!void {
-    for (paths) |p| {
-        const text = Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(256 * 1024 * 1024)) catch |e| {
-            failed.* = p;
+    return loadFilesFrom(io, arena, set, paths, null, failed);
+}
+
+pub fn loadFilesFrom(io: Io, arena: Allocator, set: *Set, paths: []const []const u8, base: ?[]const u8, failed: *[]const u8) error{ OutOfMemory, Unreadable }!void {
+    var visited: std.ArrayList([]const u8) = .empty;
+    for (paths) |p| try loadOne(io, arena, set, p, base, 0, &visited, failed);
+}
+
+const max_import_depth = 4;
+
+fn joinPath(arena: Allocator, base: ?[]const u8, p: []const u8) Allocator.Error![]const u8 {
+    if (p.len > 0 and p[0] == '/') return p;
+    const b = base orelse return p;
+    if (b.len == 0) return p;
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ std.mem.trimEnd(u8, b, "/"), p });
+}
+
+fn loadOne(io: Io, arena: Allocator, set: *Set, path: []const u8, base: ?[]const u8, depth: u32, visited: *std.ArrayList([]const u8), failed: *[]const u8) error{ OutOfMemory, Unreadable }!void {
+    const full = try joinPath(arena, base, path);
+    // A file already loaded in this run (a list that imports itself, or two lists that import each other) is skipped.
+    for (visited.items) |v| if (std.mem.eql(u8, v, full)) return;
+    try visited.append(arena, full);
+    const text = Io.Dir.cwd().readFileAlloc(io, full, arena, .limited(256 * 1024 * 1024)) catch |e| {
+        failed.* = full;
+        return if (e == error.OutOfMemory) error.OutOfMemory else error.Unreadable;
+    };
+    if (std.mem.endsWith(u8, full, ".toml")) {
+        if (depth > max_import_depth) {
+            failed.* = full;
+            return error.Unreadable;
+        }
+        const dir = std.fs.path.dirname(full);
+        loadToml(io, arena, set, text, dir, depth, visited, failed) catch |e| {
+            if (failed.len == 0) failed.* = full;
             return if (e == error.OutOfMemory) error.OutOfMemory else error.Unreadable;
         };
-        _ = try set.addText(arena, text);
+        return;
     }
+    _ = try set.addText(arena, text);
+}
+
+/// A TOML list: `domains = ["a.example", "0123...md5..."]` and `import = ["other.toml", "list.txt"]` (paths relative to the
+/// folder of this file; at most a few levels deep, so a file that imports itself ends).
+pub fn loadToml(io: Io, arena: Allocator, set: *Set, text: []const u8, dir: ?[]const u8, depth: u32, visited: *std.ArrayList([]const u8), failed: *[]const u8) error{ OutOfMemory, Malformed, Unreadable }!void {
+    var tdiag: toml.Diagnostic = .{};
+    var doc = toml.Document.parse(arena, text, .{}, &tdiag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Malformed,
+    };
+    defer doc.deinit();
+    if (doc.root.get("domains")) |v| switch (v) {
+        .array => |arr| for (arr.items.items) |item| switch (item) {
+            .string => |s| {
+                if (!(try set.addHash(arena, s))) _ = try set.add(arena, s);
+            },
+            else => return error.Malformed,
+        },
+        else => return error.Malformed,
+    };
+    if (doc.root.get("import")) |v| switch (v) {
+        .array => |arr| for (arr.items.items) |item| switch (item) {
+            .string => |s| try loadOne(io, arena, set, s, dir, depth + 1, visited, failed),
+            else => return error.Malformed,
+        },
+        else => return error.Malformed,
+    };
 }
 
 const testing = std.testing;
@@ -277,4 +355,48 @@ test "addresses on hidden networks are recognised" {
     try testing.expect(hiddenNetworkOf("https://example.org/onion") == null);
     try testing.expect(hiddenNetworkOf("https://notonion.com/") == null);
     try testing.expect(hiddenNetworkOf(null) == null);
+}
+
+test "a TOML list holds domains and hashes and imports other lists, relative to its own folder; a loop ends" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try tmp.dir.createDirPath(testing.io, "lists");
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash("hashed.example", &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "ban.toml", .data = "domains = [\"banned.example\", \"" ++ hex ++ "\"]\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "safesearch.toml", .data = "import = [\"ban.toml\", \"lists/extra.txt\", \"safesearch.toml\"]\ndomains = [\"adult.example\"]\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lists/extra.txt", .data = "# a text list\nextra.example\n" });
+    var base_buf: [160]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var ban: Set = .{};
+    var failed: []const u8 = "";
+    try loadFilesFrom(testing.io, a, &ban, &.{"ban.toml"}, base, &failed);
+    try testing.expect(ban.matches("www.banned.example") and ban.matches("hashed.example"));
+    try testing.expect(!ban.matches("adult.example"));
+    // The safe list imports the ban list (and a text list, and itself: the loop ends), so it holds all of them.
+    var safe: Set = .{};
+    try loadFilesFrom(testing.io, a, &safe, &.{"safesearch.toml"}, base, &failed);
+    try testing.expect(safe.matches("adult.example") and safe.matches("banned.example") and safe.matches("hashed.example") and safe.matches("extra.example"));
+    // A missing file and a malformed one are errors that name the file.
+    try testing.expectError(error.Unreadable, loadFilesFrom(testing.io, a, &safe, &.{"nope.toml"}, base, &failed));
+    try testing.expect(std.mem.indexOf(u8, failed, "nope.toml") != null);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "bad.toml", .data = "domains = \"not an array\"\n" });
+    try testing.expectError(error.Unreadable, loadFilesFrom(testing.io, a, &safe, &.{"bad.toml"}, base, &failed));
+}
+
+test "the safe-search list hides only when safe search applies; the blocklist always" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var l: Lists = .{};
+    _ = try l.blocked.add(ar.allocator(), "banned.example");
+    _ = try l.safe.add(ar.allocator(), "adult.example");
+    try testing.expect(l.hides("www.banned.example", false) and l.hides("banned.example", true));
+    try testing.expect(!l.hides("adult.example", false) and l.hides("www.adult.example", true));
+    try testing.expect(!l.hidesUrl("https://adult.example/x", false) and l.hidesUrl("https://adult.example/x", true));
+    try testing.expect(l.hidesUrl("https://banned.example/x", false));
+    try testing.expect(!l.hidesUrl(null, true));
 }

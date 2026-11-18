@@ -351,15 +351,23 @@ pub const Filters = struct {
     blocklist_files: []const []const u8 = &.{},
     demote: []const []const u8 = &.{},
     demote_files: []const []const u8 = &.{},
+    /// A TOML list of domains banned for everyone (`ban = "ban.toml"`, relative to the configuration file).
+    ban: ?[]const u8 = null,
     /// A demoted domain's score is multiplied by this many percent.
     demote_percent: u32 = 30,
 };
 
 /// Safe search (`[safe_search]`): when `enabled`, the ban lists are added to the blocklist for everyone.
 pub const SafeSearch = struct {
+    /// On for visitors unless they unlock it (a PIN, or an API key marked adult).
     enabled: bool = false,
     ban: []const []const u8 = &.{},
     ban_files: []const []const u8 = &.{},
+    /// A TOML list of domains hidden while safe search is on (`list = "safesearch.toml"`, relative to the
+    /// configuration file); it may `import` the ban list.
+    list: ?[]const u8 = null,
+    /// How long a PIN unlock lasts in a browser.
+    unlock_hours: u32 = 8,
 };
 
 /// Other search engines as a fallback (`[fallback]`), off unless `enabled`.
@@ -624,7 +632,8 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     cfg.safe_search = try readSafeSearch(a, src, root, diag);
     // A crawl that reaches Tor needs a ban list: crawling onion sites with none is a choice that must be written down.
     {
-        const has_ban = cfg.filters.blocklist.len > 0 or cfg.filters.blocklist_files.len > 0 or (cfg.safe_search.enabled and (cfg.safe_search.ban.len > 0 or cfg.safe_search.ban_files.len > 0));
+        // Only the blocklist counts: the safe-search list can be turned off by whoever unlocks it.
+        const has_ban = cfg.filters.blocklist.len > 0 or cfg.filters.blocklist_files.len > 0 or cfg.filters.ban != null;
         if (!has_ban) for (cfg.sources) |s| {
             if (!s.enabled or !std.mem.eql(u8, s.kind, "crawl")) continue;
             if (s.optionString("tor_socks") == null) continue;
@@ -739,23 +748,26 @@ fn optStrings(a: Allocator, src: []const u8, section: []const u8, t: *toml.Table
 
 fn readFilters(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!Filters {
     const t = (try subTable(src, root, "filters", diag)) orelse return .{};
-    try checkKeys(src, "filters", t, &[_][]const u8{ "blocklist", "blocklist_files", "demote", "demote_files", "demote_percent" }, diag);
+    try checkKeys(src, "filters", t, &[_][]const u8{ "blocklist", "blocklist_files", "demote", "demote_files", "demote_percent", "ban" }, diag);
     var f: Filters = .{};
     f.blocklist = try optStrings(a, src, "filters", t, "blocklist", diag);
     f.blocklist_files = try optStrings(a, src, "filters", t, "blocklist_files", diag);
     f.demote = try optStrings(a, src, "filters", t, "demote", diag);
     f.demote_files = try optStrings(a, src, "filters", t, "demote_files", diag);
     if (try intIn(src, "filters", t, "demote_percent", 1, 99, diag)) |n| f.demote_percent = @intCast(n);
+    if (try str(src, "filters", t, "ban", diag)) |v| f.ban = try a.dupe(u8, v);
     return f;
 }
 
 fn readSafeSearch(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!SafeSearch {
     const t = (try subTable(src, root, "safe_search", diag)) orelse return .{};
-    try checkKeys(src, "safe_search", t, &[_][]const u8{ "enabled", "ban", "ban_files" }, diag);
+    try checkKeys(src, "safe_search", t, &[_][]const u8{ "enabled", "ban", "ban_files", "list", "unlock_hours" }, diag);
     var s: SafeSearch = .{};
     if (try optBool(src, "safe_search", t, "enabled", diag)) |b| s.enabled = b;
     s.ban = try optStrings(a, src, "safe_search", t, "ban", diag);
     s.ban_files = try optStrings(a, src, "safe_search", t, "ban_files", diag);
+    if (try str(src, "safe_search", t, "list", diag)) |v| s.list = try a.dupe(u8, v);
+    if (try intIn(src, "safe_search", t, "unlock_hours", 1, 720, diag)) |n| s.unlock_hours = @intCast(n);
     return s;
 }
 

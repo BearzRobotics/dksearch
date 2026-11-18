@@ -37,6 +37,7 @@ pub const snippets = @import("snippets.zig");
 pub const similar = @import("similar.zig");
 pub const domainlist = @import("domainlist.zig");
 pub const listfetch = @import("listfetch.zig");
+pub const safesearch = @import("safesearch.zig");
 pub const optioninfo = @import("optioninfo.zig");
 pub const settinginfo = @import("settinginfo.zig");
 pub const officetext = @import("officetext.zig");
@@ -97,6 +98,7 @@ test {
     _ = similar;
     _ = domainlist;
     _ = listfetch;
+    _ = safesearch;
     _ = optioninfo;
     _ = settinginfo;
     _ = officetext;

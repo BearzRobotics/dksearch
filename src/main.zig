@@ -159,6 +159,21 @@ fn run(init: std.process.Init) u8 {
         return adminCredentialCmd(io, gpa, config_path, eq(first, "admin-token"));
     }
 
+    if (eq(first, "safesearch-pin")) {
+        var config_path: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (eq(a, "--config")) {
+                config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+            } else if (std.mem.startsWith(u8, a, "--config=")) {
+                config_path = a["--config=".len..];
+            } else {
+                err(io, "unknown option for safesearch-pin: {s}", .{a});
+                return exit_usage;
+            }
+        }
+        return safeSearchPinCmd(io, gpa, config_path);
+    }
+
     if (eq(first, "api-key")) return apiKeyCmd(io, gpa, &args);
     if (eq(first, "models")) return modelsCmd(io, gpa, &args);
     if (eq(first, "fetch-banlist")) return fetchBanlistCmd(io, gpa, &args);
@@ -667,6 +682,7 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
     var all = false;
     var rate: u32 = 0;
     var bound_node: ?[]const u8 = null;
+    var adult = false;
     var colls: std.ArrayList([]const u8) = .empty;
     defer colls.deinit(gpa);
     while (args.next()) |a| {
@@ -674,6 +690,8 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
             config_path = args.next() orelse return usageError(io, "--config needs a FILE");
         } else if (std.mem.startsWith(u8, a, "--config=")) {
             config_path = a["--config=".len..];
+        } else if (eq(a, "--adult")) {
+            adult = true;
         } else if (eq(a, "--node")) {
             bound_node = args.next() orelse return usageError(io, "--node needs a node id (dkn_...)");
         } else if (eq(a, "--rate")) {
@@ -715,6 +733,7 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
             for (k.collections, 0..) |c, i| out(io, "{s}{s}", .{ if (i > 0) "," else "", if (eq(c, dk.access.all_marker)) "ALL" else c });
             if (k.rate > 0) out(io, "  limit: {d}/min", .{k.rate});
             if (k.node) |n| out(io, "  bound to node {s}", .{n});
+            if (k.adult) out(io, "  adult (no safe search)", .{});
             out(io, "\n", .{});
         }
         return exit_ok;
@@ -757,7 +776,8 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
             }
             return exit_usage;
         };
-        dk.access.save(arena, io, Io.Dir.cwd(), path, updated) catch |e| {
+        const to_save = if (adult) (dk.access.withAdult(arena, updated, key_name) catch return exit_io) else updated;
+        dk.access.save(arena, io, Io.Dir.cwd(), path, to_save) catch |e| {
             err(io, "cannot write {s}: {t}", .{ path, e });
             return exit_io;
         };
@@ -766,6 +786,45 @@ fn apiKeyCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
         return exit_ok;
     }
     return usageError(io, "api-key needs add, list or remove");
+}
+
+/// `dksearch safesearch-pin`: sets the PIN that unlocks safe search in a browser (stored as a hash).
+fn safeSearchPinCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const path = std.fmt.allocPrint(arena_state.allocator(), "{s}/{s}", .{ cfg.data_dir, dk.safesearch.pin_file_name }) catch return exit_io;
+    var s = dk.secrets.load(gpa, io, Io.Dir.cwd(), path) catch |e| {
+        secretsProblem(io, path, e);
+        return exit_io;
+    };
+    defer s.deinit(gpa);
+    const pin = readPassword(io, gpa) orelse {
+        err(io, "no PIN was read; nothing was changed", .{});
+        return exit_usage;
+    };
+    defer {
+        std.crypto.secureZero(u8, pin);
+        gpa.free(pin);
+    }
+    if (pin.len < dk.safesearch.min_pin_len or !std.unicode.utf8ValidateSlice(pin)) {
+        err(io, "the PIN must be at least {d} characters; nothing was changed", .{dk.safesearch.min_pin_len});
+        return exit_usage;
+    }
+    s.setPassword(gpa, io, pin) catch |e| {
+        err(io, "cannot set the PIN: {t}", .{e});
+        return exit_usage;
+    };
+    dk.secrets.save(io, Io.Dir.cwd(), path, s) catch |e| {
+        err(io, "cannot write {s}: {t}", .{ path, e });
+        return exit_io;
+    };
+    err(io, "PIN hash written to {s}; browsers already unlocked stay unlocked until their time is up (restart the server to end them)", .{path});
+    if (!cfg.safe_search.enabled) err(io, "note: safe search is not turned on ([safe_search] enabled = true), so the PIN has no effect yet", .{});
+    return exit_ok;
 }
 
 fn adminCredentialCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, want_token: bool) u8 {
@@ -949,12 +1008,26 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     // unreadable file stops the server rather than silently showing what was meant to be hidden.
     var lists_arena = std.heap.ArenaAllocator.init(gpa);
     defer lists_arena.deinit();
-    var domain_lists = buildDomainLists(io, lists_arena.allocator(), cfg, true) orelse return exit_config;
-    const lists_ptr: ?*const dk.domainlist.Lists = if (domain_lists.blocked.isEmpty() and domain_lists.demoted.isEmpty()) null else &domain_lists;
+    var domain_lists = buildDomainLists(io, lists_arena.allocator(), cfg, true, config_path) orelse return exit_config;
+    const lists_ptr: ?*const dk.domainlist.Lists = if (domain_lists.blocked.isEmpty() and domain_lists.demoted.isEmpty() and domain_lists.safe.isEmpty()) null else &domain_lists;
     if (pool) |*p| p.setDomains(lists_ptr);
     index.setDomains(lists_ptr);
     dk.domainlist.global = lists_ptr;
     defer dk.domainlist.global = null;
+    // Safe search: on for visitors by default; a PIN (set with `dksearch safesearch-pin`) unlocks a browser.
+    var unlock_state: ?dk.safesearch.Unlock = null;
+    defer if (unlock_state) |*u| u.deinit();
+    if (cfg.safe_search.enabled) {
+        var dd = Io.Dir.cwd().openDir(io, cfg.data_dir, .{}) catch null;
+        if (dd) |*d| {
+            defer d.close(io);
+            unlock_state = dk.safesearch.Unlock.init(gpa, io, d.*, cfg.safe_search.unlock_hours) catch |e| blk: {
+                err(io, "cannot read the safe-search PIN file ({t}); safe search cannot be unlocked", .{e});
+                break :blk null;
+            };
+        }
+        if (unlock_state) |*u| err(io, "safe search PIN: {s}", .{if (u.hasPin()) "set (visitors can unlock at /unlock)" else "not set (run `dksearch safesearch-pin`); safe search cannot be unlocked"});
+    }
     if (pool) |*p| {
         p.setFuzzyMode(fuzzy_mode);
         p.setSimpleSyntax(!cfg.search.advanced_syntax);
@@ -1266,7 +1339,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     defer source_stats.deinit();
     var retrieve_cache = dk.retrievecache.Cache.init(gpa, io, @as(usize, cfg.search.retrieve_cache_mb) * 1024 * 1024);
     defer retrieve_cache.deinit();
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .per_domain = cfg.search.per_domain, .lists = lists_ptr, .answers = if (ollama_client != null) &answer_service else null, .fallback = if (fallback_on) &fallback_settings else null, .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .safe_default = cfg.safe_search.enabled, .unlock = if (unlock_state != null) &unlock_state.? else null, .per_domain = cfg.search.per_domain, .lists = lists_ptr, .answers = if (ollama_client != null) &answer_service else null, .fallback = if (fallback_on) &fallback_settings else null, .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };
@@ -1403,10 +1476,6 @@ fn rebuildCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    // The ban lists keep a crawl away from banned sites (they are not contacted at all).
-    var import_lists = buildDomainLists(io, arena_state.allocator(), cfg, false) orelse return exit_config;
-    dk.domainlist.global = if (import_lists.blocked.isEmpty()) null else &import_lists;
-    defer dk.domainlist.global = null;
     const paths = Paths.make(arena_state.allocator(), cfg.data_dir) catch return exit_io;
     const lock = lockWriters(io, cfg.data_dir, "rebuild") orelse return exit_io;
     defer lock.release(io);
@@ -1664,13 +1733,27 @@ fn removeCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, source: []
 
 /// Reads the domain lists named by `[filters]` and (when on) `[safe_search]` into `la`: the blocklist, the demotion list
 /// and the ban lists. An unreadable file is an error, so that what was meant to be hidden is not shown.
-fn buildDomainLists(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, announce: bool) ?dk.domainlist.Lists {
+fn buildDomainLists(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, announce: bool, config_path: ?[]const u8) ?dk.domainlist.Lists {
     var lists: dk.domainlist.Lists = .{ .demote_percent = cfg.filters.demote_percent };
     var failed: []const u8 = "";
-    const loads = [_]struct { set: *dk.domainlist.Set, entries: []const []const u8, files: []const []const u8, on: bool }{
-        .{ .set = &lists.blocked, .entries = cfg.filters.blocklist, .files = cfg.filters.blocklist_files, .on = true },
-        .{ .set = &lists.demoted, .entries = cfg.filters.demote, .files = cfg.filters.demote_files, .on = true },
-        .{ .set = &lists.blocked, .entries = cfg.safe_search.ban, .files = cfg.safe_search.ban_files, .on = cfg.safe_search.enabled },
+    // List files named with `ban` and `list` are relative to the folder of the configuration file.
+    const base: ?[]const u8 = if (config_path) |p| (std.fs.path.dirname(p) orelse ".") else null;
+    var ban_one: [1][]const u8 = undefined;
+    var list_one: [1][]const u8 = undefined;
+    const ban_files: []const []const u8 = if (cfg.filters.ban) |b| blk: {
+        ban_one[0] = b;
+        break :blk ban_one[0..1];
+    } else &.{};
+    const safe_files: []const []const u8 = if (cfg.safe_search.list) |l| blk: {
+        list_one[0] = l;
+        break :blk list_one[0..1];
+    } else &.{};
+    const loads = [_]struct { set: *dk.domainlist.Set, entries: []const []const u8, files: []const []const u8, relative: bool, on: bool }{
+        .{ .set = &lists.blocked, .entries = cfg.filters.blocklist, .files = cfg.filters.blocklist_files, .relative = false, .on = true },
+        .{ .set = &lists.blocked, .entries = &.{}, .files = ban_files, .relative = true, .on = true },
+        .{ .set = &lists.demoted, .entries = cfg.filters.demote, .files = cfg.filters.demote_files, .relative = false, .on = true },
+        .{ .set = &lists.safe, .entries = cfg.safe_search.ban, .files = cfg.safe_search.ban_files, .relative = false, .on = cfg.safe_search.enabled },
+        .{ .set = &lists.safe, .entries = &.{}, .files = safe_files, .relative = true, .on = cfg.safe_search.enabled },
     };
     for (loads) |l| {
         if (!l.on) continue;
@@ -1678,13 +1761,13 @@ fn buildDomainLists(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, announ
             err(io, "out of memory", .{});
             return null;
         };
-        dk.domainlist.loadFiles(io, la, l.set, l.files, &failed) catch |e| {
+        dk.domainlist.loadFilesFrom(io, la, l.set, l.files, if (l.relative) base else null, &failed) catch |e| {
             err(io, "cannot read the domain list {s}: {t}", .{ failed, e });
             return null;
         };
     }
     if (announce) {
-        if (cfg.safe_search.enabled) err(io, "safe search is on: {d} domains are blocked ({d} demoted)", .{ lists.blocked.count(), lists.demoted.count() }) else if (!lists.blocked.isEmpty() or !lists.demoted.isEmpty()) err(io, "domain lists: {d} blocked, {d} demoted", .{ lists.blocked.count(), lists.demoted.count() });
+        if (cfg.safe_search.enabled) err(io, "safe search is on for visitors: {d} domains hidden unless unlocked; {d} banned for everyone ({d} demoted)", .{ lists.safe.count(), lists.blocked.count(), lists.demoted.count() }) else if (!lists.blocked.isEmpty() or !lists.demoted.isEmpty()) err(io, "domain lists: {d} blocked, {d} demoted", .{ lists.blocked.count(), lists.demoted.count() });
     }
     return lists;
 }
@@ -1720,6 +1803,10 @@ fn importCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, one: ?[]co
     if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+    // The ban lists keep a crawl away from banned sites (they are not contacted at all).
+    var import_lists = buildDomainLists(io, arena_state.allocator(), cfg, false, config_path) orelse return exit_config;
+    dk.domainlist.global = if (import_lists.blocked.isEmpty()) null else &import_lists;
+    defer dk.domainlist.global = null;
     const paths = Paths.make(arena_state.allocator(), cfg.data_dir) catch return exit_io;
     const lock = lockWriters(io, cfg.data_dir, "import") orelse return exit_io;
     defer lock.release(io);

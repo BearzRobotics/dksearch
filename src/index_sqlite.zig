@@ -191,17 +191,19 @@ pub const SqliteIndex = struct {
     /// The domain lists searches apply: results of blocked domains never appear and demoted ones rank lower.
     pub fn setDomains(self: *SqliteIndex, l: ?*const domainlist.Lists) void {
         self.domains = l;
-        _ = c.sqlite3_create_function(self.db, "dk_banned", 1, c.SQLITE_UTF8, @ptrCast(@constCast(l)), bannedFn, null, null);
+        _ = c.sqlite3_create_function(self.db, "dk_banned", 2, c.SQLITE_UTF8, @ptrCast(@constCast(l)), bannedFn, null, null);
         _ = c.sqlite3_create_function(self.db, "dk_demote", 1, c.SQLITE_UTF8, @ptrCast(@constCast(l)), demoteFn, null, null);
     }
 
-    /// `dk_banned(domain)`: 1 when the domain (or one above it) is on the blocked list.
+    /// `dk_banned(domain, safe)`: 1 when the domain (or one above it) is on the blocklist, or, with `safe` 1, on the
+    /// safe-search list.
     fn bannedFn(ctx: ?*c.sqlite3_context, argc: c_int, argv: [*c]?*c.sqlite3_value) callconv(.c) void {
         _ = argc;
         const l: *const domainlist.Lists = @ptrCast(@alignCast(c.sqlite3_user_data(ctx) orelse return c.sqlite3_result_int(ctx, 0)));
         const p = c.sqlite3_value_text(argv[0]);
         if (p == null) return c.sqlite3_result_int(ctx, 0);
-        c.sqlite3_result_int(ctx, if (l.blocked.matches(p[0..@intCast(c.sqlite3_value_bytes(argv[0]))])) 1 else 0);
+        const safe = c.sqlite3_value_int(argv[1]) != 0;
+        c.sqlite3_result_int(ctx, if (l.hides(p[0..@intCast(c.sqlite3_value_bytes(argv[0]))], safe)) 1 else 0);
     }
 
     /// `dk_demote(domain)`: the factor a demoted domain's score is multiplied by (1.0 for the others).
@@ -215,10 +217,12 @@ pub const SqliteIndex = struct {
     }
 
     /// The condition that hides blocked domains, for queries over `docs d`; empty when there is no blocklist.
-    fn banClause(self: *const SqliteIndex) []const u8 {
+    fn banClause(self: *const SqliteIndex, safe: bool) []const u8 {
         const l = self.domains orelse return "";
-        if (l.blocked.isEmpty() or !self.has_meta) return "";
-        return " AND NOT dk_banned(d.domain)";
+        if (!self.has_meta) return "";
+        if (safe and !l.safe.isEmpty()) return " AND NOT dk_banned(d.domain, 1)";
+        if (!l.blocked.isEmpty()) return " AND NOT dk_banned(d.domain, 0)";
+        return "";
     }
 
     pub fn setRecency(self: *SqliteIndex, percent: u32, half_life_days: u32) void {
@@ -878,7 +882,7 @@ pub const SqliteIndex = struct {
         );
         try filterSql(arena, filters, q.collections, &sql, &binds);
         try scopeSql(arena, q.scope, &sql, &binds);
-        try sql.appendSlice(arena, self.banClause());
+        try sql.appendSlice(arena, self.banClause(q.safe_search));
         try sql.appendSlice(arena, " ORDER BY bm25(chunks_fts, 2.0, 1.0), d.id, m.idx LIMIT ?7");
         const st = Stmt.prepare(self.db, try arena.dupeSentinel(u8, sql.items, 0)) catch return &.{}; // no chunk index here
         defer st.deinit();
@@ -1311,7 +1315,7 @@ pub const SqliteIndex = struct {
         );
         try filterSql(arena, filters, q.collections, &sql, &binds);
         try scopeSql(arena, q.scope, &sql, &binds);
-        try sql.appendSlice(arena, self.banClause());
+        try sql.appendSlice(arena, self.banClause(q.safe_search));
         if (q.sort != .relevance and q.sort != .title and !self.has_meta) return error.InvalidQuery; // an old index: `rebuild` upgrades it
         try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm));
         if (q.per_domain > 0 and text_mode and self.has_meta and q.sort == .relevance) {
@@ -2226,6 +2230,34 @@ test "per_domain keeps the best results of each domain in ranking order, with pa
     try testing.expectEqualSlices(u8, &p2.hits[0].id, &c1.hits[0].id);
     // Other sort orders are left alone.
     try testing.expectEqual(@as(usize, 6), (try s.search(a, .{ .text = "raven", .per_domain = 1, .sort = .title })).hits.len);
+}
+
+test "the safe-search list is applied only to searches that ask for it; the blocklist to all" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const urls = [_][]const u8{ "https://banned.example/a", "https://adult.example/b", "https://fine.example/c" };
+    for (urls, 0..) |u, i| {
+        var sid: [4]u8 = undefined;
+        const d: doc.Document = .{ .connector = "web", .source_id = try std.fmt.bufPrint(&sid, "{d}", .{i}), .canonical_url = u, .title = "t", .text = "raven tale" };
+        try idx.indexer().add(d.id(), d);
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var lists: domainlist.Lists = .{};
+    _ = try lists.blocked.add(a, "banned.example");
+    _ = try lists.safe.add(a, "adult.example");
+    idx.setDomains(&lists);
+    const s = idx.searcher();
+    try testing.expectEqual(@as(usize, 2), (try s.search(a, .{ .text = "raven" })).hits.len); // the ban applies; the safe list does not
+    try testing.expectEqual(@as(usize, 1), (try s.search(a, .{ .text = "raven", .safe_search = true })).hits.len);
+    try testing.expectEqualStrings("https://fine.example/c", (try s.search(a, .{ .text = "raven", .safe_search = true })).hits[0].url.?);
+    // A safe list alone (no blocklist) also works.
+    var only_safe: domainlist.Lists = .{};
+    _ = try only_safe.safe.add(a, "adult.example");
+    idx.setDomains(&only_safe);
+    try testing.expectEqual(@as(usize, 3), (try s.search(a, .{ .text = "raven" })).hits.len);
+    try testing.expectEqual(@as(usize, 2), (try s.search(a, .{ .text = "raven", .safe_search = true })).hits.len);
 }
 
 test "pagination is stable and reports has_more" {

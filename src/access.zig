@@ -71,6 +71,8 @@ pub const Key = struct {
     rate: u32 = 0,
     /// A node id (`dkn_...`): the key then works only with a valid signature of that node (see identity.zig).
     node: ?[]const u8 = null,
+    /// Adult: a request with this key is not subject to safe search (see safesearch.zig).
+    adult: bool = false,
 };
 
 const id_node_len = 4 + 43;
@@ -140,6 +142,10 @@ pub fn parse(arena: Allocator, text: []const u8) KeyError![]const Key {
                 else => 0,
             } else 0,
             .node = if (t.getString("node")) |n| (if (n.len == id_node_len and std.mem.startsWith(u8, n, "dkn_")) try arena.dupe(u8, n) else return error.Malformed) else null,
+            .adult = if (t.get("adult")) |av| switch (av) {
+                .boolean => |b| b,
+                else => return error.Malformed,
+            } else false,
             .rate = if (t.get("rate")) |r| switch (r) {
                 .integer => |n| if (n > 0 and n <= max_rate) @intCast(n) else 0,
                 else => 0,
@@ -162,6 +168,7 @@ pub fn render(arena: Allocator, keys: []const Key) Allocator.Error![]const u8 {
         try out.appendSlice(arena, "]\n");
         if (k.rate > 0) try out.print(arena, "rate = {d}\n", .{k.rate});
         if (k.node) |n| try out.print(arena, "node = \"{s}\"\n", .{n});
+        if (k.adult) try out.appendSlice(arena, "adult = true\n");
     }
     return out.items;
 }
@@ -246,6 +253,15 @@ pub fn addBound(arena: Allocator, io: Io, keys: []const Key, name: []const u8, c
     return out;
 }
 
+/// A copy of `keys` in which the key named `name` is marked adult (not subject to safe search).
+pub fn withAdult(arena: Allocator, keys: []const Key, name: []const u8) Allocator.Error![]const Key {
+    const out = try arena.dupe(Key, keys);
+    for (out) |*k| if (std.mem.eql(u8, k.name, name)) {
+        k.adult = true;
+    };
+    return out;
+}
+
 /// The keys without the one named or with id `which` (null if there is none).
 pub fn remove(arena: Allocator, keys: []const Key, which: []const u8) Allocator.Error!?[]const Key {
     var at: ?usize = null;
@@ -284,7 +300,7 @@ pub const KeyStore = struct {
         self.arena.deinit();
     }
 
-    pub const Found = struct { id: []const u8, name: []const u8, collections: []const []const u8, rate: u32 = 0, node: ?[]const u8 = null };
+    pub const Found = struct { id: []const u8, name: []const u8, collections: []const []const u8, rate: u32 = 0, node: ?[]const u8 = null, adult: bool = false };
 
     /// Counts a request of key `id` against its limit of `rate` a minute (fixed one-minute windows). Null if it may
     /// go ahead; otherwise the seconds until the window ends.
@@ -316,7 +332,7 @@ pub const KeyStore = struct {
         const k = find(self.keys, token) orelse return null;
         const colls = try out.alloc([]const u8, k.collections.len);
         for (k.collections, colls) |c, *o| o.* = try out.dupe(u8, c);
-        return .{ .id = try out.dupe(u8, k.id), .name = try out.dupe(u8, k.name), .collections = colls, .rate = k.rate, .node = if (k.node) |n| try out.dupe(u8, n) else null };
+        return .{ .id = try out.dupe(u8, k.id), .name = try out.dupe(u8, k.name), .collections = colls, .rate = k.rate, .node = if (k.node) |n| try out.dupe(u8, n) else null, .adult = k.adult };
     }
 
     fn refresh(self: *KeyStore) void {

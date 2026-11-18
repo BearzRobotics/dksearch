@@ -48,7 +48,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, api_export, api_peers, api_health, style, document, zim, wopi, other };
+const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, unlock_page, lock_action, api_export, api_peers, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -59,6 +59,8 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/api/v1/search")) return .api_search;
     if (std.mem.eql(u8, path, "/api/v1/retrieve")) return .api_retrieve;
     if (std.mem.eql(u8, path, "/api/v1/answer")) return .api_answer;
+    if (std.mem.eql(u8, path, "/unlock")) return .unlock_page;
+    if (std.mem.eql(u8, path, "/lock")) return .lock_action;
     if (std.mem.eql(u8, path, "/api/v1/suggest")) return .api_suggest;
     if (std.mem.eql(u8, path, "/api/v1/similar")) return .api_similar;
     if (std.mem.eql(u8, path, "/api/v1/export")) return .api_export;
@@ -99,6 +101,11 @@ pub const Services = struct {
     /// Domains never shown (the blocklist, and safe search's ban lists when on); null for none. The index applies it
     /// to searches; the handler to documents opened by id, peers' results and the like.
     lists: ?*const dk.domainlist.Lists = null,
+    /// Safe search (ADR 0049): on for visitors by default; `unlock` holds the PIN and the unlocked browsers. `safe` is
+    /// set for each request: whether safe search applies to the one being answered.
+    safe_default: bool = false,
+    unlock: ?*dk.safesearch.Unlock = null,
+    safe: bool = false,
     /// The most results one domain may have in a search (`[search] per_domain`; 0: no limit); a request's own
     /// `per_domain` overrides it.
     per_domain: u32 = 0,
@@ -136,6 +143,7 @@ pub const Services = struct {
 /// Limits `q` to what the caller may see and tells it what the `collection:` names mean.
 fn limitQuery(arena: Allocator, q: *dk.search.Query, services: Services) error{OutOfMemory}!void {
     q.scope = services.scope.sources;
+    q.safe_search = services.safe;
     if (q.per_domain == 0) q.per_domain = services.per_domain;
     const defs = try arena.alloc(dk.search.CollectionDef, services.collections.len);
     for (services.collections, defs) |c, *d| d.* = .{ .name = c.name, .sources = c.sources };
@@ -264,6 +272,9 @@ pub fn handleAuthorized(arena: Allocator, searcher: dk.search.Searcher, services
 /// What a request says about who sent it beyond the API key: the address it was sent to and a peer's signature
 /// (see identity.zig).
 pub const Caller = struct {
+    /// The request's Cookie header and body (the safe-search unlock form is the one thing here that is posted).
+    cookie: ?[]const u8 = null,
+    body: []const u8 = "",
     host: ?[]const u8 = null,
     signed: ?dk.identity.Signed = null,
     /// A `dk-nonce` without a signature: the caller only wants the answer signed.
@@ -293,7 +304,7 @@ pub fn handleSigned(arena: Allocator, searcher: dk.search.Searcher, services: Se
 }
 
 /// The collections a bearer token's key may see, or an error message (a token that is not a valid key).
-fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8, caller: Caller, method: http.Method, target: []const u8) error{OutOfMemory}!union(enum) { ok: struct { scope: dk.access.Scope, keyed: bool, limited: ?u32 = null }, refused: []const u8 } {
+fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8, caller: Caller, method: http.Method, target: []const u8) error{OutOfMemory}!union(enum) { ok: struct { scope: dk.access.Scope, keyed: bool, limited: ?u32 = null, adult: bool = false }, refused: []const u8 } {
     if (authorization) |h| {
         const prefix = "Bearer ";
         if (std.ascii.startsWithIgnoreCase(h, prefix)) {
@@ -318,7 +329,7 @@ fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8, ca
             }
             // A key with a limit: counted here; the seconds to wait if it is over.
             const wait: ?u32 = store.allow(found.id, found.rate);
-            return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, found.collections), .keyed = true, .limited = wait } };
+            return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, found.collections), .keyed = true, .limited = wait, .adult = found.adult } };
         }
     }
     // Anonymous: every source unless the server limits it to some collections.
@@ -341,7 +352,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         if (is_api) return apiError(arena, .not_found, "not_found", "no such endpoint");
         return htmlError(arena, .not_found, "Not found", "That page does not exist.");
     }
-    if (method != .GET and method != .HEAD) {
+    if (method != .GET and method != .HEAD and !((r == .unlock_page or r == .lock_action) and method == .POST)) {
         var resp = if (is_api)
             try apiError(arena, .method_not_allowed, "method_not_allowed", "use GET")
         else
@@ -359,6 +370,8 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         .ok => |c| {
             services.scope = c.scope;
             services.keyed = c.keyed;
+            // Safe search applies unless this caller is adult (a key marked so) or has unlocked this browser.
+            services.safe = services.safe_default and !c.adult and !(if (services.unlock) |u| u.unlocked(caller.cookie) else false);
             if (c.limited) |wait| {
                 const secs = try std.fmt.allocPrint(arena, "{d}", .{wait});
                 var resp = if (is_api) try apiError(arena, .too_many_requests, "rate_limited", "this API key has made too many requests this minute") else try htmlError(arena, .too_many_requests, "Too many requests", "This key has made too many requests this minute. Try again shortly.");
@@ -387,7 +400,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
     return switch (r) {
         .home => blk: {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHomeForm(&aw.writer, null, .{ .answers_offered = services.answers != null and !services.scope.none(), .regex_enabled = regex != null, .sources = try sourceChoicesFor(arena, services, searcher), .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, null, .{ .safe_note = safeNote(services), .answers_offered = services.answers != null and !services.scope.none(), .regex_enabled = regex != null, .sources = try sourceChoicesFor(arena, services, searcher), .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
@@ -406,6 +419,8 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         .api_retrieve => try apiRetrieve(arena, searcher, services, t.params),
         .api_answer => try apiAnswer(arena, searcher, services, t.params),
         .api_suggest => try apiSuggest(arena, searcher, t.params),
+        .unlock_page => try unlockPage(arena, services, method, caller),
+        .lock_action => try lockAction(arena, services, caller),
         .api_similar => try apiSimilar(arena, searcher, services, t.params),
         .api_export => try apiExport(arena, searcher, services, t.params),
         .api_peers => try apiPeers(arena, services),
@@ -877,6 +892,58 @@ fn apiAnswer(arena: Allocator, searcher: dk.search.Searcher, services: Services,
 
 /// `GET /api/v1/peers`: the peers this node is willing to introduce (`introduce = true`), by name and address only.
 /// For a caller with a key; they are suggestions the caller's operator may accept, nothing is added by asking.
+/// What the pages say about safe search to this visitor.
+fn safeNote(services: Services) html.SafeNote {
+    if (!services.safe_default) return .none;
+    if (!services.safe) return .unlocked;
+    return if (services.unlock) |u| (if (u.hasPin()) .on_unlockable else .on) else .on;
+}
+
+/// The unlock page and the unlock itself (a PIN posted from the form): the cookie it sets marks this browser as
+/// adult for `unlock_hours`.
+fn unlockPage(arena: Allocator, services: Services, method: http.Method, caller: Caller) error{OutOfMemory}!Response {
+    const u = services.unlock orelse return htmlError(arena, .not_found, "Not found", "Safe search cannot be unlocked on this server.");
+    if (!u.hasPin()) return htmlError(arena, .not_found, "Not found", "Safe search cannot be unlocked on this server (no PIN is set).");
+    var message: ?[]const u8 = null;
+    if (method == .POST) {
+        const form_target = try std.fmt.allocPrint(arena, "/?{s}", .{std.mem.trimEnd(u8, caller.body, "\r\n")});
+        const t = query.parseTarget(arena, form_target) catch return htmlError(arena, .bad_request, "Bad request", "The form could not be read.");
+        switch (u.tryUnlock(t.params.get("pin") orelse "")) {
+            .ok => |token| {
+                const cookie = try std.fmt.allocPrint(arena, "{s}={s}; HttpOnly; SameSite=Lax; Path=/; Max-Age={d}", .{ dk.safesearch.cookie_name, token, @as(u64, u.hours) * 3600 });
+                return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cookie }, no_store }) };
+            },
+            .wrong => message = "That PIN is not right.",
+            .throttled => {
+                var r = try htmlError(arena, .too_many_requests, "Too many tries", "Too many wrong PINs; wait a minute and try again.");
+                r.headers = headersWith(arena, &.{ .{ .name = "retry-after", .value = "60" }, no_store });
+                return r;
+            },
+            .not_set => return htmlError(arena, .not_found, "Not found", "No PIN is set."),
+        }
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    html.writeHead(w, "Unlock safe search - dksearch") catch return error.OutOfMemory;
+    w.writeAll("<body class=\"home\"><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1><h2>Unlock safe search</h2><p class=\"muted\">Safe search hides some sites from this server's results. Enter the PIN to see everything in this browser for a while.</p><form class=\"search\" action=\"/unlock\" method=\"post\" autocomplete=\"off\"><input type=\"password\" name=\"pin\" maxlength=\"64\" aria-label=\"PIN\" placeholder=\"PIN\" autofocus required><button type=\"submit\">Unlock</button></form>") catch return error.OutOfMemory;
+    if (message) |m| {
+        w.writeAll("<p class=\"error\" role=\"alert\">") catch return error.OutOfMemory;
+        html.writeEscaped(w, m) catch return error.OutOfMemory;
+        w.writeAll("</p>") catch return error.OutOfMemory;
+    }
+    w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+    var r = htmlResponse(arena, .ok, aw.written());
+    r.headers = headersWith(arena, &.{no_store});
+    return r;
+}
+
+/// Ends the unlock of this browser: safe search is on again.
+fn lockAction(arena: Allocator, services: Services, caller: Caller) error{OutOfMemory}!Response {
+    if (services.unlock) |u| u.lock(caller.cookie);
+    const cleared = try std.fmt.allocPrint(arena, "{s}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0", .{dk.safesearch.cookie_name});
+    return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cleared }, no_store }) };
+}
+
 /// Documents like `id`: by vector when the server has a vector index with this document in it, otherwise by the words
 /// that set the document apart (docs/decisions/0046). Never the document itself, and only what the caller may see.
 fn similarTo(arena: Allocator, searcher: dk.search.Searcher, services: Services, id: dk.document.Id, limit: u32) error{OutOfMemory}![]const dk.search.Hit {
@@ -1041,7 +1108,7 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
             const st = try arena.alloc(ExternalStatus, replies.len);
             for (replies, st) |r, *s| {
                 s.* = .{ .provider = r.provider, .status = @tagName(r.status) };
-                for (r.results) |ext| if (!(if (services.lists) |l| l.blocksUrl(ext.url) else false)) try all.append(arena, ext);
+                for (r.results) |ext| if (!(if (services.lists) |l| l.hidesUrl(ext.url, services.safe) else false)) try all.append(arena, ext);
             }
             ext_results = all.items;
             ext_status = st;
@@ -1079,14 +1146,13 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
 /// Whether a result belongs to a domain that must not be shown (the blocklist; with safe search, its ban lists too).
 fn hitBlocked(services: Services, h: dk.search.Hit) bool {
     const l = services.lists orelse return false;
-    if (l.blocked.isEmpty()) return false;
-    if (h.domain) |d| if (l.blocked.matches(d)) return true;
-    return l.blocksUrl(h.url);
+    if (h.domain) |d| if (l.hides(d, services.safe)) return true;
+    return l.hidesUrl(h.url, services.safe);
 }
 
 fn withoutBlocked(arena: Allocator, services: Services, hits: []const dk.search.Hit) error{OutOfMemory}![]const dk.search.Hit {
     const l = services.lists orelse return hits;
-    if (l.blocked.isEmpty()) return hits;
+    if (l.blocked.isEmpty() and !(services.safe and !l.safe.isEmpty())) return hits;
     var out: std.ArrayList(dk.search.Hit) = .empty;
     for (hits) |h| if (!hitBlocked(services, h)) try out.append(arena, h);
     return out.items;
@@ -1523,7 +1589,7 @@ fn federateRetrieval(arena: Allocator, services: Services, params: query.Params,
     for (replies) |r| {
         if (r.status != .ok) continue;
         for (r.chunks, 0..) |c, rank| {
-            if (if (services.lists) |l| l.blocksUrl(c.url) else false) continue;
+            if (if (services.lists) |l| l.hidesUrl(c.url, services.safe) else false) continue;
             const contribution = 1.0 / (dk.peers.rrf_k + @as(f64, @floatFromInt(rank + 1)));
             const key = try retrievalKey(arena, c.ident, c.url, c.start, c.node, c.doc_id, c.index);
             if (seen.get(key)) |at| {
@@ -1866,7 +1932,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
     const defaulted = if (default) |d| (picked.len == 1 and std.mem.startsWith(u8, picked[0], "collection:") and std.mem.eql(u8, picked[0]["collection:".len..], d) and (try params.all(arena, "source")).len == 0) else false;
-    var form: html.Form = .{ .default_note = if (defaulted) default else null, .all_sources = all_asked, .q = parsed.typed, .language = q.language orelse "", .picked = picked, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .collections = try collectionChoices(arena, services), .sort = params.get("sort") orelse "" };
+    var form: html.Form = .{ .safe_note = safeNote(services), .default_note = if (defaulted) default else null, .all_sources = all_asked, .q = parsed.typed, .language = q.language orelse "", .picked = picked, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .collections = try collectionChoices(arena, services), .sort = params.get("sort") orelse "" };
     if (parsed.re) |req| {
         // A pattern typed in the box is already part of `q` and travels with it; only one given
         // as a parameter has to be carried separately (the pager and the exact-spelling link).
@@ -3362,6 +3428,75 @@ test "results on hidden networks are marked, and per_domain is checked" {
     // The server's default applies when the request says nothing.
     _ = handleServices(a, fake.searcher(), .{ .per_domain = 3 }, .GET, "/api/v1/search?q=hidden");
     try testing.expectEqual(@as(u32, 3), fake.last.?.per_domain);
+}
+
+test "safe search: on for visitors, a PIN unlocks a browser for a while, an adult key is never filtered, the ban is never lifted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var pin_secret: dk.secrets.Secrets = .{};
+    defer pin_secret.deinit(testing.allocator);
+    try pin_secret.setPassword(testing.allocator, testing.io, "4321");
+    try dk.secrets.save(testing.io, tmp.dir, dk.safesearch.pin_file_name, pin_secret);
+    var unlock = try dk.safesearch.Unlock.init(testing.allocator, testing.io, tmp.dir, 8);
+    defer unlock.deinit();
+    var lists: dk.domainlist.Lists = .{};
+    _ = try lists.blocked.add(a, "banned.example");
+    _ = try lists.safe.add(a, "adult.example");
+    var keys_store = dk.access.KeyStore.init(testing.allocator, testing.io, try tmp.dir.realPathFileAlloc(testing.io, ".", a));
+    defer keys_store.deinit();
+    var tok_adult: [dk.access.token_len]u8 = undefined;
+    var tok_kid: [dk.access.token_len]u8 = undefined;
+    var keys = try dk.access.add(a, testing.io, &.{}, "adult", &.{"*"}, 1, &tok_adult);
+    keys = try dk.access.withAdult(a, keys, "adult");
+    keys = try dk.access.add(a, testing.io, keys, "kid", &.{"*"}, 2, &tok_kid);
+    try dk.access.save(a, testing.io, tmp.dir, dk.access.file_name, keys);
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    const services: Services = .{ .lists = &lists, .safe_default = true, .unlock = &unlock, .keys = &keys_store };
+    // The visitor's search is marked safe; the key marked adult is not.
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{});
+    try testing.expect(fake.last.?.safe_search);
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", try std.fmt.allocPrint(a, "Bearer {s}", .{&tok_adult}), .{});
+    try testing.expect(!fake.last.?.safe_search);
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", try std.fmt.allocPrint(a, "Bearer {s}", .{&tok_kid}), .{});
+    try testing.expect(fake.last.?.safe_search);
+    // The page says so, with a way to unlock.
+    const home = handleSigned(a, fake.searcher(), services, .GET, "/", null, .{});
+    try testing.expect(std.mem.indexOf(u8, home.body, "Safe search is on.") != null and std.mem.indexOf(u8, home.body, "href=\"/unlock\"") != null);
+    // The unlock form: a wrong PIN is told so and sets nothing; the right one sets a cookie.
+    try testing.expectEqual(http.Status.ok, handleSigned(a, fake.searcher(), services, .GET, "/unlock", null, .{}).status);
+    const wrong = handleSigned(a, fake.searcher(), services, .POST, "/unlock", null, .{ .body = "pin=0000" });
+    try testing.expect(std.mem.indexOf(u8, wrong.body, "not right") != null);
+    try testing.expect(headerValue(wrong, "set-cookie") == null);
+    const right = handleSigned(a, fake.searcher(), services, .POST, "/unlock", null, .{ .body = "pin=4321" });
+    try testing.expectEqual(http.Status.see_other, right.status);
+    const set = headerValue(right, "set-cookie").?;
+    try testing.expect(std.mem.startsWith(u8, set, "dks_adult=") and std.mem.indexOf(u8, set, "HttpOnly") != null and std.mem.indexOf(u8, set, "Max-Age=28800") != null);
+    const cookie = set[0..std.mem.indexOfScalar(u8, set, ';').?];
+    // With the cookie the search is not safe, the page says so, and the ban is still on.
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = cookie });
+    try testing.expect(!fake.last.?.safe_search);
+    try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), services, .GET, "/", null, .{ .cookie = cookie }).body, "Safe search is off in this browser") != null);
+    var unlocked_services = services;
+    unlocked_services.safe = false;
+    try testing.expect(hitBlocked(unlocked_services, .{ .id = @splat(1), .connector = "w", .url = "https://banned.example/x", .title = null, .snippet = null, .score = 1 }));
+    try testing.expect(!hitBlocked(unlocked_services, .{ .id = @splat(2), .connector = "w", .url = "https://adult.example/x", .title = null, .snippet = null, .score = 1 }));
+    var safe_services = services;
+    safe_services.safe = true;
+    try testing.expect(hitBlocked(safe_services, .{ .id = @splat(2), .connector = "w", .url = "https://adult.example/x", .title = null, .snippet = null, .score = 1 }));
+    // Turning it back on ends the unlock.
+    const back = handleSigned(a, fake.searcher(), services, .POST, "/lock", null, .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.see_other, back.status);
+    try testing.expect(std.mem.indexOf(u8, headerValue(back, "set-cookie").?, "Max-Age=0") != null);
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = cookie });
+    try testing.expect(fake.last.?.safe_search);
+    // Without a PIN, or with safe search off, there is nothing to unlock.
+    const no_unlock: Services = .{ .lists = &lists, .safe_default = true };
+    try testing.expectEqual(http.Status.not_found, handleSigned(a, fake.searcher(), no_unlock, .GET, "/unlock", null, .{}).status);
+    _ = handleSigned(a, fake.searcher(), .{ .lists = &lists }, .GET, "/api/v1/search?q=odin", null, .{});
+    try testing.expect(!fake.last.?.safe_search);
 }
 
 test "answers: off by default, a question is needed, nothing is asked of the model without passages, and an unreachable model is said" {
