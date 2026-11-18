@@ -74,6 +74,21 @@ pub const commands = [_]Command{
         ,
     },
     .{
+        .name = "fetch-banlist",
+        .synopsis = "fetch-banlist --url URL --out FILE --yes",
+        .summary = "Download a list of banned domains from an address you name",
+        .detail =
+        \\Fetches one list (https only; up to three redirects), checks that it is a list of
+        \\domains or of MD5 hashes of domains (a web page or an error is refused) and replaces
+        \\FILE with it, so that a published list, such as a service's list of banned onion
+        \\domains, can be kept current without being shipped with dksearch. Name the file in
+        \\[filters] blocklist_files (or [safe_search] ban_files) and restart for it to apply.
+        \\Nothing is downloaded unless you run this, and without --yes it only says what it
+        \\would do. Example: fetch-banlist --url https://ahmia.fi/blacklist/banned/ --out ban.txt --yes
+        \\
+        ,
+    },
+    .{
         .name = "node-key",
         .synopsis = "node-key [--config FILE]",
         .summary = "Make this node's identity (a key pair) and print its node id",

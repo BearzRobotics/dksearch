@@ -161,6 +161,7 @@ fn run(init: std.process.Init) u8 {
 
     if (eq(first, "api-key")) return apiKeyCmd(io, gpa, &args);
     if (eq(first, "models")) return modelsCmd(io, gpa, &args);
+    if (eq(first, "fetch-banlist")) return fetchBanlistCmd(io, gpa, &args);
     if (eq(first, "node-key")) {
         var config_path: ?[]const u8 = null;
         while (args.next()) |a| {
@@ -509,6 +510,51 @@ fn readLine(io: Io, gpa: std.mem.Allocator, prompt: ?[]const u8) ?[]u8 {
 /// `dksearch api-key add NAME (--all | --collection C ...) | list | remove NAME_OR_ID` [--config FILE].
 /// `dksearch models list | pull NAME [--yes] | remove NAME [--yes]`: the models of the Ollama server (found at
 /// `[ollama] url` or the default address). Pulling and removing change what is on disk, so they need `--yes`.
+fn fetchBanlistCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
+    var url: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    var yes = false;
+    while (args.next()) |a| {
+        if (eq(a, "--url")) {
+            url = args.next() orelse return usageError(io, "--url needs an ADDRESS");
+        } else if (std.mem.startsWith(u8, a, "--url=")) {
+            url = a["--url=".len..];
+        } else if (eq(a, "--out")) {
+            out_path = args.next() orelse return usageError(io, "--out needs a FILE");
+        } else if (std.mem.startsWith(u8, a, "--out=")) {
+            out_path = a["--out=".len..];
+        } else if (eq(a, "--yes") or eq(a, "-y")) {
+            yes = true;
+        } else {
+            err(io, "unknown option for fetch-banlist: {s}", .{a});
+            return exit_usage;
+        }
+    }
+    const u = url orelse return usageError(io, "fetch-banlist needs --url ADDRESS");
+    const o = out_path orelse return usageError(io, "fetch-banlist needs --out FILE");
+    if (!yes) {
+        err(io, "this downloads {s} and replaces {s}; run it again with --yes to do it", .{ u, o });
+        return exit_usage;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const r = dk.listfetch.download(io, gpa, arena_state.allocator(), u, o, false) catch |e| {
+        switch (e) {
+            error.BadAddress => err(io, "the address must start with https://", .{}),
+            error.NotAvailable => err(io, "this build has no network support", .{}),
+            error.NotAList => err(io, "what came back is not a list of domains or hashes (nothing was changed)", .{}),
+            error.Refused => err(io, "the server refused or redirected somewhere unusable (nothing was changed)", .{}),
+            error.Unreachable => err(io, "could not fetch {s} (nothing was changed)", .{u}),
+            error.TooLarge => err(io, "the list is larger than {d} MiB (nothing was changed)", .{dk.listfetch.max_bytes / (1024 * 1024)}),
+            error.WriteFailed => err(io, "could not write {s}", .{o}),
+            error.OutOfMemory => err(io, "out of memory", .{}),
+        }
+        return exit_failure;
+    };
+    out(io, "wrote {s}: {d} hashes, {d} domains, {d} bytes\n", .{ o, r.stats.hashes, r.stats.domains, r.bytes });
+    return exit_ok;
+}
+
 fn modelsCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
     const sub_cmd = args.next() orelse return usageError(io, "models needs list, pull or remove");
     var config_path: ?[]const u8 = null;

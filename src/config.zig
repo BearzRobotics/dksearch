@@ -622,6 +622,17 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     cfg.fallback = try readFallback(a, src, root, diag);
     cfg.filters = try readFilters(a, src, root, diag);
     cfg.safe_search = try readSafeSearch(a, src, root, diag);
+    // A crawl that reaches Tor needs a ban list: crawling onion sites with none is a choice that must be written down.
+    {
+        const has_ban = cfg.filters.blocklist.len > 0 or cfg.filters.blocklist_files.len > 0 or (cfg.safe_search.enabled and (cfg.safe_search.ban.len > 0 or cfg.safe_search.ban_files.len > 0));
+        if (!has_ban) for (cfg.sources) |s| {
+            if (!s.enabled or !std.mem.eql(u8, s.kind, "crawl")) continue;
+            if (s.optionString("tor_socks") == null) continue;
+            if (s.optionBool("allow_unbanned_onions") orelse false) continue;
+            diag.set(src, "filters.blocklist_files", "source \"{s}\" crawls Tor sites but no ban list is configured: add a list to [filters] blocklist_files (see `dksearch fetch-banlist`), or set allow_unbanned_onions = true on that source", .{s.name});
+            return error.InvalidValue;
+        };
+    }
     if (try subTable(src, root, "ollama", diag)) |t| {
         try checkKeys(src, "ollama", t, &[_][]const u8{"url"}, diag);
         cfg.ollama = .{ .url = try baseAddress(a, src, "ollama.url", try reqStr(src, "ollama", t, "url", diag), diag) };
@@ -1844,4 +1855,21 @@ test "domain lists and safe search are read and checked" {
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[filters]\ndemote_percent = 100\n", &d));
     try testing.expectError(error.WrongType, loadFromSlice(testing.allocator, "t.toml", base ++ "[safe_search]\nban = \"x.example\"\n", &d));
     try testing.expectError(error.UnknownKey, loadFromSlice(testing.allocator, "t.toml", base ++ "[safe_search]\nlevel = \"strict\"\n", &d));
+}
+
+test "a source that crawls Tor needs a ban list, or a written-down choice not to have one" {
+    var d: Diagnostic = .{};
+    const base = "[storage]\ndata_dir = \"/tmp/x\"\n";
+    const src = "[[source]]\nname = \"onions\"\nkind = \"crawl\"\nuser_agent = \"t/1.0\"\nseeds_file = \"s.txt\"\ntor_socks = \"127.0.0.1:9050\"\n";
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ src, &d));
+    try testing.expect(std.mem.indexOf(u8, d.message(), "no ban list") != null);
+    var with_list = try loadFromSlice(testing.allocator, "t.toml", base ++ "[filters]\nblocklist_files = [\"/l/ban.txt\"]\n" ++ src, &d);
+    with_list.deinit();
+    var opted_out = try loadFromSlice(testing.allocator, "t.toml", base ++ src ++ "allow_unbanned_onions = true\n", &d);
+    opted_out.deinit();
+    // A crawl that does not use Tor, or a disabled source, is not asked.
+    var plain = try loadFromSlice(testing.allocator, "t.toml", base ++ "[[source]]\nname = \"web\"\nkind = \"crawl\"\nuser_agent = \"t/1.0\"\nseeds_file = \"s.txt\"\n", &d);
+    plain.deinit();
+    var off = try loadFromSlice(testing.allocator, "t.toml", base ++ src ++ "enabled = false\n", &d);
+    off.deinit();
 }

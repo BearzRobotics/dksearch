@@ -76,7 +76,7 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions" };
 
 // ------------------------------------------------------------ validation
 
@@ -173,6 +173,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     _ = try needString(source, "ca_bundle", false, diag);
     _ = try needString(source, "validators_file", false, diag);
     try boolOption(source, "hidden_links", diag);
+    try boolOption(source, "allow_unbanned_onions", diag);
     inline for (.{ "tor_socks", "i2p_proxy" }) |k| if (try needString(source, k, false, diag)) |v| if (hidden.parseProxy(v) == null) {
         diag.set("", key(&kbuf, source, k), "must be the address of the proxy as IP:port, e.g. \"127.0.0.1:9050\"", .{});
         return error.InvalidValue;
