@@ -1216,6 +1216,10 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .node_name = cfg.node_name,
             .node_id = node_id_text,
             .data_dir = cfg.data_dir,
+            .lists = lists_ptr,
+            .unlock = if (unlock_state != null) &unlock_state.? else null,
+            .safe_enabled = cfg.safe_search.enabled,
+            .safe_unlock_hours = cfg.safe_search.unlock_hours,
             .collections = cfg.collections,
             .anonymous_collections = cfg.access.anonymous_collections,
             .index_path = paths.index,
@@ -1763,6 +1767,20 @@ fn buildDomainLists(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, announ
         };
         dk.domainlist.loadFilesFrom(io, la, l.set, l.files, if (l.relative) base else null, &failed) catch |e| {
             err(io, "cannot read the domain list {s}: {t}", .{ failed, e });
+            return null;
+        };
+    }
+    // The lists edited in the administration interface (data_dir/lists/), when they exist.
+    const managed = [_]struct { name: []const u8, set: *dk.domainlist.Set, on: bool }{
+        .{ .name = "ban.txt", .set = &lists.blocked, .on = true },
+        .{ .name = "safesearch.txt", .set = &lists.safe, .on = cfg.safe_search.enabled },
+        .{ .name = "demote.txt", .set = &lists.demoted, .on = true },
+    };
+    for (managed) |m| {
+        if (!m.on) continue;
+        const path = std.fmt.allocPrint(la, "{s}/lists/{s}", .{ cfg.data_dir, m.name }) catch return null;
+        dk.domainlist.loadIfPresent(io, la, m.set, path, &failed) catch |e| {
+            err(io, "cannot read the domain list {s}: {t}", .{ path, e });
             return null;
         };
     }

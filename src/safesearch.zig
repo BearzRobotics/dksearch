@@ -106,6 +106,33 @@ pub const Unlock = struct {
         return false;
     }
 
+    /// Sets a new PIN: stored (as a hash) in the PIN file of `dir`, used from now on, and every browser unlocked with
+    /// the old one is locked again.
+    pub fn setPin(self: *Unlock, dir: Io.Dir, pin: []const u8) secrets.Error!void {
+        var fresh: secrets.Secrets = .{};
+        defer fresh.deinit(self.gpa);
+        try fresh.setPassword(self.gpa, self.io, pin);
+        try secrets.save(self.io, dir, pin_file_name, fresh);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const old = self.pin.password_hash;
+        self.pin.password_hash = fresh.password_hash;
+        fresh.password_hash = null;
+        if (old) |o| self.gpa.free(o);
+        self.sessions = @splat(null);
+        self.failures = 0;
+    }
+
+    /// Removes the PIN: nothing can be unlocked any more.
+    pub fn removePin(self: *Unlock, dir: Io.Dir) void {
+        dir.deleteFile(self.io, pin_file_name) catch {};
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.pin.password_hash) |o| self.gpa.free(o);
+        self.pin.password_hash = null;
+        self.sessions = @splat(null);
+    }
+
     /// Ends the unlock that `cookie` carries.
     pub fn lock(self: *Unlock, cookie: ?[]const u8) void {
         const token = tokenIn(cookie) orelse return;
@@ -171,4 +198,29 @@ test "with no PIN set nothing can be unlocked" {
     defer u.deinit();
     try testing.expect(!u.hasPin());
     try testing.expect(u.tryUnlock("1234") == .not_set);
+}
+
+test "the PIN can be changed and removed while running; unlocks made with the old one end" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var u = try testUnlock(&tmp, "4321");
+    defer u.deinit();
+    const first = u.tryUnlock("4321");
+    var cb: [100]u8 = undefined;
+    const cookie = try std.fmt.bufPrint(&cb, "{s}={s}", .{ cookie_name, &first.ok });
+    try testing.expect(u.unlocked(cookie));
+    try u.setPin(tmp.dir, "9999");
+    try testing.expect(!u.unlocked(cookie)); // locked again
+    try testing.expect(u.tryUnlock("4321") == .wrong);
+    try testing.expect(u.tryUnlock("9999") == .ok);
+    // The file holds the new hash: a fresh Unlock reads it.
+    var again = try Unlock.init(testing.allocator, testing.io, tmp.dir, 8);
+    defer again.deinit();
+    try testing.expect(again.tryUnlock("9999") == .ok);
+    u.removePin(tmp.dir);
+    try testing.expect(!u.hasPin());
+    try testing.expect(u.tryUnlock("9999") == .not_set);
+    var gone = try Unlock.init(testing.allocator, testing.io, tmp.dir, 8);
+    defer gone.deinit();
+    try testing.expect(!gone.hasPin());
 }

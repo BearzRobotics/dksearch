@@ -70,6 +70,11 @@ pub const Options = struct {
     /// The data directory (where `api-keys.toml` lives), and the collections and anonymous access setting, for the
     /// Access page.
     data_dir: []const u8 = "",
+    /// The domain lists in use and the safe-search PIN (live), for the Safe search page.
+    lists: ?*const dk.domainlist.Lists = null,
+    unlock: ?*dk.safesearch.Unlock = null,
+    safe_enabled: bool = false,
+    safe_unlock_hours: u32 = 8,
     collections: []const dk.config.Collection = &.{},
     anonymous_collections: ?[]const []const u8 = null,
     /// The peers this node can ask, and its own name, for the Access page.
@@ -146,7 +151,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/actions/collection-edit", "/docs", "/zim", "/actions/zim", "/actions/zim-folder", "/models", "/actions/model-pull", "/actions/model-remove", "/actions/model-use", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/actions/collection-edit", "/docs", "/safesearch", "/actions/safesearch", "/actions/safesearch-pin", "/actions/safesearch-lists", "/zim", "/actions/zim", "/actions/zim-folder", "/models", "/actions/model-pull", "/actions/model-remove", "/actions/model-use", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -154,7 +159,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -182,6 +187,10 @@ pub const App = struct {
             .{ "/actions/key-remove", .action_key_remove },
             .{ "/zim", .zim_page },
             .{ "/docs", .docs_page },
+            .{ "/safesearch", .safesearch_page },
+            .{ "/actions/safesearch", .action_safe_toggle },
+            .{ "/actions/safesearch-pin", .action_safe_pin },
+            .{ "/actions/safesearch-lists", .action_safe_lists },
             .{ "/actions/zim", .action_zim },
             .{ "/actions/zim-folder", .action_zim_folder },
             .{ "/api/v1/admin/maintenance", .api_maintenance },
@@ -234,7 +243,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -260,6 +269,10 @@ pub const App = struct {
             .maintenance => self.pageMaintenance(arena, csrf),
             .action_maintenance => self.startOperation(arena, req, auth, false),
             .docs_page => self.pageDocs(arena, csrf, t.params),
+            .safesearch_page => self.pageSafe(arena, csrf, null, false),
+            .action_safe_toggle => self.safeToggle(arena, req, auth),
+            .action_safe_pin => self.safePin(arena, req, auth),
+            .action_safe_lists => self.safeLists(arena, req, auth),
             .zim_page => self.pageZim(arena, csrf, t.params),
             .models_page => self.pageModels(arena, csrf, null, t.params.get("remove")),
             .action_model_pull => self.modelAction(arena, req, auth, .pull),
@@ -1205,6 +1218,7 @@ pub const App = struct {
             for (keys) |k| {
                 try w.print("<tr><td><code>{s}</code></td><td>", .{k.id});
                 try html.writeEscaped(w, k.name);
+                if (k.adult) try w.writeAll(" <span class=\"badge warn\" title=\"Not subject to safe search\">adult</span>");
                 try w.writeAll("</td><td>");
                 for (k.collections, 0..) |c, i| {
                     if (i > 0) try w.writeAll(", ");
@@ -1236,7 +1250,7 @@ pub const App = struct {
                 try html.writeEscaped(w, c.name);
                 try w.writeAll("</label>");
             }
-            try w.writeAll("</fieldset><label>Requests per minute <input name=\"rate\" type=\"number\" min=\"0\" max=\"1000000\" value=\"0\"><small>0 is no limit. Over it, the key gets 429 until the minute ends.</small></label><p><button type=\"submit\" class=\"btn\">Make the key</button></p></form>");
+            try w.writeAll("</fieldset><label>Requests per minute <input name=\"rate\" type=\"number\" min=\"0\" max=\"1000000\" value=\"0\"><small>0 is no limit. Over it, the key gets 429 until the minute ends.</small></label><label class=\"check\"><input type=\"checkbox\" name=\"adult\" value=\"1\"> Adult: not subject to safe search<small>The key sees what safe search hides from visitors (the ban still applies).</small></label><p><button type=\"submit\" class=\"btn\">Make the key</button></p></form>");
         } else {
             try w.writeAll("<p class=\"muted\">Making and removing keys here needs <code>admin.actions = true</code> and a signed-in session; <code>dksearch api-key</code> works regardless.</p>");
         }
@@ -1538,7 +1552,8 @@ pub const App = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => .{ .status = .internal_server_error, .code = "key_failed", .message = "the key could not be made" },
         });
-        dk.access.save(arena, self.io, Io.Dir.cwd(), path, updated) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "write_failed", .message = "the key file could not be written" });
+        const to_save = if (if (params.get("adult")) |v| std.mem.eql(u8, v, "1") else false) try dk.access.withAdult(arena, updated, name) else updated;
+        dk.access.save(arena, self.io, Io.Dir.cwd(), path, to_save) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "write_failed", .message = "the key file could not be written" });
         const csrf: ?[]const u8 = switch (auth) {
             .session => |s| try arena.dupe(u8, &s.csrf),
             else => null,
@@ -1571,6 +1586,178 @@ pub const App = struct {
         if (host_end >= rest.len or rest[host_end] != '/') return false;
         const host = rest[0..host_end];
         return std.mem.eql(u8, host, "kiwix.org") or std.mem.endsWith(u8, host, ".kiwix.org");
+    }
+
+    // ----------------------------------------------------------------- safe search
+
+    fn pageSafe(self: *App, arena: Allocator, csrf: ?[]const u8, notice: ?[]const u8, is_error: bool) error{OutOfMemory}!Response {
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "Safe search", csrf, "safesearch") catch return error.OutOfMemory;
+        self.writeSafe(arena, w, csrf, notice, is_error) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
+    }
+
+    fn listPath(self: *App, arena: Allocator, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(arena, "{s}/lists/{s}", .{ self.opts.data_dir, name });
+    }
+
+    fn writeSafe(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, notice: ?[]const u8, is_error: bool) !void {
+        try w.writeAll("<p class=\"muted\">Keep unwanted sites out of the results. The <strong>ban</strong> hides domains from everyone. <strong>Safe search</strong> hides more domains from visitors until they unlock it with a PIN, so adults can see everything and children cannot. Domains are matched with everything under them (<code>example.com</code> covers <code>www.example.com</code>).</p>");
+        if (notice) |n| {
+            try w.print("<p class=\"notice {s}\" role=\"status\">", .{if (is_error) "err" else "ok"});
+            try html.writeEscaped(w, n);
+            try w.writeAll("</p>");
+        }
+        const lists = self.opts.lists;
+        const pin_set = if (self.opts.unlock) |u| u.hasPin() else false;
+        try w.writeAll("<div class=\"statgrid\">");
+        try w.print("<div class=\"stat\"><span class=\"stat-n\">{s}</span><span class=\"stat-l\">safe search for visitors</span></div>", .{if (self.opts.safe_enabled) "On" else "Off"});
+        try w.print("<div class=\"stat\"><span class=\"stat-n\">{d}</span><span class=\"stat-l\">banned for everyone</span></div>", .{if (lists) |l| l.blocked.count() else 0});
+        try w.print("<div class=\"stat\"><span class=\"stat-n\">{d}</span><span class=\"stat-l\">hidden by safe search</span></div>", .{if (lists) |l| l.safe.count() else 0});
+        try w.print("<div class=\"stat\"><span class=\"stat-n\">{d}</span><span class=\"stat-l\">demoted</span></div>", .{if (lists) |l| l.demoted.count() else 0});
+        try w.print("<div class=\"stat\"><span class=\"stat-n\">{s}</span><span class=\"stat-l\">unlock PIN</span></div>", .{if (pin_set) "Set" else "Not set"});
+        try w.writeAll("</div>");
+        const token = csrf orelse {
+            try w.writeAll("<p class=\"muted\">Sign in with the password to change these settings.</p>");
+            return;
+        };
+        const can_edit = self.opts.jobs != null;
+        if (!can_edit) try w.writeAll("<p class=\"notice\">Changes from here need <code>admin.actions = true</code> in the configuration.</p>");
+
+        // Switch and unlock time.
+        try w.writeAll("<section class=\"card\"><h2>Safe search for visitors</h2><p class=\"muted\">When it is on, visitors do not see the domains of the safe-search list. An API key made with <code>--adult</code> (see Access) or a browser unlocked with the PIN below sees everything except the ban. Applies after a restart.</p><form class=\"stack\" action=\"/actions/safesearch\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        try html.writeEscaped(w, token);
+        try w.print("\"><label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{s}> Safe search is on for visitors</label><label>Unlock lasts (hours)<input type=\"number\" name=\"hours\" min=\"1\" max=\"720\" value=\"{d}\"></label><div><button type=\"submit\" class=\"btn\"{s}>Save</button></div></form></section>", .{ if (self.opts.safe_enabled) " checked" else "", self.opts.safe_unlock_hours, if (can_edit) "" else " disabled" });
+
+        // The PIN.
+        try w.writeAll("<section class=\"card\"><h2>Unlock PIN</h2><p class=\"muted\">A visitor who enters this PIN at <code>/unlock</code> sees everything in that browser for a while. It is stored only as a hash. Changing it locks every browser again.</p><form class=\"stack\" action=\"/actions/safesearch-pin\" method=\"post\" autocomplete=\"off\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        try html.writeEscaped(w, token);
+        try w.print("\"><label>New PIN<input type=\"password\" name=\"pin\" minlength=\"{d}\" maxlength=\"64\" required></label><label>Again<input type=\"password\" name=\"pin2\" minlength=\"{d}\" maxlength=\"64\" required></label><div><button type=\"submit\" class=\"btn\"{s}>{s}</button></div></form>", .{ dk.safesearch.min_pin_len, dk.safesearch.min_pin_len, if (can_edit) "" else " disabled", if (pin_set) "Change PIN" else "Set PIN" });
+        if (pin_set) {
+            try w.writeAll("<form class=\"inline\" action=\"/actions/safesearch-pin\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+            try html.writeEscaped(w, token);
+            try w.print("\"><input type=\"hidden\" name=\"remove\" value=\"1\"><button type=\"submit\" class=\"btn secondary\"{s}>Remove the PIN</button></form>", .{if (can_edit) "" else " disabled"});
+        }
+        try w.writeAll("</section>");
+
+        // The lists.
+        try w.writeAll("<section class=\"card\"><h2>Domain lists</h2><p class=\"muted\">One domain per line, or the MD5 hash of a domain (32 hex digits); <code>#</code> starts a comment. Hosts-file and ad-blocker lines work too. Lists named in the configuration file (<code>ban = \"ban.toml\"</code>, <code>blocklist_files</code>, <code>[safe_search] list</code>) are not shown here; these three are kept in <code>data_dir/lists/</code>. Applies after a restart.</p><form class=\"stack\" action=\"/actions/safesearch-lists\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        try html.writeEscaped(w, token);
+        try w.writeAll("\">");
+        const kinds = [_]struct { field: []const u8, file: []const u8, title: []const u8, help: []const u8 }{
+            .{ .field = "ban", .file = "ban.txt", .title = "Ban: hidden from everyone", .help = "Never shown, whatever the settings. A crawl never contacts these domains either." },
+            .{ .field = "safe", .file = "safesearch.txt", .title = "Hidden while safe search is on", .help = "Shown only to adults (an API key marked adult, or a browser unlocked with the PIN)." },
+            .{ .field = "demote", .file = "demote.txt", .title = "Demoted: ranked lower", .help = "Still found, but their results rank below the others." },
+        };
+        for (kinds) |k| {
+            const path = try self.listPath(arena, k.file);
+            const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(512 * 1024)) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.FileNotFound => "",
+                else => null,
+            };
+            try w.print("<label>{s}", .{k.title});
+            if (text) |t| {
+                try w.print("<textarea name=\"{s}\" rows=\"7\" spellcheck=\"false\" placeholder=\"example.com\">", .{k.field});
+                try html.writeEscaped(w, t);
+                try w.writeAll("</textarea>");
+            } else try w.writeAll("<span class=\"muted small\">This list is too large to edit here (edit the file).</span>");
+            try w.print("<small>{s}</small></label>", .{k.help});
+        }
+        try w.print("<div><button type=\"submit\" class=\"btn\"{s}>Save lists</button></div></form></section>", .{if (can_edit) "" else " disabled"});
+    }
+
+    fn safeToggle(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const csrf = try csrfCopy(arena, auth);
+        const path = self.opts.config_path orelse return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "the server was started without --config, so there is no configuration file to edit" });
+        if (!self.canEditConfig()) return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "editing the configuration is not available here" });
+        const on = if (params.get("enabled")) |v| std.mem.eql(u8, v, "1") else false;
+        const hours = std.fmt.parseInt(i64, params.get("hours") orelse "8", 10) catch return self.pageSafe(arena, csrf, "The unlock time must be a number of hours (1 to 720).", true);
+        if (hours < 1 or hours > 720) return self.pageSafe(arena, csrf, "The unlock time must be a number of hours (1 to 720).", true);
+        self.edit_mutex.lockUncancelable(self.io);
+        defer self.edit_mutex.unlock(self.io);
+        const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_unreadable", .message = "cannot read the configuration file" }),
+        };
+        var problem: dk.sourceedit.Problem = .{};
+        const out = dk.sourceedit.applySettings(arena, text, &.{
+            .{ .table = "safe_search", .key = "enabled", .value = .{ .boolean = on } },
+            .{ .table = "safe_search", .key = "unlock_hours", .value = .{ .integer = hours } },
+        }, &problem) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => return self.pageSafe(arena, csrf, try arena.dupe(u8, problem.message()), true),
+        };
+        dk.sourceedit.writeFile(self.io, arena, path, out) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Io => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_not_writable", .message = "the configuration file could not be written; nothing was changed" }),
+        };
+        return self.pageSafe(arena, csrf, "Saved. Restart dksearch for it to take effect.", false);
+    }
+
+    fn safePin(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const csrf = try csrfCopy(arena, auth);
+        var dir = Io.Dir.cwd().openDir(self.io, self.opts.data_dir, .{}) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "data_dir_unavailable", .message = "the data directory cannot be opened" });
+        defer dir.close(self.io);
+        if (params.get("remove")) |r| if (std.mem.eql(u8, r, "1")) {
+            if (self.opts.unlock) |u| u.removePin(dir) else dir.deleteFile(self.io, dk.safesearch.pin_file_name) catch {};
+            return self.pageSafe(arena, csrf, "The PIN is removed: safe search can no longer be unlocked from a page.", false);
+        };
+        const pin = params.get("pin") orelse "";
+        if (!std.mem.eql(u8, pin, params.get("pin2") orelse "")) return self.pageSafe(arena, csrf, "The two PINs are not the same.", true);
+        if (pin.len < dk.safesearch.min_pin_len or pin.len > 64 or !std.unicode.utf8ValidateSlice(pin)) return self.pageSafe(arena, csrf, try std.fmt.allocPrint(arena, "The PIN must be {d} to 64 characters.", .{dk.safesearch.min_pin_len}), true);
+        if (self.opts.unlock) |u| {
+            u.setPin(dir, pin) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "pin_failed", .message = "the PIN could not be saved" });
+            return self.pageSafe(arena, csrf, "The PIN is saved and works at once; every browser unlocked before is locked again.", false);
+        }
+        // Safe search is not running (it is off in the configuration): keep the PIN for when it is turned on.
+        var fresh: dk.secrets.Secrets = .{};
+        defer fresh.deinit(self.gpa);
+        fresh.setPassword(self.gpa, self.io, pin) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "pin_failed", .message = "the PIN could not be saved" });
+        dk.secrets.save(self.io, dir, dk.safesearch.pin_file_name, fresh) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "pin_failed", .message = "the PIN could not be saved" });
+        return self.pageSafe(arena, csrf, "The PIN is saved; it applies once safe search is on and the server is restarted.", false);
+    }
+
+    fn safeLists(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const csrf = try csrfCopy(arena, auth);
+        const kinds = [_]struct { field: []const u8, file: []const u8, title: []const u8 }{
+            .{ .field = "ban", .file = "ban.txt", .title = "The ban list" },
+            .{ .field = "safe", .file = "safesearch.txt", .title = "The safe-search list" },
+            .{ .field = "demote", .file = "demote.txt", .title = "The demotion list" },
+        };
+        // Check everything first: nothing is written unless every list is usable.
+        for (kinds) |k| {
+            const text = params.get(k.field) orelse continue;
+            if (text.len > 512 * 1024) return self.pageSafe(arena, csrf, try std.fmt.allocPrint(arena, "{s} is too long to save here (at most 512 KiB; use a file named in the configuration).", .{k.title}), true);
+            if (dk.domainlist.firstBadLine(text)) |line| return self.pageSafe(arena, csrf, try std.fmt.allocPrint(arena, "{s}, line {d}: that is not a domain or a hash of one. Nothing was saved.", .{ k.title, line }), true);
+        }
+        Io.Dir.cwd().createDirPath(self.io, try std.fmt.allocPrint(arena, "{s}/lists", .{self.opts.data_dir})) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "lists_unwritable", .message = "the lists folder could not be made" });
+        for (kinds) |k| {
+            const text = params.get(k.field) orelse continue;
+            const path = try self.listPath(arena, k.file);
+            const tmp = try std.fmt.allocPrint(arena, "{s}.new", .{path});
+            {
+                const f = Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true }) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "lists_unwritable", .message = "a list could not be written" });
+                defer f.close(self.io);
+                f.writePositionalAll(self.io, text, 0) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "lists_unwritable", .message = "a list could not be written" });
+            }
+            Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, self.io) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "lists_unwritable", .message = "a list could not be written" });
+        }
+        return self.pageSafe(arena, csrf, "Saved. Restart dksearch for the lists to take effect.", false);
     }
 
     fn pageDocs(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
@@ -2009,34 +2196,65 @@ fn renderLogin(arena: Allocator, status: http.Status, notice: ?[]const u8) error
     return handler.htmlResponse(arena, status, aw.written());
 }
 
-/// The pages of the interface, in navigation order: key, path, label.
-const nav_items = [_]struct { []const u8, []const u8, []const u8 }{
-    .{ "dashboard", "/", "Dashboard" },
-    .{ "sources", "/sources", "Sources" },
-    .{ "jobs", "/jobs", "Jobs" },
-    .{ "settings", "/settings", "Settings" },
-    .{ "maintenance", "/maintenance", "Maintenance" },
-    .{ "zim", "/zim", "ZIM files" },
-    .{ "models", "/models", "AI models" },
-    .{ "access", "/access", "Access" },
-    .{ "docs", "/docs", "Docs" },
-    .{ "search", "/search", "Search test" },
+/// The pages of the interface, in navigation order: key, path, label, group, icon.
+const nav_items = [_]struct { []const u8, []const u8, []const u8, []const u8, []const u8 }{
+    .{ "dashboard", "/", "Dashboard", "Overview", "grid" },
+    .{ "jobs", "/jobs", "Jobs", "Overview", "activity" },
+    .{ "sources", "/sources", "Sources", "Library", "database" },
+    .{ "zim", "/zim", "ZIM files", "Library", "book" },
+    .{ "settings", "/settings", "Settings", "Search", "sliders" },
+    .{ "safesearch", "/safesearch", "Safe search", "Search", "shield" },
+    .{ "access", "/access", "Access", "Search", "key" },
+    .{ "search", "/search", "Search test", "Search", "search" },
+    .{ "maintenance", "/maintenance", "Maintenance", "System", "tool" },
+    .{ "models", "/models", "AI models", "System", "cpu" },
+    .{ "docs", "/docs", "Docs", "System", "file" },
 };
+
+/// The strokes of a 24 by 24 outline icon (Feather-style), drawn in the text colour.
+fn iconPaths(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "grid")) return "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\"/>";
+    if (std.mem.eql(u8, name, "activity")) return "<polyline points=\"22 12 18 12 15 21 9 3 6 12 2 12\"/>";
+    if (std.mem.eql(u8, name, "database")) return "<ellipse cx=\"12\" cy=\"5\" rx=\"9\" ry=\"3\"/><path d=\"M21 12c0 1.66-4 3-9 3s-9-1.34-9-3\"/><path d=\"M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5\"/>";
+    if (std.mem.eql(u8, name, "book")) return "<path d=\"M4 19.5A2.5 2.5 0 0 1 6.5 17H20\"/><path d=\"M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z\"/>";
+    if (std.mem.eql(u8, name, "sliders")) return "<line x1=\"4\" y1=\"21\" x2=\"4\" y2=\"14\"/><line x1=\"4\" y1=\"10\" x2=\"4\" y2=\"3\"/><line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"12\"/><line x1=\"12\" y1=\"8\" x2=\"12\" y2=\"3\"/><line x1=\"20\" y1=\"21\" x2=\"20\" y2=\"16\"/><line x1=\"20\" y1=\"12\" x2=\"20\" y2=\"3\"/><line x1=\"1\" y1=\"14\" x2=\"7\" y2=\"14\"/><line x1=\"9\" y1=\"8\" x2=\"15\" y2=\"8\"/><line x1=\"17\" y1=\"16\" x2=\"23\" y2=\"16\"/>";
+    if (std.mem.eql(u8, name, "shield")) return "<path d=\"M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z\"/>";
+    if (std.mem.eql(u8, name, "key")) return "<path d=\"M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.78 7.78 5.5 5.5 0 0 1 7.78-7.78zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4\"/>";
+    if (std.mem.eql(u8, name, "search")) return "<circle cx=\"11\" cy=\"11\" r=\"8\"/><line x1=\"21\" y1=\"21\" x2=\"16.65\" y2=\"16.65\"/>";
+    if (std.mem.eql(u8, name, "tool")) return "<path d=\"M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94z\"/>";
+    if (std.mem.eql(u8, name, "cpu")) return "<rect x=\"4\" y=\"4\" width=\"16\" height=\"16\" rx=\"2\"/><rect x=\"9\" y=\"9\" width=\"6\" height=\"6\"/><line x1=\"9\" y1=\"1\" x2=\"9\" y2=\"4\"/><line x1=\"15\" y1=\"1\" x2=\"15\" y2=\"4\"/><line x1=\"9\" y1=\"20\" x2=\"9\" y2=\"23\"/><line x1=\"15\" y1=\"20\" x2=\"15\" y2=\"23\"/><line x1=\"20\" y1=\"9\" x2=\"23\" y2=\"9\"/><line x1=\"20\" y1=\"14\" x2=\"23\" y2=\"14\"/><line x1=\"1\" y1=\"9\" x2=\"4\" y2=\"9\"/><line x1=\"1\" y1=\"14\" x2=\"4\" y2=\"14\"/>";
+    if (std.mem.eql(u8, name, "file")) return "<path d=\"M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z\"/><polyline points=\"14 2 14 8 20 8\"/><line x1=\"16\" y1=\"13\" x2=\"8\" y2=\"13\"/><line x1=\"16\" y1=\"17\" x2=\"8\" y2=\"17\"/>";
+    return "";
+}
+
+fn writeIcon(w: *Io.Writer, name: []const u8) Io.Writer.Error!void {
+    try w.writeAll("<svg width=\"17\" height=\"17\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">");
+    try w.writeAll(iconPaths(name));
+    try w.writeAll("</svg>");
+}
 
 fn writePage(w: *Io.Writer, title: []const u8, csrf: ?[]const u8, current: []const u8) Io.Writer.Error!void {
     var tbuf: [96]u8 = undefined;
     try html.writeHead(w, std.fmt.bufPrint(&tbuf, "{s} - dksearch administration", .{title}) catch title);
-    try w.writeAll("<body class=\"admin\"><header class=\"adminbar\"><div class=\"adminbar-inner\"><a class=\"logo\" href=\"/\">dksearch <small>administration</small></a><nav aria-label=\"Sections\">");
+    try w.writeAll("<body class=\"admin\"><header class=\"adminnav\"><a class=\"logo\" href=\"/\"><svg width=\"26\" height=\"26\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" aria-hidden=\"true\"><circle cx=\"11\" cy=\"11\" r=\"7\"/><line x1=\"21\" y1=\"21\" x2=\"16.5\" y2=\"16.5\"/></svg><span>dksearch<small>administration</small></span></a>");
+    try w.writeAll("<input type=\"checkbox\" id=\"navtoggle\" class=\"navtoggle\" aria-label=\"Menu\"><label for=\"navtoggle\" class=\"navburger\">Menu</label><nav aria-label=\"Sections\">");
+    var group: []const u8 = "";
     for (nav_items) |n| {
-        try w.print("<a href=\"{s}\"{s}>{s}</a>", .{ n[1], if (std.mem.eql(u8, n[0], current)) " aria-current=\"page\"" else "", n[2] });
+        if (!std.mem.eql(u8, n[3], group)) {
+            group = n[3];
+            try w.print("<span class=\"navgroup\">{s}</span>", .{group});
+        }
+        try w.print("<a href=\"{s}\"{s}>", .{ n[1], if (std.mem.eql(u8, n[0], current)) " aria-current=\"page\"" else "" });
+        try writeIcon(w, n[4]);
+        try w.print("{s}</a>", .{n[2]});
     }
-    try w.writeAll("</nav><span class=\"grow\"></span>");
+    try w.writeAll("</nav>");
     if (csrf) |token| {
-        try w.writeAll("<form action=\"/logout\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        try w.writeAll("<form class=\"signout\" action=\"/logout\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
         try html.writeEscaped(w, token);
         try w.writeAll("\"><button type=\"submit\" class=\"btn secondary\">Sign out</button></form>");
     }
-    try w.print("</div></header><main><script src=\"/assets/admin.js?v={s}\" defer></script><h1>{s}</h1>\n", .{ admin_js_version, title });
+    try w.print("</header><main><script src=\"/assets/admin.js?v={s}\" defer></script><h1>{s}</h1>\n", .{ admin_js_version, title });
 }
 
 fn writeSearchTest(app: *App, arena: Allocator, w: *Io.Writer, searcher: dk.search.Searcher, q: dk.search.Query, rx: handler.RegexParams) !void {
@@ -2317,7 +2535,7 @@ fn writeDashboard(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot
     }
     try w.print("</section>\n<p class=\"muted\">dksearch {s}. {s}</p>\n", .{
         app.opts.version,
-        if (app.opts.jobs != null) "Imports can be started below; rebuild, check, backup and removal are command-line only." else "Read-only view: use the command line to import, rebuild, check or back up.",
+        if (app.opts.jobs != null) "Imports can be started below; check, backup and removal are under Maintenance, and rebuild is command-line only." else "Read-only view: use the command line to import, rebuild, check or back up.",
     });
 
     try writeImportsPanel(app, arena, w, csrf);
@@ -4079,6 +4297,71 @@ test "Refresh all sources: the dashboard offers it and it queues every enabled s
     const go = try f.call(a, .POST, "/actions/import", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&all=1", .{csrf}) });
     try testing.expectEqual(http.Status.see_other, go.status);
     try f.waitIdle();
+}
+
+test "Safe search page: status, the switch in the configuration, the PIN (live), the lists, and adult keys" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.toml", .data = "# mine\n" });
+    var pb: [160]u8 = undefined;
+    f.app.opts.config_path = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}/c.toml", .{tmp.sub_path});
+    var dd_buf: [160]u8 = undefined;
+    f.app.opts.data_dir = try std.fmt.bufPrint(&dd_buf, ".zig-cache/tmp/{s}", .{f.tmp.sub_path});
+    var unlock = try dk.safesearch.Unlock.init(testing.allocator, testing.io, f.tmp.dir, 8);
+    defer unlock.deinit();
+    f.app.opts.unlock = &unlock;
+    var lists: dk.domainlist.Lists = .{};
+    var ar0 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar0.deinit();
+    _ = try lists.safe.add(ar0.allocator(), "adult.example");
+    f.app.opts.lists = &lists;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const page = try f.call(a, .GET, "/safesearch", .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.ok, page.status);
+    for ([_][]const u8{ "Safe search for visitors", "Unlock PIN", "Domain lists", "hidden by safe search", "Not set" }) |want| try testing.expect(std.mem.indexOf(u8, page.body, want) != null);
+    const csrf = csrfOf(page.body);
+    const post = struct {
+        fn go(fx: *Fixture, ar: Allocator, ck: []const u8, token: []const u8, target: []const u8, rest: []const u8) !Response {
+            return fx.call(ar, .POST, target, .{ .cookie = ck, .body = try std.fmt.allocPrint(ar, "csrf={s}&{s}", .{ token, rest }) });
+        }
+    }.go;
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/safesearch-lists", .{ .cookie = cookie, .body = "csrf=wrong&ban=a.example" })).status);
+    // The switch edits the configuration (the rest of the file is kept) and asks for a restart.
+    const saved = try post(&f, a, cookie, csrf, "/actions/safesearch", "enabled=1&hours=12");
+    try testing.expect(std.mem.indexOf(u8, saved.body, "Restart dksearch") != null);
+    const file = try tmp.dir.readFileAlloc(testing.io, "c.toml", a, .limited(4096));
+    try testing.expect(std.mem.indexOf(u8, file, "# mine") != null and std.mem.indexOf(u8, file, "enabled = true") != null and std.mem.indexOf(u8, file, "unlock_hours = 12") != null);
+    try testing.expect(std.mem.indexOf(u8, (try post(&f, a, cookie, csrf, "/actions/safesearch", "enabled=1&hours=0")).body, "1 to 720") != null);
+    // The PIN: mismatches and short ones are refused; a good one works at once; removing it ends unlocking.
+    try testing.expect(std.mem.indexOf(u8, (try post(&f, a, cookie, csrf, "/actions/safesearch-pin", "pin=4321&pin2=1234")).body, "not the same") != null);
+    try testing.expect(std.mem.indexOf(u8, (try post(&f, a, cookie, csrf, "/actions/safesearch-pin", "pin=12&pin2=12")).body, "characters") != null);
+    try testing.expect(!unlock.hasPin());
+    try testing.expect(std.mem.indexOf(u8, (try post(&f, a, cookie, csrf, "/actions/safesearch-pin", "pin=4321&pin2=4321")).body, "works at once") != null);
+    try testing.expect(unlock.hasPin() and unlock.tryUnlock("4321") == .ok);
+    try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/safesearch", .{ .cookie = cookie })).body, "Change PIN") != null);
+    _ = try post(&f, a, cookie, csrf, "/actions/safesearch-pin", "remove=1");
+    try testing.expect(!unlock.hasPin());
+    // The lists: a bad line stops everything; good ones are written and shown again.
+    const bad = try post(&f, a, cookie, csrf, "/actions/safesearch-lists", "ban=good.example%0Awhat+is+this&safe=other.example&demote=");
+    try testing.expect(std.mem.indexOf(u8, bad.body, "line 2") != null and std.mem.indexOf(u8, bad.body, "Nothing was saved") != null);
+    try testing.expectError(error.FileNotFound, f.tmp.dir.readFileAlloc(testing.io, "lists/ban.txt", a, .limited(100)));
+    const good = try post(&f, a, cookie, csrf, "/actions/safesearch-lists", "ban=%23+banned%0Abad.example%0A&safe=adult.example&demote=slop.example");
+    try testing.expect(std.mem.indexOf(u8, good.body, "Saved") != null);
+    const ban_text = try f.tmp.dir.readFileAlloc(testing.io, "lists/ban.txt", a, .limited(1000));
+    try testing.expect(std.mem.indexOf(u8, ban_text, "bad.example") != null);
+    try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/safesearch", .{ .cookie = cookie })).body, "slop.example") != null);
+    // An adult key is marked when it is made, and shown as such.
+    _ = try post(&f, a, cookie, csrf, "/actions/key-add", "name=grown-up&all=1&rate=0&adult=1");
+    const keys = try dk.access.load(a, testing.io, f.tmp.dir, dk.access.file_name);
+    try testing.expect(keys.len == 1 and keys[0].adult);
+    try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/access", .{ .cookie = cookie })).body, ">adult</span>") != null);
 }
 
 test "Models: Ollama is looked for, not started; choosing a model for embeddings or answers edits the configuration" {

@@ -207,6 +207,28 @@ pub fn loadFilesFrom(io: Io, arena: Allocator, set: *Set, paths: []const []const
     for (paths) |p| try loadOne(io, arena, set, p, base, 0, &visited, failed);
 }
 
+/// The first line (1-based) of a list text that is neither a comment, a blank, a hash nor a domain, or null.
+pub fn firstBadLine(text: []const u8) ?usize {
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        n += 1;
+        const t = std.mem.trim(u8, raw, " \t\r");
+        if (t.len == 0 or t[0] == '#') continue;
+        const d = entryOf(raw) orelse return n;
+        if (d.len == 32 and std.mem.indexOfNone(u8, d, "0123456789abcdefABCDEF") == null) continue;
+        if (normalize(d) == null) return n;
+    }
+    return null;
+}
+
+/// Loads `path` into `set` when the file exists (a list the administrator may not have made yet).
+pub fn loadIfPresent(io: Io, arena: Allocator, set: *Set, path: []const u8, failed: *[]const u8) error{ OutOfMemory, Unreadable }!void {
+    Io.Dir.cwd().access(io, path, .{}) catch return;
+    var visited: std.ArrayList([]const u8) = .empty;
+    try loadOne(io, arena, set, path, null, 0, &visited, failed);
+}
+
 const max_import_depth = 4;
 
 fn joinPath(arena: Allocator, base: ?[]const u8, p: []const u8) Allocator.Error![]const u8 {
@@ -399,4 +421,11 @@ test "the safe-search list hides only when safe search applies; the blocklist al
     try testing.expect(!l.hidesUrl("https://adult.example/x", false) and l.hidesUrl("https://adult.example/x", true));
     try testing.expect(l.hidesUrl("https://banned.example/x", false));
     try testing.expect(!l.hidesUrl(null, true));
+}
+
+test "list text is checked line by line" {
+    try testing.expect(firstBadLine("# comment\n\nplain.example\n0.0.0.0 hosts.example\n||ad.example^\n0123456789abcdef0123456789abcdef\n") == null);
+    try testing.expectEqual(@as(?usize, 3), firstBadLine("ok.example\n\nwhat is this\nlater.example\n"));
+    try testing.expectEqual(@as(?usize, 1), firstBadLine("nodots\n"));
+    try testing.expectEqual(@as(?usize, 2), firstBadLine("a.example\n<html>\n"));
 }
