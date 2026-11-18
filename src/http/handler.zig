@@ -48,7 +48,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_export, api_peers, api_health, style, document, zim, wopi, other };
+const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_export, api_peers, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -59,6 +59,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/api/v1/search")) return .api_search;
     if (std.mem.eql(u8, path, "/api/v1/retrieve")) return .api_retrieve;
     if (std.mem.eql(u8, path, "/api/v1/answer")) return .api_answer;
+    if (std.mem.eql(u8, path, "/api/v1/suggest")) return .api_suggest;
     if (std.mem.eql(u8, path, "/api/v1/export")) return .api_export;
     if (std.mem.eql(u8, path, "/api/v1/peers")) return .api_peers;
     if (std.mem.eql(u8, path, "/api/v1/health")) return .api_health;
@@ -396,6 +397,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         .api_search => try apiSearch(arena, searcher, regex, services, try sourceChoices(arena, services), try sourceBoosts(arena, services), t.params),
         .api_retrieve => try apiRetrieve(arena, searcher, services, t.params),
         .api_answer => try apiAnswer(arena, searcher, services, t.params),
+        .api_suggest => try apiSuggest(arena, searcher, t.params),
         .api_export => try apiExport(arena, searcher, services, t.params),
         .api_peers => try apiPeers(arena, services),
         .search_page => try pageSearch(arena, searcher, regex, services, try sourceChoicesFor(arena, services, searcher), try sourceBoosts(arena, services), t.params),
@@ -854,6 +856,61 @@ fn apiAnswer(arena: Allocator, searcher: dk.search.Searcher, services: Services,
 
 /// `GET /api/v1/peers`: the peers this node is willing to introduce (`introduce = true`), by name and address only.
 /// For a caller with a key; they are suggestions the caller's operator may accept, nothing is added by asking.
+/// Words that can only be in a plain query word: letters and digits (no operators, quotes or wildcards).
+fn plainWord(w: []const u8) bool {
+    if (w.len == 0 or w.len > 40) return false;
+    for (w) |b| if (b < 0x80 and !std.ascii.isAlphanumeric(b)) return false;
+    return true;
+}
+
+/// `GET /api/v1/suggest?q=...`: the query with its last word completed, most common completions first (at most 8).
+fn apiSuggest(arena: Allocator, searcher: dk.search.Searcher, params: query.Params) error{OutOfMemory}!Response {
+    const q = std.mem.trim(u8, params.get("q") orelse "", " \t");
+    var out: std.ArrayList([]const u8) = .empty;
+    if (q.len > 0 and q.len <= 200 and q[q.len - 1] != ' ') {
+        const cut = if (std.mem.lastIndexOfScalar(u8, q, ' ')) |i| i + 1 else 0;
+        const last = q[cut..];
+        if (plainWord(last)) {
+            const lower = try std.ascii.allocLowerString(arena, last);
+            const found = searcher.words(arena, lower, .prefix, 8) catch &.{};
+            for (found) |w| try out.append(arena, try std.fmt.allocPrint(arena, "{s}{s}", .{ q[0..cut], w }));
+        }
+    }
+    var resp = try jsonResponse(arena, .ok, .{ .query = q, .suggestions = out.items });
+    resp.headers = headersWith(arena, &.{no_store});
+    return resp;
+}
+
+/// A spelling of the query that finds something, when the query as typed found nothing: each plain word is replaced by
+/// its closest word of the index. Null when no word has a neighbour or the corrected query finds nothing either.
+fn didYouMean(arena: Allocator, searcher: dk.search.Searcher, q: dk.search.Query) error{OutOfMemory}!?[]const u8 {
+    if (q.text.len == 0 or q.text.len > 200) return null;
+    var fixed: std.ArrayList(u8) = .empty;
+    var changed = false;
+    var it = std.mem.tokenizeScalar(u8, q.text, ' ');
+    while (it.next()) |w| {
+        if (fixed.items.len > 0) try fixed.append(arena, ' ');
+        var use = w;
+        if (plainWord(w) and w.len >= 3) {
+            const lower = try std.ascii.allocLowerString(arena, w);
+            const near = searcher.words(arena, lower, .spelling, 1) catch &.{};
+            if (near.len > 0) {
+                use = near[0];
+                changed = true;
+            }
+        }
+        try fixed.appendSlice(arena, use);
+    }
+    if (!changed) return null;
+    var probe = q;
+    probe.text = fixed.items;
+    probe.limit = 1;
+    probe.offset = 0;
+    const page = searcher.search(arena, probe) catch return null;
+    if (page.hits.len == 0) return null;
+    return fixed.items;
+}
+
 fn apiPeers(arena: Allocator, services: Services) error{OutOfMemory}!Response {
     const Entry = struct { name: []const u8, url: []const u8 };
     var list: std.ArrayList(Entry) = .empty;
@@ -1746,6 +1803,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         }
     }
     try applyFallback(arena, services, params, &form, shown.hits.len, q.offset);
+    if (shown.hits.len == 0 and q.offset == 0) form.did_you_mean = try didYouMean(arena, searcher, q);
     var aw: std.Io.Writer.Allocating = .init(arena);
     html.writeResults(&aw.writer, form, shown, q.offset, html_page_size) catch return error.OutOfMemory;
     return htmlResponse(arena, .ok, aw.written());
@@ -2974,6 +3032,38 @@ test "the fallback: nothing without it, links when local results are few, web re
     const colls = [_]dk.config.Collection{.{ .name = "c", .sources = &.{"n"} }};
     const closed: Services = .{ .fallback = &settings, .collections = &colls, .anonymous = &.{} };
     try testing.expect(std.mem.indexOf(u8, handleServices(a, few.searcher(), closed, .GET, "/search?q=lamp").body, "Search elsewhere") == null);
+}
+
+test "suggestions complete the last word; an empty result offers a spelling that finds something" {
+    const Spell = struct {
+        var hit = [_]dk.search.Hit{.{ .id = @splat(7), .connector = "t", .url = "https://e.org/e", .title = "Elephants", .snippet = null, .score = 1 }};
+        fn search(_: *anyopaque, _: Allocator, q: dk.search.Query) dk.search.Error!dk.search.Page {
+            if (std.mem.eql(u8, q.text, "elephant")) return .{ .hits = &hit, .has_more = false };
+            return .{ .hits = &.{}, .has_more = false };
+        }
+        fn words(_: *anyopaque, arena: Allocator, w: []const u8, kind: dk.search.WordKind, _: u32) dk.search.Error![]const []const u8 {
+            const list = try arena.alloc([]const u8, 1);
+            list[0] = if (kind == .prefix) "elephant" else if (std.mem.eql(u8, w, "elefant")) "elephant" else "zzz";
+            return if (kind == .spelling and !std.mem.eql(u8, w, "elefant")) &.{} else list;
+        }
+    };
+    var dummy: u8 = 0;
+    const s: dk.search.Searcher = .{ .ptr = &dummy, .vtable = &.{ .search = Spell.search, .words = Spell.words } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const sug = handle(a, s, .GET, "/api/v1/suggest?q=big+ele");
+    try testing.expectEqual(http.Status.ok, sug.status);
+    try testing.expect(std.mem.indexOf(u8, sug.body, "\"big elephant\"") != null);
+    // Operators and an empty or finished (trailing space) query give nothing.
+    try testing.expect(std.mem.indexOf(u8, handle(a, s, .GET, "/api/v1/suggest?q=ele*").body, "\"suggestions\":[]") != null);
+    try testing.expect(std.mem.indexOf(u8, handle(a, s, .GET, "/api/v1/suggest?q=").body, "\"suggestions\":[]") != null);
+    const page = handle(a, s, .GET, "/search?q=elefant");
+    try testing.expect(std.mem.indexOf(u8, page.body, "Did you mean") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "q=elephant") != null);
+    // A query that found something, or whose correction finds nothing, offers nothing.
+    try testing.expect(std.mem.indexOf(u8, handle(a, s, .GET, "/search?q=elephant").body, "Did you mean") == null);
+    try testing.expect(std.mem.indexOf(u8, handle(a, s, .GET, "/search?q=qqqq").body, "Did you mean") == null);
 }
 
 test "answers: off by default, a question is needed, nothing is asked of the model without passages, and an unreachable model is said" {

@@ -246,11 +246,13 @@ test "the nearest vectors are found exactly enough: the right documents, in orde
     const dim = 48;
     const n = 300;
     const vecs = try a.alloc([]f32, n);
+    try sqlite.execSql(store.db, "BEGIN"); // one commit, not 300 (each is an fsync, slow on some disks)
     for (vecs, 0..) |*v, i| {
         v.* = try unit(a, i + 1, dim);
         try store.put(idOf(@intCast(i)), "m", v.*);
     }
     try store.put(idOf(9999), "other", vecs[0]); // another model's vector is not in this index
+    try sqlite.execSql(store.db, "COMMIT");
     store.close();
     var idx = (try Index.load(testing.allocator, path, "m", 1 << 30)).?;
     defer idx.deinit();

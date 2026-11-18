@@ -126,6 +126,8 @@ pub const Form = struct {
     /// The AI answer for this search (`answer=1`), its sources, or why there is none; and whether the box is offered.
     answer: ?AnswerBlock = null,
     answer_note: ?[]const u8 = null,
+    /// A spelling of the query that does find something, offered when it found nothing.
+    did_you_mean: ?[]const u8 = null,
     answers_offered: bool = false,
     answer_checked: bool = false,
     /// Where to go to ask the providers (`web=1`) when that is not done by itself; null: not offered.
@@ -440,6 +442,13 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
         try w.writeAll("<p class=\"notice\">No results for &ldquo;");
         try writeEscaped(w, f.q);
         try w.writeAll("&rdquo;.</p>");
+        if (f.did_you_mean) |d| {
+            try w.writeAll("<p class=\"notice\">Did you mean <a href=\"/search?q=");
+            try query.writeEncoded(w, d);
+            try w.writeAll("\"><strong>");
+            try writeEscaped(w, d);
+            try w.writeAll("</strong></a>?</p>");
+        }
     } else {
         try w.writeAll("<ol class=\"results\" start=\"");
         try w.print("{d}", .{offset + 1});

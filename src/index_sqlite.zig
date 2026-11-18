@@ -374,7 +374,7 @@ pub const SqliteIndex = struct {
     }
 
     pub fn searcher(self: *SqliteIndex) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = searchImpl, .info = infoImpl, .search_chunks = searchChunksImpl, .source_stats = sourceStatsImpl, .export_page = exportPageImpl } };
+        return .{ .ptr = self, .vtable = &.{ .search = searchImpl, .info = infoImpl, .search_chunks = searchChunksImpl, .source_stats = sourceStatsImpl, .words = wordsImpl, .export_page = exportPageImpl } };
     }
 
     pub fn imageSearcher(self: *SqliteIndex) search.ImageSearcher {
@@ -694,6 +694,32 @@ pub const SqliteIndex = struct {
             });
         }
         return out.items;
+    }
+    pub fn wordsImpl(ptr: *anyopaque, arena: Allocator, word: []const u8, kind: search.WordKind, limit: u32) search.Error![]const []const u8 {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
+        if (word.len == 0 or word.len > 64 or limit == 0) return &.{};
+        switch (kind) {
+            .spelling => {
+                const edits = queryparse.autoEdits(word.len);
+                const got = try self.expandWord(arena, word, if (edits == 0) 1 else edits);
+                return got[0..@min(got.len, limit)];
+            },
+            .prefix => {
+                var upper = try arena.dupe(u8, word);
+                upper[upper.len - 1] +%= 1;
+                const st = Stmt.prepare(self.db, "SELECT term FROM fts_vocab WHERE term > ?1 AND term >= ?1 AND term < ?2 ORDER BY doc DESC, term LIMIT ?3") catch return &.{};
+                defer st.deinit();
+                st.text(1, word) catch |e| return searchError(e);
+                st.text(2, upper) catch |e| return searchError(e);
+                st.int(3, limit) catch |e| return searchError(e);
+                var out: std.ArrayList([]const u8) = .empty;
+                while (st.step() catch |e| return searchError(e)) {
+                    const t = st.colText(0) orelse continue;
+                    try out.append(arena, try arena.dupe(u8, t));
+                }
+                return out.items;
+            },
+        }
     }
     pub fn sourceStatsImpl(ptr: *anyopaque, arena: Allocator) search.Error![]const search.SourceStat {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
@@ -1347,7 +1373,7 @@ pub const SearchPool = struct {
     }
 
     pub fn searcher(self: *SearchPool) search.Searcher {
-        return .{ .ptr = self, .vtable = &.{ .search = poolSearch, .info = poolInfo, .search_chunks = poolSearchChunks, .source_stats = poolSourceStats, .export_page = poolExportPage } };
+        return .{ .ptr = self, .vtable = &.{ .search = poolSearch, .info = poolInfo, .search_chunks = poolSearchChunks, .source_stats = poolSourceStats, .words = poolWords, .export_page = poolExportPage } };
     }
 
     pub fn imageSearcher(self: *SearchPool) search.ImageSearcher {
@@ -1375,6 +1401,18 @@ pub const SearchPool = struct {
             if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
                 defer slot.busy.store(false, .release);
                 return SqliteIndex.exportPageImpl(&slot.index, arena, connector, after, limit);
+            }
+        }
+        unreachable;
+    }
+    fn poolWords(ptr: *anyopaque, arena: Allocator, word: []const u8, kind: search.WordKind, limit: u32) search.Error![]const []const u8 {
+        const self: *SearchPool = @ptrCast(@alignCast(ptr));
+        self.idle.waitUncancelable(self.io);
+        defer self.idle.post(self.io);
+        for (self.slots) |*slot| {
+            if (slot.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                defer slot.busy.store(false, .release);
+                return SqliteIndex.wordsImpl(&slot.index, arena, word, kind, limit);
             }
         }
         unreachable;
@@ -1730,6 +1768,26 @@ test "typo tolerance uses the words of the index: two edits for longer words, ra
     const words = try idx.expandWord(a, "elefant", 2);
     try testing.expect(words.len >= 1 and std.mem.eql(u8, words[0], "elephant"));
     try testing.expect(words.len <= queryparse.max_expansions);
+}
+
+test "words of the vocabulary: completions of a prefix, most common first, and the spelling of a mistyped word" {
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    _ = try put(&idx, "t", "1", "Zoo", "The elephant and the elevator; an elephant again.");
+    _ = try put(&idx, "t", "2", "Two", "Another elephant, and an electric eel.");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = idx.searcher();
+    const ele = try s.words(a, "ele", .prefix, 3);
+    try testing.expectEqual(@as(usize, 3), ele.len);
+    try testing.expectEqualStrings("elephant", ele[0]); // in both documents, so first
+    for (ele) |w| try testing.expect(std.mem.startsWith(u8, w, "ele"));
+    try testing.expectEqual(@as(usize, 0), (try s.words(a, "zzz", .prefix, 5)).len);
+    try testing.expectEqual(@as(usize, 0), (try s.words(a, "", .prefix, 5)).len);
+    const sp = try s.words(a, "elefant", .spelling, 1);
+    try testing.expectEqual(@as(usize, 1), sp.len);
+    try testing.expectEqualStrings("elephant", sp[0]);
 }
 
 test "passages of large documents are indexed, found with their conditions, replaced on update and removed" {

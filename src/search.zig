@@ -222,6 +222,8 @@ pub const ExportRow = struct {
 /// What the index holds for one source.
 pub const SourceStat = struct { name: []const u8, docs: u64, last_added: ?i64 = null };
 
+pub const WordKind = enum { prefix, spelling };
+
 pub const Searcher = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -238,8 +240,17 @@ pub const Searcher = struct {
         /// How many documents each source has and when the last one was added. Optional.
         source_stats: ?*const fn (ptr: *anyopaque, arena: Allocator) Error![]const SourceStat = null,
         /// The documents of one source after a position, in a stable order. Optional.
+        /// Words of the vocabulary: those that start with a prefix, or those a few edits from a word. Optional.
+        words: ?*const fn (ptr: *anyopaque, arena: Allocator, word: []const u8, kind: WordKind, limit: u32) Error![]const []const u8 = null,
         export_page: ?*const fn (ptr: *anyopaque, arena: Allocator, connector: []const u8, after: i64, limit: u32) Error![]const ExportRow = null,
     };
+
+    /// Words of the index that start with `prefix` (most common first) or that are within the usual number of edits of
+    /// `prefix` taken as a whole word (closest first). Empty if the index cannot say.
+    pub fn words(self: Searcher, arena: Allocator, word: []const u8, kind: WordKind, limit: u32) Error![]const []const u8 {
+        const f = self.vtable.words orelse return &.{};
+        return f(self.ptr, arena, word, kind, limit);
+    }
 
     /// A page of the documents of `connector` after the cursor `after` (0: from the start); empty if the index cannot say.
     pub fn exportPage(self: Searcher, arena: Allocator, connector: []const u8, after: i64, limit: u32) Error![]const ExportRow {
