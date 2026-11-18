@@ -7,6 +7,7 @@ pub const query = @import("query.zig");
 pub const html = @import("html.zig");
 pub const server = @import("server.zig");
 pub const admin = @import("admin.zig");
+pub const docspage = @import("docspage.zig");
 pub const accesslog = @import("accesslog.zig");
 
 test {
@@ -16,4 +17,5 @@ test {
     _ = server;
     _ = accesslog;
     _ = admin;
+    _ = docspage;
 }

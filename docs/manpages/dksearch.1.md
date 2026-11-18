@@ -505,6 +505,8 @@ The **vector index** holds every document's vector in memory (quantized to one b
 
 When a search finds nothing, the page offers **Did you mean**: each plain word is replaced by its closest word in the index (up to the usual typo distance) and the corrected query is offered only if it does find something. `GET /api/v1/suggest?q=...` completes the last word of a query (see dksearch-api(7)), for clients that offer autocomplete; the search page itself needs no script.
 
+The administration interface has a **Docs** page with this manual and the HTTP API reference, one section at a time. On the **ZIM files** page, when no folder is set, a form asks for one: it is created, saved as `[admin] zim_dir` in the configuration and used at once, with no restart. `dksearch serve` refuses to start when something already listens on its search or administration address (a stale server sharing the port would answer some requests with its own sessions and data).
+
 SOURCE LIST AND DUPLICATES
 The search page's source list shows how many documents each source holds, and `/sources` lists the sources the visitor may search with their kind, document count, when a document was last added, and the collections each is in, with a link that searches just that source. The numbers are counted at most every five minutes (counting groups the whole index). On the search page the same text found in several sources (or the same web page by its address) is shown once, naming the others ("same text in ..."); `group=0` shows every copy. The API folds them only with `group=1` (`same_in` lists the other sources).
 

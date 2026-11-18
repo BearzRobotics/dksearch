@@ -17,6 +17,7 @@ const handler = @import("handler.zig");
 const admin_js = @embedFile("assets/admin.js");
 const admin_js_version = html.assetVersion(admin_js);
 const html = @import("html.zig");
+const docspage = @import("docspage.zig");
 const query = @import("query.zig");
 
 const Response = handler.Response;
@@ -145,7 +146,7 @@ pub const App = struct {
     /// A fixed label for the access log; never the URL.
     pub fn label(target: []const u8) []const u8 {
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/actions/collection-edit", "/zim", "/actions/zim", "/models", "/actions/model-pull", "/actions/model-remove", "/actions/model-use", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
+        for ([_][]const u8{ "/", "/jobs", "/jobs/skipped", "/api/v1/admin/jobs/skipped", "/sources", "/sources/new", "/sources/edit", "/actions/sources", "/settings", "/actions/settings", "/maintenance", "/actions/maintenance", "/access", "/actions/key-add", "/actions/key-remove", "/actions/peer-test", "/actions/peer-edit", "/actions/collection-edit", "/docs", "/zim", "/actions/zim", "/actions/zim-folder", "/models", "/actions/model-pull", "/actions/model-remove", "/actions/model-use", "/api/v1/admin/maintenance", "/login", "/logout", "/actions/import", "/actions/cancel", "/search", "/api/v1/admin/search", "/assets/style.css", "/assets/admin.js", "/api/v1/admin/status", "/api/v1/admin/sources", "/api/v1/admin/jobs", "/api/v1/admin/imports", "/api/v1/admin/imports/cancel" }) |known| {
             if (std.mem.eql(u8, path, known)) return known;
         }
         return "other";
@@ -153,7 +154,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, zim_page, action_zim, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -180,7 +181,9 @@ pub const App = struct {
             .{ "/actions/collection-edit", .action_collection_edit },
             .{ "/actions/key-remove", .action_key_remove },
             .{ "/zim", .zim_page },
+            .{ "/docs", .docs_page },
             .{ "/actions/zim", .action_zim },
+            .{ "/actions/zim-folder", .action_zim_folder },
             .{ "/api/v1/admin/maintenance", .api_maintenance },
             .{ "/login", .login },
             .{ "/logout", .logout },
@@ -231,7 +234,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -256,6 +259,7 @@ pub const App = struct {
             .api_jobs_skipped => self.apiSkipped(arena, t.params),
             .maintenance => self.pageMaintenance(arena, csrf),
             .action_maintenance => self.startOperation(arena, req, auth, false),
+            .docs_page => self.pageDocs(arena, csrf, t.params),
             .zim_page => self.pageZim(arena, csrf, t.params),
             .models_page => self.pageModels(arena, csrf, null, t.params.get("remove")),
             .action_model_pull => self.modelAction(arena, req, auth, .pull),
@@ -268,6 +272,7 @@ pub const App = struct {
             .action_key_add => self.addKey(arena, req, auth),
             .action_key_remove => self.removeKey(arena, req, auth),
             .action_zim => self.startZimDownload(arena, req, auth),
+            .action_zim_folder => self.setZimFolder(arena, req, auth),
             .api_maintenance => self.startOperation(arena, req, auth, true),
             .api_status => self.apiStatus(arena),
             .api_sources => if (req.method == .POST) self.editSources(arena, req, auth, true) else self.apiSources(arena),
@@ -1554,6 +1559,17 @@ pub const App = struct {
         return std.mem.eql(u8, host, "kiwix.org") or std.mem.endsWith(u8, host, ".kiwix.org");
     }
 
+    fn pageDocs(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
+        _ = self;
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "Docs", csrf, "docs") catch return error.OutOfMemory;
+        const section = if (params.get("s")) |s| std.fmt.parseInt(usize, s, 10) catch null else null;
+        docspage.write(arena, w, params.get("book") orelse "manual", section) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
+    }
+
     fn pageZim(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
         var aw: Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
@@ -1567,7 +1583,14 @@ pub const App = struct {
         const zim_dir = if (self.opts.jobs) |m| m.opts.zim_dir else null;
         try w.writeAll("<p class=\"muted\">Search the <a href=\"https://library.kiwix.org\">Kiwix library</a> of offline copies of Wikipedia, Wiktionary, Stack Exchange sites, books and more, and download a file to index. This page contacts <code>library.kiwix.org</code> only when you search here; nothing is downloaded without your confirmation.</p>");
         const dir = zim_dir orelse {
-            try w.writeAll("<section class=\"card\"><h2>Not set up</h2><p class=\"muted\">Downloads need a folder to put the files in: add <code>zim_dir = \"/path/to/zim\"</code> to the <code>[admin]</code> table of the configuration (a folder you control and that has room for the files; the interface writes nowhere else) and enable <code>actions</code>, then restart.</p></section>");
+            if (csrf != null and self.canEditConfig()) {
+                // The folder is set here, not in the file: the form writes `[admin] zim_dir` and applies it at once.
+                try w.writeAll("<section class=\"card\"><h2>Choose a folder for ZIM files</h2><p class=\"muted\">Downloads and the ZIM files you add are kept in one folder. Pick a folder on a disk with room (a Wikipedia copy is tens of gigabytes). It is created if it does not exist, saved in the configuration and used straight away.</p><form action=\"/actions/zim-folder\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+                try html.writeEscaped(w, csrf.?);
+                try w.writeAll("\"><label>Folder <input type=\"text\" name=\"folder\" size=\"50\" maxlength=\"1000\" required value=\"");
+                try html.writeEscaped(w, try std.fmt.allocPrint(arena, "{s}/zim", .{std.mem.trimEnd(u8, self.opts.data_dir, "/")}));
+                try w.writeAll("\"></label> <button type=\"submit\" class=\"btn\">Use this folder</button></form></section>");
+            } else try w.writeAll("<section class=\"card\"><h2>Not set up</h2><p class=\"muted\">Downloads need a folder to put the files in. Turn on <code>actions</code> in the <code>[admin]</code> table of the configuration and start the server with <code>--config</code>; this page can then set the folder for you (or add <code>zim_dir = \"/path/to/zim\"</code> yourself).</p></section>");
             return;
         };
 
@@ -1822,6 +1845,44 @@ pub const App = struct {
         }
     }
 
+    /// Sets the ZIM folder: creates it, saves `[admin] zim_dir` in the configuration file and applies it without a restart.
+    fn setZimFolder(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const jobs = self.opts.jobs orelse return actionFailure(arena, false, .{ .status = .forbidden, .code = "actions_disabled", .message = "actions are disabled" });
+        const path = self.opts.config_path orelse return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "the server was started without --config, so there is no configuration file to edit" });
+        const folder = std.mem.trimEnd(u8, std.mem.trim(u8, params.get("folder") orelse "", " "), "/");
+        if (folder.len == 0 or folder.len > 1000 or folder[0] != '/' or std.mem.indexOfScalar(u8, folder, 0) != null or std.mem.indexOf(u8, folder, "..") != null)
+            return actionFailure(arena, false, .{ .status = .bad_request, .code = "bad_folder", .message = "give the full path of a folder, starting with / (no ..)" });
+        Io.Dir.cwd().createDirPath(self.io, folder) catch return actionFailure(arena, false, .{ .status = .bad_request, .code = "folder_failed", .message = "that folder could not be created" });
+        const folder_z = try arena.dupeSentinel(u8, folder, 0);
+        if (dk.kiwix.freeBytes(folder_z) == null) return actionFailure(arena, false, .{ .status = .bad_request, .code = "folder_failed", .message = "that folder cannot be used (no such disk, or not writable)" });
+        {
+            self.edit_mutex.lockUncancelable(self.io);
+            defer self.edit_mutex.unlock(self.io);
+            const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_unreadable", .message = "cannot read the configuration file" }),
+            };
+            var problem: dk.sourceedit.Problem = .{};
+            const out = dk.sourceedit.applySettings(arena, text, &.{.{ .table = "admin", .key = "zim_dir", .value = .{ .string = folder } }}, &problem) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Invalid => return actionFailure(arena, false, .{ .status = .bad_request, .code = "config_invalid", .message = try arena.dupe(u8, problem.message()) }),
+            };
+            dk.sourceedit.writeFile(self.io, arena, path, out) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Io => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_not_writable", .message = "the configuration file could not be written; nothing was changed" }),
+            };
+        }
+        const kept = self.gpa.dupe(u8, folder) catch return error.OutOfMemory;
+        jobs.mutex.lockUncancelable(self.io);
+        jobs.opts.zim_dir = kept; // the old value, if any, is left allocated: this happens once
+        jobs.mutex.unlock(self.io);
+        return redirect(arena, "/zim", null);
+    }
+
     fn startZimDownload(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
         const params = switch (try self.checkAction(arena, req, auth, false)) {
             .ok => |p| p,
@@ -1944,6 +2005,7 @@ const nav_items = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "zim", "/zim", "ZIM files" },
     .{ "models", "/models", "AI models" },
     .{ "access", "/access", "Access" },
+    .{ "docs", "/docs", "Docs" },
     .{ "search", "/search", "Search test" },
 };
 
@@ -3509,6 +3571,43 @@ test "ZIM files: the page explains when no folder is set, confirms before downlo
     try testing.expectEqual(http.Status.bad_request, refused.status);
     const bad_name = try f.call(a, .POST, "/actions/zim", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&file=..%2Fa.zim&meta4={s}", .{ csrf, ok_url }) });
     try testing.expectEqual(http.Status.bad_request, bad_name.status);
+}
+
+test "ZIM files: the folder is chosen on the page, created, saved in the configuration and used at once" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    defer if (f.manager.opts.zim_dir) |d| testing.allocator.free(d); // the page stored a copy
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.toml", .data = "# mine\n" });
+    var pb: [160]u8 = undefined;
+    f.app.opts.config_path = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}/c.toml", .{tmp.sub_path});
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const page = try f.call(a, .GET, "/zim", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, page.body, "Choose a folder for ZIM files") != null);
+    const csrf = csrfOf(page.body);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, ".zig-cache", a);
+    const folder = try std.fmt.allocPrint(a, "{s}/tmp/{s}/zims", .{ root, tmp.sub_path });
+    const enc = try std.mem.replaceOwned(u8, a, folder, "/", "%2F");
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/zim-folder", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf=wrong&folder={s}", .{enc}) })).status);
+    try testing.expectEqual(http.Status.bad_request, (try f.call(a, .POST, "/actions/zim-folder", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&folder=relative%2Fpath", .{csrf}) })).status);
+    try testing.expectEqual(http.Status.bad_request, (try f.call(a, .POST, "/actions/zim-folder", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&folder=%2Ftmp%2F..%2Fetc", .{csrf}) })).status);
+    const done = try f.call(a, .POST, "/actions/zim-folder", .{ .cookie = cookie, .body = try std.fmt.allocPrint(a, "csrf={s}&folder={s}", .{ csrf, enc }) });
+    try testing.expectEqual(http.Status.see_other, done.status);
+    // Created, saved (the rest of the file kept) and in use: the page now searches the library instead of asking.
+    var dir = try tmp.dir.openDir(testing.io, "zims", .{});
+    dir.close(testing.io);
+    const file = try tmp.dir.readFileAlloc(testing.io, "c.toml", a, .limited(4096));
+    try testing.expect(std.mem.indexOf(u8, file, "# mine") != null);
+    try testing.expect(std.mem.indexOf(u8, file, "zim_dir = ") != null and std.mem.indexOf(u8, file, "zims") != null);
+    const after = try f.call(a, .GET, "/zim", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, after.body, "Choose a folder for ZIM files") == null);
+    try testing.expect(std.mem.indexOf(u8, after.body, "Search the library") != null);
 }
 
 test "ZIM files: the confirmation shows the free space, and a download that cannot fit is refused with the numbers" {

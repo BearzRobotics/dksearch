@@ -123,7 +123,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/http/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "dksearch", .module = core }},
+        .imports = &.{
+            .{ .name = "dksearch", .module = core },
+            .{ .name = "manpages", .module = b.createModule(.{ .root_source_file = b.path("docs/manpages/embed.zig") }) },
+        },
     });
 
     // The command-line program.

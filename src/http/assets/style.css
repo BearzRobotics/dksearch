@@ -262,3 +262,12 @@ fieldset.options label.check { display: block; }
 fieldset.options small { display: block; color: var(--muted); font-weight: 400; }
 fieldset.options input[type="text"], fieldset.options input[type="number"] { width: 100%; max-width: 40rem; }
 .req { color: #b3261e; }
+
+/* Admin: the Docs page, a list of sections beside the section text. */
+.docs { display: grid; grid-template-columns: 14rem minmax(0, 1fr); gap: 1.5rem; align-items: start; }
+.docs-nav ul { list-style: none; margin: 0; padding: 0; position: sticky; top: 1rem; max-height: 85vh; overflow: auto; }
+.docs-nav a { display: block; padding: 0.25rem 0.6rem; border-radius: 0.4rem; text-decoration: none; }
+.docs-nav a[aria-current="page"] { background: var(--card); border: 1px solid var(--border); font-weight: 600; }
+.docs-body { max-width: 52rem; min-width: 0; overflow-wrap: anywhere; }
+.docs-body pre { overflow: auto; }
+@media (max-width: 40rem) { .docs { grid-template-columns: 1fr; } .docs-nav ul { position: static; max-height: none; } }

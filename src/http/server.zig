@@ -217,7 +217,27 @@ pub const ServeError = Allocator.Error || Io.Cancelable || error{ConcurrencyUnav
 /// Binds a listener. The returned server's `socket.address` holds the actual
 /// port when `address` asked for port 0.
 pub fn listen(io: Io, address: net.IpAddress) net.IpAddress.ListenError!net.Server {
+    // `reuse_address` also lets a second process bind the same port on Linux, and the kernel then splits connections
+    // between the two (a stale server keeps answering some requests, and sign-ins seem to vanish). So a port that
+    // already has a listener is refused here instead.
+    if (address.getPort() != 0 and somethingListens(io, address)) return error.AddressInUse;
     return address.listen(io, .{ .reuse_address = true });
+}
+
+/// Whether a connection to `address` (its loopback when it is the unspecified address) is accepted.
+fn somethingListens(io: Io, address: net.IpAddress) bool {
+    var probe = address;
+    switch (probe) {
+        .ip4 => |*a| if (std.mem.allEqual(u8, &a.bytes, 0)) {
+            a.bytes = .{ 127, 0, 0, 1 };
+        },
+        .ip6 => |*a| if (std.mem.allEqual(u8, &a.bytes, 0)) {
+            a.bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+        },
+    }
+    const stream = probe.connect(io, .{ .mode = .stream }) catch return false;
+    stream.close(io);
+    return true;
 }
 
 /// Accepts connections until `control` asks to stop (a graceful drain, then
@@ -810,4 +830,13 @@ test "counters by status class and latency, and an access log that leaves out ev
     for ([_][]const u8{ "SECRET", "127.0.0.1", "token", "dks_session", "Bearer", "x=" }) |forbidden| {
         try testing.expect(std.mem.indexOf(u8, text, forbidden) == null);
     }
+}
+
+test "a port that already has a listener is refused, a free one is not" {
+    var first = try listen(testing.io, try net.IpAddress.parse("127.0.0.1", 0));
+    defer first.deinit(testing.io);
+    const port = first.socket.address.getPort();
+    try testing.expectError(error.AddressInUse, listen(testing.io, try net.IpAddress.parse("127.0.0.1", port)));
+    var other = try listen(testing.io, try net.IpAddress.parse("127.0.0.1", 0));
+    other.deinit(testing.io);
 }
