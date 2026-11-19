@@ -88,7 +88,7 @@ const max_mediawiki_calls = 200;
 const feed_cap = 100;
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page", "report_file", "robots_sitemaps", "use_feeds", "mediawiki", "mediawiki_max_pages" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page", "report_file", "robots_sitemaps", "use_feeds", "mediawiki", "mediawiki_max_pages", "render_command", "render_args", "render_hosts", "render_timeout_seconds", "render_max_pages" };
 
 // ------------------------------------------------------------ validation
 
@@ -192,6 +192,18 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     try boolOption(source, "use_feeds", diag);
     try boolOption(source, "mediawiki", diag);
     try intOption(source, "mediawiki_max_pages", 1, 100000, diag);
+    try intOption(source, "render_timeout_seconds", 5, 300, diag);
+    try intOption(source, "render_max_pages", 1, 100000, diag);
+    _ = try needString(source, "render_args", false, diag);
+    _ = try needString(source, "render_hosts", false, diag);
+    if (try needString(source, "render_command", false, diag)) |cmd| if (cmd.len == 0 or cmd[0] != '/' or cmd.len > 500) {
+        diag.set("", key(&kbuf, source, "render_command"), "must be the absolute path of a program (starting with /), for example \"/usr/bin/chromium\"", .{});
+        return error.InvalidValue;
+    };
+    if (source.optionString("render_hosts") != null and source.optionString("render_command") == null) {
+        diag.set("", key(&kbuf, source, "render_hosts"), "needs render_command (the program that renders a page)", .{});
+        return error.InvalidValue;
+    }
     try intOption(source, "max_images_per_page", 1, 50, diag);
     try intOption(source, "recrawl_min_hours", 1, 24 * 30, diag);
     try intOption(source, "recrawl_max_days", 1, 365, diag);
@@ -275,6 +287,15 @@ pub const CrawlConnector = struct {
     /// all pages) instead of relying on the links of its front page; at most `mediawiki_max_pages` articles per wiki.
     mediawiki: bool,
     mediawiki_max_pages: u32,
+    /// Pages of the sites in `render_hosts` are read by an external program that runs the page's scripts and prints the
+    /// resulting HTML (a headless browser), for sites whose text only appears after JavaScript runs (docs/decisions/0060).
+    /// Off unless both are set. `render_args` come before the address; the program is given `render_timeout_s` seconds for a
+    /// page and at most `render_max_pages` pages are rendered in a run (the rest are fetched plainly).
+    render_command: ?[]const u8,
+    render_args: ?[]const u8,
+    render_hosts: ?[]const u8,
+    render_timeout_s: u32,
+    render_max_pages: u32,
     /// The first extra wait after a refusal (429 or 503), when the site did not say how long: at least this, then doubled.
     backoff_ms: u32 = 2000,
     checkpoint_buf: std.ArrayList(u8) = .empty,
@@ -327,6 +348,11 @@ pub const CrawlConnector = struct {
             .use_feeds = source.optionBool("use_feeds") orelse false,
             .mediawiki = source.optionBool("mediawiki") orelse false,
             .mediawiki_max_pages = @intCast(source.optionInt("mediawiki_max_pages") orelse 5000),
+            .render_command = if (source.optionString("render_command")) |v| try gpa.dupe(u8, v) else null,
+            .render_args = if (source.optionString("render_args")) |v| try gpa.dupe(u8, v) else null,
+            .render_hosts = if (source.optionString("render_hosts")) |v| try gpa.dupe(u8, v) else null,
+            .render_timeout_s = @intCast(source.optionInt("render_timeout_seconds") orelse 30),
+            .render_max_pages = @intCast(source.optionInt("render_max_pages") orelse 500),
             .tor = if (source.optionString("tor_socks")) |v| hidden.parseProxy(v) else null,
             .i2p = if (source.optionString("i2p_proxy")) |v| hidden.parseProxy(v) else null,
             .hidden_links = source.optionBool("hidden_links") orelse false,
@@ -361,6 +387,9 @@ pub const CrawlConnector = struct {
         if (self.language) |l| self.gpa.free(l);
         if (self.validators_file) |l| self.gpa.free(l);
         if (self.report_file) |l| self.gpa.free(l);
+        if (self.render_command) |l| self.gpa.free(l);
+        if (self.render_args) |l| self.gpa.free(l);
+        if (self.render_hosts) |l| self.gpa.free(l);
         if (self.seeds_sections) |l| self.gpa.free(l);
         if (self.seeds_skip) |l| self.gpa.free(l);
         self.checkpoint_buf.deinit(self.gpa);
@@ -1079,6 +1108,14 @@ pub fn nextInterval(previous: u32, changed: bool, first: bool, lo: u32, hi: u32)
     n = std.math.clamp(n, lo, hi);
     return @intCast(n);
 }
+/// Whether a rendered page is a bot check or an access block rather than the page: such pages are skipped, never solved.
+pub fn looksLikeChallenge(html: []const u8) bool {
+    if (html.len > 300_000) return false; // a real page is rarely this small and also a challenge
+    const markers = [_][]const u8{ "Just a moment...", "cf-chl-", "challenge-platform", "Attention Required! | Cloudflare", "Checking your browser before accessing", "Enable JavaScript and cookies to continue", "ddos-guard", "Verify you are human" };
+    for (markers) |m| if (std.ascii.findIgnoreCase(html, m) != null) return true;
+    return false;
+}
+
 const max_validators = 2_000_000;
 const max_images_seen = 2_000_000;
 const max_validators_bytes = 512 * 1024 * 1024;
@@ -1118,6 +1155,8 @@ const Shared = struct {
     finished_since_checkpoint: u32 = 0,
     /// Pages stored since the work was last committed. Under `mutex`.
     unsaved: u32 = 0,
+    /// Pages given to the rendering program so far, against `render_max_pages`.
+    rendered: std.atomic.Value(u32) = .init(0),
 };
 
 /// Serialises the pipeline's sink, which one thread at a time may use.
@@ -1340,7 +1379,7 @@ const Run = struct {
             if (!host.rules.allowed(try targetOf(a, u))) return self.skip(.robots);
             if (!self.waitTurn(host)) return .stopped;
 
-            const resp = fetch.get(self.client, a, .{
+            const resp = if (self.renders(u, via)) self.renderPage(a, url) else fetch.get(self.client, a, .{
                 .url = url,
                 .user_agent = self.conn.user_agent,
                 .accept = accept,
@@ -1422,6 +1461,51 @@ const Run = struct {
             else => .other,
         });
         return .skipped;
+    }
+
+    /// Whether this page is read by the rendering program: one is set up, the site is one of `render_hosts`, it is reached
+    /// directly, and the run's budget of rendered pages is not spent.
+    fn renders(self: *Run, u: Url, via: hidden.Via) bool {
+        const cmd = self.conn.render_command orelse return false;
+        _ = cmd;
+        if (via != .direct) return false;
+        const list = self.conn.render_hosts orelse return false;
+        var it = std.mem.tokenizeAny(u8, list, ", \t");
+        var listed = false;
+        while (it.next()) |h| if (sameSite(h, u.host)) {
+            listed = true;
+        };
+        if (!listed) return false;
+        return self.sh.rendered.fetchAdd(1, .monotonic) < self.conn.render_max_pages;
+    }
+
+    /// The page as the rendering program makes it: `render_command render_args... URL`, no shell, the program's output taken
+    /// as the page's HTML. The program is killed at the deadline, its output is cut at `max_page_bytes`, and a page that is a
+    /// bot check or a block ("Just a moment...") is reported as blocked (403): it is not worked around.
+    fn renderPage(self: *Run, a: Allocator, url: []const u8) fetch.Failure!fetch.Response {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.append(a, self.conn.render_command.?);
+        if (self.conn.render_args) |ra| {
+            var it = std.mem.tokenizeAny(u8, ra, " \t");
+            while (it.next()) |x| try argv.append(a, x);
+        }
+        try argv.append(a, url);
+        const r = std.process.run(a, self.conn.io, .{
+            .argv = argv.items,
+            .stdout_limit = .limited(self.conn.max_page_bytes),
+            .stderr_limit = .limited(16 * 1024),
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(self.conn.render_timeout_s), .clock = .awake } },
+        }) catch |e| {
+            const name = @errorName(e);
+            if (std.mem.eql(u8, name, "OutOfMemory")) return error.OutOfMemory;
+            if (std.mem.eql(u8, name, "StreamTooLong")) return error.TooLarge;
+            if (std.mem.eql(u8, name, "Timeout")) return error.Timeout;
+            if (std.mem.eql(u8, name, "Canceled")) return error.Canceled;
+            return error.Network;
+        };
+        if (!r.term.success()) return error.Network;
+        if (looksLikeChallenge(r.stdout)) return .{ .status = 403, .content_type = "text/html" };
+        return .{ .status = 200, .content_type = "text/html; charset=utf-8", .body = r.stdout };
     }
 
     /// The site's own answer to a refusal: more spacing from now on, a wait if it asked for one, and giving up if it asked
@@ -3374,4 +3458,125 @@ test "a MediaWiki's articles come from its API, 500 at a time, and join the craw
     try testing.expectEqual(@as(usize, 1), srv.count("/wiki/Alpha"));
     try testing.expectEqual(@as(usize, 1), srv.count("/wiki/Beta_Page"));
     try testing.expectEqual(@as(usize, 1), srv.count("/wiki/Gamma_Ray"));
+}
+
+// ------------------------------------------------------------- rendering with an external program
+
+/// A script that prints a page the way a rendering program would: the first line of its arguments after the flag, and the
+/// address it was asked for.
+fn renderScript(tmp: *testing.TmpDir, body: []const u8) ![]u8 {
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "render.sh", .data = body });
+    var f = try tmp.dir.openFile(testing.io, "render.sh", .{});
+    defer f.close(testing.io);
+    try f.setPermissions(testing.io, .executable_file);
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    return std.fmt.allocPrint(testing.allocator, "{s}/render.sh", .{dir});
+}
+
+test "challenge pages are recognised and ordinary pages are not" {
+    try testing.expect(looksLikeChallenge("<title>Just a moment...</title><script src=\"/cdn-cgi/challenge-platform/h/b\"></script>"));
+    try testing.expect(looksLikeChallenge("<html>Verify you are human by completing the action below</html>"));
+    try testing.expect(!looksLikeChallenge("<html><title>Kernel docs</title><p>The page about a moment in time.</p></html>"));
+}
+
+test "a page of a render host is read by the rendering program, other sites are fetched plainly, and a bot check is not worked around" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/app", .body = "<p>empty until scripts run</p>" },
+        .{ .path = "/blocked", .body = "<p>plain fetch would work</p>" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script = try renderScript(&tmp,
+        \\#!/bin/sh
+        \\for last; do :; done
+        \\case "$last" in
+        \\  */blocked) printf '<html><title>Just a moment...</title></html>' ;;
+        \\  *) printf '<html><head><title>Rendered</title></head><body><p>made by scripts for %s with %s</p></body></html>' "$last" "$1" ;;
+        \\esac
+        \\
+    );
+    defer testing.allocator.free(script);
+    var ub: [2][96]u8 = undefined;
+    const seeds = try std.fmt.allocPrint(testing.allocator, "{s}\n{s}\n", .{ srv.url(&ub[0], "/app"), srv.url(&ub[1], "/blocked") });
+    defer testing.allocator.free(seeds);
+    var conn = try testConnector(&tmp, seeds, "t/1");
+    defer conn.deinit();
+    conn.max_depth = 0;
+    conn.render_command = try testing.allocator.dupe(u8, script);
+    conn.render_args = try testing.allocator.dupe(u8, "--flag-one");
+    conn.render_hosts = try testing.allocator.dupe(u8, "127.0.0.1");
+    conn.render_timeout_s = 10;
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    _ = try conn.connector().run(got.sink(), &ctl, null);
+    try testing.expectEqual(@as(usize, 1), got.ids.items.len); // the bot check was skipped
+    try testing.expectEqualStrings("Rendered", got.titles.items[0]);
+    try testing.expect(std.mem.indexOf(u8, got.texts.items[0], "with --flag-one") != null);
+    try testing.expectEqual(@as(usize, 0), srv.count("/app")); // read by the program, not by the crawler
+    try testing.expectEqual(@as(usize, 0), srv.count("/blocked"));
+    try testing.expectEqual(@as(u64, 1), ctl.reasonCounts()[@backingInt(api.Reason.http_status)]);
+}
+
+test "rendering is bounded: a program that is too slow is killed, the budget of rendered pages ends it, and it is off without a host list" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/a", .body = "<p>plain a</p>" },
+        .{ .path = "/b", .body = "<p>plain b</p>" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const slow = try renderScript(&tmp, "#!/bin/sh\nsleep 30\n");
+    defer testing.allocator.free(slow);
+    var ub: [2][96]u8 = undefined;
+    const seeds = try std.fmt.allocPrint(testing.allocator, "{s}\n{s}\n", .{ srv.url(&ub[0], "/a"), srv.url(&ub[1], "/b") });
+    defer testing.allocator.free(seeds);
+    var conn = try testConnector(&tmp, seeds, "t/1");
+    defer conn.deinit();
+    conn.max_depth = 0;
+    conn.render_command = try testing.allocator.dupe(u8, slow);
+    conn.render_hosts = try testing.allocator.dupe(u8, "127.0.0.1");
+    conn.render_timeout_s = 1;
+    conn.render_max_pages = 1;
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    _ = try conn.connector().run(got.sink(), &ctl, null);
+    // The first page was given to the slow program and killed after a second (skipped: a network-type failure); the budget
+    // of one rendered page was then spent, so the second page was fetched plainly.
+    try testing.expectEqual(@as(usize, 1), got.ids.items.len);
+    try testing.expectEqual(@as(usize, 0), srv.count("/a"));
+    try testing.expectEqual(@as(usize, 1), srv.count("/b"));
+    // Without render_hosts nothing is rendered.
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var plain = try testConnector(&tmp2, seeds, "t/1");
+    defer plain.deinit();
+    plain.max_depth = 0;
+    plain.render_command = try testing.allocator.dupe(u8, slow);
+    var got2: Collect = .{};
+    defer got2.deinit();
+    var ctl2: api.Control = .{};
+    _ = try plain.connector().run(got2.sink(), &ctl2, null);
+    try testing.expectEqual(@as(usize, 2), got2.ids.items.len);
+}
+
+test "the rendering options are checked" {
+    var d: config.Diagnostic = .{};
+    const base = [_]config.Option{
+        .{ .key = "user_agent", .value = .{ .string = "t/1 (+https://e.org)" } },
+        .{ .key = "seeds_file", .value = .{ .string = "/s.txt" } },
+    };
+    var relative = base ++ [_]config.Option{.{ .key = "render_command", .value = .{ .string = "chromium" } }};
+    try testing.expectError(error.InvalidValue, validate(.{ .name = "w", .kind = "crawl", .options = &relative }, &d));
+    var orphan = base ++ [_]config.Option{.{ .key = "render_hosts", .value = .{ .string = "example.org" } }};
+    try testing.expectError(error.InvalidValue, validate(.{ .name = "w", .kind = "crawl", .options = &orphan }, &d));
+    var good = base ++ [_]config.Option{ .{ .key = "render_command", .value = .{ .string = "/usr/bin/chromium" } }, .{ .key = "render_hosts", .value = .{ .string = "example.org" } }, .{ .key = "render_timeout_seconds", .value = .{ .integer = 20 } } };
+    try validate(.{ .name = "w", .kind = "crawl", .options = &good }, &d);
+    var slow = base ++ [_]config.Option{.{ .key = "render_timeout_seconds", .value = .{ .integer = 1 } }};
+    try testing.expectError(error.InvalidValue, validate(.{ .name = "w", .kind = "crawl", .options = &slow }, &d));
 }
