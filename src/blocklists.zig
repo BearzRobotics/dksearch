@@ -1,8 +1,10 @@
 //! The Block List Project's lists (https://github.com/blocklistproject/Lists, public domain / MIT), offered in the
 //! administration interface as switches: each list can be downloaded and turned on or off. The files live in
 //! `data_dir/lists/blocklistproject/NAME.txt`, the names of the lists in use in `data_dir/lists/blocklists.txt` (one per
-//! line). A list in use makes its domains banned for everyone (not crawled, never shown), like any `blocklist_files`
-//! entry, and the owner's `allow` list still takes domains out of it. Nothing is downloaded unless the administrator asks.
+//! line, `NAME` for a ban or `NAME safe`). A banned list makes its domains banned for everyone (not crawled, never shown),
+//! like any `blocklist_files` entry, and the owner's `allow` list still takes domains out of it. A `safe` list hides its
+//! domains only while safe search is on (like the safe-search list: adults unlock them with the PIN or an adult key) and
+//! does not stop them from being crawled. Nothing is downloaded unless the administrator asks.
 
 const std = @import("std");
 const Io = std.Io;
@@ -61,35 +63,52 @@ pub fn url(arena: Allocator, base: []const u8, name: []const u8) Allocator.Error
     return std.fmt.allocPrint(arena, "{s}/{s}.txt", .{ std.mem.trimEnd(u8, base, "/"), name });
 }
 
-/// The names of the lists in use: lines of the enabled file that are names of the catalogue (the rest is ignored).
-/// A missing file means none.
-pub fn readEnabled(io: Io, arena: Allocator, data_dir: []const u8) Allocator.Error![]const []const u8 {
+/// What a list does when it is on.
+pub const Mode = enum { off, ban, safe };
+
+pub const Chosen = struct { name: []const u8, mode: Mode };
+
+/// The lists in use and what each does: lines of the file that start with a name of the catalogue, `NAME` (ban) or
+/// `NAME safe` (the rest of the line is ignored). A missing file means none.
+pub fn readChosen(io: Io, arena: Allocator, data_dir: []const u8) Allocator.Error![]const Chosen {
     const path = try std.fmt.allocPrint(arena, "{s}/lists/{s}", .{ std.mem.trimEnd(u8, data_dir, "/"), enabled_file });
     const text = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024)) catch return &.{};
-    var out: std.ArrayList([]const u8) = .empty;
+    var out: std.ArrayList(Chosen) = .empty;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
-        if (find(line)) |e| try out.append(arena, e.name);
+        var parts = std.mem.tokenizeAny(u8, line, " \t");
+        const name = parts.next() orelse continue;
+        const e = find(name) orelse continue;
+        const mode: Mode = if (parts.next()) |m| (if (std.mem.eql(u8, m, "safe")) .safe else .ban) else .ban;
+        try out.append(arena, .{ .name = e.name, .mode = mode });
     }
     return out.items;
 }
 
-pub fn isEnabled(enabled: []const []const u8, name: []const u8) bool {
-    for (enabled) |n| if (std.mem.eql(u8, n, name)) return true;
-    return false;
+/// What the list `name` does among `chosen` (off when it is not there).
+pub fn modeOf(chosen: []const Chosen, name: []const u8) Mode {
+    for (chosen) |c| if (std.mem.eql(u8, c.name, name)) return c.mode;
+    return .off;
 }
 
 pub const WriteError = error{WriteFailed};
 
-/// Saves the names in use (only catalogue names, in catalogue order).
-pub fn writeEnabled(io: Io, arena: Allocator, data_dir: []const u8, names: []const []const u8) (Allocator.Error || WriteError)!void {
+/// Saves the choice (only catalogue names, in catalogue order; lists that are off are not written).
+pub fn writeChosen(io: Io, arena: Allocator, data_dir: []const u8, chosen: []const Chosen) (Allocator.Error || WriteError)!void {
     const dir = try std.fmt.allocPrint(arena, "{s}/lists", .{std.mem.trimEnd(u8, data_dir, "/")});
     Io.Dir.cwd().createDirPath(io, dir) catch return error.WriteFailed;
     var text: std.ArrayList(u8) = .empty;
-    for (catalog) |e| if (isEnabled(names, e.name)) {
-        try text.appendSlice(arena, e.name);
-        try text.append(arena, '\n');
+    for (catalog) |e| switch (modeOf(chosen, e.name)) {
+        .off => {},
+        .ban => {
+            try text.appendSlice(arena, e.name);
+            try text.append(arena, '\n');
+        },
+        .safe => {
+            try text.appendSlice(arena, e.name);
+            try text.appendSlice(arena, " safe\n");
+        },
     };
     const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, enabled_file });
     const tmp = try std.fmt.allocPrint(arena, "{s}.new", .{path});
@@ -111,7 +130,7 @@ test "the catalogue has unique plain names" {
     try testing.expect(find("phishing") != null and find("nonsense") == null);
 }
 
-test "the lists in use are saved in catalogue order, unknown names are dropped, and a missing file means none" {
+test "the lists in use are saved in catalogue order with their mode, unknown names are dropped, and a missing file means none" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
@@ -119,12 +138,16 @@ test "the lists in use are saved in catalogue order, unknown names are dropped, 
     const a = ar.allocator();
     const root = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, ".zig-cache", a);
     const dir = try std.fmt.allocPrint(a, "{s}/tmp/{s}", .{ root, tmp.sub_path });
-    try testing.expectEqual(@as(usize, 0), (try readEnabled(testing.io, a, dir)).len);
-    try writeEnabled(testing.io, a, dir, &.{ "ads", "evil", "phishing" });
-    const got = try readEnabled(testing.io, a, dir);
-    try testing.expectEqual(@as(usize, 2), got.len);
-    try testing.expectEqualStrings("phishing", got[0]); // catalogue order
-    try testing.expectEqualStrings("ads", got[1]);
-    try testing.expect(isEnabled(got, "ads") and !isEnabled(got, "fraud"));
+    try testing.expectEqual(@as(usize, 0), (try readChosen(testing.io, a, dir)).len);
+    try writeChosen(testing.io, a, dir, &.{ .{ .name = "ads", .mode = .ban }, .{ .name = "evil", .mode = .ban }, .{ .name = "porn", .mode = .safe }, .{ .name = "phishing", .mode = .ban }, .{ .name = "drugs", .mode = .off } });
+    const got = try readChosen(testing.io, a, dir);
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqualStrings("phishing", got[0].name); // catalogue order
+    try testing.expectEqualStrings("ads", got[1].name);
+    try testing.expectEqualStrings("porn", got[2].name);
+    try testing.expect(modeOf(got, "ads") == .ban and modeOf(got, "porn") == .safe and modeOf(got, "fraud") == .off and modeOf(got, "drugs") == .off);
+    // An old file (a name per line) means ban.
+    const raw = try Io.Dir.cwd().readFileAlloc(testing.io, try std.fmt.allocPrint(a, "{s}/lists/{s}", .{ dir, enabled_file }), a, .limited(1000));
+    try testing.expectEqualStrings("phishing\nads\nporn safe\n", raw);
     try testing.expectEqualStrings("https://example.org/x/ads.txt", try url(a, "https://example.org/x/", "ads"));
 }

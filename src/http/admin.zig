@@ -1865,24 +1865,31 @@ pub const App = struct {
         return self.pageSafe(arena, csrf, "Saved. Restart dksearch for the lists to take effect.", false);
     }
 
-    /// The Block List Project's lists as switches.
+    /// The Block List Project's lists, each off, banned for everyone, or hidden while safe search is on.
     fn writeBlocklists(self: *App, arena: Allocator, w: *Io.Writer, token: []const u8, can_edit: bool) !void {
-        const enabled = try dk.blocklists.readEnabled(self.io, arena, self.opts.data_dir);
-        try w.writeAll("<section class=\"card\"><h2>Block lists from the Block List Project</h2><p class=\"muted\">Public lists of domains nobody wants. A list that is on bans its domains for everyone: they are not crawled and never shown, whatever safe search says. Turning a list on downloads it (from <a href=\"https://github.com/blocklistproject/Lists\">github.com/blocklistproject/Lists</a>); nothing is fetched otherwise. Domains of your own that a list gets wrong go in <code>allow</code> under <code>[filters]</code>. Changes apply when dksearch is restarted.</p><form action=\"/actions/blocklists\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        const chosen = try dk.blocklists.readChosen(self.io, arena, self.opts.data_dir);
+        try w.writeAll("<section class=\"card\"><h2>Block lists from the Block List Project</h2><p class=\"muted\">Public lists of domains nobody wants. <strong>Ban</strong>: not crawled and never shown, to anyone. <strong>Hide</strong>: still crawled and indexed, but hidden while safe search is on (adults unlock them with the PIN or an adult key; this only matters when safe search is on). Choosing a list downloads it (from <a href=\"https://github.com/blocklistproject/Lists\">github.com/blocklistproject/Lists</a>); nothing is fetched otherwise. Domains of your own that a list gets wrong go in <code>allow</code> under <code>[filters]</code>. Changes apply when dksearch is restarted.</p><form action=\"/actions/blocklists\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
         try html.writeEscaped(w, token);
-        try w.writeAll("\"><table><thead><tr><th>On</th><th>List</th><th>What it bans</th><th>Downloaded</th></tr></thead><tbody>");
+        try w.writeAll("\"><table><thead><tr><th>Use</th><th>List</th><th>What it covers</th><th>Downloaded</th></tr></thead><tbody>");
         for (dk.blocklists.catalog) |e| {
             const path = try dk.blocklists.filePath(arena, self.opts.data_dir, e.name);
             const st = Io.Dir.cwd().statFile(self.io, path, .{}) catch null;
-            const on = dk.blocklists.isEnabled(enabled, e.name);
-            try w.print("<tr><td><input type=\"checkbox\" name=\"use\" value=\"{s}\" id=\"bl-{s}\"{s}{s} aria-label=\"Use the {s} list\"></td><td><label for=\"bl-{s}\"><strong>{s}</strong></label></td><td>", .{ e.name, e.name, if (on) " checked" else "", if (can_edit) "" else " disabled", e.name, e.name, e.name });
+            const mode = dk.blocklists.modeOf(chosen, e.name);
+            const dis: []const u8 = if (can_edit) "" else " disabled";
+            try w.print("<tr><td><select name=\"mode_{s}\" id=\"bl-{s}\" aria-label=\"What the {s} list does\"{s}>", .{ e.name, e.name, e.name, dis });
+            try w.print("<option value=\"off\"{s}>Off</option><option value=\"ban\"{s}>Ban</option><option value=\"safe\"{s}>Hide</option>", .{
+                if (mode == .off) " selected" else "",
+                if (mode == .ban) " selected" else "",
+                if (mode == .safe) " selected" else "",
+            });
+            try w.print("</select></td><td><label for=\"bl-{s}\"><strong>{s}</strong></label></td><td>", .{ e.name, e.name });
             try html.writeEscaped(w, e.what);
-            if (e.big_sites) try w.writeAll(" <span class=\"muted\">(bans well-known sites: only turn it on if you mean it)</span>");
+            if (e.big_sites) try w.writeAll(" <span class=\"muted\">(covers well-known sites: only use it if you mean it)</span>");
             try w.writeAll("</td><td>");
-            if (st) |s| try writeBytes(w, s.size) else try w.writeAll("<span class=\"muted\">not yet</span>");
+            if (st) |fs| try writeBytes(w, fs.size) else try w.writeAll("<span class=\"muted\">not yet</span>");
             try w.writeAll("</td></tr>");
         }
-        try w.print("</tbody></table><p><button type=\"submit\" name=\"act\" value=\"save\" class=\"btn\"{s}>Save and download what is missing</button> <button type=\"submit\" name=\"act\" value=\"update\" class=\"btn secondary\"{s}>Download the lists that are on again</button></p></form></section>", .{ if (can_edit) "" else " disabled", if (can_edit) "" else " disabled" });
+        try w.print("</tbody></table><p><button type=\"submit\" name=\"act\" value=\"save\" class=\"btn\"{s}>Save and download what is missing</button> <button type=\"submit\" name=\"act\" value=\"update\" class=\"btn secondary\"{s}>Download the lists in use again</button></p></form></section>", .{ if (can_edit) "" else " disabled", if (can_edit) "" else " disabled" });
     }
 
     fn blocklistsAction(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
@@ -1891,27 +1898,31 @@ pub const App = struct {
             .refused => |r| return r,
         };
         const csrf = try csrfCopy(arena, auth);
-        const chosen = try params.all(arena, "use");
-        var names: std.ArrayList([]const u8) = .empty;
-        for (chosen) |n| if (dk.blocklists.find(n)) |e| try names.append(arena, e.name);
+        var chosen: std.ArrayList(dk.blocklists.Chosen) = .empty;
+        for (dk.blocklists.catalog) |e| {
+            const key = try std.fmt.allocPrint(arena, "mode_{s}", .{e.name});
+            const v = params.get(key) orelse "off";
+            const mode: dk.blocklists.Mode = if (std.mem.eql(u8, v, "ban")) .ban else if (std.mem.eql(u8, v, "safe")) .safe else .off;
+            if (mode != .off) try chosen.append(arena, .{ .name = e.name, .mode = mode });
+        }
         const update = if (params.get("act")) |a| std.mem.eql(u8, a, "update") else false;
-        if (!update) dk.blocklists.writeEnabled(self.io, arena, self.opts.data_dir, names.items) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "lists_unwritable", .message = "the choice could not be saved" });
-        // Download what is on and missing (all of what is on, for "again").
+        if (!update) dk.blocklists.writeChosen(self.io, arena, self.opts.data_dir, chosen.items) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "lists_unwritable", .message = "the choice could not be saved" });
+        // Download what is on and missing (everything that is on, for "again").
         var failed: std.ArrayList([]const u8) = .empty;
         var fetched: usize = 0;
         const dir = try std.fmt.allocPrint(arena, "{s}/lists/{s}", .{ std.mem.trimEnd(u8, self.opts.data_dir, "/"), dk.blocklists.folder });
         Io.Dir.cwd().createDirPath(self.io, dir) catch {};
-        const now_on = if (update) try dk.blocklists.readEnabled(self.io, arena, self.opts.data_dir) else names.items;
-        for (now_on) |n| {
-            const path = try dk.blocklists.filePath(arena, self.opts.data_dir, n);
+        const now_on = if (update) try dk.blocklists.readChosen(self.io, arena, self.opts.data_dir) else chosen.items;
+        for (now_on) |c| {
+            const path = try dk.blocklists.filePath(arena, self.opts.data_dir, c.name);
             if (!update) if (Io.Dir.cwd().statFile(self.io, path, .{})) |_| continue else |_| {};
-            const address = try dk.blocklists.url(arena, self.opts.blocklist_base_url, n);
-            if (dk.listfetch.download(self.io, self.gpa, arena, address, path, false)) |_| fetched += 1 else |_| try failed.append(arena, n);
+            const address = try dk.blocklists.url(arena, self.opts.blocklist_base_url, c.name);
+            if (dk.listfetch.download(self.io, self.gpa, arena, address, path, false)) |_| fetched += 1 else |_| try failed.append(arena, c.name);
         }
         const note = if (failed.items.len > 0)
             try std.fmt.allocPrint(arena, "Saved, but these could not be downloaded: {s}. Try again in a moment.", .{try std.mem.join(arena, ", ", failed.items)})
         else
-            try std.fmt.allocPrint(arena, "Saved ({d} lists on, {d} downloaded). Restart dksearch for the lists to take effect.", .{ names.items.len, fetched });
+            try std.fmt.allocPrint(arena, "Saved ({d} lists on, {d} downloaded). Restart dksearch for the lists to take effect.", .{ chosen.items.len, fetched });
         return self.pageSafe(arena, csrf, note, failed.items.len > 0);
     }
 
@@ -4790,17 +4801,17 @@ test "Safe search page: status, the switch in the configuration, the PIN (live),
     // download cannot be made, and the failure is said (this test never reaches the real server: its address is not https).
     f.app.opts.blocklist_base_url = "http://127.0.0.1:1";
     const card = (try f.call(a, .GET, "/safesearch", .{ .cookie = cookie })).body;
-    for ([_][]const u8{ "Block lists from the Block List Project", "value=\"phishing\"", "value=\"drugs\"", "value=\"youtube\"", "bans well-known sites" }) |want| try testing.expect(std.mem.indexOf(u8, card, want) != null);
-    const chosen = try post(&f, a, cookie, csrf, "/actions/blocklists", "act=save&use=phishing&use=ads&use=not-a-list");
-    try testing.expect(std.mem.indexOf(u8, chosen.body, "could not be downloaded: phishing, ads") != null);
+    for ([_][]const u8{ "Block lists from the Block List Project", "name=\"mode_phishing\"", "name=\"mode_drugs\"", "name=\"mode_youtube\"", "covers well-known sites" }) |want| try testing.expect(std.mem.indexOf(u8, card, want) != null);
+    const chosen = try post(&f, a, cookie, csrf, "/actions/blocklists", "act=save&mode_phishing=ban&mode_ads=ban&mode_porn=safe&mode_not-a-list=ban");
+    try testing.expect(std.mem.indexOf(u8, chosen.body, "could not be downloaded: phishing, ads, porn") != null);
     const on_text = try f.tmp.dir.readFileAlloc(testing.io, "lists/blocklists.txt", a, .limited(100));
-    try testing.expectEqualStrings("phishing\nads\n", on_text);
-    try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/safesearch", .{ .cookie = cookie })).body, "value=\"phishing\" id=\"bl-phishing\" checked") != null);
-    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/blocklists", .{ .cookie = cookie, .body = "csrf=wrong&use=ads" })).status);
+    try testing.expectEqualStrings("phishing\nads\nporn safe\n", on_text);
+    try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/safesearch", .{ .cookie = cookie })).body, "<option value=\"ban\" selected>Ban</option>") != null);
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/blocklists", .{ .cookie = cookie, .body = "csrf=wrong&mode_ads=ban" })).status);
     // Present files are not fetched again by "save"; the choice can be emptied.
     try f.tmp.dir.createDirPath(testing.io, "lists/blocklistproject");
     try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "lists/blocklistproject/ads.txt", .data = "0.0.0.0 ads.example\n" });
-    try testing.expect(std.mem.indexOf(u8, (try post(&f, a, cookie, csrf, "/actions/blocklists", "act=save&use=ads")).body, "Saved (1 lists on, 0 downloaded)") != null);
+    try testing.expect(std.mem.indexOf(u8, (try post(&f, a, cookie, csrf, "/actions/blocklists", "act=save&mode_ads=ban")).body, "Saved (1 lists on, 0 downloaded)") != null);
     _ = try post(&f, a, cookie, csrf, "/actions/blocklists", "act=save");
     try testing.expectEqualStrings("", try f.tmp.dir.readFileAlloc(testing.io, "lists/blocklists.txt", a, .limited(100)));
     // An adult key is marked when it is made, and shown as such.

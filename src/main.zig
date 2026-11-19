@@ -1962,10 +1962,13 @@ fn buildDomainLists(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, announ
     {
         var enabled_arena = std.heap.ArenaAllocator.init(la);
         defer enabled_arena.deinit();
-        const names = dk.blocklists.readEnabled(io, enabled_arena.allocator(), cfg.data_dir) catch &.{};
-        for (names) |n| {
-            const path = dk.blocklists.filePath(enabled_arena.allocator(), cfg.data_dir, n) catch return null;
-            dk.domainlist.loadIfPresent(io, la, &lists.blocked, path, &failed) catch |e| {
+        const chosen = dk.blocklists.readChosen(io, enabled_arena.allocator(), cfg.data_dir) catch &.{};
+        for (chosen) |c| {
+            // A list that hides (rather than bans) only matters while safe search is on.
+            if (c.mode == .safe and !cfg.safe_search.enabled) continue;
+            const path = dk.blocklists.filePath(enabled_arena.allocator(), cfg.data_dir, c.name) catch return null;
+            const target = if (c.mode == .safe) &lists.safe else &lists.blocked;
+            dk.domainlist.loadIfPresent(io, la, target, path, &failed) catch |e| {
                 err(io, "cannot read the domain list {s}: {t}", .{ path, e });
                 return null;
             };
@@ -1977,6 +1980,12 @@ fn buildDomainLists(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, announ
         // Right after the lists of other people (the first load) the owner's allow list takes its domains out again.
         if (li == 1) for (cfg.filters.allow) |d| {
             allowed_out += lists.blocked.removeUnder(la, d) catch {
+                err(io, "out of memory", .{});
+                return null;
+            };
+            // The lists of other people that only hide are corrected the same way (the owner's own safesearch.toml is
+            // loaded after this and is not touched).
+            allowed_out += lists.safe.removeUnder(la, d) catch {
                 err(io, "out of memory", .{});
                 return null;
             };
