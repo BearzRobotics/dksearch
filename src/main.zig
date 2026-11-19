@@ -1805,6 +1805,19 @@ fn buildDomainLists(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, announ
         .{ .set = &lists.safe, .entries = cfg.safe_search.ban, .files = cfg.safe_search.ban_files, .relative = false, .on = cfg.safe_search.enabled },
         .{ .set = &lists.safe, .entries = &.{}, .files = safe_files, .relative = true, .on = cfg.safe_search.enabled },
     };
+    // The Block List Project lists switched on in the administration interface (downloaded to data_dir/lists/blocklistproject/).
+    {
+        var enabled_arena = std.heap.ArenaAllocator.init(la);
+        defer enabled_arena.deinit();
+        const names = dk.blocklists.readEnabled(io, enabled_arena.allocator(), cfg.data_dir) catch &.{};
+        for (names) |n| {
+            const path = dk.blocklists.filePath(enabled_arena.allocator(), cfg.data_dir, n) catch return null;
+            dk.domainlist.loadIfPresent(io, la, &lists.blocked, path, &failed) catch |e| {
+                err(io, "cannot read the domain list {s}: {t}", .{ path, e });
+                return null;
+            };
+        }
+    }
     var allowed_out: usize = 0;
     for (loads, 0..) |l, li| {
         if (!l.on) continue;

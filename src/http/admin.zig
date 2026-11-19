@@ -92,6 +92,8 @@ pub const Options = struct {
     /// The Kiwix library's catalogue (tests point this at a local server).
     kiwix_catalog_url: []const u8 = dk.kiwix.catalog_base,
     kiwix_options: dk.kiwix.Options = .{},
+    /// Where the Block List Project lists are fetched from (tests point it at nothing).
+    blocklist_base_url: []const u8 = dk.blocklists.default_base,
 };
 
 const Session = struct {
@@ -162,7 +164,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, action_embed, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, action_embed, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, action_blocklists, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -197,6 +199,7 @@ pub const App = struct {
             .{ "/actions/safesearch", .action_safe_toggle },
             .{ "/actions/safesearch-pin", .action_safe_pin },
             .{ "/actions/safesearch-lists", .action_safe_lists },
+            .{ "/actions/blocklists", .action_blocklists },
             .{ "/actions/zim", .action_zim },
             .{ "/actions/zim-folder", .action_zim_folder },
             .{ "/api/v1/admin/maintenance", .api_maintenance },
@@ -249,7 +252,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_embed or route == .action_findimage or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_embed or route == .action_findimage or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_blocklists or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -282,6 +285,7 @@ pub const App = struct {
             .action_safe_toggle => self.safeToggle(arena, req, auth),
             .action_safe_pin => self.safePin(arena, req, auth),
             .action_safe_lists => self.safeLists(arena, req, auth),
+            .action_blocklists => self.blocklistsAction(arena, req, auth),
             .zim_page => self.pageZim(arena, csrf, t.params),
             .models_page => self.pageModels(arena, csrf, null, t.params.get("remove")),
             .action_model_pull => self.modelAction(arena, req, auth, .pull),
@@ -1741,6 +1745,8 @@ pub const App = struct {
         }
         try w.writeAll("</section>");
 
+        try self.writeBlocklists(arena, w, token, can_edit);
+
         // The lists.
         try w.writeAll("<section class=\"card\"><h2>Domain lists</h2><p class=\"muted\">One domain per line, or the MD5 hash of a domain (32 hex digits); <code>#</code> starts a comment. Hosts-file and ad-blocker lines work too. Lists named in the configuration file (<code>ban = \"ban.toml\"</code>, <code>blocklist_files</code>, <code>[safe_search] list</code>) are not shown here; these three are kept in <code>data_dir/lists/</code>. Applies after a restart.</p><form class=\"stack\" action=\"/actions/safesearch-lists\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
         try html.writeEscaped(w, token);
@@ -1857,6 +1863,56 @@ pub const App = struct {
             Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, self.io) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "lists_unwritable", .message = "a list could not be written" });
         }
         return self.pageSafe(arena, csrf, "Saved. Restart dksearch for the lists to take effect.", false);
+    }
+
+    /// The Block List Project's lists as switches.
+    fn writeBlocklists(self: *App, arena: Allocator, w: *Io.Writer, token: []const u8, can_edit: bool) !void {
+        const enabled = try dk.blocklists.readEnabled(self.io, arena, self.opts.data_dir);
+        try w.writeAll("<section class=\"card\"><h2>Block lists from the Block List Project</h2><p class=\"muted\">Public lists of domains nobody wants. A list that is on bans its domains for everyone: they are not crawled and never shown, whatever safe search says. Turning a list on downloads it (from <a href=\"https://github.com/blocklistproject/Lists\">github.com/blocklistproject/Lists</a>); nothing is fetched otherwise. Domains of your own that a list gets wrong go in <code>allow</code> under <code>[filters]</code>. Changes apply when dksearch is restarted.</p><form action=\"/actions/blocklists\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        try html.writeEscaped(w, token);
+        try w.writeAll("\"><table><thead><tr><th>On</th><th>List</th><th>What it bans</th><th>Downloaded</th></tr></thead><tbody>");
+        for (dk.blocklists.catalog) |e| {
+            const path = try dk.blocklists.filePath(arena, self.opts.data_dir, e.name);
+            const st = Io.Dir.cwd().statFile(self.io, path, .{}) catch null;
+            const on = dk.blocklists.isEnabled(enabled, e.name);
+            try w.print("<tr><td><input type=\"checkbox\" name=\"use\" value=\"{s}\" id=\"bl-{s}\"{s}{s} aria-label=\"Use the {s} list\"></td><td><label for=\"bl-{s}\"><strong>{s}</strong></label></td><td>", .{ e.name, e.name, if (on) " checked" else "", if (can_edit) "" else " disabled", e.name, e.name, e.name });
+            try html.writeEscaped(w, e.what);
+            if (e.big_sites) try w.writeAll(" <span class=\"muted\">(bans well-known sites: only turn it on if you mean it)</span>");
+            try w.writeAll("</td><td>");
+            if (st) |s| try writeBytes(w, s.size) else try w.writeAll("<span class=\"muted\">not yet</span>");
+            try w.writeAll("</td></tr>");
+        }
+        try w.print("</tbody></table><p><button type=\"submit\" name=\"act\" value=\"save\" class=\"btn\"{s}>Save and download what is missing</button> <button type=\"submit\" name=\"act\" value=\"update\" class=\"btn secondary\"{s}>Download the lists that are on again</button></p></form></section>", .{ if (can_edit) "" else " disabled", if (can_edit) "" else " disabled" });
+    }
+
+    fn blocklistsAction(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const csrf = try csrfCopy(arena, auth);
+        const chosen = try params.all(arena, "use");
+        var names: std.ArrayList([]const u8) = .empty;
+        for (chosen) |n| if (dk.blocklists.find(n)) |e| try names.append(arena, e.name);
+        const update = if (params.get("act")) |a| std.mem.eql(u8, a, "update") else false;
+        if (!update) dk.blocklists.writeEnabled(self.io, arena, self.opts.data_dir, names.items) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "lists_unwritable", .message = "the choice could not be saved" });
+        // Download what is on and missing (all of what is on, for "again").
+        var failed: std.ArrayList([]const u8) = .empty;
+        var fetched: usize = 0;
+        const dir = try std.fmt.allocPrint(arena, "{s}/lists/{s}", .{ std.mem.trimEnd(u8, self.opts.data_dir, "/"), dk.blocklists.folder });
+        Io.Dir.cwd().createDirPath(self.io, dir) catch {};
+        const now_on = if (update) try dk.blocklists.readEnabled(self.io, arena, self.opts.data_dir) else names.items;
+        for (now_on) |n| {
+            const path = try dk.blocklists.filePath(arena, self.opts.data_dir, n);
+            if (!update) if (Io.Dir.cwd().statFile(self.io, path, .{})) |_| continue else |_| {};
+            const address = try dk.blocklists.url(arena, self.opts.blocklist_base_url, n);
+            if (dk.listfetch.download(self.io, self.gpa, arena, address, path, false)) |_| fetched += 1 else |_| try failed.append(arena, n);
+        }
+        const note = if (failed.items.len > 0)
+            try std.fmt.allocPrint(arena, "Saved, but these could not be downloaded: {s}. Try again in a moment.", .{try std.mem.join(arena, ", ", failed.items)})
+        else
+            try std.fmt.allocPrint(arena, "Saved ({d} lists on, {d} downloaded). Restart dksearch for the lists to take effect.", .{ names.items.len, fetched });
+        return self.pageSafe(arena, csrf, note, failed.items.len > 0);
     }
 
     fn pageDocs(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
@@ -4730,6 +4786,23 @@ test "Safe search page: status, the switch in the configuration, the PIN (live),
     const ban_text = try f.tmp.dir.readFileAlloc(testing.io, "lists/ban.txt", a, .limited(1000));
     try testing.expect(std.mem.indexOf(u8, ban_text, "bad.example") != null);
     try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/safesearch", .{ .cookie = cookie })).body, "slop.example") != null);
+    // The Block List Project lists: the card shows them all; a choice is saved (catalogue names only) even when the
+    // download cannot be made, and the failure is said (this test never reaches the real server: its address is not https).
+    f.app.opts.blocklist_base_url = "http://127.0.0.1:1";
+    const card = (try f.call(a, .GET, "/safesearch", .{ .cookie = cookie })).body;
+    for ([_][]const u8{ "Block lists from the Block List Project", "value=\"phishing\"", "value=\"drugs\"", "value=\"youtube\"", "bans well-known sites" }) |want| try testing.expect(std.mem.indexOf(u8, card, want) != null);
+    const chosen = try post(&f, a, cookie, csrf, "/actions/blocklists", "act=save&use=phishing&use=ads&use=not-a-list");
+    try testing.expect(std.mem.indexOf(u8, chosen.body, "could not be downloaded: phishing, ads") != null);
+    const on_text = try f.tmp.dir.readFileAlloc(testing.io, "lists/blocklists.txt", a, .limited(100));
+    try testing.expectEqualStrings("phishing\nads\n", on_text);
+    try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/safesearch", .{ .cookie = cookie })).body, "value=\"phishing\" id=\"bl-phishing\" checked") != null);
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/blocklists", .{ .cookie = cookie, .body = "csrf=wrong&use=ads" })).status);
+    // Present files are not fetched again by "save"; the choice can be emptied.
+    try f.tmp.dir.createDirPath(testing.io, "lists/blocklistproject");
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "lists/blocklistproject/ads.txt", .data = "0.0.0.0 ads.example\n" });
+    try testing.expect(std.mem.indexOf(u8, (try post(&f, a, cookie, csrf, "/actions/blocklists", "act=save&use=ads")).body, "Saved (1 lists on, 0 downloaded)") != null);
+    _ = try post(&f, a, cookie, csrf, "/actions/blocklists", "act=save");
+    try testing.expectEqualStrings("", try f.tmp.dir.readFileAlloc(testing.io, "lists/blocklists.txt", a, .limited(100)));
     // An adult key is marked when it is made, and shown as such.
     _ = try post(&f, a, cookie, csrf, "/actions/key-add", "name=grown-up&all=1&rate=0&adult=1");
     const keys = try dk.access.load(a, testing.io, f.tmp.dir, dk.access.file_name);
