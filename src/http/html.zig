@@ -345,6 +345,7 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
     try writeEscaped(w, f.q);
     try w.writeAll("\"><button type=\"submit\">Search</button><button type=\"submit\" name=\"images\" value=\"1\" class=\"secondary\">Images</button>");
     const open = if (f.language.len > 0 or f.picked.len > 0 or f.sort.len > 0 or f.peers_on) " open" else "";
+    try w.writeAll("<div class=\"filterrow\">");
     try w.print("<details{s}><summary><span>Filters</span></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
     try writeEscaped(w, f.language);
     try w.writeAll("\"></label>");
@@ -368,7 +369,10 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
     try w.writeAll("<label>Excerpts <select name=\"snippets\">");
     for ([_]u8{ 1, 2, 3, 5 }) |n| try w.print("<option value=\"{d}\"{s}>{d}</option>", .{ n, if (n == f.snippets) " selected" else "", n });
     try w.writeAll("</select></label>");
-    try w.writeAll("</details></form>\n");
+    try w.writeAll("</details>");
+    try writeSafeNote(w, f.safe_note);
+    try w.writeAll("</div></form>\n");
+    try writeSafeForms(w, f.safe_note);
     if (f.regex_notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
         try writeEscaped(w, n);
@@ -416,12 +420,23 @@ pub fn writeHomeWith(w: *Writer, notice: ?[]const u8, regex_enabled: bool) Write
 /// Safe search as the visitor meets it: on (with a way to unlock when the server has a PIN), or off in this browser.
 pub const SafeNote = enum { none, on_unlockable, on, unlocked };
 
+/// The safe-search state, on the line of the Filters switch at the right (inside the search form, so its fields name the
+/// separate forms below with `form=`: a form cannot hold another form).
 fn writeSafeNote(w: *Writer, note: SafeNote) Writer.Error!void {
     switch (note) {
         .none => {},
-        .on => try w.writeAll("<p class=\"muted small\">Safe search is on.</p>\n"),
-        .on_unlockable => try w.writeAll("<form class=\"inline unlock\" action=\"/unlock\" method=\"post\"><span class=\"muted small\">Safe search is on.</span> <label class=\"muted small\">PIN <input type=\"password\" name=\"pin\" inputmode=\"numeric\" autocomplete=\"off\" size=\"6\" aria-label=\"PIN to unlock safe search\"></label> <button type=\"submit\" class=\"secondary\">Unlock</button></form>\n"),
-        .unlocked => try w.writeAll("<p class=\"muted small\">Safe search is off in this browser. <form class=\"inline\" action=\"/lock\" method=\"post\"><button type=\"submit\" class=\"btn secondary\">Turn it back on</button></form></p>\n"),
+        .on => try w.writeAll("<div class=\"safenote muted small\">Safe search is on.</div>"),
+        .on_unlockable => try w.writeAll("<div class=\"safenote muted small\"><span>Safe search is on.</span> <label>PIN <input form=\"unlockform\" type=\"password\" name=\"pin\" inputmode=\"numeric\" autocomplete=\"off\" size=\"6\" aria-label=\"PIN to unlock safe search\"></label> <button form=\"unlockform\" type=\"submit\" class=\"secondary\">Unlock</button></div>"),
+        .unlocked => try w.writeAll("<div class=\"safenote muted small\"><span>Safe search is off in this browser.</span> <button form=\"lockform\" type=\"submit\" class=\"secondary\">Turn it back on</button></div>"),
+    }
+}
+
+/// The forms the safe-search controls belong to (empty: their fields are inside the search form).
+fn writeSafeForms(w: *Writer, note: SafeNote) Writer.Error!void {
+    switch (note) {
+        .on_unlockable => try w.writeAll("<form id=\"unlockform\" action=\"/unlock\" method=\"post\"></form>\n"),
+        .unlocked => try w.writeAll("<form id=\"lockform\" action=\"/lock\" method=\"post\"></form>\n"),
+        else => {},
     }
 }
 
@@ -432,7 +447,6 @@ pub fn writeHomeForm(w: *Writer, notice: ?[]const u8, form: Form) Writer.Error!v
     try writeSidePanel(w, regex_enabled);
     try w.writeAll("<main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
     try writeForm(w, form);
-    try writeSafeNote(w, form.safe_note);
     if (notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
         try writeEscaped(w, n);
@@ -448,7 +462,6 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     try w.writeAll("<main class=\"results-page\"><div class=\"head\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>");
     try writeForm(w, f);
     try w.writeAll("</div>\n");
-    try writeSafeNote(w, f.safe_note);
     if (f.semantic_text) |t| {
         try w.writeAll("<p class=\"muted small\">");
         try writeEscaped(w, t);

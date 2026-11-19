@@ -364,3 +364,10 @@ form.unlock button { padding: 0.25rem 0.7rem; }
 form.zimfilter { display: flex; flex-wrap: wrap; gap: 0.6rem 1rem; align-items: end; margin: 0.8rem 0; }
 form.zimfilter label { display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.85rem; color: var(--muted); }
 form.zimfilter select, form.zimfilter input[type=search], form.zimfilter input[type=text] { font-size: 0.95rem; }
+
+/* The safe-search state sits on the line of the Filters switch, at the right. */
+.filterrow { position: relative; }
+.filterrow .safenote { position: absolute; top: 0; right: 0; display: flex; gap: 0.5rem; align-items: center; min-height: 1.6rem; }
+.filterrow .safenote input[type=password] { width: 4.5rem; padding: 0.15rem 0.35rem; }
+.filterrow .safenote button { padding: 0.15rem 0.6rem; }
+@media (max-width: 36rem) { .filterrow .safenote { position: static; margin: 0.4rem 0; } }
