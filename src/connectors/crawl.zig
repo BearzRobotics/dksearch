@@ -34,6 +34,7 @@ const fetch = @import("crawl/fetch.zig");
 const hidden = @import("crawl/hidden.zig");
 const frontier = @import("crawl/frontier.zig");
 const feedlinks = @import("crawl/feedlinks.zig");
+const mediawiki = @import("crawl/mediawiki.zig");
 const toml = @import("toml");
 const domainlist = @import("../domainlist.zig");
 const cabundle = @import("crawl/cabundle.zig");
@@ -79,11 +80,15 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_feed = "application/rss+xml,application/atom+xml,application/xml;q=0.9,text/xml;q=0.8";
 const max_feed_bytes = 2 * 1024 * 1024;
+const accept_json = "application/json,text/json;q=0.9";
+const max_api_bytes = 4 * 1024 * 1024;
+/// The most calls to a wiki's list of articles in one run (500 titles each).
+const max_mediawiki_calls = 200;
 /// The most entries taken from one site's feed.
 const feed_cap = 100;
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page", "report_file", "robots_sitemaps", "use_feeds" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page", "report_file", "robots_sitemaps", "use_feeds", "mediawiki", "mediawiki_max_pages" };
 
 // ------------------------------------------------------------ validation
 
@@ -185,6 +190,8 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     try boolOption(source, "index_images", diag);
     try boolOption(source, "robots_sitemaps", diag);
     try boolOption(source, "use_feeds", diag);
+    try boolOption(source, "mediawiki", diag);
+    try intOption(source, "mediawiki_max_pages", 1, 100000, diag);
     try intOption(source, "max_images_per_page", 1, 50, diag);
     try intOption(source, "recrawl_min_hours", 1, 24 * 30, diag);
     try intOption(source, "recrawl_max_days", 1, 365, diag);
@@ -264,6 +271,10 @@ pub const CrawlConnector = struct {
     /// Take the newest entries of the feed (RSS or Atom) that the first page of a listed site names, so new pages are
     /// found without waiting for a deep crawl to reach them (docs/decisions/0058).
     use_feeds: bool,
+    /// For a listed site whose first page says it is a MediaWiki, take its articles from the wiki's own API (the list of
+    /// all pages) instead of relying on the links of its front page; at most `mediawiki_max_pages` articles per wiki.
+    mediawiki: bool,
+    mediawiki_max_pages: u32,
     /// The first extra wait after a refusal (429 or 503), when the site did not say how long: at least this, then doubled.
     backoff_ms: u32 = 2000,
     checkpoint_buf: std.ArrayList(u8) = .empty,
@@ -314,6 +325,8 @@ pub const CrawlConnector = struct {
             .report_file = report_file,
             .robots_sitemaps = source.optionBool("robots_sitemaps") orelse false,
             .use_feeds = source.optionBool("use_feeds") orelse false,
+            .mediawiki = source.optionBool("mediawiki") orelse false,
+            .mediawiki_max_pages = @intCast(source.optionInt("mediawiki_max_pages") orelse 5000),
             .tor = if (source.optionString("tor_socks")) |v| hidden.parseProxy(v) else null,
             .i2p = if (source.optionString("i2p_proxy")) |v| hidden.parseProxy(v) else null,
             .hidden_links = source.optionBool("hidden_links") orelse false,
@@ -988,6 +1001,8 @@ const Host = struct {
     sitemaps_done: std.atomic.Value(bool) = .init(false),
     /// The site's feed has been taken (once per site and run).
     feeds_done: std.atomic.Value(bool) = .init(false),
+    /// The wiki's article list has been taken (once per site and run).
+    mediawiki_done: std.atomic.Value(bool) = .init(false),
 };
 
 /// The most pages taken from the sitemaps of one site's robots.txt.
@@ -1612,7 +1627,76 @@ const Run = struct {
         }
         if (self.conn.robots_sitemaps and t.root and t.depth == 0) try self.robotsSitemaps(a, t, got.url, out);
         if (self.conn.use_feeds and t.root and t.depth == 0 and stored.feeds.len > 0) try self.feedPages(a, t, got.url, stored.feeds, out);
+        if (self.conn.mediawiki and t.root and t.depth == 0 and mediawiki.isMediaWiki(stored.generator)) try self.mediawikiPages(a, t, got.url, stored.edit_uri, out);
         return stored.result;
+    }
+
+    /// The articles of a MediaWiki, from its API, once per site: the API's address from the page (or the usual places),
+    /// the article path from the wiki's own description, then the list of all articles 500 at a time up to
+    /// `mediawiki_max_pages`. They join the next level as pages at the depth limit. The calls go through the same polite
+    /// fetching as pages (robots.txt, delay, backoff): a wiki that does not allow its API to crawlers is left to its links.
+    fn mediawikiPages(self: *Run, a: Allocator, t: CrawlConnector.Task, page_url: []const u8, edit_uri: ?[]const u8, out: *std.ArrayList(CrawlConnector.Task)) error{OutOfMemory}!void {
+        const u = parseUrl(page_url) orelse return;
+        const host = self.hostFor(u, true) catch return;
+        if (host.mediawiki_done.swap(true, .acq_rel)) return;
+        const origin = try originOf(a, u);
+        const hint: ?[]const u8 = if (edit_uri) |e| try mediawiki.apiFromEditUri(a, page_url, e) else null;
+        var candidates: [3][]const u8 = undefined;
+        var n: usize = 0;
+        if (hint) |h| {
+            candidates[n] = h;
+            n += 1;
+        }
+        candidates[n] = try std.fmt.allocPrint(a, "{s}/api.php", .{origin});
+        n += 1;
+        candidates[n] = try std.fmt.allocPrint(a, "{s}/w/api.php", .{origin});
+        n += 1;
+        var tmp = std.heap.ArenaAllocator.init(self.conn.gpa);
+        defer tmp.deinit();
+        const ta = tmp.allocator();
+        // The first candidate that answers with the wiki's description is the API.
+        var wiki_api: ?[]const u8 = null;
+        var article_path: ?[]const u8 = null;
+        for (candidates[0..n]) |cand| {
+            const au = parseUrl(cand) orelse continue;
+            if (!sameSite(au.host, t.site)) continue;
+            const got = switch (try self.get(ta, try mediawiki.siteinfoUrl(ta, cand), t.site, accept_json, max_api_bytes, true, null)) {
+                .stopped => return,
+                .skipped, .unchanged => continue,
+                .page => |p| p,
+            };
+            if (try mediawiki.parseArticlePath(a, got.resp.body)) |ap| {
+                wiki_api = cand;
+                article_path = ap;
+                break;
+            }
+        }
+        const api_url = wiki_api orelse return;
+        const path = article_path.?;
+        var cont: ?[]const u8 = null;
+        var added: u32 = 0;
+        var calls: u32 = 0;
+        while (added < self.conn.mediawiki_max_pages and calls < max_mediawiki_calls) : (calls += 1) {
+            const got = switch (try self.get(ta, try mediawiki.listUrl(ta, api_url, cont), t.site, accept_json, max_api_bytes, true, null)) {
+                .stopped => return,
+                .skipped, .unchanged => return,
+                .page => |p| p,
+            };
+            const list = try mediawiki.parseList(ta, got.resp.body);
+            for (list.titles) |title| {
+                if (added >= self.conn.mediawiki_max_pages or out.items.len >= max_level_items) break;
+                const target = try frontier.tidy(a, try mediawiki.articleUrl(a, origin, path, title));
+                if (frontier.isTrap(target)) {
+                    self.bump(target, .traps);
+                    continue;
+                }
+                const keep = (try self.firstVisit(target)) orelse continue;
+                try out.append(self.conn.gpa, .{ .url = keep, .depth = self.conn.max_depth, .seed = t.seed, .site = t.site });
+                added += 1;
+            }
+            // Keep what the list said where to go on from: the answer's memory goes away with the next call.
+            cont = if (list.next) |nx| try ta.dupe(u8, nx) else break;
+        }
     }
 
     /// The newest entries of the feed a listed site's first page names (the first that is not a comments feed), once per
@@ -1778,7 +1862,7 @@ const Run = struct {
         return true;
     }
 
-    const Stored = struct { result: Result, links: []const []const u8 = &.{}, feeds: []const []const u8 = &.{} };
+    const Stored = struct { result: Result, links: []const []const u8 = &.{}, feeds: []const []const u8 = &.{}, generator: ?[]const u8 = null, edit_uri: ?[]const u8 = null };
 
     fn store(self: *Run, a: Allocator, url: []const u8, got: fetch.Response) error{OutOfMemory}!Stored {
         const ct = parseContentType(got.content_type);
@@ -1831,7 +1915,7 @@ const Run = struct {
             error.Stopped => return .{ .result = .stopped },
             else => {}, // not fatal: the next page tries again
         };
-        return .{ .result = .stored, .links = scanned.links, .feeds = scanned.feeds };
+        return .{ .result = .stored, .links = scanned.links, .feeds = scanned.feeds, .generator = scanned.generator, .edit_uri = scanned.edit_uri };
     }
 };
 
@@ -1972,6 +2056,7 @@ test {
     _ = hidden;
     _ = frontier;
     _ = feedlinks;
+    _ = mediawiki;
 }
 
 test "validate requires a user agent and a seeds file, and checks ranges" {
@@ -3248,4 +3333,45 @@ test "the feed a listed site's first page names brings in its newest entries, on
     try testing.expectEqual(@as(usize, 1), srv.count("/feed.xml"));
     try testing.expectEqual(@as(usize, 1), srv.count("/new1"));
     try testing.expectEqual(@as(usize, 1), srv.count("/new2"));
+}
+
+test "a MediaWiki's articles come from its API, 500 at a time, and join the crawl; off by default" {
+    var srv: TestServer = undefined;
+    try srv.open();
+    defer srv.stop();
+    var hb: [400]u8 = undefined;
+    const home = try std.fmt.bufPrint(&hb, "<head><meta name=\"generator\" content=\"MediaWiki 1.43.0\"><link rel=\"EditURI\" href=\"//127.0.0.1:{d}/w/api.php?action=rsd\"></head><body><p>Main page</p></body>", .{srv.port});
+    try srv.serve(&.{
+        .{ .path = "/wiki/Main_Page", .body = home },
+        .{ .path = "/w/api.php?action=query&meta=siteinfo&siprop=general&format=json", .content_type = "application/json", .body = "{\"query\":{\"general\":{\"articlepath\":\"/wiki/$1\"}}}" },
+        .{ .path = "/w/api.php?action=query&list=allpages&aplimit=500&apnamespace=0&apfilterredir=nonredirects&format=json", .content_type = "application/json", .body = "{\"continue\":{\"apcontinue\":\"Gamma Ray\"},\"query\":{\"allpages\":[{\"title\":\"Alpha\"},{\"title\":\"Beta Page\"}]}}" },
+        .{ .path = "/w/api.php?action=query&list=allpages&aplimit=500&apnamespace=0&apfilterredir=nonredirects&format=json&apcontinue=Gamma_Ray", .content_type = "application/json", .body = "{\"query\":{\"allpages\":[{\"title\":\"Gamma Ray\"},{\"title\":\"Special:Foo\"}]}}" },
+        .{ .path = "/wiki/Alpha", .body = "<p>alpha</p>" },
+        .{ .path = "/wiki/Beta_Page", .body = "<p>beta</p>" },
+        .{ .path = "/wiki/Gamma_Ray", .body = "<p>gamma</p>" },
+    });
+    var ub: [96]u8 = undefined;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var plain: Collect = .{};
+    defer plain.deinit();
+    var ctl: api.Control = .{};
+    try crawlWith(&srv, &tmp, srv.url(&ub, "/wiki/Main_Page"), 1, 50, &plain, &ctl);
+    try testing.expectEqual(@as(usize, 1), plain.ids.items.len);
+    try testing.expectEqual(@as(usize, 0), srv.count("/wiki/Alpha"));
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var conn = try testConnector(&tmp2, srv.url(&ub, "/wiki/Main_Page"), "t/1");
+    defer conn.deinit();
+    conn.max_depth = 1;
+    conn.max_pages = 50;
+    conn.mediawiki = true;
+    var with: Collect = .{};
+    defer with.deinit();
+    var ctl2: api.Control = .{};
+    _ = try conn.connector().run(with.sink(), &ctl2, null);
+    try testing.expectEqual(@as(usize, 4), with.ids.items.len); // the main page and the three articles (not the Special page)
+    try testing.expectEqual(@as(usize, 1), srv.count("/wiki/Alpha"));
+    try testing.expectEqual(@as(usize, 1), srv.count("/wiki/Beta_Page"));
+    try testing.expectEqual(@as(usize, 1), srv.count("/wiki/Gamma_Ray"));
 }

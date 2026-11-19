@@ -245,6 +245,10 @@ pub const Scan = struct {
     images: []const PageImage = &.{},
     /// Addresses of the page's feeds (`<link rel="alternate" type="application/rss+xml|atom+xml" href>`), at most three.
     feeds: []const []const u8 = &.{},
+    /// `<meta name="generator" content="...">`: what made the page ("MediaWiki 1.43.0").
+    generator: ?[]const u8 = null,
+    /// `<link rel="EditURI" href="...">`: where a MediaWiki's API is (the address with `?action=rsd`).
+    edit_uri: ?[]const u8 = null,
 };
 
 /// A picture of a page: where it is (as written in the page: it may be relative), what the page says it shows.
@@ -325,10 +329,15 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
                 continue;
             };
         }
-        if (feeds.items.len < 3 and std.ascii.eqlIgnoreCase(t.name, "link")) {
+        if (std.ascii.eqlIgnoreCase(t.name, "link")) {
             const rel = attr(body, "rel") orelse "";
             const ty = attr(body, "type") orelse "";
-            if (hasToken(rel, "alternate") and (std.ascii.startsWithIgnoreCase(ty, "application/rss+xml") or std.ascii.startsWithIgnoreCase(ty, "application/atom+xml"))) {
+            if (hasToken(rel, "edituri")) {
+                if (attr(body, "href")) |href| {
+                    const trimmed = std.mem.trim(u8, href, " \t\r\n");
+                    if (trimmed.len > 0 and trimmed.len <= 2000 and out.edit_uri == null) out.edit_uri = try decodeEntities(arena, trimmed);
+                }
+            } else if (feeds.items.len < 3 and hasToken(rel, "alternate") and (std.ascii.startsWithIgnoreCase(ty, "application/rss+xml") or std.ascii.startsWithIgnoreCase(ty, "application/atom+xml"))) {
                 if (attr(body, "href")) |href| {
                     const trimmed = std.mem.trim(u8, href, " \t\r\n");
                     if (trimmed.len > 0 and trimmed.len <= 2000) try feeds.append(arena, try decodeEntities(arena, trimmed));
@@ -338,6 +347,12 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
         }
         if (std.ascii.eqlIgnoreCase(t.name, "meta")) {
             const name = attr(body, "name") orelse continue;
+            if (std.ascii.eqlIgnoreCase(name, "generator")) {
+                if (attr(body, "content")) |g| if (out.generator == null and g.len <= 120) {
+                    out.generator = try decodeEntities(arena, std.mem.trim(u8, g, " \t\r\n"));
+                };
+                continue;
+            }
             if (!std.ascii.eqlIgnoreCase(name, "robots") and !std.ascii.eqlIgnoreCase(name, "dksearch")) continue;
             const content = attr(body, "content") orelse continue;
             if (hasToken(content, "noindex") or hasToken(content, "none")) out.noindex = true;
@@ -574,4 +589,15 @@ test "the feeds a page names are found, in order, and a stylesheet link is not o
     try testing.expectEqual(@as(usize, 2), s.feeds.len);
     try testing.expectEqualStrings("/feed.xml", s.feeds[0]);
     try testing.expectEqualStrings("https://e.org/atom", s.feeds[1]);
+}
+
+test "a MediaWiki page says so, and where its API is" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const html = "<head><meta name=\"generator\" content=\"MediaWiki 1.43.0\"><link rel=\"EditURI\" type=\"application/rsd+xml\" href=\"//wiki.e.org/w/api.php?action=rsd\"></head><body></body>";
+    const s = try scan(ar.allocator(), html, 10);
+    try testing.expectEqualStrings("MediaWiki 1.43.0", s.generator.?);
+    try testing.expectEqualStrings("//wiki.e.org/w/api.php?action=rsd", s.edit_uri.?);
+    const plain = try scan(ar.allocator(), "<head><meta name=\"robots\" content=\"noindex\"></head>", 10);
+    try testing.expect(plain.generator == null and plain.edit_uri == null and plain.noindex);
 }
