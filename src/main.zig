@@ -14,6 +14,14 @@ const build_options = @import("build_options");
 /// argument, so these have to be globals; setting them is async-signal-safe.
 var stop_control: dkhttp.server.Control = .{};
 var import_control: dk.connector.Control = .{};
+/// Set by the administration interface's "Restart dksearch": the server stops cleanly, then starts again.
+var restart_flag: std.atomic.Value(bool) = .init(false);
+var restart_dummy: u8 = 0;
+
+fn requestRestart(_: *anyopaque) void {
+    restart_flag.store(true, .release);
+    stop_control.requestStop();
+}
 /// Used by `now`, which the pipeline calls without an `Io`.
 var clock_io: Io = undefined;
 
@@ -113,7 +121,7 @@ fn run(init: std.process.Init) u8 {
     const gpa = init.gpa;
 
     var args = init.minimal.args.iterate();
-    _ = args.next(); // program name
+    const argv0: []const u8 = args.next() orelse "dksearch"; // program name, as it was started: a restart runs it again
     const first = args.next() orelse {
         Io.File.stderr().writeStreamingAll(io, short_usage) catch {};
         return exit_usage;
@@ -250,7 +258,13 @@ fn run(init: std.process.Init) u8 {
                 return exit_usage;
             }
         }
-        return if (eq(first, "serve")) serve(io, gpa, config_path) else if (eq(first, "embed")) embedCmd(io, gpa, config_path) else rebuildCmd(io, gpa, config_path);
+        if (eq(first, "serve")) {
+            const code = serve(io, gpa, config_path);
+            // The administration interface asked for a restart: everything is closed now, so run the program again.
+            if (restart_flag.load(.acquire)) restartSelf(io, argv0, config_path);
+            return code;
+        }
+        return if (eq(first, "embed")) embedCmd(io, gpa, config_path) else if (eq(first, "embed")) embedCmd(io, gpa, config_path) else rebuildCmd(io, gpa, config_path);
     }
 
     if (eq(first, "remove")) {
@@ -1440,6 +1454,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         admin_app = dkhttp.admin.App.init(gpa, io, .{
             .store = &source_store,
             .config_path = config_path,
+            .restart = .{ .ctx = &restart_dummy, .request = requestRestart },
             .jobs = if (job_manager_ready) &job_manager else null,
             .searcher = searcher,
             .regex = if (admin_regex_service) |*r| r else null,
@@ -1594,6 +1609,17 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
 }
 
 /// Takes the data directory's writer lock, or explains why not.
+/// Runs the program again as `dksearch serve [--config FILE]`, in place of this process (same process id, same
+/// working directory). `argv0` is how it was started, so a new binary put in the same place is the one that runs.
+/// Returns only when that failed.
+fn restartSelf(io: Io, argv0: []const u8, config_path: ?[]const u8) void {
+    err(io, "restarting", .{});
+    var argv: [4][]const u8 = .{ argv0, "serve", "--config", config_path orelse "" };
+    const n: usize = if (config_path != null) 4 else 2;
+    const e = std.process.replace(io, .{ .argv = argv[0..n] });
+    err(io, "cannot restart ({t}); start dksearch again by hand", .{e});
+}
+
 fn lockWriters(io: Io, data_dir: []const u8, what: []const u8) ?dk.maintenance.WriterLock {
     var dir = Io.Dir.cwd().openDir(io, data_dir, .{}) catch |e| {
         err(io, "cannot open data_dir {s}: {t}", .{ data_dir, e });

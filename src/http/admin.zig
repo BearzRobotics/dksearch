@@ -35,6 +35,12 @@ const max_delay_ms: u64 = 5_000;
 const max_waiting = 4;
 const failure_memory_ns: i96 = 15 * 60 * std.time.ns_per_s;
 
+/// What the administration interface may ask of the process that runs it: to stop cleanly and start again.
+pub const Restart = struct {
+    ctx: *anyopaque,
+    request: *const fn (ctx: *anyopaque) void,
+};
+
 pub const Options = struct {
     /// Paths of the three databases (the state one is read for the pages).
     index_path: [:0]const u8,
@@ -48,6 +54,8 @@ pub const Options = struct {
     /// The configuration file the server was started with, for editing sources.
     /// Null: sources cannot be edited from the interface.
     config_path: ?[]const u8 = null,
+    /// Present when the process can restart itself: the "Restart dksearch" button.
+    restart: ?Restart = null,
     version: []const u8,
     session_idle_ms: u64 = 30 * 60 * 1000,
     session_max_ms: u64 = 8 * 60 * 60 * 1000,
@@ -164,7 +172,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, action_embed, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, action_blocklists, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, action_embed, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, action_blocklists, action_restart, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -200,6 +208,7 @@ pub const App = struct {
             .{ "/actions/safesearch-pin", .action_safe_pin },
             .{ "/actions/safesearch-lists", .action_safe_lists },
             .{ "/actions/blocklists", .action_blocklists },
+            .{ "/actions/restart", .action_restart },
             .{ "/actions/zim", .action_zim },
             .{ "/actions/zim-folder", .action_zim_folder },
             .{ "/api/v1/admin/maintenance", .api_maintenance },
@@ -252,7 +261,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_embed or route == .action_findimage or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_blocklists or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_embed or route == .action_findimage or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_blocklists or route == .action_restart or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -286,6 +295,7 @@ pub const App = struct {
             .action_safe_pin => self.safePin(arena, req, auth),
             .action_safe_lists => self.safeLists(arena, req, auth),
             .action_blocklists => self.blocklistsAction(arena, req, auth),
+            .action_restart => self.restartAction(arena, req, auth),
             .zim_page => self.pageZim(arena, csrf, t.params),
             .models_page => self.pageModels(arena, csrf, null, t.params.get("remove")),
             .action_model_pull => self.modelAction(arena, req, auth, .pull),
@@ -599,6 +609,12 @@ pub const App = struct {
         const text = self.readConfigText(arena);
         const editable = self.canEditSources() and text != null;
         writeSettings(arena, w, csrf orelse "", text, editable, self.opts.config_path != null, done, problem, posted) catch return error.OutOfMemory;
+        if (csrf) |token| {
+            w.writeAll("<section class=\"card\"><h2>Restart</h2><p class=\"muted\">Settings are read when dksearch starts. The file is checked first: if it has a problem nothing is restarted.</p>") catch return error.OutOfMemory;
+            self.writeRestartForm(w, token) catch return error.OutOfMemory;
+            if (self.opts.restart == null) w.writeAll("<p class=\"muted\">This server cannot restart itself; restart it from the shell or with <code>systemctl restart dksearch</code>.</p>") catch return error.OutOfMemory;
+            w.writeAll("</section>") catch return error.OutOfMemory;
+        }
         w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
         return handler.htmlResponse(arena, status, aw.written());
     }
@@ -627,6 +643,51 @@ pub const App = struct {
             error.Io => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_not_writable", .message = "the configuration file could not be written (check its permissions); nothing was changed" }),
         };
         return redirect(arena, "/settings?done=saved", null);
+    }
+
+    /// `POST /actions/restart`: checks the configuration file as `check-config` would, and only if it is good asks the
+    /// server to stop cleanly and start again with the same command line. A bad file is reported and nothing stops.
+    fn restartAction(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => {},
+            .refused => |r| return r,
+        }
+        const hook = self.opts.restart orelse return actionFailure(arena, false, .{ .status = .conflict, .code = "no_restart", .message = "this server cannot restart itself (restart it from the shell or with systemctl)" });
+        const path = self.opts.config_path orelse return actionFailure(arena, false, .{ .status = .conflict, .code = "no_config_file", .message = "the server was started without --config, so there is no file to restart with" });
+        if (self.opts.jobs == null) return actionFailure(arena, false, .{ .status = .conflict, .code = "actions_off", .message = "restarting from here needs admin.actions = true" });
+        const csrf = try csrfCopy(arena, auth);
+        const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_unreadable", .message = "cannot read the configuration file, so nothing was restarted" }),
+        };
+        var d: dk.config.Diagnostic = .{};
+        if (dk.config.loadFromSlice(self.gpa, path, text, &d)) |checked| {
+            var c = checked;
+            c.deinit();
+        } else |_| {
+            const why = try std.fmt.allocPrint(arena, "The configuration file has a problem, so dksearch was not restarted: {s}{s}{s}", .{ d.key(), if (d.key().len > 0) ": " else "", d.message() });
+            var aw: Io.Writer.Allocating = .init(arena);
+            const w = &aw.writer;
+            writePage(w, "Restart", csrf, "settings") catch return error.OutOfMemory;
+            w.writeAll("<p class=\"notice err\" role=\"alert\">") catch return error.OutOfMemory;
+            html.writeEscaped(w, why) catch return error.OutOfMemory;
+            w.writeAll("</p><p>Fix the file (Settings, or by hand) and try again. Nothing was stopped.</p></main></body></html>\n") catch return error.OutOfMemory;
+            return handler.htmlResponse(arena, .bad_request, aw.written());
+        }
+        hook.request(hook.ctx);
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "Restarting", csrf, "settings") catch return error.OutOfMemory;
+        w.writeAll("<p class=\"notice ok\" role=\"status\">dksearch is restarting. Requests in progress are finished first, then it starts again with the file as it is now. You will have to sign in again.</p><p><a href=\"/\">Back to the dashboard</a> (try again in a few seconds if it does not answer).</p><meta http-equiv=\"refresh\" content=\"8; url=/\"></main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
+    }
+
+    /// The restart button, where a page says that something applies after a restart.
+    fn writeRestartForm(self: *App, w: *Io.Writer, csrf: []const u8) !void {
+        if (self.opts.restart == null or self.opts.config_path == null or self.opts.jobs == null) return;
+        try w.writeAll("<form class=\"inline\" action=\"/actions/restart\" method=\"post\" onsubmit=\"return confirm('Restart dksearch now? Searches in progress finish first; imports started here are cancelled and can be run again.')\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        try html.writeEscaped(w, csrf);
+        try w.writeAll("\"><button type=\"submit\" class=\"btn secondary\">Restart dksearch</button></form>");
     }
 
     fn canEditSources(self: *App) bool {
@@ -1712,6 +1773,10 @@ pub const App = struct {
             try w.print("<p class=\"notice {s}\" role=\"status\">", .{if (is_error) "err" else "ok"});
             try html.writeEscaped(w, n);
             try w.writeAll("</p>");
+            if (!is_error and csrf != null and std.mem.indexOf(u8, n, "Restart") != null) {
+                try self.writeRestartForm(w, csrf.?);
+                try w.writeAll("<p></p>");
+            }
         }
         const lists = self.opts.lists;
         const pin_set = if (self.opts.unlock) |u| u.hasPin() else false;
@@ -1949,7 +2014,8 @@ pub const App = struct {
     fn writeZim(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, params: query.Params) !void {
         const zim_dir = if (self.opts.jobs) |m| m.opts.zim_dir else null;
         try w.writeAll("<p class=\"muted\">Search the <a href=\"https://library.kiwix.org\">Kiwix library</a> of offline copies of Wikipedia, Wiktionary, Stack Exchange sites, books and more, and download a file to index. This page contacts <code>library.kiwix.org</code> only when you search here; nothing is downloaded without your confirmation.</p>");
-        const dir = zim_dir orelse {
+        // Browsing the library needs no folder; only a download does, so the folder card sits above the catalog.
+        if (zim_dir == null) {
             if (csrf != null and self.canEditConfig()) {
                 // The folder is set here, not in the file: the form writes `[admin] zim_dir` and applies it at once.
                 try w.writeAll("<section class=\"card\"><h2>Choose a folder for ZIM files</h2><p class=\"muted\">Downloads and the ZIM files you add are kept in one folder. Pick a folder on a disk with room (a Wikipedia copy is tens of gigabytes). It is created if it does not exist, saved in the configuration and used straight away.</p><form action=\"/actions/zim-folder\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
@@ -1958,8 +2024,8 @@ pub const App = struct {
                 try html.writeEscaped(w, try std.fmt.allocPrint(arena, "{s}/zim", .{std.mem.trimEnd(u8, self.opts.data_dir, "/")}));
                 try w.writeAll("\"></label> <button type=\"submit\" class=\"btn\">Use this folder</button></form></section>");
             } else try w.writeAll("<section class=\"card\"><h2>Not set up</h2><p class=\"muted\">Downloads need a folder to put the files in. Turn on <code>actions</code> in the <code>[admin]</code> table of the configuration and start the server with <code>--config</code>; this page can then set the folder for you (or add <code>zim_dir = \"/path/to/zim\"</code> yourself).</p></section>");
-            return;
-        };
+        }
+        const dir: []const u8 = zim_dir orelse "";
 
         // The confirmation for one file.
         if (params.get("file")) |file| {
@@ -1967,6 +2033,10 @@ pub const App = struct {
             const size = std.fmt.parseInt(u64, params.get("size") orelse "0", 10) catch 0;
             if (!dk.kiwix.validFileName(file) or !self.kiwixUrlOk(meta4)) {
                 try w.writeAll("<p class=\"error\">That file cannot be downloaded from here.</p>");
+                return;
+            }
+            if (dir.len == 0) {
+                try w.writeAll("<p class=\"error\">Choose a folder for the downloads first (the card at the top of the page), then press Download again.</p>");
                 return;
             }
             try w.writeAll("<section class=\"card\"><h2>Download this file?</h2><dl class=\"facts\"><div><dt>File</dt><dd><code>");
@@ -2174,9 +2244,13 @@ pub const App = struct {
     /// Ways to get a file without this page, always offered: the library in a browser, the mirror listing, and adding a file
     /// that is already in the folder as a source.
     fn writeZimFallback(w: *Io.Writer, dir: []const u8) !void {
-        try w.writeAll("<p class=\"muted small\">Rather use a browser? Browse <a href=\"https://library.kiwix.org/\">library.kiwix.org</a> or the plain file listing at <a href=\"https://download.kiwix.org/zim/\">download.kiwix.org/zim</a>, put the file in <code>");
-        try html.writeEscaped(w, dir);
-        try w.writeAll("</code> and <a href=\"/sources/new\">add it as a ZIM source</a>.</p>");
+        try w.writeAll("<p class=\"muted small\">Rather use a browser? Browse <a href=\"https://library.kiwix.org/\">library.kiwix.org</a> or the plain file listing at <a href=\"https://download.kiwix.org/zim/\">download.kiwix.org/zim</a>, put the file in ");
+        if (dir.len > 0) {
+            try w.writeAll("<code>");
+            try html.writeEscaped(w, dir);
+            try w.writeAll("</code>");
+        } else try w.writeAll("a folder of your choice");
+        try w.writeAll(" and <a href=\"/sources/new\">add it as a ZIM source</a>.</p>");
     }
 
     // ----------------------------------------------------- AI models (Ollama)
@@ -4177,6 +4251,10 @@ test "ZIM files: the folder is chosen on the page, created, saved in the configu
     const cookie = try f.signIn(a);
     const page = try f.call(a, .GET, "/zim", .{ .cookie = cookie });
     try testing.expect(std.mem.indexOf(u8, page.body, "Choose a folder for ZIM files") != null);
+    // The library is browsable before any folder is chosen; only a download needs one.
+    try testing.expect(std.mem.indexOf(u8, page.body, "name=\"pictures\"") != null and std.mem.indexOf(u8, page.body, "library.kiwix.org") != null);
+    const no_folder = try f.call(a, .GET, "/zim?file=a_2026-01.zim&meta4=https%3A%2F%2Fdownload.kiwix.org%2Fzim%2Fwikipedia%2Fa_2026-01.zim.meta4&size=1024", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, no_folder.body, "Choose a folder for the downloads first") != null);
     const csrf = csrfOf(page.body);
     const root = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, ".zig-cache", a);
     const folder = try std.fmt.allocPrint(a, "{s}/tmp/{s}/zims", .{ root, tmp.sub_path });
@@ -4240,6 +4318,53 @@ test "ZIM files: the filter form keeps its choices, sorting works, paging keeps 
     var aw4: Io.Writer.Allocating = .init(a);
     try App.writeZimFallback(&aw4.writer, "/data/zim");
     try testing.expect(std.mem.indexOf(u8, aw4.written(), "https://library.kiwix.org/") != null and std.mem.indexOf(u8, aw4.written(), "href=\"/sources/new\"") != null and std.mem.indexOf(u8, aw4.written(), "/data/zim") != null);
+}
+
+test "Restart: a good file asks the server to restart, a bad file is reported and nothing stops, and without the hook it says so" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.toml", .data = "# mine\n" });
+    var pb: [160]u8 = undefined;
+    f.app.opts.config_path = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}/c.toml", .{tmp.sub_path});
+    const Hook = struct {
+        var asked: bool = false;
+        var dummy: u8 = 0;
+        fn request(_: *anyopaque) void {
+            asked = true;
+        }
+    };
+    Hook.asked = false;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const settings = try f.call(a, .GET, "/settings", .{ .cookie = cookie });
+    const csrf = csrfOf(settings.body);
+    // No way to restart: no button, and the action says so.
+    try testing.expect(std.mem.indexOf(u8, settings.body, "action=\"/actions/restart\"") == null);
+    const body = try std.fmt.allocPrint(a, "csrf={s}", .{csrf});
+    try testing.expectEqual(http.Status.conflict, (try f.call(a, .POST, "/actions/restart", .{ .cookie = cookie, .body = body })).status);
+    f.app.opts.restart = .{ .ctx = &Hook.dummy, .request = Hook.request };
+    // The button is there; a wrong token is refused and nothing happens.
+    try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/settings", .{ .cookie = cookie })).body, "action=\"/actions/restart\"") != null);
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/restart", .{ .cookie = cookie, .body = "csrf=wrong" })).status);
+    try testing.expect(!Hook.asked);
+    // A bad file: reported, nothing stops.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.toml", .data = "[server]\nport = \"x\"\n" });
+    const bad = try f.call(a, .POST, "/actions/restart", .{ .cookie = cookie, .body = body });
+    try testing.expectEqual(http.Status.bad_request, bad.status);
+    try testing.expect(std.mem.indexOf(u8, bad.body, "was not restarted") != null);
+    try testing.expect(!Hook.asked);
+    // A good file: the server is asked to restart.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.toml", .data = "# mine\n" });
+    const good = try f.call(a, .POST, "/actions/restart", .{ .cookie = cookie, .body = body });
+    try testing.expectEqual(http.Status.ok, good.status);
+    try testing.expect(std.mem.indexOf(u8, good.body, "is restarting") != null);
+    try testing.expect(Hook.asked);
 }
 
 test "ZIM files: the confirmation shows the free space, and a download that cannot fit is refused with the numbers" {
