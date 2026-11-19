@@ -35,3 +35,18 @@
     area.setSelectionRange(area.value.length, area.value.length);
   }
 })();
+
+// A picture that cannot be loaded (a dead link on a page of the web) is left out of the gallery instead of showing a
+// broken-image icon.
+(function () {
+  var imgs = document.querySelectorAll(".gallery img");
+  Array.prototype.forEach.call(imgs, function (img) {
+    function drop() {
+      var li = img.closest ? img.closest("li") : null;
+      if (li) li.hidden = true;
+    }
+    img.addEventListener("error", drop);
+    // It may already have failed before this script ran.
+    if (img.complete && img.currentSrc && img.naturalWidth === 0) drop();
+  });
+})();

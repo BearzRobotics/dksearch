@@ -239,6 +239,9 @@ pub const SearchSettings = struct {
     /// over a very large index take seconds to rank; past this the search is
     /// stopped and answers "too broad" instead of tying up a connection.
     query_timeout_ms: u32 = 5000,
+    /// A plain word in more than this share (percent) of the documents is not required by a query that has other words
+    /// ("how to program in c" is searched as "how program c"); the page says which were left out. 0 requires every word.
+    common_word_percent: u32 = 15,
     /// Typo tolerance: "auto" retries an exact search that finds fewer than 3
     /// results with words one typo away; "always" expands every word; "off".
     fuzzy: FuzzyMode = .auto,
@@ -484,7 +487,7 @@ const server_keys = [_][]const u8{
 const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions", "backup_dir", "zim_dir" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
-const search_keys = [_][]const u8{ "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "per_domain", "trusted_first", "trusted_min_boost", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
+const search_keys = [_][]const u8{ "common_word_percent", "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "per_domain", "trusted_first", "trusted_min_boost", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
 const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings", "fallback", "ollama", "answers", "filters", "safe_search", "images" };
 
 /// Parses and validates configuration text. `source_name` is only used in
@@ -607,6 +610,13 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
                 diag.set(src, "search.query_syntax", "must be \"advanced\" or \"simple\", got \"{s}\"", .{v});
                 return error.InvalidValue;
             }
+        }
+        if (try intIn(src, "search", t, "common_word_percent", 0, 90, diag)) |n| {
+            if (n != 0 and n < 3) {
+                diag.set(src, "search.common_word_percent", "must be 0 (off) or 3 to 90", .{});
+                return error.InvalidValue;
+            }
+            cfg.search.common_word_percent = @intCast(n);
         }
         if (try intIn(src, "search", t, "title_weight", 1, 1000, diag)) |n| cfg.search.title_weight = @intCast(n);
         if (try intIn(src, "search", t, "body_weight", 1, 1000, diag)) |n| cfg.search.body_weight = @intCast(n);
@@ -2035,4 +2045,20 @@ test "the thumbnail cache settings are read and checked" {
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nthumbnail_dir = \"relative/thumbs\"\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nthumbnail_cache_mb = 1\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nthumbnail_px = 10\n", &d));
+}
+
+test "search.common_word_percent is read and checked" {
+    var d: Diagnostic = .{};
+    const base = "[storage]\ndata_dir = \"/tmp/x\"\n";
+    var c = try loadFromSlice(testing.allocator, "t.toml", base ++ "[search]\ncommon_word_percent = 25\n", &d);
+    defer c.deinit();
+    try testing.expectEqual(@as(u32, 25), c.search.common_word_percent);
+    var off = try loadFromSlice(testing.allocator, "t.toml", base ++ "[search]\ncommon_word_percent = 0\n", &d);
+    defer off.deinit();
+    try testing.expectEqual(@as(u32, 0), off.search.common_word_percent);
+    var plain = try loadFromSlice(testing.allocator, "t.toml", base, &d);
+    defer plain.deinit();
+    try testing.expectEqual(@as(u32, 15), plain.search.common_word_percent);
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[search]\ncommon_word_percent = 1\n", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[search]\ncommon_word_percent = 95\n", &d));
 }

@@ -559,6 +559,12 @@ The administration interface has a **Safe search** page for all of this: whether
 
 A hidden domain's documents are removed inside the search itself (so paging, counts, excerpts, similar documents, retrieval and answers never see them) and are also refused where a document is opened by its address (`/doc/ID`, its original file and pictures: not found) and dropped from the results of peers and of fallback search engines. What is handed to peers (`/api/v1/export`) leaves out the ban only: a peer you chose is not asked to apply your household's safe search. Limits: it works on the domain of a document's address, not on what the text says, so sites that are not on a list are not filtered, a ZIM file's articles are not judged, search by image applies the ban but not safe search, and a mirror of a hidden site under another domain is a different domain. The server states at start how many domains are hidden.
 
+**Very common words.** Ranking has to read every occurrence of every required word, so a word that is in most documents ("in", "to", "the") made searches such as "how to program in c" take many seconds on a large index and fail. With `[search] common_word_percent` (default 15; 0 turns it off), a plain word that is in more than that share of the documents is not required by a query that has other words: that query is searched as "how program c", the page says "Left out as too common to help: to, in", and the API lists them as `ignored_words`. A word in quotes, a word with `title:`, a word excluded with `-` and a query made only of common words are searched as typed. It has no effect on an index of fewer than a thousand documents.
+
+**Excerpts.** The excerpt of a result is made by dksearch from the text in the index, in one pass: the window of 16 words with the most different query words (a few words of context before it), the matches bracketed, adjacent matches in one bracket. SQLite's own excerpt function is slow on a word that occurs thousands of times in a long document (its time grows with the square of the occurrences); with a stemmed index (`tokenizer = "porter"`) SQLite's is still used, because it knows the stems.
+
+**Downloading ZIM files.** The Download button of the ZIM files page queues the file and keeps you on the same list; the page shows the one downloading with a progress bar (speed and time left), the ones waiting (each can be removed) and the free space. Downloads wait behind a running import or download and start by themselves; the room is checked when a file is queued and again when its turn comes.
+
 **Thumbnail cache (opt-in).** With `[images] thumbnails = true`, the gallery (the Images button) keeps a small JPEG copy of each picture it shows, made the first time the picture is shown, and serves that instead of the original: pages load fast, and large wallpapers are not sent to every browser. Only the small copy is kept; for pictures of the web (`index_images`, `[images] remote`) the original is fetched, shrunk and dropped. `thumbnail_dir` is an absolute folder (default `thumbs` in the data directory), `thumbnail_cache_mb` the most it may hold (16 to 1048576, default 1024: about 70,000 thumbnails, at roughly 12 KB each), `thumbnail_px` the longer side (64 to 1024, default 320) and `thumbnail_quality` the JPEG quality (30 to 95, default 75). Thumbnails are spread over a two-level folder tree by document id; when the folder is over its limit the oldest are deleted until it is 10% under. Photos are turned upright by their EXIF orientation. A picture format that is not shrunk here (SVG, AVIF, TIFF), one too large to decode, or a moment when too many are being made at once sends the browser to the original instead. The Maintenance page of the administration interface shows the cache and has a button to empty it; the settings are under Settings, Pictures. Changes apply after a restart.
 
 **Login on the search page.** Set a password with `dksearch owner-password` (or on the Access page of the administration interface) and the search page shows a **Login** button at the top right. The owner who logs in sees everything the server holds (every source, safe search lifted); visitors see only what `[access] anonymous_collections` allows. A login lasts `[access] owner_login_days` (1 to 365, default 30); it is a signed cookie, so a restart does not end it, and changing or removing the password ends every login. Wrong passwords are limited to five a minute. The same box takes an API key (`dkk_...`) for other programs that want a browser session; `/login` and `/logout` are the pages.
@@ -831,6 +837,26 @@ Searches return nothing: the index may be empty. Run **import** for a configured
 
 Slow operation
 Check that `data_dir` is on a local filesystem. WAL mode does not work reliably on network filesystems, and a filesystem with slow fsync slows index writes.
+
+WORKAROUNDS
+Hacks that are used on purpose, with why, the commands, and how to undo them.
+
+Build and test cache on a fast disk (developers). `zig build test` writes a large cache (it reached 76 GB after many runs), and the tests make their temporary folders in `.zig-cache/tmp` under the repository, with many synced writes. When the repository is on a slow or shared spinning disk, a test run that takes minutes elsewhere takes a quarter of an hour (the test program waits in `wait_log_commit`). Keep the cache on a fast disk and make `.zig-cache` a link to it:
+
+    mkdir -p ~/.cache/dksearch-zig
+    rm -rf .zig-cache && ln -s ~/.cache/dksearch-zig .zig-cache
+    export ZIG_LOCAL_CACHE_DIR=~/.cache/dksearch-zig      # before zig build / zig build test
+    echo .zig-cache >> .git/info/exclude                  # the .gitignore entry (".zig-cache/") matches folders, not links
+
+Prune it when it passes about 20 GB (`rm -rf ~/.cache/dksearch-zig/*`; the next build is a full one). To undo: remove the link and the variable; Zig makes `.zig-cache` again.
+
+Replacing the binary of a running server. Copying over a program that is running fails ("Text file busy"). Put the new file beside it and rename it over the old one (`cp dksearch dksearch-new && mv -f dksearch-new dksearch-cur`): the running process keeps the old file until it stops, and the next start uses the new one.
+
+A server and an import together. A new server cannot start while an import holds the databases (`cannot open state.db`), but an import started after the server works. Start the server first, then the import; to restart the server while an import runs, stop the import (it resumes from its checkpoint), start the server, and start the import again. The Restart button of the administration interface does this for the server alone.
+
+Profiling the server. `perf record -g` and hardware events are refused for a normal user. With `kernel.perf_event_paranoid=2` (`sudo sysctl -w kernel.perf_event_paranoid=2`, until reboot; `=4` restores the usual default) user-space samples work: `perf record -e cpu-clock:u -F 499 -p PID -- sleep 10`, then `perf report --no-children --stdio --sort symbol`.
+
+Do not use `pkill -f` or `pgrep -f` with text that is also in the command that runs it: the pattern matches the shell itself. Name the program exactly (`pgrep -x dksearch`) or take the process id from the process list.
 
 NOTES
 The three databases are SQLite files. The index holds a `docs` table and an FTS5 table `fts`. Layouts are internal and may change between versions; a version mismatch is detected and reported.

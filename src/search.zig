@@ -234,6 +234,9 @@ pub const Page = struct {
     /// True if these results include words one typo away from the ones typed
     /// (asked for, or tried because the exact words found nothing).
     fuzzy: bool = false,
+    /// Very common words of the query that were left out of the required words, because requiring them only made
+    /// the search slow (see `queryparse.Common`).
+    ignored: []const []const u8 = &.{},
 };
 
 pub const Error = error{

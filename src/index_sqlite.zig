@@ -28,6 +28,7 @@ const idx_api = @import("indexer.zig");
 const search = @import("search.zig");
 const image_mod = @import("image.zig");
 const queryparse = @import("queryparse.zig");
+const snippets = @import("snippets.zig");
 const domainlist = @import("domainlist.zig");
 const lexicon_mod = @import("lexicon.zig");
 const retrieve = @import("retrieve.zig");
@@ -118,6 +119,14 @@ pub const SqliteIndex = struct {
     /// code using the index directly gets exact words; `serve` sets it from
     /// `[search] fuzzy` (default `auto`).
     fuzzy_mode: FuzzyMode = .off,
+    /// A plain word in more than this share (percent) of the documents is not required by a query that has other words
+    /// (0: every word is required). It matters only for an index of a few thousand documents or more.
+    common_percent: u32 = 15,
+    doc_total: u64 = 0,
+    doc_total_at: i96 = 0,
+    /// Whether the index stems words (`porter`): then excerpts are made by SQLite, which knows the stems.
+    porter: bool = false,
+    porter_known: bool = false,
     /// How much a match in the title counts against one in the body when ranking
     /// (`[search] title_weight`, `body_weight`).
     title_weight: u32 = 10,
@@ -142,6 +151,8 @@ pub const SqliteIndex = struct {
     has_vocab: bool = false,
     /// Domains never shown and domains ranked lower (must outlive the index); null for none.
     domains: ?*const domainlist.Lists = null,
+    /// The answers of the domain lists already worked out for this connection (see `Memo`).
+    memo: ?*Memo = null,
 
     /// Opens (creating if needed) the index at `path`; ":memory:" gives a
     /// throwaway index.
@@ -164,6 +175,7 @@ pub const SqliteIndex = struct {
 
     pub fn close(self: *SqliteIndex) void {
         _ = c.sqlite3_close(self.db);
+        if (self.memo) |m| std.heap.page_allocator.destroy(m);
         self.* = undefined;
     }
 
@@ -179,6 +191,10 @@ pub const SqliteIndex = struct {
         self.fuzzy_mode = mode;
     }
 
+    pub fn setCommonPercent(self: *SqliteIndex, percent: u32) void {
+        self.common_percent = percent;
+    }
+
     pub fn setWeights(self: *SqliteIndex, title: u32, body: u32) void {
         self.title_weight = title;
         self.body_weight = body;
@@ -191,29 +207,72 @@ pub const SqliteIndex = struct {
     /// The domain lists searches apply: results of blocked domains never appear and demoted ones rank lower.
     pub fn setDomains(self: *SqliteIndex, l: ?*const domainlist.Lists) void {
         self.domains = l;
-        _ = c.sqlite3_create_function(self.db, "dk_banned", 2, c.SQLITE_UTF8, @ptrCast(@constCast(l)), bannedFn, null, null);
-        _ = c.sqlite3_create_function(self.db, "dk_demote", 1, c.SQLITE_UTF8, @ptrCast(@constCast(l)), demoteFn, null, null);
+        // A fresh memo for the new lists. (Each connection is used by one search at a time, so it needs no lock.)
+        if (self.memo) |m| std.heap.page_allocator.destroy(m);
+        self.memo = null;
+        if (l != null) if (std.heap.page_allocator.create(Memo)) |m| {
+            m.* = .{ .lists = l.? };
+            self.memo = m;
+        } else |_| {};
+        const ctx: ?*anyopaque = if (self.memo) |m| @ptrCast(m) else null;
+        _ = c.sqlite3_create_function(self.db, "dk_banned", 2, c.SQLITE_UTF8, ctx, bannedFn, null, null);
+        _ = c.sqlite3_create_function(self.db, "dk_demote", 1, c.SQLITE_UTF8, ctx, demoteFn, null, null);
     }
+
+    /// What the domain lists said about the domains seen so far. A search that matches hundreds of thousands of
+    /// documents asks about the same few domains over and over, and each answer costs several hash look-ups (and a
+    /// hash of the name for lists of hashed domains), which was a third of such a search. Direct-mapped, by a 64-bit hash
+    /// of the domain; a different domain with the same 64-bit hash is not a case worth a lock.
+    const Memo = struct {
+        lists: *const domainlist.Lists,
+        ban: [2][memo_slots]Entry = @splat(@splat(.{})),
+        demote: [memo_slots]Entry = @splat(.{}),
+
+        const memo_slots = 2048;
+        const Entry = struct { hash: u64 = 0, valid: bool = false, result: bool = false };
+
+        fn slot(h: u64) usize {
+            return @intCast(h % memo_slots);
+        }
+
+        fn banned(self: *Memo, domain: []const u8, safe: bool) bool {
+            const h = std.hash.Wyhash.hash(0x9e3779b97f4a7c15, domain);
+            const e = &self.ban[@intFromBool(safe)][slot(h)];
+            if (e.valid and e.hash == h) return e.result;
+            const r = self.lists.hides(domain, safe);
+            e.* = .{ .hash = h, .valid = true, .result = r };
+            return r;
+        }
+
+        fn demoted(self: *Memo, domain: []const u8) bool {
+            const h = std.hash.Wyhash.hash(0x9e3779b97f4a7c15, domain);
+            const e = &self.demote[slot(h)];
+            if (e.valid and e.hash == h) return e.result;
+            const r = self.lists.demoted.matches(domain);
+            e.* = .{ .hash = h, .valid = true, .result = r };
+            return r;
+        }
+    };
 
     /// `dk_banned(domain, safe)`: 1 when the domain (or one above it) is on the blocklist, or, with `safe` 1, on the
     /// safe-search list.
     fn bannedFn(ctx: ?*c.sqlite3_context, argc: c_int, argv: [*c]?*c.sqlite3_value) callconv(.c) void {
         _ = argc;
-        const l: *const domainlist.Lists = @ptrCast(@alignCast(c.sqlite3_user_data(ctx) orelse return c.sqlite3_result_int(ctx, 0)));
+        const m: *Memo = @ptrCast(@alignCast(c.sqlite3_user_data(ctx) orelse return c.sqlite3_result_int(ctx, 0)));
         const p = c.sqlite3_value_text(argv[0]);
         if (p == null) return c.sqlite3_result_int(ctx, 0);
         const safe = c.sqlite3_value_int(argv[1]) != 0;
-        c.sqlite3_result_int(ctx, if (l.hides(p[0..@intCast(c.sqlite3_value_bytes(argv[0]))], safe)) 1 else 0);
+        c.sqlite3_result_int(ctx, if (m.banned(p[0..@intCast(c.sqlite3_value_bytes(argv[0]))], safe)) 1 else 0);
     }
 
     /// `dk_demote(domain)`: the factor a demoted domain's score is multiplied by (1.0 for the others).
     fn demoteFn(ctx: ?*c.sqlite3_context, argc: c_int, argv: [*c]?*c.sqlite3_value) callconv(.c) void {
         _ = argc;
-        const l: *const domainlist.Lists = @ptrCast(@alignCast(c.sqlite3_user_data(ctx) orelse return c.sqlite3_result_double(ctx, 1.0)));
+        const m: *Memo = @ptrCast(@alignCast(c.sqlite3_user_data(ctx) orelse return c.sqlite3_result_double(ctx, 1.0)));
         const p = c.sqlite3_value_text(argv[0]);
         if (p == null) return c.sqlite3_result_double(ctx, 1.0);
-        const hit = l.demoted.matches(p[0..@intCast(c.sqlite3_value_bytes(argv[0]))]);
-        c.sqlite3_result_double(ctx, if (hit) @as(f64, @floatFromInt(l.demote_percent)) / 100.0 else 1.0);
+        const hit = m.demoted(p[0..@intCast(c.sqlite3_value_bytes(argv[0]))]);
+        c.sqlite3_result_double(ctx, if (hit) @as(f64, @floatFromInt(m.lists.demote_percent)) / 100.0 else 1.0);
     }
 
     /// The condition that hides blocked domains, for queries over `docs d`; empty when there is no blocklist.
@@ -939,7 +998,7 @@ pub const SqliteIndex = struct {
 
         if (self.simple_syntax) {
             const m = try buildMatchSimple(arena, q.text);
-            return self.runMatch(arena, q, base_filters, limit, m, null, false);
+            return self.runMatch(arena, q, base_filters, limit, m, null, false, false);
         }
 
         // Typo tolerance: forced on or off by the search, or by the server's mode;
@@ -955,12 +1014,15 @@ pub const SqliteIndex = struct {
         };
         const first = self.parseQuery(arena, q.text, forced orelse false, now) catch |e| {
             // Conditions given as parameters can stand alone, without words to find.
-            if (e == error.EmptyQuery and base_filters.len > 0) return self.runMatch(arena, q, base_filters, limit, "", null, false);
+            if (e == error.EmptyQuery and base_filters.len > 0) return self.runMatch(arena, q, base_filters, limit, "", null, false, false);
             return e;
         };
         const all = try mergeFilters(arena, base_filters, first.filters);
         const t0: i96 = if (self.timeout) |t| Io.Timestamp.now(t.io, .awake).nanoseconds else 0;
-        const page = try self.runMatch(arena, q, all, limit, first.fts, interpretedOf(first), first.fuzzy_applied);
+        const own = first.terms.len > 0 and !self.isPorter();
+        var page = try self.runMatch(arena, q, all, limit, first.fts, interpretedOf(first), first.fuzzy_applied, own);
+        if (own) page = self.withOwnSnippets(arena, page, first.terms);
+        page.ignored = first.ignored;
         if (forced == null and page.hits.len < auto_fuzzy_below and q.offset == 0 and first.fts.len > 0) {
             // The repeat gets what is left of the time limit, and is skipped if the first attempt used half of it:
             // two full attempts would outlast the connection's own deadline.
@@ -975,10 +1037,13 @@ pub const SqliteIndex = struct {
                     self.retry_budget_ms = budget;
                     defer self.retry_budget_ms = null;
                     // A repeat that runs out of time leaves the first answer standing.
-                    const again = self.runMatch(arena, q, all, limit, second.fts, interpretedOf(second), true) catch |e| switch (e) {
+                    const own2 = second.terms.len > 0 and !self.isPorter();
+                    var again = self.runMatch(arena, q, all, limit, second.fts, interpretedOf(second), true, own2) catch |e| switch (e) {
                         error.Timeout => return page,
                         else => return e,
                     };
+                    if (own2) again = self.withOwnSnippets(arena, again, second.terms);
+                    again.ignored = second.ignored;
                     if (again.hits.len > page.hits.len) return again;
                 }
             } else |_| {}
@@ -1075,8 +1140,65 @@ pub const SqliteIndex = struct {
         return out;
     }
 
-    fn parseQuery(self: *const SqliteIndex, arena: Allocator, text: []const u8, fuzzy_words: bool, now: i64) search.Error!queryparse.Parsed {
-        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now, .lexicon = self.lexicon, .expander = if (self.has_vocab) .{ .ctx = @constCast(self), .f = expandCb } else null }) catch |e| switch (e) {
+    fn isPorter(self: *SqliteIndex) bool {
+        if (!self.porter_known) {
+            self.porter = if (self.existingTokenizer() catch null) |t| t == .porter else false;
+            self.porter_known = true;
+        }
+        return self.porter;
+    }
+
+    /// The excerpts of the results, made here from the text in the index: one pass over the text, whatever the word (see
+    /// `snippets.bestExcerpt`). SQLite's own `snippet()` takes seconds on a very common word in long documents.
+    fn withOwnSnippets(self: *SqliteIndex, arena: Allocator, page: search.Page, terms: []const snippets.Term) search.Page {
+        if (page.hits.len == 0) return page;
+        const hits = arena.alloc(search.Hit, page.hits.len) catch return page;
+        @memcpy(hits, page.hits);
+        for (hits) |*h| {
+            const st = Stmt.prepare(self.db, "SELECT c1 FROM fts_content WHERE id = (SELECT rowid FROM docs WHERE id = ?1)") catch continue;
+            defer st.deinit();
+            st.blob(1, &h.id) catch continue;
+            if (!(st.step() catch false)) continue;
+            const body = st.colText(0) orelse continue;
+            h.snippet = (snippets.bestExcerpt(arena, body, terms) catch null) orelse h.snippet;
+        }
+        var out = page;
+        out.hits = hits;
+        return out;
+    }
+
+    /// The smallest index (documents) in which a word can be "too common": below it every word is required, as typed.
+    const common_min_docs: u64 = 1000;
+
+    /// How many documents there are, looked at again every half minute.
+    fn documentTotal(self: *SqliteIndex) u64 {
+        const now: i96 = if (self.timeout) |t| Io.Timestamp.now(t.io, .awake).nanoseconds else 0;
+        if (self.doc_total != 0 and now - self.doc_total_at < 30 * std.time.ns_per_s) return self.doc_total;
+        const st = Stmt.prepare(self.db, "SELECT count(*) FROM docs") catch return self.doc_total;
+        defer st.deinit();
+        if (st.step() catch false) {
+            self.doc_total = @intCast(@max(0, st.colInt(0)));
+            self.doc_total_at = now;
+        }
+        return self.doc_total;
+    }
+
+    fn commonCb(ctx: *anyopaque, word: []const u8) bool {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ctx));
+        if (self.common_percent == 0 or !self.has_vocab or word.len == 0 or word.len > 64) return false;
+        const total = self.documentTotal();
+        if (total < common_min_docs) return false;
+        var buf: [64]u8 = undefined;
+        const lower = std.ascii.lowerString(&buf, word);
+        const st = Stmt.prepare(self.db, "SELECT doc FROM fts_vocab WHERE term = ?1") catch return false;
+        defer st.deinit();
+        st.text(1, lower) catch return false;
+        const df: u64 = if (st.step() catch false) @intCast(@max(0, st.colInt(0))) else 0;
+        return df * 100 > total * self.common_percent;
+    }
+
+    fn parseQuery(self: *SqliteIndex, arena: Allocator, text: []const u8, fuzzy_words: bool, now: i64) search.Error!queryparse.Parsed {
+        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now, .lexicon = self.lexicon, .common = if (self.common_percent > 0 and self.has_vocab) .{ .ctx = self, .isCommon = commonCb } else null, .expander = if (self.has_vocab) .{ .ctx = @constCast(self), .f = expandCb } else null }) catch |e| switch (e) {
             error.EmptyQuery => error.EmptyQuery,
             error.InvalidQuery => error.InvalidQuery,
             error.OutOfMemory => error.OutOfMemory,
@@ -1262,7 +1384,9 @@ pub const SqliteIndex = struct {
         };
     }
 
-    fn runMatch(self: *SqliteIndex, arena: Allocator, q: search.Query, filters: []const search.Filter, limit: u32, match: []const u8, interpreted: ?[]const u8, fuzzy: bool) search.Error!search.Page {
+    /// `own_snippets`: SQLite's excerpt function (slow on a word that occurs thousands of times in a document) is not asked
+    /// for; the caller makes the excerpts.
+    fn runMatch(self: *SqliteIndex, arena: Allocator, q: search.Query, filters: []const search.Filter, limit: u32, match: []const u8, interpreted: ?[]const u8, fuzzy: bool, own_snippets: bool) search.Error!search.Page {
         if (filters.len > 0 and !self.has_meta) return error.InvalidQuery; // an index from before filters: `rebuild` upgrades it
         const columns = if (self.has_meta) "d.language, d.content_type, d.modified_at, d.size, d.author, d.kind, d.domain" else "d.language, d.content_type, NULL, NULL, NULL, NULL, NULL";
         const text_mode = match.len > 0;
@@ -1321,11 +1445,11 @@ pub const SqliteIndex = struct {
         if (text_mode) {
             try sql.print(arena,
                 \\SELECT d.id, d.connector, d.url, d.title,
-                \\       snippet(fts, 1, ?1, ?2, '…', 16),
+                \\       {s},
                 \\       -({s}) AS col6, {s}{s}{s}
                 \\FROM fts JOIN docs d ON d.rowid = fts.rowid
                 \\WHERE fts MATCH ?3
-            , .{ bm, columns, explain_cols, tier_col });
+            , .{ if (own_snippets) "NULL" else "snippet(fts, 1, ?1, ?2, '…', 16)", bm, columns, explain_cols, tier_col });
         } else {
             try sql.print(arena, "SELECT d.id, d.connector, d.url, d.title, NULL, 0.0, {s} FROM docs d WHERE 1", .{columns});
         }
@@ -1472,6 +1596,10 @@ pub const SearchPool = struct {
 
     pub fn setFuzzyMode(self: *SearchPool, mode: FuzzyMode) void {
         for (self.slots) |*sl| sl.index.setFuzzyMode(mode);
+    }
+
+    pub fn setCommonPercent(self: *SearchPool, percent: u32) void {
+        for (self.slots) |*sl| sl.index.setCommonPercent(percent);
     }
 
     pub fn setWeights(self: *SearchPool, title: u32, body: u32) void {
@@ -1716,6 +1844,43 @@ test "a search past its time limit stops with Timeout; without a limit it finish
     idx.setQueryTimeout(testing.io, 0);
     const page = try searchAll(arena.allocator(), &idx, "common");
     try testing.expectEqual(@as(usize, 10), page.hits.len);
+}
+
+test "very common words are left out of a query that has others; the excerpt is made in one pass; common words alone still answer" {
+    var idx = try SqliteIndex.open(":memory:", .{ .sync = .off });
+    defer idx.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 1,200 documents that all say "the" and "in", and one about a cat.
+    var i: usize = 0;
+    while (i < 1200) : (i += 1) {
+        _ = try put(&idx, "t", try std.fmt.allocPrint(a, "d{d}", .{i}), "a page", try std.fmt.allocPrint(a, "the quick brown fox number {d} jumps over the lazy dog in the garden", .{i}));
+    }
+    _ = try put(&idx, "t", "special", "Cats", "the cat sat in the sun and the cat purred");
+    // "the" and "in" are in every document: they are not required, and the page says so.
+    const page = try searchAll(a, &idx, "the cat in");
+    try testing.expectEqual(@as(usize, 1), page.hits.len);
+    try testing.expectEqual(@as(usize, 2), page.ignored.len);
+    const snip = page.hits[0].snippet.?;
+    try testing.expect(std.mem.indexOf(u8, snip, "\x02cat\x03") != null);
+    try testing.expect(std.mem.indexOf(u8, snip, "\x02the\x03") == null);
+    // A phrase is exact, and common words alone are searched for after all (with an excerpt all the same).
+    const phrase = try searchAll(a, &idx, "\"the cat\"");
+    try testing.expect(phrase.hits.len == 1 and phrase.ignored.len == 0);
+    const only = try searchAll(a, &idx, "the in");
+    try testing.expect(only.hits.len > 0 and only.ignored.len == 0 and only.hits[0].snippet != null);
+    try testing.expect(std.mem.indexOf(u8, only.hits[0].snippet.?, "\x02") != null);
+    // Turned off, every word is required (and still found here).
+    idx.setCommonPercent(0);
+    const strict = try searchAll(a, &idx, "the cat in");
+    try testing.expect(strict.hits.len == 1 and strict.ignored.len == 0);
+    // A small index has no common words: everything is required as typed.
+    var tiny = try SqliteIndex.open(":memory:", .{ .sync = .off });
+    defer tiny.close();
+    _ = try put(&tiny, "t", "x", "x", "the cat in the hat");
+    const small = try searchAll(a, &tiny, "the cat");
+    try testing.expect(small.hits.len == 1 and small.ignored.len == 0);
 }
 
 test "pictures are found by hash distance, nearest first, and forgotten with their document" {

@@ -176,7 +176,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, action_embed, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, action_blocklists, action_restart, action_owner_password, action_thumbs_clear, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, action_embed, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, action_blocklists, action_restart, action_owner_password, action_thumbs_clear, action_zim_unqueue, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -214,6 +214,7 @@ pub const App = struct {
             .{ "/actions/blocklists", .action_blocklists },
             .{ "/actions/restart", .action_restart },
             .{ "/actions/thumbs-clear", .action_thumbs_clear },
+            .{ "/actions/zim-unqueue", .action_zim_unqueue },
             .{ "/actions/owner-password", .action_owner_password },
             .{ "/actions/zim", .action_zim },
             .{ "/actions/zim-folder", .action_zim_folder },
@@ -267,7 +268,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_embed or route == .action_findimage or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_blocklists or route == .action_restart or route == .action_owner_password or route == .action_thumbs_clear or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_embed or route == .action_findimage or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_blocklists or route == .action_restart or route == .action_owner_password or route == .action_thumbs_clear or route == .action_zim_unqueue or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -304,6 +305,7 @@ pub const App = struct {
             .action_restart => self.restartAction(arena, req, auth),
             .action_owner_password => self.ownerPasswordAction(arena, req, auth),
             .action_thumbs_clear => self.thumbsClearAction(arena, req, auth),
+            .action_zim_unqueue => self.zimUnqueueAction(arena, req, auth),
             .zim_page => self.pageZim(arena, csrf, t.params),
             .models_page => self.pageModels(arena, csrf, null, t.params.get("remove")),
             .action_model_pull => self.modelAction(arena, req, auth, .pull),
@@ -2132,6 +2134,8 @@ pub const App = struct {
         // The lists for the drop-downs come from the library too; without them the form still works (a code to type).
         const languages = self.catalogChoices(arena, "languages");
         const categories = self.catalogChoices(arena, "categories");
+        const back = try zimBackString(arena, f, start);
+        try self.writeZimDownloads(arena, w, csrf, params, back, dir);
         try writeZimForm(arena, w, f, languages, categories);
         if (!go) {
             try w.writeAll("<p class=\"muted\">Choose what you want and press Show. Nothing is asked of the library until you do.</p>");
@@ -2166,6 +2170,7 @@ pub const App = struct {
             try writeZimFallback(w, dir);
             return;
         };
+        const free_now: ?u64 = if (dir.len > 0) dk.kiwix.freeBytes(dir) else null;
         const rows = try arena.dupe(dk.kiwix.Entry, cat.entries);
         sortZim(rows, f.sort);
         try w.print("<p class=\"muted\">{d} matching files; showing {d}&ndash;{d}, sorted within this page.</p>", .{ cat.total, @min(start + 1, cat.total), start + cat.entries.len });
@@ -2186,11 +2191,21 @@ pub const App = struct {
             try writeBytes(w, e.size);
             try w.writeAll("</td><td>");
             try html.writeEscaped(w, e.issued[0..@min(10, e.issued.len)]);
-            try w.writeAll("</td><td><a href=\"/zim?file=");
-            try query.writeEncoded(w, file);
-            try w.writeAll("&amp;meta4=");
-            try query.writeEncoded(w, e.meta4_url);
-            try w.print("&amp;size={d}\">Download&hellip;</a></td></tr>", .{e.size});
+            try w.writeAll("</td><td>");
+            if (csrf) |token| {
+                // The download is queued from here and the list stays as it is: no page in between.
+                const too_big = e.size > 0 and (if (free_now) |fr| fr < e.size + dk.kiwix.free_margin else false);
+                try w.writeAll("<form class=\"inline\" action=\"/actions/zim\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+                try html.writeEscaped(w, token);
+                try w.writeAll("\"><input type=\"hidden\" name=\"file\" value=\"");
+                try html.writeEscaped(w, file);
+                try w.writeAll("\"><input type=\"hidden\" name=\"meta4\" value=\"");
+                try html.writeEscaped(w, e.meta4_url);
+                try w.print("\"><input type=\"hidden\" name=\"size\" value=\"{d}\"><input type=\"hidden\" name=\"back\" value=\"", .{e.size});
+                try html.writeEscaped(w, back);
+                try w.print("\"><button type=\"submit\" class=\"btn\"{s}{s}>Download</button></form>", .{ if (dir.len == 0 or too_big) " disabled" else "", if (dir.len == 0) " title=\"Choose a folder for the downloads first\"" else if (too_big) " title=\"Not enough room in the ZIM folder for this file\"" else "" });
+            } else try w.writeAll("<span class=\"muted\">sign in</span>");
+            try w.writeAll("</td></tr>");
         }
         try w.writeAll("</tbody></table>");
         if (start > 0) {
@@ -2207,6 +2222,69 @@ pub const App = struct {
     }
 
     const zim_page_size = 50;
+
+    /// The list's own parameters as a query string (percent-encoded, `&` between), to come back to the same list.
+    fn zimBackString(arena: Allocator, f: ZimFilter, start: u32) ![]const u8 {
+        var aw: Io.Writer.Allocating = .init(arena);
+        const bw = &aw.writer;
+        const pairs = [_][2][]const u8{ .{ "q", f.q }, .{ "lang", f.lang }, .{ "category", f.category }, .{ "pictures", f.pictures }, .{ "videos", f.videos }, .{ "sort", f.sort } };
+        for (pairs, 0..) |pr, i| {
+            if (i > 0) try bw.writeByte('&');
+            try bw.print("{s}=", .{pr[0]});
+            try query.writeEncoded(bw, pr[1]);
+        }
+        try bw.print("&start={d}", .{start});
+        return aw.written();
+    }
+
+    /// What was just asked for, what is downloading (with a progress bar) and what waits, above the list.
+    fn writeZimDownloads(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, params: query.Params, back: []const u8, dir: []const u8) !void {
+        if (params.get("queued")) |file| {
+            try w.writeAll("<p class=\"notice ok\" role=\"status\">Queued <code>");
+            try html.writeEscaped(w, file);
+            try w.print("</code>: {d} waiting. It starts when the one before it is done; you can keep choosing files here.</p>", .{std.fmt.parseInt(u32, params.get("waiting") orelse "0", 10) catch 0});
+        } else if (params.get("started")) |file| {
+            try w.writeAll("<p class=\"notice ok\" role=\"status\">Downloading <code>");
+            try html.writeEscaped(w, file);
+            try w.writeAll("</code> now. More files you choose wait their turn.</p>");
+        }
+        const m = self.opts.jobs orelse return;
+        const running = try m.current(arena);
+        const waiting = try m.waiting(arena);
+        if (running) |c| {
+            if (c.op == .download) {
+                try writeRunningCard(self, arena, w, csrf, c);
+            } else try w.writeAll("<p class=\"notice\">Something else is running (see the dashboard); downloads wait for it.</p>");
+        }
+        if (waiting.len > 0) {
+            try w.writeAll("<section class=\"card\"><h2>Waiting</h2><ol>");
+            for (waiting) |x| {
+                try w.writeAll("<li><code>");
+                try html.writeEscaped(w, x.name);
+                try w.writeAll("</code> <span class=\"muted\">");
+                try w.writeAll(if (x.op == .download) "download" else "import");
+                try w.writeAll("</span>");
+                if (x.op == .download) if (csrf) |token| {
+                    try w.writeAll(" <form class=\"inline\" action=\"/actions/zim-unqueue\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+                    try html.writeEscaped(w, token);
+                    try w.writeAll("\"><input type=\"hidden\" name=\"file\" value=\"");
+                    try html.writeEscaped(w, x.name);
+                    try w.writeAll("\"><input type=\"hidden\" name=\"back\" value=\"");
+                    try html.writeEscaped(w, back);
+                    try w.writeAll("\"><button type=\"submit\" class=\"btn secondary\">Remove</button></form>");
+                };
+                try w.writeAll("</li>");
+            }
+            try w.writeAll("</ol></section>");
+        }
+        if (dir.len > 0) if (dk.kiwix.freeBytes(dir)) |free| {
+            try w.writeAll("<p class=\"muted small\">Free space in <code>");
+            try html.writeEscaped(w, dir);
+            try w.writeAll("</code>: ");
+            try writeBytes(w, free);
+            try w.writeAll(".</p>");
+        };
+    }
 
     const ZimFilter = struct { q: []const u8, lang: []const u8, category: []const u8, pictures: []const u8, videos: []const u8, sort: []const u8 };
 
@@ -2567,15 +2645,48 @@ pub const App = struct {
         const meta4 = params.get("meta4") orelse "";
         const size = std.fmt.parseInt(u64, params.get("size") orelse "0", 10) catch 0;
         if (!self.kiwixUrlOk(meta4)) return actionFailure(arena, false, .{ .status = .bad_request, .code = "bad_address", .message = "downloads only come from the Kiwix library (kiwix.org)" });
-        self.opts.jobs.?.startDownload(.{ .meta4_url = meta4, .file_name = file, .size = size }) catch |e| return actionFailure(arena, false, switch (e) {
+        const m = self.opts.jobs.?;
+        const waiting = m.queueDownload(.{ .meta4_url = meta4, .file_name = file, .size = size }) catch |e| return actionFailure(arena, false, switch (e) {
             error.NotConfigured => .{ .status = .conflict, .code = "not_configured", .message = "downloads need a folder: set [admin] zim_dir" },
             error.BadArgument => .{ .status = .bad_request, .code = "bad_argument", .message = "that file name or address cannot be used" },
-            error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "another operation is already running" },
-            error.NoSpace => .{ .status = .conflict, .code = "no_space", .message = try std.fmt.allocPrint(arena, "the ZIM folder has {d} MiB too little room for this file (it needs the file's size plus {d} MiB to spare)", .{ (self.opts.jobs.?.spaceShort(.{ .meta4_url = meta4, .file_name = file, .size = size }) orelse 0) / (1024 * 1024) + 1, dk.kiwix.free_margin / (1024 * 1024) }) },
+            error.AlreadyRunning => .{ .status = .conflict, .code = "already_running", .message = "the server is shutting down" },
+            error.NoSpace => .{ .status = .conflict, .code = "no_space", .message = try std.fmt.allocPrint(arena, "the ZIM folder has {d} MiB too little room for this file (it needs the file's size and some margin)", .{(m.spaceShort(.{ .meta4_url = meta4, .file_name = file, .size = size }) orelse 0) / (1024 * 1024)}) },
             error.OutOfMemory => return error.OutOfMemory,
             else => .{ .status = .service_unavailable, .code = "unavailable", .message = "cannot start the download" },
         });
-        return redirect(arena, "/", null);
+        // Back to the list the person was looking at, with what happened said at its top.
+        const running_now = if (try m.current(arena)) |c| (c.op == .download and std.mem.eql(u8, c.source, file)) else false;
+        var back_aw: Io.Writer.Allocating = .init(arena);
+        const bw = &back_aw.writer;
+        bw.writeAll("/zim?go=1") catch return error.OutOfMemory;
+        if (zimBackQuery(params.get("back") orelse "")) |keep| bw.print("&{s}", .{keep}) catch return error.OutOfMemory;
+        bw.writeAll(if (running_now) "&started=" else "&queued=") catch return error.OutOfMemory;
+        query.writeEncoded(bw, file) catch return error.OutOfMemory;
+        bw.print("&waiting={d}", .{waiting}) catch return error.OutOfMemory;
+        return redirect(arena, back_aw.written(), null);
+    }
+
+    /// The part of a list's address that is kept when a download is queued: only the characters of the filters' own
+    /// parameters, so nothing else can be put into the address the person is sent back to.
+    fn zimBackQuery(raw: []const u8) ?[]const u8 {
+        if (raw.len == 0 or raw.len > 400) return null;
+        for (raw) |b| if (!(std.ascii.isAlphanumeric(b) or b == '_' or b == '%' or b == '=' or b == '&' or b == '.' or b == ':' or b == ',' or b == '~' or b == '+' or b == '-')) return null;
+        return raw;
+    }
+
+    /// `POST /actions/zim-unqueue`: a download that waits is taken off the queue.
+    fn zimUnqueueAction(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const m = self.opts.jobs orelse return actionFailure(arena, false, .{ .status = .conflict, .code = "actions_off", .message = "this needs admin.actions = true" });
+        _ = m.unqueue(params.get("file") orelse "");
+        var back_aw: Io.Writer.Allocating = .init(arena);
+        const bw = &back_aw.writer;
+        bw.writeAll("/zim?go=1") catch return error.OutOfMemory;
+        if (zimBackQuery(params.get("back") orelse "")) |keep| bw.print("&{s}", .{keep}) catch return error.OutOfMemory;
+        return redirect(arena, back_aw.written(), null);
     }
 
     /// Examples of what one job skipped (a few per reason), from state.db.
@@ -2891,42 +3002,49 @@ fn writeStat(w: *Io.Writer, value: []const u8, label: []const u8) Io.Writer.Erro
     try w.print("<div class=\"stat\"><span class=\"stat-n\">{s}</span><span class=\"stat-l\">{s}</span></div>", .{ value, label });
 }
 
+/// The card of the task that is running: what it is, a progress bar with speed and time left (updated live by the page's
+/// script), and a button to cancel it.
+fn writeRunningCard(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, c: dk.jobs.Active) !void {
+    _ = arena;
+    try w.writeAll("<section class=\"card running\" id=\"import-live\" data-running=\"1\"><h2>");
+    switch (c.op) {
+        .import => try w.writeAll("Importing "),
+        .check => try w.writeAll("Checking the stored data"),
+        .backup => try w.writeAll("Backing up"),
+        .remove => try w.writeAll("Removing "),
+        .download => try w.writeAll("Downloading "),
+        .model_pull => try w.writeAll("Pulling the model "),
+        .embed => try w.writeAll("Making vectors for semantic search"),
+    }
+    if (c.op == .import or c.op == .remove or c.op == .download or c.op == .model_pull) {
+        try w.writeAll("<strong>");
+        try html.writeEscaped(w, c.source);
+        try w.writeAll("</strong>");
+    }
+    try w.writeAll("</h2>");
+    if (c.progress_total > 0) {
+        try w.print("<progress id=\"import-bar\" max=\"{d}\" value=\"{d}\"></progress> <span data-f=\"percent\" class=\"muted\">{d:.1} %</span>", .{ c.progress_total, @min(c.progress_done, c.progress_total), 100.0 * @as(f64, @floatFromInt(@min(c.progress_done, c.progress_total))) / @as(f64, @floatFromInt(c.progress_total)) });
+    } else {
+        try w.writeAll("<progress id=\"import-bar\"></progress> <span data-f=\"percent\" class=\"muted\">size unknown</span>");
+    }
+    try w.print("<dl class=\"facts\"><div><dt>{s}</dt><dd data-f=\"docs\">{d}</dd></div><div><dt>Speed</dt><dd data-f=\"rate\">measuring</dd></div><div><dt>Time left</dt><dd data-f=\"eta\">estimating</dd></div><div><dt>Running for</dt><dd data-f=\"elapsed\">", .{ if (c.op == .remove) "Removed" else "Documents", c.submitted });
+    try writeDuration(w, @intCast(@max(0, unixNow(app.io) - c.started_at)));
+    try w.writeAll("</dd></div></dl>\n<noscript><p class=\"muted\">Without JavaScript the numbers above only update when you reload the page.</p></noscript>");
+    if (csrf) |token| {
+        try w.writeAll("<form action=\"/actions/cancel\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        try html.writeEscaped(w, token);
+        try w.writeAll(if (c.op == .download) "\"><button type=\"submit\" class=\"btn danger\">Cancel the download (and those waiting)</button></form>" else "\"><button type=\"submit\" class=\"btn danger\">Cancel the import</button></form>");
+    }
+    try w.writeAll("</section>\n");
+}
+
 fn writeImportsPanel(app: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8) !void {
     const m = app.opts.jobs orelse {
         try w.writeAll("<section class=\"card\"><h2>Imports</h2><p class=\"muted\">Starting imports from here is turned off (<code>admin.actions</code> is false). Use <code>dksearch import</code> on the command line.</p></section>\n");
         return;
     };
     if (try m.current(arena)) |c| {
-        try w.writeAll("<section class=\"card running\" id=\"import-live\" data-running=\"1\"><h2>");
-        switch (c.op) {
-            .import => try w.writeAll("Importing "),
-            .check => try w.writeAll("Checking the stored data"),
-            .backup => try w.writeAll("Backing up"),
-            .remove => try w.writeAll("Removing "),
-            .download => try w.writeAll("Downloading "),
-            .model_pull => try w.writeAll("Pulling the model "),
-            .embed => try w.writeAll("Making vectors for semantic search"),
-        }
-        if (c.op == .import or c.op == .remove or c.op == .download or c.op == .model_pull) {
-            try w.writeAll("<strong>");
-            try html.writeEscaped(w, c.source);
-            try w.writeAll("</strong>");
-        }
-        try w.writeAll("</h2>");
-        if (c.progress_total > 0) {
-            try w.print("<progress id=\"import-bar\" max=\"{d}\" value=\"{d}\"></progress> <span data-f=\"percent\" class=\"muted\">{d:.1} %</span>", .{ c.progress_total, @min(c.progress_done, c.progress_total), 100.0 * @as(f64, @floatFromInt(@min(c.progress_done, c.progress_total))) / @as(f64, @floatFromInt(c.progress_total)) });
-        } else {
-            try w.writeAll("<progress id=\"import-bar\"></progress> <span data-f=\"percent\" class=\"muted\">size unknown</span>");
-        }
-        try w.print("<dl class=\"facts\"><div><dt>{s}</dt><dd data-f=\"docs\">{d}</dd></div><div><dt>Speed</dt><dd data-f=\"rate\">measuring</dd></div><div><dt>Time left</dt><dd data-f=\"eta\">estimating</dd></div><div><dt>Running for</dt><dd data-f=\"elapsed\">", .{ if (c.op == .remove) "Removed" else "Documents", c.submitted });
-        try writeDuration(w, @intCast(@max(0, unixNow(app.io) - c.started_at)));
-        try w.writeAll("</dd></div></dl>\n<noscript><p class=\"muted\">Without JavaScript the numbers above only update when you reload the page.</p></noscript>");
-        if (csrf) |token| {
-            try w.writeAll("<form action=\"/actions/cancel\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
-            try html.writeEscaped(w, token);
-            try w.writeAll("\"><button type=\"submit\" class=\"btn danger\">Cancel the import</button></form>");
-        }
-        try w.writeAll("</section>\n");
+        try writeRunningCard(app, arena, w, csrf, c);
         return;
     }
     try w.writeAll("<section class=\"card\"><h2>Imports</h2>");

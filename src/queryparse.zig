@@ -26,6 +26,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const search = @import("search.zig");
+const snippets = @import("snippets.zig");
 const lexicon = @import("lexicon.zig");
 
 pub const max_query_bytes = 1024;
@@ -64,6 +65,8 @@ pub const Options = struct {
     /// Finds the words of the index that are within a number of edits of a word, for typo tolerance. Without it
     /// a fuzzy word is expanded to every spelling one edit away, whether or not it exists.
     expander: ?Expander = null,
+    /// Leaves out of the required words those that are too common to be worth it (see `Common`); null keeps every word.
+    common: ?Common = null,
 };
 
 /// Looks words up in the index's vocabulary. `f` returns the words within `max_edits` of `word` (not `word`
@@ -86,6 +89,21 @@ const Lx = struct {
     lexicon: ?*const lexicon.Lexicon = null,
     stops: bool = false,
     expander: ?Expander = null,
+    /// Words so common in the index that they are not worth requiring (see `Common`), when other words remain.
+    common: ?Common = null,
+    /// Where the words that were left out are noted (for telling the person), without repeats.
+    ignored: ?*std.ArrayList([]const u8) = null,
+    /// Where the words searched for in the text are noted (for making excerpts), without repeats.
+    terms: ?*std.ArrayList(snippets.Term) = null,
+};
+
+/// Decides whether a plain word is too common in the index to be required (it appears in a large share of the
+/// documents): such a word is left out of the required terms of a query that has other words. The reason: ranking has
+/// to read every occurrence of every required word, and a word like "in" has tens of thousands of long position
+/// lists, which made searches such as "how to program in c" take many seconds for nothing a person wanted.
+pub const Common = struct {
+    ctx: *anyopaque,
+    isCommon: *const fn (ctx: *anyopaque, word: []const u8) bool,
 };
 
 pub const Parsed = struct {
@@ -101,6 +119,12 @@ pub const Parsed = struct {
     shown: []const u8,
     /// True if the query used anything beyond plain words and phrases.
     advanced: bool,
+    /// Very common words that were left out of the required words (`Options.common`).
+    ignored: []const []const u8 = &.{},
+    /// Only very common words were typed, so they are searched after all.
+    heavy: bool = false,
+    /// The words the text is searched for (not those restricted to the title, nor excluded ones), lower case.
+    terms: []const snippets.Term = &.{},
 };
 
 const Kind = enum { word, prefix, fuzzy, phrase, near };
@@ -648,11 +672,19 @@ pub fn parseWith(arena: Allocator, text: []const u8, options: Options) Error!Par
     if (p.too_many) return error.InvalidQuery;
 
     var fts: std.ArrayList(u8) = .empty;
-    var lx: Lx = .{ .lexicon = options.lexicon, .stops = options.lexicon != null and options.lexicon.?.stops.count() > 0, .expander = options.expander };
+    var ignored: std.ArrayList([]const u8) = .empty;
+    var terms: std.ArrayList(snippets.Term) = .empty;
+    var lx: Lx = .{ .lexicon = options.lexicon, .stops = options.lexicon != null and options.lexicon.?.stops.count() > 0, .expander = options.expander, .common = options.common, .ignored = &ignored, .terms = &terms };
     var has_terms = try emitOr(arena, &fts, lx, root);
-    if (!has_terms and lx.stops) {
-        // Only stop words were typed (`the`): search for them after all rather than for nothing.
+    var heavy = false;
+    if (!has_terms and (lx.stops or lx.common != null)) {
+        heavy = lx.common != null and ignored.items.len > 0;
+        // Only stop words, or only very common words, were typed (`the`): search for them after all rather than for
+        // nothing.
         lx.stops = false;
+        lx.common = null;
+        ignored.clearRetainingCapacity();
+        terms.clearRetainingCapacity();
         fts.items.len = 0;
         has_terms = try emitOr(arena, &fts, lx, root);
     }
@@ -673,7 +705,7 @@ pub fn parseWith(arena: Allocator, text: []const u8, options: Options) Error!Par
         if (shown.items.len > 0) try shown.append(arena, ' ');
         try shown.appendSlice(arena, t);
     }
-    return .{ .fts = fts.items, .shown = shown.items, .advanced = p.advanced, .fuzzy_applied = p.fuzzy_applied, .filters = p.filters.items };
+    return .{ .fts = fts.items, .shown = shown.items, .advanced = p.advanced, .fuzzy_applied = p.fuzzy_applied, .filters = p.filters.items, .ignored = ignored.items, .heavy = heavy, .terms = terms.items };
 }
 
 // ------------------------------------------------------------- FTS5 output
@@ -692,6 +724,16 @@ fn emitTerm(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, t: Term) Allocato
     switch (t.kind) {
         .word => {
             if (lx.stops and (lx.lexicon.?).isStop(t.text)) return false;
+            if (lx.common) |c| if (t.column == null and c.isCommon(c.ctx, t.text)) {
+                if (lx.ignored) |list| {
+                    var seen = false;
+                    for (list.items) |w| if (std.ascii.eqlIgnoreCase(w, t.text)) {
+                        seen = true;
+                    };
+                    if (!seen) try list.append(arena, t.text);
+                }
+                return false;
+            };
             const syn: []const []const u8 = if (lx.lexicon) |l| l.synonymsOf(t.text) else &.{};
             if (syn.len == 0) {
                 try quoted(arena, out, t.text);
@@ -732,7 +774,28 @@ fn emitTerm(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, t: Term) Allocato
             }
         },
     }
+    try noteTerms(arena, lx, t);
     return true;
+}
+
+/// Notes the words of an emitted term that the text is searched for, for making excerpts.
+fn noteTerms(arena: Allocator, lx: Lx, t: Term) Allocator.Error!void {
+    const list = lx.terms orelse return;
+    if (t.column) |c| if (c == .title) return; // the excerpt is of the text
+    var i: usize = 0;
+    while (i < t.text.len) {
+        while (i < t.text.len and !(std.ascii.isAlphanumeric(t.text[i]) or t.text[i] >= 0x80)) i += 1;
+        const start = i;
+        while (i < t.text.len and (std.ascii.isAlphanumeric(t.text[i]) or t.text[i] >= 0x80)) i += 1;
+        if (i == start) break;
+        const word = try std.ascii.allocLowerString(arena, t.text[start..i]);
+        const prefix = t.kind == .prefix and i == t.text.len;
+        var seen = false;
+        for (list.items) |x| if (std.mem.eql(u8, x.text, word) and x.prefix == prefix) {
+            seen = true;
+        };
+        if (!seen and list.items.len < 16) try list.append(arena, .{ .text = word, .prefix = prefix });
+    }
 }
 
 const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -838,6 +901,10 @@ fn emitUnit(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, u: Unit) Allocato
 fn emitAnd(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, a: *const And) Allocator.Error!bool {
     const mark = out.items.len;
     var wrote: usize = 0;
+    // What is excluded is taken as typed: a very common word someone asks to leave out stays a word to leave out.
+    var negative_lx = lx;
+    negative_lx.common = null;
+    negative_lx.terms = null; // and is not a word to look for in an excerpt
     if (a.negative.items.len > 0) try out.append(arena, '(');
     for (a.positive.items) |u| {
         const at = out.items.len;
@@ -856,7 +923,7 @@ fn emitAnd(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, a: *const And) All
         for (a.negative.items) |u| {
             const at = out.items.len;
             if (neg > 0) try out.appendSlice(arena, " OR ");
-            if (try emitUnit(arena, out, lx, u)) {
+            if (try emitUnit(arena, out, negative_lx, u)) {
                 neg += 1;
             } else out.items.len = at;
         }
@@ -1253,4 +1320,45 @@ test "random queries never crash and always give balanced, quote-safe output" {
         try testing.expect(!in_quote);
         try testing.expectEqual(@as(i32, 0), depth);
     }
+}
+
+const CommonSet = struct {
+    words: []const []const u8,
+    fn is(ctx: *anyopaque, word: []const u8) bool {
+        const self: *const CommonSet = @ptrCast(@alignCast(ctx));
+        for (self.words) |w| if (std.ascii.eqlIgnoreCase(w, word)) return true;
+        return false;
+    }
+};
+
+test "very common words are not required when the query has other words; the page can say which" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var set: CommonSet = .{ .words = &.{ "to", "in", "the" } };
+    const common: Common = .{ .ctx = &set, .isCommon = CommonSet.is };
+    const p = try parseWith(a, "how to program in C", .{ .common = common });
+    try testing.expectEqualStrings("\"how\" AND \"program\" AND \"C\"", p.fts);
+    try testing.expectEqual(@as(usize, 2), p.ignored.len);
+    try testing.expectEqualStrings("to", p.ignored[0]);
+    try testing.expectEqualStrings("in", p.ignored[1]);
+    try testing.expect(!p.heavy);
+    // The words to find in an excerpt are the ones searched for (lower case), not the left out ones.
+    try testing.expectEqual(@as(usize, 3), p.terms.len);
+    try testing.expectEqualStrings("how", p.terms[0].text);
+    try testing.expectEqualStrings("c", p.terms[2].text);
+    // A quoted phrase is exact, a word someone excludes stays excluded, a title-only word is kept.
+    const phrase = try parseWith(a, "\"how to\" program", .{ .common = common });
+    try testing.expect(std.mem.indexOf(u8, phrase.fts, "\"how to\"") != null and phrase.ignored.len == 0);
+    const neg = try parseWith(a, "program -in", .{ .common = common });
+    try testing.expect(std.mem.indexOf(u8, neg.fts, "NOT") != null and std.mem.indexOf(u8, neg.fts, "\"in\"") != null);
+    const titled = try parseWith(a, "title:the program", .{ .common = common });
+    try testing.expect(std.mem.indexOf(u8, titled.fts, "\"the\"") != null);
+    // Only very common words: searched after all, and said to be a heavy search.
+    const only = try parseWith(a, "to the", .{ .common = common });
+    try testing.expectEqualStrings("\"to\" AND \"the\"", only.fts);
+    try testing.expect(only.heavy and only.ignored.len == 0);
+    // Without the callback every word is required, as typed.
+    const plain = try parseWith(a, "how to program in C", .{});
+    try testing.expectEqualStrings("\"how\" AND \"to\" AND \"program\" AND \"in\" AND \"C\"", plain.fts);
 }

@@ -220,6 +220,9 @@ Explain configuration, locale, terminal, and version factors.
 Slow operation
 Explain diagnostic flags and resource constraints.
 
+WORKAROUNDS
+Optional. List the deliberate hacks that a user or developer of this program relies on, one per paragraph: the problem it works around, the exact commands (so that it can be repeated), what it costs or risks, and how to undo it. A workaround that has become the normal way to do something belongs in the main text, not here; one that is removed when the real fix ships is removed from here too.
+
 NOTES
 Include implementation details or operational caveats useful to users but not central to normal usage.
 

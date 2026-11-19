@@ -617,6 +617,16 @@ fn writeInterpretation(w: *Writer, f: Form, page: dk.search.Page, offset: u32) W
         }
         try w.writeAll("&amp;fuzzy=0\">Search exactly as typed</a></p>\n");
     }
+    if (page.ignored.len > 0) {
+        try w.writeAll("<p class=\"muted small\">Left out as too common to help: ");
+        for (page.ignored, 0..) |word, i| {
+            if (i > 0) try w.writeAll(", ");
+            try w.writeAll("<code>");
+            try writeEscaped(w, word);
+            try w.writeAll("</code>");
+        }
+        try w.writeAll(" (they appear in a large share of all documents). Put words in quotes to require them.</p>\n");
+    }
     if (page.interpreted) |text| {
         try w.writeAll("<p class=\"muted small\">Searching for: <code>");
         try writeEscaped(w, text);

@@ -148,10 +148,23 @@ pub const Manager = struct {
     group: Io.Group = .init,
     running: ?Running = null,
     last: ?OwnedFinished = null,
-    /// Sources waiting for their turn after "refresh all" (names, owned); run one after another.
-    queue: std.ArrayList([]u8) = .empty,
+    /// What waits for its turn (imports after "refresh all", ZIM downloads asked for while something runs); run one after
+    /// another, in the order they were asked for.
+    queue: std.ArrayList(QueueItem) = .empty,
     /// Set when the manager is shutting down: nothing new is started.
     closing: bool = false,
+
+    /// One thing waiting in the queue: an import (by source name) or a ZIM download. Owned.
+    const QueueItem = struct {
+        op: Op,
+        name: []u8,
+        dl: ?*OwnedDownload = null,
+
+        fn free(self: QueueItem, gpa: Allocator) void {
+            gpa.free(self.name);
+            if (self.dl) |d| d.destroy(gpa);
+        }
+    };
 
     const Running = struct {
         op: Op,
@@ -184,7 +197,7 @@ pub const Manager = struct {
         if (self.running) |r| r.control.cancel();
         self.mutex.unlock(self.io);
         self.group.await(self.io) catch {};
-        for (self.queue.items) |n| self.gpa.free(n);
+        for (self.queue.items) |it| it.free(self.gpa);
         self.queue.deinit(self.gpa);
         if (self.last) |l| self.freeFinished(l);
         self.* = undefined;
@@ -211,12 +224,12 @@ pub const Manager = struct {
             for (self.sources()) |s| {
                 if (!s.enabled) continue;
                 var have = false;
-                for (self.queue.items) |q| if (std.mem.eql(u8, q, s.name)) {
+                for (self.queue.items) |q| if (q.op == .import and std.mem.eql(u8, q.name, s.name)) {
                     have = true;
                 };
                 if (have or (if (self.running) |r| (r.op == .import and std.mem.eql(u8, r.source, s.name)) else false)) continue;
                 const copy = self.gpa.dupe(u8, s.name) catch return error.OutOfMemory;
-                self.queue.append(self.gpa, copy) catch {
+                self.queue.append(self.gpa, .{ .op = .import, .name = copy }) catch {
                     self.gpa.free(copy);
                     return error.OutOfMemory;
                 };
@@ -233,20 +246,91 @@ pub const Manager = struct {
         return self.queue.items.len;
     }
 
-    /// Starts the first waiting source if nothing is running. A source that cannot be started (it was removed or
-    /// disabled meanwhile, or another program holds the data directory) is dropped and the next one tried.
+    /// What waits, in order, for the pages that show the queue. Names are allocated from `arena`.
+    pub const Waiting = struct { op: Op, name: []const u8 };
+
+    pub fn waiting(self: *Manager, arena: Allocator) Allocator.Error![]const Waiting {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const out = try arena.alloc(Waiting, self.queue.items.len);
+        for (self.queue.items, out) |it, *o| o.* = .{ .op = it.op, .name = try arena.dupe(u8, it.name) };
+        return out;
+    }
+
+    /// Asks for a ZIM download: it starts now if nothing is running, and otherwise waits its turn behind what is running
+    /// and what is already waiting. Asking again for a file that is downloading or waiting changes nothing. The space the
+    /// file needs is checked now and again when its turn comes. Returns how many downloads and imports wait afterwards.
+    pub fn queueDownload(self: *Manager, d: Download) StartError!usize {
+        if (self.opts.zim_dir == null) return error.NotConfigured;
+        if (!kiwix.validFileName(d.file_name) or d.meta4_url.len == 0 or d.meta4_url.len > 2048) return error.BadArgument;
+        if (d.size > 0) if (self.spaceShort(d)) |_| return error.NoSpace;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.closing) return error.AlreadyRunning;
+            if (self.running) |r| if (r.op == .download and std.mem.eql(u8, r.source, d.file_name)) return self.queue.items.len;
+            for (self.queue.items) |q| if (q.op == .download and std.mem.eql(u8, q.name, d.file_name)) return self.queue.items.len;
+            const name = self.gpa.dupe(u8, d.file_name) catch return error.OutOfMemory;
+            const owned = OwnedDownload.create(self.gpa, d) catch {
+                self.gpa.free(name);
+                return error.OutOfMemory;
+            };
+            self.queue.append(self.gpa, .{ .op = .download, .name = name, .dl = owned }) catch {
+                self.gpa.free(name);
+                owned.destroy(self.gpa);
+                return error.OutOfMemory;
+            };
+        }
+        self.startNext();
+        return self.queued();
+    }
+
+    /// Takes `name` (an import or a download) off the queue. False if it was not waiting.
+    pub fn unqueue(self: *Manager, name: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.queue.items, 0..) |it, i| if (std.mem.eql(u8, it.name, name)) {
+            it.free(self.gpa);
+            _ = self.queue.orderedRemove(i);
+            return true;
+        };
+        return false;
+    }
+
+    /// Starts the first waiting item if nothing is running. One that cannot be started (a source removed or disabled
+    /// meanwhile, another program holding the data directory, a download for which the room is gone) is dropped and the
+    /// next one tried.
     fn startNext(self: *Manager) void {
         while (true) {
-            var name: []u8 = undefined;
+            var item: QueueItem = undefined;
             {
                 self.mutex.lockUncancelable(self.io);
                 defer self.mutex.unlock(self.io);
                 if (self.closing or self.running != null or self.queue.items.len == 0) return;
-                name = self.queue.orderedRemove(0);
+                item = self.queue.orderedRemove(0);
             }
-            defer self.gpa.free(name);
-            self.start(name) catch |e| {
-                if (e == error.AlreadyRunning) return; // something else started in between: its end starts the next
+            defer item.free(self.gpa);
+            const started: StartError!void = switch (item.op) {
+                .download => self.startDownload(.{ .meta4_url = item.dl.?.meta4_url, .file_name = item.dl.?.file_name, .size = item.dl.?.size }),
+                else => self.start(item.name),
+            };
+            started catch |e| {
+                if (e == error.AlreadyRunning) {
+                    // Something else started in between: put this back at the front; its end starts the next.
+                    self.mutex.lockUncancelable(self.io);
+                    defer self.mutex.unlock(self.io);
+                    const name = self.gpa.dupe(u8, item.name) catch return;
+                    var dl_copy: ?*OwnedDownload = null;
+                    if (item.dl) |o| dl_copy = OwnedDownload.create(self.gpa, .{ .meta4_url = o.meta4_url, .file_name = o.file_name, .size = o.size }) catch {
+                        self.gpa.free(name);
+                        return;
+                    };
+                    self.queue.insert(self.gpa, 0, .{ .op = item.op, .name = name, .dl = dl_copy }) catch {
+                        self.gpa.free(name);
+                        if (dl_copy) |o| o.destroy(self.gpa);
+                    };
+                    return;
+                }
                 continue;
             };
             return;
@@ -360,8 +444,8 @@ pub const Manager = struct {
         defer self.mutex.unlock(self.io);
         const r = self.running orelse return false;
         r.control.cancel();
-        // Stopping the running import also stops the refresh that was queued behind it.
-        for (self.queue.items) |n| self.gpa.free(n);
+        // Stopping the running task also stops what was queued behind it.
+        for (self.queue.items) |it| it.free(self.gpa);
         self.queue.clearRetainingCapacity();
         return true;
     }
@@ -905,6 +989,52 @@ test "refresh all runs every enabled source one after another, and cancelling fo
     try testing.expect(m.cancel());
     try testing.expectEqual(@as(usize, 0), m.queued());
     try waitIdle(&m);
+}
+
+test "downloads wait their turn behind what runs: queued once, in order, removable, and the room is checked" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    var opts = env.options();
+    opts.zim_dir = env.data_dir[0..env.data_len];
+    var m = Manager.init(testing.allocator, testing.io, opts);
+    defer m.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Something is running (made up, so that no network is touched and nothing races).
+    var control: connector.Control = .{};
+    const busy_name = try testing.allocator.dupe(u8, "other-file.zim");
+    m.running = .{ .op = .download, .source = busy_name, .started_at = 0, .control = &control };
+    defer {
+        m.running = null;
+        testing.allocator.free(busy_name);
+    }
+    const one: Download = .{ .meta4_url = "https://127.0.0.1:1/a_2026-01.zim.meta4", .file_name = "a_2026-01.zim" };
+    const two: Download = .{ .meta4_url = "https://127.0.0.1:1/b_2026-01.zim.meta4", .file_name = "b_2026-01.zim" };
+    try testing.expectEqual(@as(usize, 1), try m.queueDownload(one));
+    try testing.expectEqual(@as(usize, 2), try m.queueDownload(two));
+    // Asking again for what waits, or for what is running, changes nothing.
+    try testing.expectEqual(@as(usize, 2), try m.queueDownload(one));
+    try testing.expectEqual(@as(usize, 2), try m.queueDownload(.{ .meta4_url = "https://127.0.0.1:1/o.zim.meta4", .file_name = "other-file.zim" }));
+    const waiting = try m.waiting(a);
+    try testing.expectEqual(@as(usize, 2), waiting.len);
+    try testing.expect(waiting[0].op == .download and std.mem.eql(u8, waiting[0].name, "a_2026-01.zim"));
+    try testing.expectEqualStrings("b_2026-01.zim", waiting[1].name);
+    // One can be taken off; another cannot be, twice.
+    try testing.expect(m.unqueue("a_2026-01.zim"));
+    try testing.expect(!m.unqueue("a_2026-01.zim"));
+    try testing.expectEqual(@as(usize, 1), m.queued());
+    // Bad names and a file that cannot fit are refused when asked for, not when their turn comes.
+    try testing.expectError(error.BadArgument, m.queueDownload(.{ .meta4_url = "https://127.0.0.1:1/x.meta4", .file_name = "../evil.zim" }));
+    try testing.expectError(error.NoSpace, m.queueDownload(.{ .meta4_url = "https://127.0.0.1:1/big.zim.meta4", .file_name = "big_2026-01.zim", .size = 1 << 62 }));
+    // Cancelling the running task forgets what waits.
+    try testing.expect(m.cancel());
+    try testing.expectEqual(@as(usize, 0), m.queued());
+    // Without a ZIM folder there is nothing to queue.
+    var nodir = Manager.init(testing.allocator, testing.io, env.options());
+    defer nodir.deinit();
+    try testing.expectError(error.NotConfigured, nodir.queueDownload(one));
 }
 
 test "making vectors runs as a background job, can be run again, and is refused when no model is set up" {

@@ -641,7 +641,7 @@ const ApiHit = struct {
 const SemanticNote = struct { used: bool, model: ?[]const u8 = null, compared: u32 = 0, reason: ?[]const u8 = null, index: bool = false, from_vectors: u32 = 0 };
 
 const PeerNote = struct { peer: []const u8, status: []const u8, ms: u32, results: u32, http_status: ?u16 = null, cached: bool = false };
-const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, peers: ?[]const PeerNote = null, semantic: ?SemanticNote = null, external: ?[]const dk.fallback.External = null, external_status: ?[]const ExternalStatus = null, next_cursor: ?[]const u8 = null };
+const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, ignored_words: []const []const u8 = &.{}, peers: ?[]const PeerNote = null, semantic: ?SemanticNote = null, external: ?[]const dk.fallback.External = null, external_status: ?[]const ExternalStatus = null, next_cursor: ?[]const u8 = null };
 const ExternalStatus = struct { provider: []const u8, status: []const u8 };
 
 const Federated = struct { hits: []const dk.search.Hit, notes: []const PeerNote };
@@ -1259,7 +1259,7 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
     for (page.hits, local) |h, *dst| dst.* = try withIdent(arena, services, h);
     const fed = try federate(arena, services, params, q, local);
     const grouped = if (fed == null and (if (params.get("group")) |g| std.mem.eql(u8, g, "1") else false)) try groupDuplicates(arena, local) else local;
-    const shown = try withMoreSnippets(arena, services, if (fed) |f| f.hits else grouped, parsed_typed_for_terms(params), snippetCount(params));
+    const shown = try withMoreSnippets(arena, services, try withFirstSnippets(arena, services, if (fed) |f| f.hits else grouped, parsed_typed_for_terms(params)), parsed_typed_for_terms(params), snippetCount(params));
     const hits = try arena.alloc(ApiHit, shown.len);
     for (shown, hits) |h, *out| out.* = try apiHit(arena, h);
     // The cursor of the next page: after the last result of this one, for a relevance-ordered search of words.
@@ -1268,7 +1268,7 @@ fn apiSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexse
         try arena.dupe(u8, (dk.search.Cursor{ .score = page.hits[page.hits.len - 1].score, .id = page.hits[page.hits.len - 1].id }).format(&cursor_buf))
     else
         null;
-    return jsonResponse(arena, .ok, ApiPage{ .next_cursor = next_cursor, .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null, .semantic = semantic, .external = ext_results, .external_status = ext_status });
+    return jsonResponse(arena, .ok, ApiPage{ .next_cursor = next_cursor, .hits = hits, .has_more = page.has_more, .interpreted = page.interpreted, .ignored_words = page.ignored, .fuzzy = page.fuzzy, .peers = if (fed) |f| f.notes else null, .semantic = semantic, .external = ext_results, .external_status = ext_status });
 }
 
 /// Whether a result belongs to a domain that must not be shown (the blocklist; with safe search, its ban lists too).
@@ -1299,6 +1299,28 @@ fn parsed_typed_for_terms(params: query.Params) []const u8 {
 
 /// The hits of this node with up to `n - 1` further excerpts from their stored text (nothing when `n` is 1, there is
 /// no content store, or the document is not stored).
+/// The excerpt of a result that came without one: a search of only very common words does not ask SQLite for it (that
+/// is slow for words that occur thousands of times in a document), so it is made here from the stored text.
+fn withFirstSnippets(arena: Allocator, services: Services, hits: []const dk.search.Hit, typed: []const u8) error{OutOfMemory}![]const dk.search.Hit {
+    var missing = false;
+    for (hits) |h| if (h.snippet == null and h.node == null) {
+        missing = true;
+    };
+    if (!missing) return hits;
+    const store = services.content orelse return hits;
+    const terms = try dk.snippets.queryTerms(arena, typed);
+    if (terms.len == 0) return hits;
+    const out = try arena.alloc(dk.search.Hit, hits.len);
+    for (hits, out) |h, *dst| {
+        dst.* = h;
+        if (h.snippet != null or h.node != null) continue;
+        const text = store.get(arena, h.id) catch continue;
+        const got = try dk.snippets.more(arena, text, terms, null, 1);
+        if (got.len > 0) dst.snippet = got[0];
+    }
+    return out;
+}
+
 fn withMoreSnippets(arena: Allocator, services: Services, hits: []const dk.search.Hit, typed: []const u8, n: u8) error{OutOfMemory}![]const dk.search.Hit {
     if (n <= 1) return hits;
     const store = services.content orelse return hits;
@@ -2271,7 +2293,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         try std.fmt.allocPrint(arena, "Ordered by meaning with {s}{s}.", .{ n.model orelse "the embedding model", if (n.index) " (documents the words missed are included)" else "" })
     else
         try std.fmt.allocPrint(arena, "Not ordered by meaning: {s}.", .{n.reason orelse "no reason given"});
-    shown.hits = try withMoreSnippets(arena, services, shown.hits, parsed.typed, form.snippets);
+    shown.hits = try withMoreSnippets(arena, services, try withFirstSnippets(arena, services, shown.hits, parsed.typed), parsed.typed, form.snippets);
     try applyFallback(arena, services, params, &form, shown.hits.len, q.offset);
     if (shown.hits.len == 0 and q.offset == 0) form.did_you_mean = try didYouMean(arena, searcher, q);
     var aw: std.Io.Writer.Allocating = .init(arena);
