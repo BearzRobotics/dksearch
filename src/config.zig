@@ -299,6 +299,8 @@ pub const Access = struct {
     anonymous_collections: ?[]const []const u8 = null,
     /// Add `Secure` to the cookie of /login (set it when a reverse proxy serves the site over HTTPS).
     cookie_secure: bool = false,
+    /// How long a login with the owner password lasts (days).
+    owner_login_days: u32 = 30,
 };
 
 /// Another dksearch node this one may ask (federated search). Configured by the operator, never discovered.
@@ -371,6 +373,14 @@ pub const Images = struct {
     /// The largest picture the relay hands on (MiB), and how many it fetches at once.
     relay_max_mb: u32 = 8,
     relay_concurrency: u32 = 6,
+    /// Keep small JPEG copies of the pictures shown in the gallery (off by default).
+    thumbnails: bool = false,
+    /// Where they are kept; null: `thumbs` in the data directory.
+    thumbnail_dir: ?[]const u8 = null,
+    /// The longer side of a thumbnail (pixels), its JPEG quality, and the most the folder may hold (MiB).
+    thumbnail_px: u32 = 320,
+    thumbnail_quality: u32 = 75,
+    thumbnail_cache_mb: u32 = 1024,
 };
 
 /// Safe search (`[safe_search]`): when `enabled`, the ban lists are added to the blocklist for everyone.
@@ -654,7 +664,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     cfg.fallback = try readFallback(a, src, root, diag);
     cfg.filters = try readFilters(a, src, root, diag);
     cfg.safe_search = try readSafeSearch(a, src, root, diag);
-    cfg.images = try readImages(src, root, diag);
+    cfg.images = try readImages(a, src, root, diag);
     // A crawl that reaches Tor needs a ban list: crawling onion sites with none is a choice that must be written down.
     {
         // Only the blocklist counts: the safe-search list can be turned off by whoever unlocks it.
@@ -696,7 +706,8 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
         return error.InvalidValue;
     }
     if (try subTable(src, root, "access", diag)) |t| {
-        try checkKeys(src, "access", t, &[_][]const u8{ "anonymous_collections", "cookie_secure" }, diag);
+        try checkKeys(src, "access", t, &[_][]const u8{ "anonymous_collections", "cookie_secure", "owner_login_days" }, diag);
+        if (try intIn(src, "access", t, "owner_login_days", 1, 365, diag)) |n| cfg.access.owner_login_days = @intCast(n);
         if (try optBool(src, "access", t, "cookie_secure", diag)) |b| cfg.access.cookie_secure = b;
         if (t.get("anonymous_collections")) |v| {
             const list = try stringList(a, src, "access.anonymous_collections", v, diag);
@@ -788,13 +799,24 @@ fn readFilters(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnost
     return f;
 }
 
-fn readImages(src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!Images {
+fn readImages(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!Images {
     const t = (try subTable(src, root, "images", diag)) orelse return .{};
-    try checkKeys(src, "images", t, &[_][]const u8{ "remote", "relay_max_mb", "relay_concurrency" }, diag);
+    try checkKeys(src, "images", t, &[_][]const u8{ "remote", "relay_max_mb", "relay_concurrency", "thumbnails", "thumbnail_dir", "thumbnail_px", "thumbnail_quality", "thumbnail_cache_mb" }, diag);
     var i: Images = .{};
     if (try optBool(src, "images", t, "remote", diag)) |b| i.remote = b;
     if (try intIn(src, "images", t, "relay_max_mb", 1, 64, diag)) |n| i.relay_max_mb = @intCast(n);
     if (try intIn(src, "images", t, "relay_concurrency", 1, 64, diag)) |n| i.relay_concurrency = @intCast(n);
+    if (try optBool(src, "images", t, "thumbnails", diag)) |b| i.thumbnails = b;
+    if (try str(src, "images", t, "thumbnail_dir", diag)) |d| {
+        if (d.len == 0 or d[0] != '/') {
+            diag.set(src, "images.thumbnail_dir", "must be an absolute folder path", .{});
+            return error.InvalidValue;
+        }
+        i.thumbnail_dir = try a.dupe(u8, d);
+    }
+    if (try intIn(src, "images", t, "thumbnail_px", 64, 1024, diag)) |n| i.thumbnail_px = @intCast(n);
+    if (try intIn(src, "images", t, "thumbnail_quality", 30, 95, diag)) |n| i.thumbnail_quality = @intCast(n);
+    if (try intIn(src, "images", t, "thumbnail_cache_mb", 16, 1048576, diag)) |n| i.thumbnail_cache_mb = @intCast(n);
     return i;
 }
 
@@ -1998,4 +2020,19 @@ test "public_mode refuses what would give the public more than intended" {
     // Off by default: the same file without public_mode loads.
     var off = try loadFromSlice(testing.allocator, "t.toml", "[storage]\ndata_dir = \"/tmp/x\"\n" ++ files, &d);
     off.deinit();
+}
+
+test "the thumbnail cache settings are read and checked" {
+    var d: Diagnostic = .{};
+    const base = "[storage]\ndata_dir = \"/tmp/x\"\n";
+    var c = try loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nthumbnails = true\nthumbnail_dir = \"/mnt/scratch/thumbs\"\nthumbnail_px = 256\nthumbnail_quality = 80\nthumbnail_cache_mb = 15360\n", &d);
+    defer c.deinit();
+    try testing.expect(c.images.thumbnails and c.images.thumbnail_px == 256 and c.images.thumbnail_quality == 80 and c.images.thumbnail_cache_mb == 15360);
+    try testing.expectEqualStrings("/mnt/scratch/thumbs", c.images.thumbnail_dir.?);
+    var plain = try loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nremote = true\n", &d);
+    defer plain.deinit();
+    try testing.expect(!plain.images.thumbnails and plain.images.thumbnail_cache_mb == 1024 and plain.images.thumbnail_dir == null);
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nthumbnail_dir = \"relative/thumbs\"\n", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nthumbnail_cache_mb = 1\n", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nthumbnail_px = 10\n", &d));
 }

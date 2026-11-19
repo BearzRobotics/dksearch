@@ -372,3 +372,18 @@ form.search .filterrow { flex-basis: 100%; position: relative; margin: 1.4rem 0 
 .filterrow .safenote input[type=password] { width: 4.5rem; padding: 0.15rem 0.35rem; }
 .filterrow .safenote button { padding: 0.15rem 0.6rem; }
 @media (max-width: 36rem) { .filterrow .safenote { position: static; margin: 0.4rem 0; } }
+
+/* The search box once search.js has made it multi-line. */
+form.search textarea[name="q"] {
+  flex: 1 1 14rem; padding: 0.6rem 0.8rem; font: inherit; line-height: 1.35; color: inherit; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 0.5rem; resize: none; overflow-y: auto; max-height: 12rem; min-width: 0;
+}
+.topbar form.search textarea[name="q"] { padding: 0.35rem 0.7rem; flex: 1 1 auto; }
+
+/* The Login / Logout button at the top right of the search pages. */
+.loginbtn { position: fixed; top: 0.7rem; right: 0.9rem; z-index: 5; margin: 0; }
+.loginbtn a, .loginbtn button {
+  display: inline-block; padding: 0.35rem 0.9rem; font: inherit; font-size: 0.9rem; color: var(--fg); text-decoration: none;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; cursor: pointer;
+}
+.loginbtn a:hover, .loginbtn button:hover, .loginbtn a:focus-visible, .loginbtn button:focus-visible { border-color: var(--accent); }

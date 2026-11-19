@@ -56,6 +56,10 @@ pub const Options = struct {
     config_path: ?[]const u8 = null,
     /// Present when the process can restart itself: the "Restart dksearch" button.
     restart: ?Restart = null,
+    /// The owner's password sign-in on the search page (the card on the Access page sets it).
+    owner: ?*dk.owner.OwnerLogin = null,
+    /// The thumbnail cache of the gallery (`[images] thumbnails`), with its settings, for the Maintenance page.
+    thumbs: ?*dk.thumbcache.Cache = null,
     version: []const u8,
     session_idle_ms: u64 = 30 * 60 * 1000,
     session_max_ms: u64 = 8 * 60 * 60 * 1000,
@@ -172,7 +176,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, action_embed, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, action_blocklists, action_restart, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, action_embed, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, action_blocklists, action_restart, action_owner_password, action_thumbs_clear, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -209,6 +213,8 @@ pub const App = struct {
             .{ "/actions/safesearch-lists", .action_safe_lists },
             .{ "/actions/blocklists", .action_blocklists },
             .{ "/actions/restart", .action_restart },
+            .{ "/actions/thumbs-clear", .action_thumbs_clear },
+            .{ "/actions/owner-password", .action_owner_password },
             .{ "/actions/zim", .action_zim },
             .{ "/actions/zim-folder", .action_zim_folder },
             .{ "/api/v1/admin/maintenance", .api_maintenance },
@@ -261,7 +267,7 @@ pub const App = struct {
             else => {},
         }
 
-        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_embed or route == .action_findimage or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_blocklists or route == .action_restart or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
+        const post_only = route == .action_import or route == .action_cancel or route == .api_imports_cancel or route == .action_maintenance or route == .action_zim or route == .action_zim_folder or route == .action_embed or route == .action_findimage or route == .action_safe_toggle or route == .action_safe_pin or route == .action_safe_lists or route == .action_blocklists or route == .action_restart or route == .action_owner_password or route == .action_thumbs_clear or route == .action_peer_test or route == .action_peer_edit or route == .action_model_pull or route == .action_model_remove or route == .action_model_use or route == .action_collection_edit or route == .action_key_add or route == .action_key_remove or route == .api_maintenance or route == .action_sources or route == .action_settings;
         if (post_only and req.method != .POST) return methodNotAllowed(arena, is_api, "POST");
         if (route == .api_imports and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
         if (route == .api_sources and !head_ok and req.method != .POST) return methodNotAllowed(arena, true, "GET, HEAD, POST");
@@ -296,6 +302,8 @@ pub const App = struct {
             .action_safe_lists => self.safeLists(arena, req, auth),
             .action_blocklists => self.blocklistsAction(arena, req, auth),
             .action_restart => self.restartAction(arena, req, auth),
+            .action_owner_password => self.ownerPasswordAction(arena, req, auth),
+            .action_thumbs_clear => self.thumbsClearAction(arena, req, auth),
             .zim_page => self.pageZim(arena, csrf, t.params),
             .models_page => self.pageModels(arena, csrf, null, t.params.get("remove")),
             .action_model_pull => self.modelAction(arena, req, auth, .pull),
@@ -1225,6 +1233,7 @@ pub const App = struct {
 
     fn writeAccess(self: *App, arena: Allocator, w: *Io.Writer, csrf: ?[]const u8, fresh: ?NewKey, suggest: bool) !void {
         try w.writeAll("<p class=\"muted\">Who may see what. A <em>collection</em> is a named group of sources (written as <code>[[collection]]</code> in the configuration file); an <em>API key</em> lets a program see only the collections it was made for. Without keys, everyone can search everything unless <code>[access] anonymous_collections</code> says otherwise.</p>");
+        if (csrf) |token| try self.writeOwnerCard(w, token);
         if (fresh) |f| {
             try w.writeAll("<section class=\"card\"><h2>New key made</h2><p>Copy it now: it is shown only this once, and only its hash is kept. Key <strong>");
             try html.writeEscaped(w, f.name);
@@ -1565,6 +1574,52 @@ pub const App = struct {
             error.Io => return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "config_not_writable", .message = "the configuration file could not be written (check its permissions); nothing was changed" }),
         };
         return self.pageAccessWith(arena, csrf, "Saved to the configuration file. Restart dksearch for the change to take effect.", .ok);
+    }
+
+    /// The card for the owner's password: the Login button on the search page.
+    fn writeOwnerCard(self: *App, w: *Io.Writer, token: []const u8) !void {
+        const owner = self.opts.owner orelse return;
+        const can_edit = self.opts.jobs != null;
+        const set = owner.hasPassword();
+        try w.print("<section class=\"card\"><h2>Login on the search page</h2><p class=\"muted\">With a password set, the search page has a <strong>Login</strong> button. You log in with this password and see everything this server holds (every source, safe search lifted); visitors see only what <code>anonymous_collections</code> allows. The password is stored only as a hash. Status: <strong>{s}</strong>.</p>", .{if (set) "a password is set" else "no password yet"});
+        try w.writeAll("<form action=\"/actions/owner-password\" method=\"post\" class=\"stack\"><input type=\"hidden\" name=\"csrf\" value=\"");
+        try html.writeEscaped(w, token);
+        try w.print("\"><label>{s}<input type=\"password\" name=\"password\" minlength=\"{d}\" maxlength=\"{d}\" autocomplete=\"new-password\" required></label><label>Again<input type=\"password\" name=\"password2\" minlength=\"{d}\" maxlength=\"{d}\" autocomplete=\"new-password\" required></label><button type=\"submit\" class=\"btn\"{s}>{s}</button></form>", .{ if (set) "New password" else "Password", dk.owner.min_password_len, dk.owner.max_password_len, dk.owner.min_password_len, dk.owner.max_password_len, if (can_edit) "" else " disabled", if (set) "Change the password" else "Set the password" });
+        if (set) {
+            try w.writeAll("<form class=\"inline\" action=\"/actions/owner-password\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
+            try html.writeEscaped(w, token);
+            try w.print("\"><input type=\"hidden\" name=\"remove\" value=\"1\"><button type=\"submit\" class=\"btn secondary\"{s}>Remove the password</button></form>", .{if (can_edit) "" else " disabled"});
+        }
+        try w.writeAll("<p class=\"muted small\">Changing or removing it logs every browser out.</p></section>");
+    }
+
+    fn thumbsClearAction(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => {},
+            .refused => |r| return r,
+        }
+        const cache = self.opts.thumbs orelse return actionFailure(arena, false, .{ .status = .conflict, .code = "no_thumbnails", .message = "the thumbnail cache is not turned on" });
+        if (self.opts.jobs == null) return actionFailure(arena, false, .{ .status = .conflict, .code = "actions_off", .message = "clearing the cache from here needs admin.actions = true" });
+        const n = cache.clear();
+        return redirect(arena, try std.fmt.allocPrint(arena, "/maintenance?done=thumbs-{d}", .{n}), null);
+    }
+
+    fn ownerPasswordAction(self: *App, arena: Allocator, req: server.Request, auth: Auth) error{OutOfMemory}!Response {
+        const params = switch (try self.checkAction(arena, req, auth, false)) {
+            .ok => |p| p,
+            .refused => |r| return r,
+        };
+        const csrf = try csrfCopy(arena, auth);
+        const owner = self.opts.owner orelse return self.pageAccessWith(arena, csrf, "Logging in on the search page is not available on this server.", .conflict);
+        if (params.get("remove")) |r| if (std.mem.eql(u8, r, "1")) {
+            owner.removePassword();
+            return self.pageAccess(arena, csrf, null, "The owner password is removed: the Login button is gone and everyone is logged out.");
+        };
+        const pw = params.get("password") orelse "";
+        if (!std.mem.eql(u8, pw, params.get("password2") orelse "")) return self.pageAccessWith(arena, csrf, "The two passwords are not the same.", .bad_request);
+        if (pw.len < dk.owner.min_password_len or pw.len > dk.owner.max_password_len or !std.unicode.utf8ValidateSlice(pw)) return self.pageAccessWith(arena, csrf, try std.fmt.allocPrint(arena, "The password must be {d} to {d} characters.", .{ dk.owner.min_password_len, dk.owner.max_password_len }), .bad_request);
+        owner.setPassword(pw) catch return actionFailure(arena, false, .{ .status = .internal_server_error, .code = "owner_password_failed", .message = "the password could not be saved" });
+        return self.pageAccess(arena, csrf, null, "The password is saved and works at once. The search page now has a Login button; anyone logged in with the old password is logged out.");
     }
 
     fn pageAccessWith(self: *App, arena: Allocator, csrf: ?[]const u8, notice: []const u8, status: http.Status) error{OutOfMemory}!Response {
@@ -3396,6 +3451,27 @@ fn opTitle(op: dk.jobs.Op) []const u8 {
     };
 }
 
+/// The thumbnail cache: whether it is on, where, how full, and a button to empty it.
+fn writeThumbsCard(app: *App, arena: Allocator, w: *Io.Writer, token: []const u8) !void {
+    try w.writeAll("<section class=\"card\"><h2>Thumbnail cache</h2>");
+    const cache = app.opts.thumbs orelse {
+        try w.writeAll("<p class=\"muted\">Off. With <code>thumbnails = true</code> under <code>[images]</code> (Settings, Pictures), the gallery keeps small JPEG copies of the pictures it shows and serves those instead of the originals. Nothing is kept otherwise.</p></section>\n");
+        return;
+    };
+    const st = cache.stats(arena);
+    try w.writeAll("<p class=\"muted\">On. Small JPEG copies (longest side ");
+    try w.print("{d} pixels) of pictures shown in the gallery are kept in <code>", .{cache.settings.px});
+    try html.writeEscaped(w, cache.settings.dir);
+    try w.writeAll("</code> up to ");
+    try writeBytes(w, cache.settings.max_bytes);
+    try w.writeAll("; when it is full the oldest are deleted. Now: ");
+    try w.print("{d} thumbnails, ", .{st.files});
+    try writeBytes(w, st.bytes);
+    try w.writeAll(".</p><form action=\"/actions/thumbs-clear\" method=\"post\" onsubmit=\"return confirm('Delete every thumbnail? They are made again when pictures are shown.')\"><input type=\"hidden\" name=\"csrf\" value=\"");
+    try html.writeEscaped(w, token);
+    try w.writeAll("\"><button type=\"submit\" class=\"btn secondary\">Clear the thumbnail cache</button></form></section>\n");
+}
+
 fn writeMaintenance(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapshot, csrf: ?[]const u8) !void {
     const m = app.opts.jobs orelse {
         try w.writeAll("<section class=\"card\"><h2>Maintenance</h2><p class=\"muted\">Running maintenance from here is turned off (<code>admin.actions</code> is false). Use the command line: <code>dksearch check</code>, <code>backup</code>, <code>remove</code>, <code>rebuild</code>, <code>restore</code> (see <code>dksearch help</code>).</p></section>\n");
@@ -3435,6 +3511,7 @@ fn writeMaintenance(app: *App, arena: Allocator, w: *Io.Writer, snap: App.Snapsh
     if (!any) try w.writeAll("<p class=\"muted\">No documents have been imported yet.</p>");
     try w.writeAll("</section>\n");
 
+    try writeThumbsCard(app, arena, w, token);
     try w.writeAll("<section class=\"card\"><h2>Rebuild and restore</h2><p class=\"muted\">These stay on the command line: <code>dksearch rebuild</code> recreates the index (stop <code>serve</code> first), and <code>dksearch restore DIR</code> recreates the stored data from a backup. Both replace files the running server is using.</p></section>\n");
 }
 
@@ -4365,6 +4442,38 @@ test "Restart: a good file asks the server to restart, a bad file is reported an
     try testing.expectEqual(http.Status.ok, good.status);
     try testing.expect(std.mem.indexOf(u8, good.body, "is restarting") != null);
     try testing.expect(Hook.asked);
+}
+
+test "Access: the owner password is set, changed and removed from the page, with checks" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.enableJobs();
+    var owner = try dk.owner.OwnerLogin.init(testing.allocator, testing.io, f.tmp.dir, 30);
+    defer owner.deinit();
+    f.app.opts.owner = &owner;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = try f.signIn(a);
+    const page = try f.call(a, .GET, "/access", .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, page.body, "Login on the search page") != null and std.mem.indexOf(u8, page.body, "no password yet") != null);
+    const csrf = csrfOf(page.body);
+    const post = struct {
+        fn go(fx: *Fixture, ar: Allocator, ck: []const u8, token: []const u8, rest: []const u8) !Response {
+            return fx.call(ar, .POST, "/actions/owner-password", .{ .cookie = ck, .body = try std.fmt.allocPrint(ar, "csrf={s}&{s}", .{ token, rest }) });
+        }
+    }.go;
+    try testing.expectEqual(http.Status.forbidden, (try f.call(a, .POST, "/actions/owner-password", .{ .cookie = cookie, .body = "csrf=wrong&password=correct+horse&password2=correct+horse" })).status);
+    try testing.expect(std.mem.indexOf(u8, (try post(&f, a, cookie, csrf, "password=correct+horse&password2=different")).body, "not the same") != null);
+    try testing.expect(std.mem.indexOf(u8, (try post(&f, a, cookie, csrf, "password=short&password2=short")).body, "8 to 128") != null);
+    try testing.expect(!owner.hasPassword());
+    const saved = try post(&f, a, cookie, csrf, "password=correct+horse&password2=correct+horse");
+    try testing.expect(std.mem.indexOf(u8, saved.body, "works at once") != null);
+    try testing.expect(owner.hasPassword() and owner.tryLogin("correct horse") == .ok);
+    try testing.expect(std.mem.indexOf(u8, (try f.call(a, .GET, "/access", .{ .cookie = cookie })).body, "a password is set") != null);
+    _ = try post(&f, a, cookie, csrf, "remove=1");
+    try testing.expect(!owner.hasPassword());
 }
 
 test "ZIM files: the confirmation shows the free space, and a download that cannot fit is refused with the numbers" {

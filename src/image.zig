@@ -56,6 +56,32 @@ pub fn info(bytes: []const u8) Error!Info {
     return .{ .width = @intCast(w), .height = @intCast(h) };
 }
 
+/// A decoded picture: `width * height` pixels of 3 bytes (red, green, blue), row by row.
+pub const Decoded = struct {
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+
+    pub fn deinit(self: Decoded) void {
+        if (available) c.stbi_image_free(@ptrCast(@constCast(self.pixels.ptr)));
+    }
+};
+
+/// Decodes the picture (JPEG, PNG, GIF, WebP or BMP) to RGB. Transparency is dropped. The caller calls `deinit`.
+pub fn decodeRgb(bytes: []const u8) Error!Decoded {
+    const inf = try info(bytes);
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var comp: c_int = 0;
+    const px = c.stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 3) orelse return error.NotAnImage;
+    // The decoder must agree with the header; never trust one to size the other.
+    if (w != inf.width or h != inf.height) {
+        c.stbi_image_free(px);
+        return error.NotAnImage;
+    }
+    return .{ .pixels = px[0 .. @as(usize, inf.width) * inf.height * 3], .width = inf.width, .height = inf.height };
+}
+
 /// The 64-bit difference hash of the picture.
 pub fn dhash(gpa: Allocator, bytes: []const u8) Error!u64 {
     const inf = try info(bytes);

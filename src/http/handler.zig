@@ -50,7 +50,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, unlock_page, lock_action, login_page, logout_action, api_export, api_peers, api_health, style, document, zim, wopi, other };
+const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, unlock_page, lock_action, login_page, logout_action, search_script, api_export, api_peers, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -71,6 +71,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/api/v1/peers")) return .api_peers;
     if (std.mem.eql(u8, path, "/api/v1/health")) return .api_health;
     if (std.mem.eql(u8, path, "/assets/style.css")) return .style;
+    if (std.mem.eql(u8, path, "/assets/search.js")) return .search_script;
     if (std.mem.startsWith(u8, path, "/doc/")) return .document;
     if (std.mem.startsWith(u8, path, "/zim/")) return .zim;
     if (std.mem.startsWith(u8, path, "/wopi/files/")) return .wopi;
@@ -111,6 +112,10 @@ pub const Services = struct {
     relay: ?*dk.imagerelay.Relay = null,
     safe_default: bool = false,
     unlock: ?*dk.safesearch.Unlock = null,
+    /// The thumbnail cache of the gallery (`[images] thumbnails`); null: the gallery shows the originals.
+    thumbs: ?*dk.thumbcache.Cache = null,
+    /// The owner's password sign-in (`dksearch owner-password`, or the Access page of the administration interface).
+    owner: ?*dk.owner.OwnerLogin = null,
     /// Add `Secure` to the sign-in cookie (set it when a proxy serves the site over HTTPS).
     cookie_secure: bool = false,
     safe: bool = false,
@@ -360,6 +365,10 @@ fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8, ca
             return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, found.collections), .keyed = true, .limited = wait, .adult = found.adult } };
         }
     }
+    // A browser that signed in as the owner (the password at /login) sees everything, safe search lifted.
+    if (authorization == null) if (services.owner) |o| if (o.valid(caller.cookie)) {
+        return .{ .ok = .{ .scope = .{}, .keyed = true, .limited = null, .adult = true } };
+    };
     // A browser that signed in with a key (the cookie of /login) is that key. A key that is no longer valid, or that is
     // bound to a node (which needs signatures), is not an error here: the browser is simply anonymous again.
     if (cookieValue(caller.cookie, login_cookie)) |token| if (services.keys) |store| {
@@ -440,6 +449,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
+        .search_script => .{ .status = .ok, .content_type = "text/javascript; charset=utf-8", .body = html.search_js, .headers = headersWith(arena, &.{asset_cache}) },
         .api_health => try jsonResponse(arena, .ok, .{ .status = "ok" }),
         .help_search => blk: {
             var aw: std.Io.Writer.Allocating = .init(arena);
@@ -937,9 +947,10 @@ fn apiAnswer(arena: Allocator, searcher: dk.search.Searcher, services: Services,
 
 /// `GET /api/v1/peers`: the peers this node is willing to introduce (`introduce = true`), by name and address only.
 /// For a caller with a key; they are suggestions the caller's operator may accept, nothing is added by asking.
-/// What the side panel offers about signing in: nothing when the server has no keys.
+/// What the Login button says: nothing when nobody can sign in here (no owner password, no keys).
 fn loginNote(services: Services) html.LoginNote {
-    if (services.keys == null) return .none;
+    const owner_set = if (services.owner) |o| o.hasPassword() else false;
+    if (!owner_set and services.keys == null) return .none;
     return if (services.keyed) .signed_in else .offered;
 }
 
@@ -988,34 +999,52 @@ fn unlockPage(arena: Allocator, services: Services, method: http.Method, caller:
     return r;
 }
 
-/// `/login`: a browser signs in with an API key (made with `dksearch api-key add`); the key is kept in a cookie, so that
-/// browser sees what the key may see (its collections, and everything for a key made with --all) and, for a key made
-/// with --adult, skips safe search. A key bound to a node cannot sign in: it needs signatures a browser cannot make.
+/// `/login`: the owner signs in with the password (`dksearch owner-password`), or a browser with an API key (made with
+/// `dksearch api-key add`). Either is kept in a cookie, so that browser sees what it may see: everything for the owner
+/// (safe search lifted), the key's collections for a key (and, for a key made with --adult, no safe search). A key
+/// bound to a node cannot sign in: it needs signatures a browser cannot make.
 fn loginPage(arena: Allocator, services: Services, method: http.Method, caller: Caller) error{OutOfMemory}!Response {
-    const store = services.keys orelse return htmlError(arena, .not_found, "Not found", "Signing in with a key is not set up on this server.");
+    if (services.keys == null and services.owner == null) return htmlError(arena, .not_found, "Not found", "Signing in is not set up on this server.");
     var message: ?[]const u8 = null;
     if (method == .POST) {
         const form_target = try std.fmt.allocPrint(arena, "/?{s}", .{std.mem.trimEnd(u8, caller.body, "\r\n")});
         const t = query.parseTarget(arena, form_target) catch return htmlError(arena, .bad_request, "Bad request", "The form could not be read.");
-        const token = std.mem.trim(u8, t.params.get("key") orelse "", " \t");
-        const found = if (token.len > 0 and token.len <= 200) try store.lookup(arena, token) else null;
-        if (found) |f| {
-            if (f.node == null) {
-                const secure: []const u8 = if (services.cookie_secure) "; Secure" else "";
-                const cookie = try std.fmt.allocPrint(arena, "{s}={s}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000{s}", .{ login_cookie, token, secure });
-                return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cookie }, no_store }) };
+        const given = std.mem.trim(u8, t.params.get("credential") orelse (t.params.get("key") orelse ""), " \t");
+        const secure: []const u8 = if (services.cookie_secure) "; Secure" else "";
+        if (std.mem.startsWith(u8, given, "dkk_")) {
+            const found = if (services.keys) |store| (if (given.len <= 200) try store.lookup(arena, given) else null) else null;
+            if (found) |f| {
+                if (f.node == null) {
+                    const cookie = try std.fmt.allocPrint(arena, "{s}={s}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000{s}", .{ login_cookie, given, secure });
+                    return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cookie }, no_store }) };
+                }
+                message = "That key is bound to a node and cannot be used in a browser.";
+            } else message = "That key is not valid.";
+        } else if (services.owner) |o| {
+            switch (o.tryLogin(given)) {
+                .ok => |r| {
+                    const cookie = try std.fmt.allocPrint(arena, "{s}={s}; HttpOnly; SameSite=Lax; Path=/; Max-Age={d}{s}", .{ dk.owner.cookie_name, &r.value, r.max_age, secure });
+                    return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cookie }, no_store }) };
+                },
+                .wrong => message = "That password is not right.",
+                .not_set => message = "There is no owner password on this server. Set one with dksearch owner-password, or on the Access page of the administration interface.",
+                .throttled => {
+                    var r = try htmlError(arena, .too_many_requests, "Too many tries", "Too many wrong passwords; wait a minute and try again.");
+                    r.headers = headersWith(arena, &.{ .{ .name = "retry-after", .value = "60" }, no_store });
+                    return r;
+                },
             }
-            message = "That key is bound to a node and cannot be used in a browser.";
         } else message = "That key is not valid.";
     }
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
-    html.writeHead(w, "Sign in - dksearch") catch return error.OutOfMemory;
-    w.writeAll("<body class=\"home\"><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1><h2>Sign in with a key</h2>") catch return error.OutOfMemory;
-    if (cookieValue(caller.cookie, login_cookie) != null and services.keyed) {
-        w.writeAll("<p class=\"muted\">This browser is signed in. <form class=\"inline\" action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></p>") catch return error.OutOfMemory;
+    html.writeHead(w, "Login - dksearch") catch return error.OutOfMemory;
+    w.writeAll("<body class=\"home\"><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1><h2>Login</h2>") catch return error.OutOfMemory;
+    const owner_in = if (services.owner) |o| o.valid(caller.cookie) else false;
+    if (owner_in or (cookieValue(caller.cookie, login_cookie) != null and services.keyed)) {
+        w.writeAll("<p class=\"muted\">You are logged in. <form class=\"inline\" action=\"/logout\" method=\"post\"><button type=\"submit\">Logout</button></form></p>") catch return error.OutOfMemory;
     } else {
-        w.writeAll("<p class=\"muted\">A key (made by the owner with <code>dksearch api-key add</code>) lets this browser see more than visitors do. It is kept in this browser for 30 days.</p><form class=\"stack\" action=\"/login\" method=\"post\"><label>API key <input type=\"password\" name=\"key\" autocomplete=\"off\" spellcheck=\"false\" maxlength=\"200\" required autofocus></label> <button type=\"submit\">Sign in</button></form>") catch return error.OutOfMemory;
+        w.writeAll("<p class=\"muted\">Log in to see everything this server holds. Use the owner password, or an API key made by the owner.</p><form class=\"stack\" action=\"/login\" method=\"post\"><label>Password or API key <input type=\"password\" name=\"credential\" autocomplete=\"current-password\" spellcheck=\"false\" maxlength=\"200\" required autofocus></label> <button type=\"submit\">Login</button></form>") catch return error.OutOfMemory;
     }
     if (message) |m| {
         w.writeAll("<p class=\"error\" role=\"alert\">") catch return error.OutOfMemory;
@@ -1028,11 +1057,12 @@ fn loginPage(arena: Allocator, services: Services, method: http.Method, caller: 
     return r;
 }
 
-/// Signs the browser out: the key's cookie is deleted.
+/// Logs the browser out: both cookies are deleted.
 fn logoutAction(arena: Allocator, services: Services) error{OutOfMemory}!Response {
     const secure: []const u8 = if (services.cookie_secure) "; Secure" else "";
-    const cleared = try std.fmt.allocPrint(arena, "{s}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{s}", .{ login_cookie, secure });
-    return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cleared }, no_store }) };
+    const key_gone = try std.fmt.allocPrint(arena, "{s}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{s}", .{ login_cookie, secure });
+    const owner_gone = try std.fmt.allocPrint(arena, "{s}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{s}", .{ dk.owner.cookie_name, secure });
+    return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = key_gone }, .{ .name = "set-cookie", .value = owner_gone }, no_store }) };
 }
 
 /// Ends the unlock of this browser: safe search is on again.
@@ -1410,6 +1440,7 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     var want_file = false;
     var want_open = false;
     var want_relay = false;
+    var want_thumb = false;
     var want_image: ?usize = null;
     if (std.mem.endsWith(u8, hex, "/open")) {
         want_open = true;
@@ -1417,6 +1448,9 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     } else if (std.mem.endsWith(u8, hex, "/file")) {
         want_file = true;
         hex = hex[0 .. hex.len - "/file".len];
+    } else if (std.mem.endsWith(u8, hex, "/thumb")) {
+        want_thumb = true;
+        hex = hex[0 .. hex.len - "/thumb".len];
     } else if (std.mem.endsWith(u8, hex, "/image")) {
         want_relay = true;
         hex = hex[0 .. hex.len - "/image".len];
@@ -1432,6 +1466,7 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     // A document outside the caller's scope, or of a blocked domain, is as good as absent.
     if (!services.scope.allows(hit.connector) or hitBlocked(services, hit)) return htmlError(arena, .not_found, "Not found", "No such document.");
     if (want_relay) return relayedImage(arena, services, id, hit);
+    if (want_thumb) return thumbnail(arena, services, id, hit);
     const can_open = if (services.originals) |o| (if (hit.url) |u| o.serves(hit.connector, u) else false) else false;
     if (want_file) return if (can_open) originalFile(arena, services.originals.?, hit) else htmlError(arena, .not_found, "Not found", "The original file of this document is not available here.");
     if (want_image) |n| return if (can_open) documentImage(arena, services.originals.?, hit, n) else htmlError(arena, .not_found, "Not found", "The pictures of this document are not available here.");
@@ -1555,6 +1590,60 @@ fn wopiPage(arena: Allocator, searcher: dk.search.Searcher, services: Services, 
 }
 
 /// The original file of a document, for the browser to show or download.
+/// `/doc/ID/thumb`: a small JPEG of the picture, from the cache when it is there, else made now from the original (a
+/// file this server may serve, or a web picture fetched through the relay) and kept. Anything that cannot be shrunk (a
+/// picture format that is not read here, too large, too many at once) sends the browser to the original instead, so a
+/// picture is never missing from the gallery. The thumbnail is cached by the browser too.
+fn thumbnail(arena: Allocator, services: Services, id: dk.document.Id, hit: dk.search.Hit) error{OutOfMemory}!Response {
+    const cache = services.thumbs orelse return htmlError(arena, .not_found, "Not found", "Thumbnails are not turned on here.");
+    if (!(if (hit.kind) |k| std.mem.eql(u8, k, "image") else false)) return htmlError(arena, .not_found, "Not found", "No picture here.");
+    const hex = std.fmt.bytesToHex(id, .lower);
+    const is_file = if (hit.url) |u| std.mem.startsWith(u8, u, "file://") else false;
+    const original_route = try std.fmt.allocPrint(arena, "/doc/{s}/{s}", .{ &hex, if (is_file) "file" else "image" });
+    if (cache.get(arena, id)) |bytes| return thumbnailResponse(arena, bytes);
+    // The original.
+    const original: []const u8 = blk: {
+        if (is_file) {
+            const o = services.originals orelse return htmlError(arena, .not_found, "Not found", "No picture here.");
+            if (!o.serves(hit.connector, hit.url.?)) return htmlError(arena, .not_found, "Not found", "No picture here.");
+            const served = o.read(arena, hit.connector, hit.url.?) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => htmlError(arena, .not_found, "Not found", "The picture is not available."),
+            };
+            break :blk served.bytes;
+        }
+        const relay = services.relay orelse return htmlError(arena, .not_found, "Not found", "No picture here.");
+        const store = services.content orelse return htmlError(arena, .not_found, "Not found", "No picture here.");
+        const page_url = hit.url orelse return htmlError(arena, .not_found, "Not found", "No picture here.");
+        if (!std.mem.startsWith(u8, page_url, "http")) return htmlError(arena, .not_found, "Not found", "No picture here.");
+        const text = store.get(arena, id) catch return htmlError(arena, .not_found, "Not found", "No picture here.");
+        const prefix = "Image: ";
+        if (!std.mem.startsWith(u8, text, prefix)) return htmlError(arena, .not_found, "Not found", "No picture here.");
+        const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+        const img = relay.fetchImage(arena, std.mem.trim(u8, text[prefix.len..line_end], " \r")) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return htmlError(arena, .not_found, "Not found", "The picture could not be fetched."),
+        };
+        break :blk img.bytes;
+    };
+    const small = cache.make(arena, original) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Not shrinkable here (or too busy): let the browser take the original.
+        error.NotAPicture, error.TooLarge, error.Unsupported, error.Busy => return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = original_route }, no_store }) },
+    };
+    cache.put(arena, id, small);
+    return thumbnailResponse(arena, small);
+}
+
+fn thumbnailResponse(arena: Allocator, bytes: []const u8) error{OutOfMemory}!Response {
+    const headers = try arena.alloc(Header, 4);
+    headers[0] = .{ .name = "x-content-type-options", .value = "nosniff" };
+    headers[1] = .{ .name = "content-security-policy", .value = "default-src 'none'; sandbox" };
+    headers[2] = .{ .name = "cross-origin-resource-policy", .value = "same-origin" };
+    headers[3] = .{ .name = "cache-control", .value = "private, max-age=86400" };
+    return .{ .status = .ok, .content_type = "image/jpeg", .body = bytes, .headers = headers };
+}
+
 /// `/doc/ID/image`: the picture of a web picture record, fetched now from where it is and passed on, nothing kept. Only
 /// for documents of kind image that the crawler recorded (the address comes from the stored text, never from the request).
 fn relayedImage(arena: Allocator, services: Services, id: dk.document.Id, hit: dk.search.Hit) error{OutOfMemory}!Response {
@@ -2174,6 +2263,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
                 services.relay != null and h.node == null and std.mem.startsWith(u8, u, "http");
         }
         form.gallery_ok = ok;
+        form.gallery_thumbs = services.thumbs != null;
     }
     form.semantic_offered = services.embed != null;
     form.semantic_checked = semantic_note != null;
@@ -3710,13 +3800,13 @@ test "sign in with a key: the browser gets the key's collections, an adult key s
     // Anonymous: only the public collection, safe search on, and the page offers signing in.
     _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{});
     try testing.expect(fake.last.?.safe_search);
-    try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), services, .GET, "/", null, .{}).body, "href=\"/login\"") != null);
+    try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), services, .GET, "/", null, .{}).body, "class=\"loginbtn\"><a href=\"/login\">Login</a>") != null);
     try testing.expectEqual(http.Status.ok, handleSigned(a, fake.searcher(), services, .GET, "/login", null, .{}).status);
     // A wrong key is told so and sets nothing; a good one sets the cookie.
-    const wrong = handleSigned(a, fake.searcher(), services, .POST, "/login", null, .{ .body = "key=dkk_nope" });
+    const wrong = handleSigned(a, fake.searcher(), services, .POST, "/login", null, .{ .body = "credential=dkk_nope" });
     try testing.expectEqual(http.Status.ok, wrong.status);
     try testing.expect(std.mem.indexOf(u8, wrong.body, "not valid") != null and headerValue(wrong, "set-cookie") == null);
-    const good = handleSigned(a, fake.searcher(), services, .POST, "/login", null, .{ .body = try std.fmt.allocPrint(a, "key={s}", .{made_token}) });
+    const good = handleSigned(a, fake.searcher(), services, .POST, "/login", null, .{ .body = try std.fmt.allocPrint(a, "credential={s}", .{made_token}) });
     try testing.expectEqual(http.Status.see_other, good.status);
     const set = headerValue(good, "set-cookie").?;
     try testing.expect(std.mem.startsWith(u8, set, "dks_key=dkk_") and std.mem.indexOf(u8, set, "HttpOnly") != null and std.mem.indexOf(u8, set, "Secure") == null);
@@ -3725,7 +3815,7 @@ test "sign in with a key: the browser gets the key's collections, an adult key s
     _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = cookie });
     try testing.expect(fake.last.?.safe_search); // this key is not an adult key
     const signed = handleSigned(a, fake.searcher(), services, .GET, "/", null, .{ .cookie = cookie });
-    try testing.expect(std.mem.indexOf(u8, signed.body, "Signed in.") != null);
+    try testing.expect(std.mem.indexOf(u8, signed.body, "action=\"/logout\"") != null and std.mem.indexOf(u8, signed.body, ">Logout<") != null);
     // An adult key skips safe search.
     _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = try std.fmt.allocPrint(a, "dks_key={s}", .{adult_token}) });
     try testing.expect(!fake.last.?.safe_search);
@@ -3739,10 +3829,134 @@ test "sign in with a key: the browser gets the key's collections, an adult key s
     try testing.expect(std.mem.indexOf(u8, headerValue(out, "set-cookie").?, "Max-Age=0") != null);
     var https = services;
     https.cookie_secure = true;
-    const secure_login = handleSigned(a, fake.searcher(), https, .POST, "/login", null, .{ .body = try std.fmt.allocPrint(a, "key={s}", .{made_token}) });
+    const secure_login = handleSigned(a, fake.searcher(), https, .POST, "/login", null, .{ .body = try std.fmt.allocPrint(a, "credential={s}", .{made_token}) });
     try testing.expect(std.mem.indexOf(u8, headerValue(secure_login, "set-cookie").?, "; Secure") != null);
     // A server without keys has no sign-in page.
     try testing.expectEqual(http.Status.not_found, handleSigned(a, fake.searcher(), .{}, .GET, "/login", null, .{}).status);
+}
+
+test "owner login: the password gives the full view with safe search lifted, a wrong one is told so, and logout clears the cookie" {
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var owner = try dk.owner.OwnerLogin.init(testing.allocator, testing.io, tmp.dir, 30);
+    defer owner.deinit();
+    const cols = [_]dk.config.Collection{.{ .name = "web", .description = "", .sources = &.{"curated"} }};
+    var lists: dk.domainlist.Lists = .{};
+    const services: Services = .{ .owner = &owner, .collections = &cols, .anonymous = &.{"web"}, .lists = &lists, .safe_default = true };
+    // No password yet: no button, and the page says what to do.
+    try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), services, .GET, "/", null, .{}).body, "loginbtn") == null);
+    try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), services, .POST, "/login", null, .{ .body = "credential=whatever" }).body, "no owner password") != null);
+    try owner.setPassword("correct horse battery");
+    // A visitor: the public collection, safe search on, and a Login button.
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{});
+    try testing.expect(fake.last.?.safe_search);
+    try testing.expect(fake.last.?.scope != null); // only the public collection
+    try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), services, .GET, "/", null, .{}).body, ">Login</a>") != null);
+    // A wrong password is told so and sets nothing; the right one sets the owner cookie.
+    const wrong = handleSigned(a, fake.searcher(), services, .POST, "/login", null, .{ .body = "credential=not+the+password" });
+    try testing.expect(std.mem.indexOf(u8, wrong.body, "not right") != null and headerValue(wrong, "set-cookie") == null);
+    const good = handleSigned(a, fake.searcher(), services, .POST, "/login", null, .{ .body = "credential=correct+horse+battery" });
+    try testing.expectEqual(http.Status.see_other, good.status);
+    const set = headerValue(good, "set-cookie").?;
+    try testing.expect(std.mem.startsWith(u8, set, "dks_owner=") and std.mem.indexOf(u8, set, "HttpOnly") != null and std.mem.indexOf(u8, set, "Max-Age=2592000") != null);
+    // With the cookie: every source (no scope), safe search lifted, a Logout button.
+    const cookie = set["dks_owner=".len..std.mem.indexOfScalar(u8, set, ';').?];
+    const header = try std.fmt.allocPrint(a, "other=1; dks_owner={s}", .{cookie});
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = header });
+    try testing.expect(!fake.last.?.safe_search);
+    try testing.expect(fake.last.?.scope == null); // no limit: every source
+    const home = handleSigned(a, fake.searcher(), services, .GET, "/", null, .{ .cookie = header });
+    try testing.expect(std.mem.indexOf(u8, home.body, ">Logout<") != null and std.mem.indexOf(u8, home.body, ">Login</a>") == null);
+    // Logout clears both cookies; a changed password ends every login.
+    const out = handleSigned(a, fake.searcher(), services, .POST, "/logout", null, .{ .cookie = header });
+    try testing.expectEqual(http.Status.see_other, out.status);
+    var cleared: u32 = 0;
+    for (out.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "set-cookie") and std.mem.indexOf(u8, h.value, "Max-Age=0") != null) {
+        cleared += 1;
+    };
+    try testing.expectEqual(@as(u32, 2), cleared);
+    try owner.setPassword("a different password");
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = header });
+    try testing.expect(fake.last.?.safe_search);
+}
+
+test "the search pages load the script that makes the box multi-line, and serve it" {
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const home = run(&fake, .GET, "/", &ar);
+    try testing.expect(std.mem.indexOf(u8, home.body, "<script src=\"/assets/search.js?v=") != null);
+    // The box is still a plain input, so the page works without the script (Enter searches).
+    try testing.expect(std.mem.indexOf(u8, home.body, "<input type=\"search\" name=\"q\"") != null);
+    try testing.expect(std.mem.indexOf(u8, run(&fake, .GET, "/search?q=odin", &ar).body, "/assets/search.js") != null);
+    const js = run(&fake, .GET, "/assets/search.js", &ar);
+    try testing.expectEqual(http.Status.ok, js.status);
+    try testing.expect(std.mem.startsWith(u8, js.content_type, "text/javascript"));
+    try testing.expect(std.mem.indexOf(u8, js.body, "shiftKey") != null and std.mem.indexOf(u8, js.body, "requestSubmit") != null);
+    // A query with a line break searches like one with a space.
+    try testing.expectEqual(http.Status.ok, run(&fake, .GET, "/search?q=odin%0D%0Aoneeye", &ar).status);
+}
+
+test "thumbnails: made on first use from the original, kept, served after the original is gone; what cannot be shrunk goes to the original; off means none" {
+    if (!dk.image.available) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "pics");
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = try std.fmt.allocPrint(a, "{s}/pics", .{try tmp.dir.realPathFileAlloc(testing.io, ".", a)});
+    // A real picture (made by the encoder) and a file that is a picture only by its name.
+    const raw = try a.alloc(u8, 400 * 300 * 3);
+    for (raw, 0..) |*b, i| b.* = @intCast((i * 7) % 256);
+    const big = try dk.jpegenc.encodeRgb(testing.allocator, raw, 400, 300, 90);
+    defer testing.allocator.free(big);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "pics/sky.jpg", .data = big });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "pics/logo.svg", .data = "<svg xmlns=\"http://www.w3.org/2000/svg\"/>" });
+    var idx = try dk.index_sqlite.SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const sky: dk.document.Document = .{ .connector = "pics", .source_id = "sky", .title = "sky", .text = "blue sky", .content_type = "image/jpeg", .canonical_url = try std.fmt.allocPrint(a, "file://{s}/sky.jpg", .{base}) };
+    const logo: dk.document.Document = .{ .connector = "pics", .source_id = "logo", .title = "logo", .text = "a logo", .content_type = "image/svg+xml", .canonical_url = try std.fmt.allocPrint(a, "file://{s}/logo.svg", .{base}) };
+    const page: dk.document.Document = .{ .connector = "pics", .source_id = "page", .title = "page", .text = "words", .content_type = "text/plain", .canonical_url = try std.fmt.allocPrint(a, "file://{s}/sky.jpg", .{base}) };
+    for ([_]dk.document.Document{ sky, logo, page }) |d| try idx.indexer().add(d.id(), d);
+    const roots = [_]dk.originals.Root{.{ .connector = "pics", .base = base }};
+    const originals: dk.originals.Service = .{ .io = testing.io, .roots = &roots };
+    const thumb_dir = try std.fmt.allocPrint(a, "{s}/thumbs", .{try tmp.dir.realPathFileAlloc(testing.io, ".", a)});
+    var cache = dk.thumbcache.Cache.init(testing.allocator, testing.io, .{ .dir = thumb_dir, .max_bytes = 1 << 28, .px = 100, .quality = 70 });
+    const services: Services = .{ .originals = &originals, .thumbs = &cache };
+    const s = idx.searcher();
+    const sky_hex = std.fmt.bytesToHex(sky.id(), .lower);
+    const logo_hex = std.fmt.bytesToHex(logo.id(), .lower);
+    const page_hex = std.fmt.bytesToHex(page.id(), .lower);
+    // First use: made from the original, small, and stored.
+    const first = handleServices(a, s, services, .GET, try std.fmt.allocPrint(a, "/doc/{s}/thumb", .{&sky_hex}));
+    try testing.expectEqual(http.Status.ok, first.status);
+    try testing.expectEqualStrings("image/jpeg", first.content_type);
+    try testing.expect(first.body.len < big.len);
+    const got = try dk.image.info(first.body);
+    try testing.expect(got.width == 100 and got.height == 75);
+    try testing.expect(std.mem.indexOf(u8, headerValue(first, "cache-control").?, "max-age=86400") != null);
+    try testing.expectEqual(@as(u64, 1), cache.stats(a).files);
+    // The original goes away: the stored thumbnail is still served.
+    try tmp.dir.deleteFile(testing.io, "pics/sky.jpg");
+    const again = handleServices(a, s, services, .GET, try std.fmt.allocPrint(a, "/doc/{s}/thumb", .{&sky_hex}));
+    try testing.expectEqual(http.Status.ok, again.status);
+    try testing.expectEqualSlices(u8, first.body, again.body);
+    // A picture format that is not shrunk here goes to the original; a document that is not a picture is not found.
+    const svg = handleServices(a, s, services, .GET, try std.fmt.allocPrint(a, "/doc/{s}/thumb", .{&logo_hex}));
+    try testing.expectEqual(http.Status.see_other, svg.status);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "/doc/{s}/file", .{&logo_hex}), headerValue(svg, "location").?);
+    try testing.expectEqual(http.Status.not_found, handleServices(a, s, services, .GET, try std.fmt.allocPrint(a, "/doc/{s}/thumb", .{&page_hex})).status);
+    // Off: no route. On: the gallery asks for thumbnails.
+    try testing.expectEqual(http.Status.not_found, handleServices(a, s, .{ .originals = &originals }, .GET, try std.fmt.allocPrint(a, "/doc/{s}/thumb", .{&sky_hex})).status);
+    const gallery = handleServices(a, s, services, .GET, "/search?q=sky&images=1");
+    try testing.expect(std.mem.indexOf(u8, gallery.body, "/thumb\"") != null);
+    const without = handleServices(a, s, .{ .originals = &originals }, .GET, "/search?q=sky&images=1");
+    try testing.expect(std.mem.indexOf(u8, without.body, "/thumb\"") == null);
 }
 
 test "trusted first: asked for by the server's default or by a request, and then no cursor is offered" {

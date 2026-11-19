@@ -167,6 +167,21 @@ fn run(init: std.process.Init) u8 {
         return adminCredentialCmd(io, gpa, config_path, eq(first, "admin-token"));
     }
 
+    if (eq(first, "owner-password")) {
+        var config_path: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (eq(a, "--config")) {
+                config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+            } else if (std.mem.startsWith(u8, a, "--config=")) {
+                config_path = a["--config=".len..];
+            } else {
+                err(io, "unknown option for owner-password: {s}", .{a});
+                return exit_usage;
+            }
+        }
+        return ownerPasswordCmd(io, gpa, config_path);
+    }
+
     if (eq(first, "safesearch-pin")) {
         var config_path: ?[]const u8 = null;
         while (args.next()) |a| {
@@ -1061,6 +1076,44 @@ fn safeSearchPinCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8
     return exit_ok;
 }
 
+/// `dksearch owner-password`: sets the password the owner logs in with on the search page (stored only as a hash).
+fn ownerPasswordCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const path = std.fmt.allocPrint(arena_state.allocator(), "{s}/{s}", .{ cfg.data_dir, dk.owner.file_name }) catch return exit_io;
+    var s = dk.secrets.load(gpa, io, Io.Dir.cwd(), path) catch |e| {
+        secretsProblem(io, path, e);
+        return exit_io;
+    };
+    defer s.deinit(gpa);
+    const pw = readPassword(io, gpa) orelse {
+        err(io, "no password was read; nothing was changed", .{});
+        return exit_usage;
+    };
+    defer {
+        std.crypto.secureZero(u8, pw);
+        gpa.free(pw);
+    }
+    if (pw.len < dk.owner.min_password_len or pw.len > dk.owner.max_password_len or !std.unicode.utf8ValidateSlice(pw)) {
+        err(io, "the password must be {d} to {d} characters; nothing was changed", .{ dk.owner.min_password_len, dk.owner.max_password_len });
+        return exit_usage;
+    }
+    s.setPassword(gpa, io, pw) catch |e| {
+        err(io, "cannot set the password: {t}", .{e});
+        return exit_usage;
+    };
+    dk.secrets.save(io, Io.Dir.cwd(), path, s) catch |e| {
+        err(io, "cannot write {s}: {t}", .{ path, e });
+        return exit_io;
+    };
+    err(io, "owner password hash written to {s}; a running server uses it within a few seconds, and every browser logged in with the old one is logged out", .{path});
+    return exit_ok;
+}
+
 fn adminCredentialCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, want_token: bool) u8 {
     var diag: dk.config.Diagnostic = .{};
     var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
@@ -1250,19 +1303,42 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     defer dk.domainlist.global = null;
     // The relay that shows pictures of the web in the gallery without storing them (`[images] remote`).
     var image_relay: dk.imagerelay.Relay = .{ .gpa = gpa, .io = io, .max_bytes = @as(usize, cfg.images.relay_max_mb) * 1024 * 1024, .max_concurrent = cfg.images.relay_concurrency };
+    // The thumbnail cache of the gallery (`[images] thumbnails`): small JPEG copies, kept up to a size.
+    var thumb_cache: ?dk.thumbcache.Cache = null;
+    const thumb_dir: []const u8 = if (cfg.images.thumbnails) (cfg.images.thumbnail_dir orelse (std.fmt.allocPrint(gpa, "{s}/thumbs", .{cfg.data_dir}) catch return exit_io)) else "";
+    defer if (cfg.images.thumbnails and cfg.images.thumbnail_dir == null) gpa.free(thumb_dir);
+    if (cfg.images.thumbnails) {
+        thumb_cache = dk.thumbcache.Cache.init(gpa, io, .{ .dir = thumb_dir, .max_bytes = @as(u64, cfg.images.thumbnail_cache_mb) * 1024 * 1024, .px = cfg.images.thumbnail_px, .quality = @intCast(cfg.images.thumbnail_quality) });
+        err(io, "thumbnails: on, kept in {s} up to {d} MiB ({d} pixels, quality {d})", .{ thumb_dir, cfg.images.thumbnail_cache_mb, cfg.images.thumbnail_px, cfg.images.thumbnail_quality });
+    }
     // Safe search: on for visitors by default; a PIN (set with `dksearch safesearch-pin`) unlocks a browser.
     var unlock_state: ?dk.safesearch.Unlock = null;
     defer if (unlock_state) |*u| u.deinit();
     if (cfg.safe_search.enabled) {
         var dd = Io.Dir.cwd().openDir(io, cfg.data_dir, .{}) catch null;
         if (dd) |*d| {
-            defer d.close(io);
+            // The directory stays open for the life of the server: the PIN file is looked at again while it runs.
             unlock_state = dk.safesearch.Unlock.init(gpa, io, d.*, cfg.safe_search.unlock_hours) catch |e| blk: {
                 err(io, "cannot read the safe-search PIN file ({t}); safe search cannot be unlocked", .{e});
+                d.close(io);
                 break :blk null;
             };
         }
         if (unlock_state) |*u| err(io, "safe search PIN: {s}", .{if (u.hasPin()) "set (visitors can unlock at /unlock)" else "not set (run `dksearch safesearch-pin`); safe search cannot be unlocked"});
+    }
+    // The owner's password sign-in (`dksearch owner-password`, or the Access page of the administration interface).
+    var owner_state: ?dk.owner.OwnerLogin = null;
+    defer if (owner_state) |*o| o.deinit();
+    {
+        var od = Io.Dir.cwd().openDir(io, cfg.data_dir, .{}) catch null;
+        if (od) |*d| {
+            owner_state = dk.owner.OwnerLogin.init(gpa, io, d.*, cfg.access.owner_login_days) catch |e| blk: {
+                err(io, "cannot read the owner password file ({t}); the owner cannot log in", .{e});
+                d.close(io);
+                break :blk null;
+            };
+        }
+        if (owner_state) |*o| err(io, "owner login: {s}", .{if (o.hasPassword()) "a password is set (the Login button is on the search page)" else "no password yet (run `dksearch owner-password`, or set one on the Access page)"});
     }
     if (pool) |*p| {
         p.setFuzzyMode(fuzzy_mode);
@@ -1471,6 +1547,8 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .image_searcher = if (pool) |*p| p.imageSearcher() else index.imageSearcher(),
             .lists = lists_ptr,
             .unlock = if (unlock_state != null) &unlock_state.? else null,
+            .owner = if (owner_state != null) &owner_state.? else null,
+            .thumbs = if (thumb_cache != null) &thumb_cache.? else null,
             .safe_enabled = cfg.safe_search.enabled,
             .safe_unlock_hours = cfg.safe_search.unlock_hours,
             .collections = cfg.collections,
@@ -1597,7 +1675,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     defer source_stats.deinit();
     var retrieve_cache = dk.retrievecache.Cache.init(gpa, io, @as(usize, cfg.search.retrieve_cache_mb) * 1024 * 1024);
     defer retrieve_cache.deinit();
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .cookie_secure = cfg.access.cookie_secure, .relay = if (cfg.images.remote) &image_relay else null, .trusted_first = cfg.search.trusted_first, .trusted_min_boost = cfg.search.trusted_min_boost, .safe_default = cfg.safe_search.enabled, .unlock = if (unlock_state != null) &unlock_state.? else null, .per_domain = cfg.search.per_domain, .lists = lists_ptr, .answers = if (ollama_client != null) &answer_service else null, .fallback = if (fallback_on) &fallback_settings else null, .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .owner = if (owner_state != null) &owner_state.? else null, .thumbs = if (thumb_cache != null) &thumb_cache.? else null, .cookie_secure = cfg.access.cookie_secure, .relay = if (cfg.images.remote) &image_relay else null, .trusted_first = cfg.search.trusted_first, .trusted_min_boost = cfg.search.trusted_min_boost, .safe_default = cfg.safe_search.enabled, .unlock = if (unlock_state != null) &unlock_state.? else null, .per_domain = cfg.search.per_domain, .lists = lists_ptr, .answers = if (ollama_client != null) &answer_service else null, .fallback = if (fallback_on) &fallback_settings else null, .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

@@ -118,6 +118,20 @@ pub const commands = [_]Command{
         ,
     },
     .{
+        .name = "owner-password",
+        .synopsis = "owner-password [--config FILE]",
+        .summary = "Set the password the owner logs in with on the search page",
+        .detail =
+        \\Reads a password (typed twice without echo, or one line from a pipe) and stores only its
+        \\hash in data_dir/owner-login.toml. The search page then shows a Login button: the owner
+        \\who logs in with it sees everything the server holds (every source, safe search
+        \\lifted), while visitors see only what [access] anonymous_collections allows. A
+        \\running server picks the password up within a few seconds; changing it logs every
+        \\browser out. A login lasts [access] owner_login_days (default 30).
+        \\
+        ,
+    },
+    .{
         .name = "safesearch-pin",
         .synopsis = "safesearch-pin [--config FILE]",
         .summary = "Set the PIN that unlocks safe search in a browser",

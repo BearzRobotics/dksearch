@@ -19,6 +19,11 @@ pub fn assetVersion(comptime content: []const u8) []const u8 {
 }
 
 pub const style_version = assetVersion(style_css);
+pub const search_js = @embedFile("assets/search.js");
+pub const search_js_version = assetVersion(search_js);
+
+/// The script that makes the search box multi-line; loaded at the end of the pages that have the box.
+const search_script = "<script src=\"/assets/search.js?v=" ++ search_js_version ++ "\" defer></script>\n";
 
 pub fn writeEscaped(w: *Writer, s: []const u8) Writer.Error!void {
     for (s) |b| switch (b) {
@@ -90,6 +95,8 @@ fn kindLabel(kind: []const u8) []const u8 {
 
 pub const Form = struct {
     q: []const u8 = "",
+    /// Show the gallery through the thumbnail cache (`/thumb`) instead of the originals.
+    gallery_thumbs: bool = false,
     login: LoginNote = .none,
     language: []const u8 = "",
     /// The sources ticked in the Source list: names, or `kind:NAME` for every source of a kind. Empty means
@@ -406,11 +413,7 @@ fn writeSidePanel(w: *Writer, regex_enabled: bool, login: LoginNote) Writer.Erro
     try w.writeAll("<p class=\"small\"><a href=\"/sources\">Sources</a> &middot; <a href=\"/help/search\">Full guide</a>");
     if (regex_enabled) try w.writeAll(" &middot; <a href=\"/help/regex\">Regex guide</a>");
     try w.writeAll("</p>");
-    switch (login) {
-        .none => {},
-        .offered => try w.writeAll("<p class=\"small\"><a href=\"/login\">Sign in with a key</a></p>"),
-        .signed_in => try w.writeAll("<p class=\"small\">Signed in. <a href=\"/login\">Sign out</a></p>"),
-    }
+    _ = login; // the Login button is in the page header
     try w.writeAll("</aside>\n");
 }
 
@@ -429,6 +432,15 @@ pub const SafeNote = enum { none, on_unlockable, on, unlocked };
 
 /// What the side panel offers about signing in with an API key.
 pub const LoginNote = enum { none, offered, signed_in };
+
+/// The Login button at the top right of the search pages, or Logout when signed in.
+fn writeLoginButton(w: *Writer, login: LoginNote) Writer.Error!void {
+    switch (login) {
+        .none => {},
+        .offered => try w.writeAll("<div class=\"loginbtn\"><a href=\"/login\">Login</a></div>\n"),
+        .signed_in => try w.writeAll("<form class=\"loginbtn\" action=\"/logout\" method=\"post\"><button type=\"submit\">Logout</button></form>\n"),
+    }
+}
 
 /// The safe-search state, on the line of the Filters switch at the right (inside the search form, so its fields name the
 /// separate forms below with `form=`: a form cannot hold another form).
@@ -454,6 +466,7 @@ pub fn writeHomeForm(w: *Writer, notice: ?[]const u8, form: Form) Writer.Error!v
     const regex_enabled = form.regex_enabled;
     try writeHead(w, "dksearch");
     try w.writeAll("<body class=\"home\">");
+    try writeLoginButton(w, form.login);
     try writeSidePanel(w, regex_enabled, form.login);
     try w.writeAll("<main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
     try writeForm(w, form);
@@ -462,12 +475,14 @@ pub fn writeHomeForm(w: *Writer, notice: ?[]const u8, form: Form) Writer.Error!v
         try writeEscaped(w, n);
         try w.writeAll("</p>");
     }
+    try w.writeAll(search_script);
     try w.writeAll("</main></body></html>\n");
 }
 
 pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page_size: u32) Writer.Error!void {
     try writeHead(w, if (f.q.len > 0) f.q else "dksearch");
     try w.writeAll("<body>");
+    try writeLoginButton(w, f.login);
     try writeSidePanel(w, f.regex_enabled, f.login);
     try w.writeAll("<main class=\"results-page\"><div class=\"head\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>");
     try writeForm(w, f);
@@ -527,6 +542,7 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
         if (page.has_more) try writePagerLink(w, f, offset + page_size, "Next &rarr;");
         try w.writeAll("</span></nav>\n");
     }
+    try w.writeAll(search_script);
     try w.writeAll("</main></body></html>\n");
 }
 
@@ -664,8 +680,11 @@ fn writeGallery(w: *Writer, f: Form, hits: []const dk.search.Hit) Writer.Error!v
             try writeEscaped(w, label);
             try w.writeAll("\" src=\"");
             try writeViewHref(w, h);
-            // A picture of a file is shown from the file, one of the web through the relay.
-            try w.writeAll(if (h.url) |u| (if (std.mem.startsWith(u8, u, "file://")) "/file\">" else "/image\">") else "/file\">");
+            // A small copy from the thumbnail cache when there is one; else a picture of a file is shown from the file,
+            // one of the web through the relay.
+            if (f.gallery_thumbs) {
+                try w.writeAll("/thumb\">");
+            } else try w.writeAll(if (h.url) |u| (if (std.mem.startsWith(u8, u, "file://")) "/file\">" else "/image\">") else "/file\">");
         } else try w.writeAll("<span class=\"nopic\">no preview</span>");
         try w.writeAll("<span class=\"cap\">");
         try writeEscaped(w, label);
@@ -1057,7 +1076,9 @@ test "results page: escapes titles, only links safe URLs, shows pager" {
     try testing.expect(std.mem.indexOf(u8, out, "wiki&lt;script&gt;") != null);
     try testing.expect(std.mem.indexOf(u8, out, "href=\"https://e.org/?a=1&amp;b=2\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "href=\"javascript:") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "<script") == null);
+    // The one script on the page is our own search.js; nothing from a title or snippet becomes a tag.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "<script"));
+    try testing.expect(std.mem.indexOf(u8, out, "<script src=\"/assets/search.js?v=") != null);
     try testing.expect(std.mem.indexOf(u8, out, "value=\"a &quot;b&quot; &lt;c&gt;\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "<mark>y</mark>") != null);
     // Pager: previous goes to offset 0 (no offset param), next to offset 20.

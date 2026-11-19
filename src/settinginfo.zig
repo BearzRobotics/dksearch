@@ -27,6 +27,18 @@ pub const Field = struct {
 
 pub const groups = [_]struct { title: []const u8, note: []const u8, fields: []const Field }{
     .{
+        .title = "Pictures",
+        .note = "The gallery of the search page (the Images button). Thumbnails are off unless you turn them on.",
+        .fields = &.{
+            .{ .table = "images", .key = "remote", .label = "Show pictures found on web pages", .type = .flag, .default = "false", .help = "Show the pictures the crawler recorded, fetched when someone looks at them (nothing stored unless thumbnails are on)." },
+            .{ .table = "images", .key = "thumbnails", .label = "Keep thumbnails", .type = .flag, .default = "false", .help = "Keep a small JPEG copy of each picture the gallery shows, so the gallery loads fast and never sends large originals. Only the small copy is kept: for pictures of the web the original is fetched, shrunk and dropped." },
+            .{ .table = "images", .key = "thumbnail_dir", .label = "Thumbnail folder", .type = .text, .placeholder = "/mnt/scratch/thumbs", .help = "An absolute folder with room for them (default: thumbs in the data directory)." },
+            .{ .table = "images", .key = "thumbnail_cache_mb", .label = "Thumbnail cache size (MiB)", .type = .number, .min = 16, .max = 1048576, .default = "1024", .help = "The most the folder may hold; when it is full the oldest thumbnails are deleted. About 12 KB each: 1024 MiB holds roughly 70,000." },
+            .{ .table = "images", .key = "thumbnail_px", .label = "Thumbnail size (pixels)", .type = .number, .min = 64, .max = 1024, .default = "320", .help = "The longer side of a thumbnail." },
+            .{ .table = "images", .key = "thumbnail_quality", .label = "Thumbnail quality", .type = .number, .min = 30, .max = 95, .default = "75", .help = "JPEG quality: higher is sharper and bigger." },
+        },
+    },
+    .{
         .title = "Search",
         .note = "How searches are read and limited. These apply to the public page and the API.",
         .fields = &.{
