@@ -367,7 +367,7 @@ fn run(init: std.process.Init) u8 {
                 return usageError(io, "too many arguments");
             }
         }
-        return evalCmd(io, gpa, config_path, file orelse return usageError(io, "eval needs a JUDGMENTS file"), k, json);
+        return evalCmd(io, gpa, config_path, file orelse return usageError(io, "eval needs a JUDGMENTS file"), k, json, language);
     }
 
     err(io, "unknown command: {s}", .{first});
@@ -1901,7 +1901,7 @@ fn backupCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, dest_dir:
     return exit_ok;
 }
 
-fn evalCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, judgments_path: []const u8, k: u32, json: bool) u8 {
+fn evalCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, judgments_path: []const u8, k: u32, json: bool, language: []const u8) u8 {
     var diag: dk.config.Diagnostic = .{};
     var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
     defer cfg.deinit();
