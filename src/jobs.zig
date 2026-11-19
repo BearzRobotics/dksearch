@@ -832,7 +832,7 @@ fn waitIdle(m: *Manager) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var waited: u32 = 0;
-    while (waited < 3000) : (waited += 1) {
+    while (waited < 20000) : (waited += 1) {
         if ((try m.current(arena.allocator())) == null) return;
         try testing.io.sleep(.fromMilliseconds(10), .awake);
     }

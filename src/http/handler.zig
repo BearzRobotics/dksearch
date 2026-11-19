@@ -50,7 +50,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, unlock_page, lock_action, api_export, api_peers, api_health, style, document, zim, wopi, other };
+const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, unlock_page, lock_action, login_page, logout_action, api_export, api_peers, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -63,6 +63,8 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/api/v1/answer")) return .api_answer;
     if (std.mem.eql(u8, path, "/unlock")) return .unlock_page;
     if (std.mem.eql(u8, path, "/lock")) return .lock_action;
+    if (std.mem.eql(u8, path, "/login")) return .login_page;
+    if (std.mem.eql(u8, path, "/logout")) return .logout_action;
     if (std.mem.eql(u8, path, "/api/v1/suggest")) return .api_suggest;
     if (std.mem.eql(u8, path, "/api/v1/similar")) return .api_similar;
     if (std.mem.eql(u8, path, "/api/v1/export")) return .api_export;
@@ -109,6 +111,8 @@ pub const Services = struct {
     relay: ?*dk.imagerelay.Relay = null,
     safe_default: bool = false,
     unlock: ?*dk.safesearch.Unlock = null,
+    /// Add `Secure` to the sign-in cookie (set it when a proxy serves the site over HTTPS).
+    cookie_secure: bool = false,
     safe: bool = false,
     /// Results of highly boosted sources first (`[search] trusted_first`, from `trusted_min_boost` percent); a request's
     /// own `trusted=1` or `trusted=0` overrides it.
@@ -313,6 +317,20 @@ pub fn handleSigned(arena: Allocator, searcher: dk.search.Searcher, services: Se
     return resp;
 }
 
+/// The cookie that holds the key of a browser that signed in at /login.
+pub const login_cookie = "dks_key";
+
+/// The value of cookie `name` in a Cookie header.
+fn cookieValue(cookie: ?[]const u8, name: []const u8) ?[]const u8 {
+    const header = cookie orelse return null;
+    var it = std.mem.splitScalar(u8, header, ';');
+    while (it.next()) |part| {
+        const p = std.mem.trim(u8, part, " \t");
+        if (p.len > name.len + 1 and std.mem.startsWith(u8, p, name) and p[name.len] == '=') return p[name.len + 1 ..];
+    }
+    return null;
+}
+
 /// The collections a bearer token's key may see, or an error message (a token that is not a valid key).
 fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8, caller: Caller, method: http.Method, target: []const u8) error{OutOfMemory}!union(enum) { ok: struct { scope: dk.access.Scope, keyed: bool, limited: ?u32 = null, adult: bool = false }, refused: []const u8 } {
     if (authorization) |h| {
@@ -342,6 +360,14 @@ fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8, ca
             return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, found.collections), .keyed = true, .limited = wait, .adult = found.adult } };
         }
     }
+    // A browser that signed in with a key (the cookie of /login) is that key. A key that is no longer valid, or that is
+    // bound to a node (which needs signatures), is not an error here: the browser is simply anonymous again.
+    if (cookieValue(caller.cookie, login_cookie)) |token| if (services.keys) |store| {
+        if (try store.lookup(arena, token)) |found| if (found.node == null) {
+            const wait: ?u32 = store.allow(found.id, found.rate);
+            return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, found.collections), .keyed = true, .limited = wait, .adult = found.adult } };
+        };
+    };
     // Anonymous: every source unless the server limits it to some collections.
     const names = services.anonymous orelse return .{ .ok = .{ .scope = .{}, .keyed = false } };
     return .{ .ok = .{ .scope = try dk.access.resolve(arena, services.collections, names), .keyed = false } };
@@ -362,7 +388,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         if (is_api) return apiError(arena, .not_found, "not_found", "no such endpoint");
         return htmlError(arena, .not_found, "Not found", "That page does not exist.");
     }
-    if (method != .GET and method != .HEAD and !((r == .unlock_page or r == .lock_action) and method == .POST)) {
+    if (method != .GET and method != .HEAD and !((r == .unlock_page or r == .lock_action or r == .login_page or r == .logout_action) and method == .POST)) {
         var resp = if (is_api)
             try apiError(arena, .method_not_allowed, "method_not_allowed", "use GET")
         else
@@ -410,7 +436,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
     return switch (r) {
         .home => blk: {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            html.writeHomeForm(&aw.writer, null, .{ .semantic_offered = services.embed != null, .safe_note = safeNote(services), .answers_offered = services.answers != null and !services.scope.none(), .regex_enabled = regex != null, .sources = try sourceChoicesFor(arena, services, searcher), .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
+            html.writeHomeForm(&aw.writer, null, .{ .semantic_offered = services.embed != null, .login = loginNote(services), .safe_note = safeNote(services), .answers_offered = services.answers != null and !services.scope.none(), .regex_enabled = regex != null, .sources = try sourceChoicesFor(arena, services, searcher), .collections = try collectionChoices(arena, services), .peer_names = try peerNames(arena, services) }) catch return error.OutOfMemory;
             break :blk htmlResponse(arena, .ok, aw.written());
         },
         .style => .{ .status = .ok, .content_type = css_ct, .body = html.style_css, .headers = headersWith(arena, &.{asset_cache}) },
@@ -430,6 +456,8 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         .api_answer => try apiAnswer(arena, searcher, services, t.params),
         .api_suggest => try apiSuggest(arena, searcher, t.params),
         .unlock_page => try unlockPage(arena, services, method, caller),
+        .login_page => try loginPage(arena, services, method, caller),
+        .logout_action => try logoutAction(arena, services),
         .lock_action => try lockAction(arena, services, caller),
         .api_similar => try apiSimilar(arena, searcher, services, t.params),
         .api_export => try apiExport(arena, searcher, services, t.params),
@@ -909,6 +937,12 @@ fn apiAnswer(arena: Allocator, searcher: dk.search.Searcher, services: Services,
 
 /// `GET /api/v1/peers`: the peers this node is willing to introduce (`introduce = true`), by name and address only.
 /// For a caller with a key; they are suggestions the caller's operator may accept, nothing is added by asking.
+/// What the side panel offers about signing in: nothing when the server has no keys.
+fn loginNote(services: Services) html.LoginNote {
+    if (services.keys == null) return .none;
+    return if (services.keyed) .signed_in else .offered;
+}
+
 /// What the pages say about safe search to this visitor.
 fn safeNote(services: Services) html.SafeNote {
     if (!services.safe_default) return .none;
@@ -952,6 +986,53 @@ fn unlockPage(arena: Allocator, services: Services, method: http.Method, caller:
     var r = htmlResponse(arena, .ok, aw.written());
     r.headers = headersWith(arena, &.{no_store});
     return r;
+}
+
+/// `/login`: a browser signs in with an API key (made with `dksearch api-key add`); the key is kept in a cookie, so that
+/// browser sees what the key may see (its collections, and everything for a key made with --all) and, for a key made
+/// with --adult, skips safe search. A key bound to a node cannot sign in: it needs signatures a browser cannot make.
+fn loginPage(arena: Allocator, services: Services, method: http.Method, caller: Caller) error{OutOfMemory}!Response {
+    const store = services.keys orelse return htmlError(arena, .not_found, "Not found", "Signing in with a key is not set up on this server.");
+    var message: ?[]const u8 = null;
+    if (method == .POST) {
+        const form_target = try std.fmt.allocPrint(arena, "/?{s}", .{std.mem.trimEnd(u8, caller.body, "\r\n")});
+        const t = query.parseTarget(arena, form_target) catch return htmlError(arena, .bad_request, "Bad request", "The form could not be read.");
+        const token = std.mem.trim(u8, t.params.get("key") orelse "", " \t");
+        const found = if (token.len > 0 and token.len <= 200) try store.lookup(arena, token) else null;
+        if (found) |f| {
+            if (f.node == null) {
+                const secure: []const u8 = if (services.cookie_secure) "; Secure" else "";
+                const cookie = try std.fmt.allocPrint(arena, "{s}={s}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000{s}", .{ login_cookie, token, secure });
+                return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cookie }, no_store }) };
+            }
+            message = "That key is bound to a node and cannot be used in a browser.";
+        } else message = "That key is not valid.";
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    html.writeHead(w, "Sign in - dksearch") catch return error.OutOfMemory;
+    w.writeAll("<body class=\"home\"><main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1><h2>Sign in with a key</h2>") catch return error.OutOfMemory;
+    if (cookieValue(caller.cookie, login_cookie) != null and services.keyed) {
+        w.writeAll("<p class=\"muted\">This browser is signed in. <form class=\"inline\" action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></p>") catch return error.OutOfMemory;
+    } else {
+        w.writeAll("<p class=\"muted\">A key (made by the owner with <code>dksearch api-key add</code>) lets this browser see more than visitors do. It is kept in this browser for 30 days.</p><form class=\"stack\" action=\"/login\" method=\"post\"><label>API key <input type=\"password\" name=\"key\" autocomplete=\"off\" spellcheck=\"false\" maxlength=\"200\" required autofocus></label> <button type=\"submit\">Sign in</button></form>") catch return error.OutOfMemory;
+    }
+    if (message) |m| {
+        w.writeAll("<p class=\"error\" role=\"alert\">") catch return error.OutOfMemory;
+        html.writeEscaped(w, m) catch return error.OutOfMemory;
+        w.writeAll("</p>") catch return error.OutOfMemory;
+    }
+    w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+    var r = htmlResponse(arena, .ok, aw.written());
+    r.headers = headersWith(arena, &.{no_store});
+    return r;
+}
+
+/// Signs the browser out: the key's cookie is deleted.
+fn logoutAction(arena: Allocator, services: Services) error{OutOfMemory}!Response {
+    const secure: []const u8 = if (services.cookie_secure) "; Secure" else "";
+    const cleared = try std.fmt.allocPrint(arena, "{s}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{s}", .{ login_cookie, secure });
+    return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cleared }, no_store }) };
 }
 
 /// Ends the unlock of this browser: safe search is on again.
@@ -1998,7 +2079,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
     const defaulted = if (default) |d| (picked.len == 1 and std.mem.startsWith(u8, picked[0], "collection:") and std.mem.eql(u8, picked[0]["collection:".len..], d) and (try params.all(arena, "source")).len == 0) else false;
-    var form: html.Form = .{ .safe_note = safeNote(services), .default_note = if (defaulted) default else null, .all_sources = all_asked, .q = parsed.typed, .language = q.language orelse "", .picked = picked, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .collections = try collectionChoices(arena, services), .sort = params.get("sort") orelse "" };
+    var form: html.Form = .{ .login = loginNote(services), .safe_note = safeNote(services), .default_note = if (defaulted) default else null, .all_sources = all_asked, .q = parsed.typed, .language = q.language orelse "", .picked = picked, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .collections = try collectionChoices(arena, services), .sort = params.get("sort") orelse "" };
     if (parsed.re) |req| {
         // A pattern typed in the box is already part of `q` and travels with it; only one given
         // as a parameter has to be carried separately (the pager and the exact-spelling link).
@@ -3601,6 +3682,67 @@ test "safe search: on for visitors, a PIN unlocks a browser for a while, an adul
     try testing.expectEqual(http.Status.not_found, handleSigned(a, fake.searcher(), no_unlock, .GET, "/unlock", null, .{}).status);
     _ = handleSigned(a, fake.searcher(), .{ .lists = &lists }, .GET, "/api/v1/search?q=odin", null, .{});
     try testing.expect(!fake.last.?.safe_search);
+}
+
+test "sign in with a key: the browser gets the key's collections, an adult key skips safe search, a bad or removed key is anonymous again" {
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var keys_store = dk.access.KeyStore.init(testing.allocator, testing.io, try tmp.dir.realPathFileAlloc(testing.io, ".", a));
+    defer keys_store.deinit();
+    const cols = [_]dk.config.Collection{
+        .{ .name = "web", .description = "", .sources = &.{"curated"} },
+        .{ .name = "books", .description = "", .sources = &.{"folklore"} },
+    };
+    var tok_me: [dk.access.token_len]u8 = undefined;
+    var tok_adult: [dk.access.token_len]u8 = undefined;
+    var keys = try dk.access.add(a, testing.io, &.{}, "me", &.{"*"}, 1, &tok_me);
+    keys = try dk.access.add(a, testing.io, keys, "grown-up", &.{"*"}, 2, &tok_adult);
+    keys = try dk.access.withAdult(a, keys, "grown-up");
+    try dk.access.save(a, testing.io, tmp.dir, dk.access.file_name, keys);
+    const made_token: []const u8 = &tok_me;
+    const adult_token: []const u8 = &tok_adult;
+    var lists: dk.domainlist.Lists = .{};
+    const services: Services = .{ .keys = &keys_store, .collections = &cols, .anonymous = &.{"web"}, .lists = &lists, .safe_default = true };
+    // Anonymous: only the public collection, safe search on, and the page offers signing in.
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{});
+    try testing.expect(fake.last.?.safe_search);
+    try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), services, .GET, "/", null, .{}).body, "href=\"/login\"") != null);
+    try testing.expectEqual(http.Status.ok, handleSigned(a, fake.searcher(), services, .GET, "/login", null, .{}).status);
+    // A wrong key is told so and sets nothing; a good one sets the cookie.
+    const wrong = handleSigned(a, fake.searcher(), services, .POST, "/login", null, .{ .body = "key=dkk_nope" });
+    try testing.expectEqual(http.Status.ok, wrong.status);
+    try testing.expect(std.mem.indexOf(u8, wrong.body, "not valid") != null and headerValue(wrong, "set-cookie") == null);
+    const good = handleSigned(a, fake.searcher(), services, .POST, "/login", null, .{ .body = try std.fmt.allocPrint(a, "key={s}", .{made_token}) });
+    try testing.expectEqual(http.Status.see_other, good.status);
+    const set = headerValue(good, "set-cookie").?;
+    try testing.expect(std.mem.startsWith(u8, set, "dks_key=dkk_") and std.mem.indexOf(u8, set, "HttpOnly") != null and std.mem.indexOf(u8, set, "Secure") == null);
+    const cookie = try std.fmt.allocPrint(a, "other=1; dks_key={s}", .{made_token});
+    // With the cookie: the key's scope (everything, for --all), keyed, the page offers signing out.
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = cookie });
+    try testing.expect(fake.last.?.safe_search); // this key is not an adult key
+    const signed = handleSigned(a, fake.searcher(), services, .GET, "/", null, .{ .cookie = cookie });
+    try testing.expect(std.mem.indexOf(u8, signed.body, "Signed in.") != null);
+    // An adult key skips safe search.
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = try std.fmt.allocPrint(a, "dks_key={s}", .{adult_token}) });
+    try testing.expect(!fake.last.?.safe_search);
+    // A key that is not valid (any more) is anonymous, not an error.
+    const stale = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = "dks_key=dkk_removed" });
+    try testing.expectEqual(http.Status.ok, stale.status);
+    try testing.expect(fake.last.?.safe_search);
+    // Signing out clears the cookie. Behind HTTPS the cookie is Secure.
+    const out = handleSigned(a, fake.searcher(), services, .POST, "/logout", null, .{ .cookie = cookie });
+    try testing.expectEqual(http.Status.see_other, out.status);
+    try testing.expect(std.mem.indexOf(u8, headerValue(out, "set-cookie").?, "Max-Age=0") != null);
+    var https = services;
+    https.cookie_secure = true;
+    const secure_login = handleSigned(a, fake.searcher(), https, .POST, "/login", null, .{ .body = try std.fmt.allocPrint(a, "key={s}", .{made_token}) });
+    try testing.expect(std.mem.indexOf(u8, headerValue(secure_login, "set-cookie").?, "; Secure") != null);
+    // A server without keys has no sign-in page.
+    try testing.expectEqual(http.Status.not_found, handleSigned(a, fake.searcher(), .{}, .GET, "/login", null, .{}).status);
 }
 
 test "trusted first: asked for by the server's default or by a request, and then no cursor is offered" {

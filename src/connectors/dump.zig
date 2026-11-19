@@ -1,10 +1,12 @@
 //! The dump connector (docs/decisions/0037): archives and data dumps that the administrator has already got on
-//! disk. It never uses the network and executes nothing. One kind, four `format`s:
+//! disk. It never uses the network and executes nothing. One kind, five `format`s:
 //!
 //!   zip            the text, Markdown and HTML files inside ZIP archives (`.zip`)
 //!   warc           the pages of web archives (`.warc`, `.warc.gz`: Common Crawl, Archive Team, wget `--warc-file`)
 //!   stackexchange  a Stack Exchange data dump's `Posts.xml`: every question and every answer is a document
 //!   reddit         Reddit submissions and comments as JSON lines (`.jsonl`, `.ndjson`, `.json`, `.zst`)
+//!   export         documents written by `dksearch export` (`.dksearch.jsonl`, or `.dksearch.jsonl.zst`): full texts
+//!                  with their address, title, language and type, to copy a crawl to another machine
 //!
 //! `path` is one file or a directory searched for files of the format (sorted, hidden entries and symbolic links
 //! skipped). Large files are read as a stream, never whole. The resume position is the last finished file, so a
@@ -20,6 +22,7 @@ const Allocator = std.mem.Allocator;
 const config = @import("../config.zig");
 const api = @import("../connector.zig");
 const doc = @import("../document.zig");
+const exportfile = @import("../exportfile.zig");
 const files = @import("files.zig");
 const htmltext = @import("../htmltext.zig");
 const ziparchive = @import("../ziparchive.zig");
@@ -37,12 +40,14 @@ pub const Format = enum {
     warc,
     stackexchange,
     reddit,
+    @"export",
 
     fn matches(self: Format, path: []const u8) bool {
         return switch (self) {
             .zip => std.ascii.endsWithIgnoreCase(path, ".zip"),
             .warc => std.ascii.endsWithIgnoreCase(path, ".warc") or std.ascii.endsWithIgnoreCase(path, ".warc.gz"),
             .stackexchange => std.mem.eql(u8, std.fs.path.basename(path), "Posts.xml"),
+            .@"export" => std.ascii.endsWithIgnoreCase(path, ".dksearch.jsonl") or std.ascii.endsWithIgnoreCase(path, ".dksearch.jsonl.zst"),
             .reddit => std.ascii.endsWithIgnoreCase(path, ".jsonl") or std.ascii.endsWithIgnoreCase(path, ".ndjson") or std.ascii.endsWithIgnoreCase(path, ".json") or std.ascii.endsWithIgnoreCase(path, ".zst"),
         };
     }
@@ -77,7 +82,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
         }
     }
     if (std.meta.stringToEnum(Format, source.optionString("format").?) == null) {
-        diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].format", .{source.name}) catch "format", "must be \"zip\", \"warc\", \"stackexchange\" or \"reddit\"", .{});
+        diag.set("", std.fmt.bufPrint(&kbuf, "source[{s}].format", .{source.name}) catch "format", "must be \"zip\", \"warc\", \"stackexchange\", \"reddit\" or \"export\"", .{});
         return error.InvalidValue;
     }
     inline for (.{ .{ "max_file_bytes", 1, hard_max_file_bytes }, .{ "zstd_window_mb", 1, 2048 }, .{ "min_score", -1_000_000, 100_000_000 } }) |opt| {
@@ -290,6 +295,7 @@ pub const DumpConnector = struct {
             .warc => readWarc(&ctx, file),
             .stackexchange => readStackExchange(&ctx, file),
             .reddit => readReddit(&ctx, file),
+            .@"export" => readExport(&ctx, file),
         };
     }
 };
@@ -715,6 +721,58 @@ fn stackExchangePost(ctx: *Ctx, a: Allocator, p: Post, site: []const u8, titles:
 // ---------------------------------------------------------------------------------------------- reddit
 
 fn readReddit(ctx: *Ctx, file: Io.File) DumpConnector.FileResult {
+    return readJsonLines(ctx, file, redditLine);
+}
+
+/// The documents of an export file (`dksearch export`): each line is one document with its full text.
+fn readExport(ctx: *Ctx, file: Io.File) DumpConnector.FileResult {
+    return readJsonLines(ctx, file, exportLine);
+}
+
+fn exportLine(ctx: *Ctx, a: Allocator, line: []const u8) Step {
+    const conn = ctx.conn;
+    const r = exportfile.decode(a, line) catch |e| switch (e) {
+        error.OutOfMemory => return .out_of_memory,
+        error.BadLine => {
+            ctx.reject(.unreadable, "(not a document of an export file)");
+            return .ok;
+        },
+    };
+    if (r.text.len > conn.max_file_bytes) {
+        ctx.reject(.too_large, r.id);
+        return .ok;
+    }
+    if (std.mem.trim(u8, r.text, " \t\r\n").len == 0 or std.mem.indexOfScalar(u8, r.text, 0) != null) {
+        ctx.reject(.no_text, r.id);
+        return .ok;
+    }
+    const redistribution: doc.Redistribution = if (std.mem.eql(u8, r.redistribution, "allowed")) .allowed else if (std.mem.eql(u8, r.redistribution, "restricted")) .restricted else .unknown;
+    const url: ?[]const u8 = if (r.url) |u| (if (std.mem.startsWith(u8, u, "http://") or std.mem.startsWith(u8, u, "https://")) u else null) else null;
+    const d: doc.Document = .{
+        .connector = conn.name,
+        .source_id = r.url orelse r.id, // the address names a page, so a page copied twice is one document
+        .canonical_url = url,
+        .title = r.title,
+        .text = r.text,
+        .language = r.language orelse conn.language,
+        .content_type = r.content_type,
+        .author = r.author,
+        .modified_at = r.modified_at,
+        .published_at = r.published_at,
+        .rights = .{
+            .attribution = std.fmt.allocPrint(a, "Copied from an export of the source {s}", .{if (r.source.len > 0) r.source else "(unknown)"}) catch return .out_of_memory,
+            .access_notes = "Copied with `dksearch export`; the rights stated by the source's owner apply.",
+            .redistribution = redistribution,
+        },
+    };
+    return switch (ctx.submit(d)) {
+        .ok => .ok,
+        .stopped => .stopped,
+        .out_of_memory => .out_of_memory,
+    };
+}
+
+fn readJsonLines(ctx: *Ctx, file: Io.File, lineFn: *const fn (*Ctx, Allocator, []const u8) Step) DumpConnector.FileResult {
     const conn = ctx.conn;
     const line_cap: usize = 8 * 1024 * 1024;
     const raw_buf = conn.gpa.alloc(u8, 256 * 1024) catch return .out_of_memory;
@@ -747,7 +805,7 @@ fn readReddit(ctx: *Ctx, file: Io.File) DumpConnector.FileResult {
         if (line.len < 2) continue;
         var item = std.heap.ArenaAllocator.init(conn.gpa);
         defer item.deinit();
-        switch (redditLine(ctx, item.allocator(), line)) {
+        switch (lineFn(ctx, item.allocator(), line)) {
             .ok => {},
             .stopped => return .stopped,
             .out_of_memory => return .out_of_memory,
@@ -998,6 +1056,24 @@ test "reddit: submissions and comments, deleted and adult posts left out, filter
     var z = try runAll(&tmp3, "posts.jsonl.zst", "reddit", &.{.{ .key = "zstd_window_mb", .value = .{ .integer = 8 } }}, @embedFile("../testdata/dump/sample.jsonl.zst"));
     defer z.deinit();
     try testing.expectEqual(@as(usize, 4), z.ids.items.len);
+}
+
+test "export: the documents of an export file come back with their addresses, titles and types; bad lines are counted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data =
+        \\{"id":"0123456789abcdef0123456789abcdef","source":"curated","url":"https://example.org/a","title":"First page","text":"Gannets nest on the cape","language":"en","content_type":"text/html","redistribution":"unknown"}
+        \\{"id":"fedcba9876543210fedcba9876543210","source":"curated","url":"https://example.org/pic.png","title":"A picture","text":"Image: https://example.org/pic.png\nPage: https://example.org/a","content_type":"image/png"}
+        \\this line is not a document
+        \\{"id":"11111111111111111111111111111111","source":"curated","url":"https://example.org/empty","title":"Empty","text":"   "}
+        \\
+    ;
+    var got = try runAll(&tmp, "web.dksearch.jsonl", "export", &.{}, data);
+    defer got.deinit();
+    try testing.expectEqual(@as(usize, 2), got.ids.items.len);
+    try testing.expectEqualStrings("https://example.org/a", got.ids.items[0]); // the address names the document
+    try testing.expectEqualStrings("First page", got.titles.items[0]);
+    try testing.expectEqualStrings("A picture", got.titles.items[1]);
 }
 
 test "the source is validated" {

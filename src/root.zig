@@ -41,6 +41,7 @@ pub const safesearch = @import("safesearch.zig");
 pub const embedjob = @import("embedjob.zig");
 pub const imagerelay = @import("imagerelay.zig");
 pub const blocklists = @import("blocklists.zig");
+pub const exportfile = @import("exportfile.zig");
 pub const optioninfo = @import("optioninfo.zig");
 pub const settinginfo = @import("settinginfo.zig");
 pub const officetext = @import("officetext.zig");
@@ -105,6 +106,7 @@ test {
     _ = embedjob;
     _ = imagerelay;
     _ = blocklists;
+    _ = exportfile;
     _ = optioninfo;
     _ = settinginfo;
     _ = officetext;

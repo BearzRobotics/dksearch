@@ -90,6 +90,7 @@ fn kindLabel(kind: []const u8) []const u8 {
 
 pub const Form = struct {
     q: []const u8 = "",
+    login: LoginNote = .none,
     language: []const u8 = "",
     /// The sources ticked in the Source list: names, or `kind:NAME` for every source of a kind. Empty means
     /// all sources.
@@ -201,7 +202,7 @@ pub const SourceRow = struct { name: []const u8, kind: []const u8, docs: ?u64, l
 pub fn writeSourcesPage(w: *Writer, rows: []const SourceRow, now: i64) Writer.Error!void {
     try writeHead(w, "Sources");
     try w.writeAll("<body>");
-    try writeSidePanel(w, false);
+    try writeSidePanel(w, false, .none);
     try w.writeAll("<main class=\"results-page\"><div class=\"head\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1></div><h2>Sources</h2>");
     if (rows.len == 0) {
         try w.writeAll("<p class=\"notice\">No sources are available here.</p>");
@@ -381,7 +382,7 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
 }
 
 /// The left panel: the search syntax at a glance, with links to the full guides.
-fn writeSidePanel(w: *Writer, regex_enabled: bool) Writer.Error!void {
+fn writeSidePanel(w: *Writer, regex_enabled: bool, login: LoginNote) Writer.Error!void {
     try w.writeAll("<input type=\"checkbox\" id=\"sidetoggle\" class=\"sidetoggle\" aria-label=\"Show search tips\"><label for=\"sidetoggle\" class=\"burger\" title=\"Search tips\">&#9776;</label><label for=\"sidetoggle\" class=\"scrim\"></label>");
     try w.writeAll("<aside class=\"side\" aria-label=\"Search tips\"><h2>Search tips</h2>");
     try w.writeAll("<h3>Words</h3><dl><dt><code>\"exact phrase\"</code></dt><dd>words together, in order</dd>" ++
@@ -404,7 +405,13 @@ fn writeSidePanel(w: *Writer, regex_enabled: bool) Writer.Error!void {
         "<dt><code>-re:/draft/</code></dt><dd>leave out those that match</dd></dl><p class=\"small\">Use it together with at least one word.</p>");
     try w.writeAll("<p class=\"small\"><a href=\"/sources\">Sources</a> &middot; <a href=\"/help/search\">Full guide</a>");
     if (regex_enabled) try w.writeAll(" &middot; <a href=\"/help/regex\">Regex guide</a>");
-    try w.writeAll("</p></aside>\n");
+    try w.writeAll("</p>");
+    switch (login) {
+        .none => {},
+        .offered => try w.writeAll("<p class=\"small\"><a href=\"/login\">Sign in with a key</a></p>"),
+        .signed_in => try w.writeAll("<p class=\"small\">Signed in. <a href=\"/login\">Sign out</a></p>"),
+    }
+    try w.writeAll("</aside>\n");
 }
 
 pub fn writeHome(w: *Writer, notice: ?[]const u8) Writer.Error!void {
@@ -419,6 +426,9 @@ pub fn writeHomeWith(w: *Writer, notice: ?[]const u8, regex_enabled: bool) Write
 /// The home page with a prepared form (the source list and so on).
 /// Safe search as the visitor meets it: on (with a way to unlock when the server has a PIN), or off in this browser.
 pub const SafeNote = enum { none, on_unlockable, on, unlocked };
+
+/// What the side panel offers about signing in with an API key.
+pub const LoginNote = enum { none, offered, signed_in };
 
 /// The safe-search state, on the line of the Filters switch at the right (inside the search form, so its fields name the
 /// separate forms below with `form=`: a form cannot hold another form).
@@ -444,7 +454,7 @@ pub fn writeHomeForm(w: *Writer, notice: ?[]const u8, form: Form) Writer.Error!v
     const regex_enabled = form.regex_enabled;
     try writeHead(w, "dksearch");
     try w.writeAll("<body class=\"home\">");
-    try writeSidePanel(w, regex_enabled);
+    try writeSidePanel(w, regex_enabled, form.login);
     try w.writeAll("<main><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>\n");
     try writeForm(w, form);
     if (notice) |n| {
@@ -458,7 +468,7 @@ pub fn writeHomeForm(w: *Writer, notice: ?[]const u8, form: Form) Writer.Error!v
 pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page_size: u32) Writer.Error!void {
     try writeHead(w, if (f.q.len > 0) f.q else "dksearch");
     try w.writeAll("<body>");
-    try writeSidePanel(w, f.regex_enabled);
+    try writeSidePanel(w, f.regex_enabled, f.login);
     try w.writeAll("<main class=\"results-page\"><div class=\"head\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>");
     try writeForm(w, f);
     try w.writeAll("</div>\n");

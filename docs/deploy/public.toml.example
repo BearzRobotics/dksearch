@@ -1,0 +1,88 @@
+# A public dksearch on a small server (see public-instance.md). Copy to /etc/dksearch/dksearch.toml.
+# It holds only what is crawled from the web: no folders of your own files, no ZIM files, no document server.
+
+[storage]
+data_dir = "/var/lib/dksearch"
+
+[server]
+# Loopback: Caddy (or nginx) in front terminates HTTPS and proxies here.
+address = "127.0.0.1"
+port = 8080
+# Refuses to start if this file would give the public more than the web collection
+# (originals of local files, a document server, an administration address that is not loopback,
+# or no [access] anonymous_collections). Needs dksearch with public_mode.
+public_mode = true
+
+# The administration interface stays on this machine. Reach it with an SSH tunnel:
+#   ssh -L 8081:127.0.0.1:8081 you@dksearch.org     then open http://127.0.0.1:8081/
+[admin]
+address = "127.0.0.1"
+port = 8081
+actions = true
+cookie_secure = true
+
+# What everyone may search: the web collection. Your own key (made with `dksearch api-key add me --all`, used at
+# /login) sees every source. Secure: the sign-in cookie only travels over HTTPS.
+[access]
+anonymous_collections = ["web"]
+cookie_secure = true
+
+[[collection]]
+name = "web"
+description = "The crawled web"
+sources = ["seed", "curated"]
+
+# A copy of a crawl made at home with `dksearch export` (see public-instance.md), so the first crawl here does not
+# have to start from nothing. Put the .dksearch.jsonl file in /var/lib/dksearch/seed/ and run:
+#   dksearch import --config /etc/dksearch/dksearch.toml seed
+[[source]]
+name = "seed"
+kind = "dump"
+format = "export"
+path = "/var/lib/dksearch/seed"
+
+# The crawl, from the same links file as at home. Be polite: delay_ms is per site.
+[[source]]
+name = "curated"
+kind = "crawl"
+user_agent = "dksearch-crawler (+https://dksearch.org/about)"
+seeds_file = "/etc/dksearch/links.toml"
+seeds_skip = "Tor"
+validators_file = "/var/lib/dksearch/curated.validators"
+recrawl_adaptive = true
+index_images = true
+max_depth = 1
+max_pages = 30000
+max_hosts = 3000
+delay_ms = 1500
+timeout_seconds = 30
+schedule = "weekly"
+
+# The onion sites of the same file, through a local Tor daemon (sudo apt install tor). A ban list is required for
+# this (see [filters]); the Block List Project lists are switched on in the administration interface.
+#[[source]]
+#name = "curated-tor"
+#kind = "crawl"
+#seeds_file = "/etc/dksearch/links.toml"
+#seeds_sections = "Tor"
+#tor_socks = "127.0.0.1:9050"
+#validators_file = "/var/lib/dksearch/curated-tor.validators"
+#max_depth = 1
+#max_pages = 2000
+#timeout_seconds = 120
+#delay_ms = 3000
+#workers = 2
+
+[filters]
+ban = "/etc/dksearch/ban.toml"
+# Domains of yours that the downloaded lists get wrong.
+#allow = ["wallpapers.com"]
+
+# Safe search is on for visitors; adults unlock it with the PIN (dksearch safesearch-pin) or a key made with --adult.
+[safe_search]
+enabled = true
+list = "/etc/dksearch/safesearch.toml"
+
+# Show the pictures found on pages in the gallery, fetched when looked at, nothing stored.
+[images]
+remote = true

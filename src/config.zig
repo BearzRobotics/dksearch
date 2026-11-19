@@ -297,6 +297,8 @@ pub const Access = struct {
     /// The collections anyone can search without a key. Null (the default): every source. An empty list: nothing,
     /// so the API needs a key (the search page then finds nothing for visitors).
     anonymous_collections: ?[]const []const u8 = null,
+    /// Add `Secure` to the cookie of /login (set it when a reverse proxy serves the site over HTTPS).
+    cookie_secure: bool = false,
 };
 
 /// Another dksearch node this one may ask (federated search). Configured by the operator, never discovered.
@@ -450,6 +452,8 @@ pub const Config = struct {
     fallback: Fallback = .{},
     filters: Filters = .{},
     safe_search: SafeSearch = .{},
+    /// `[server] public_mode`: refuse to start with a configuration that gives the public more than intended.
+    public_mode: bool = false,
     images: Images = .{},
     ollama: ?Ollama = null,
     answers: Answers = .{},
@@ -522,7 +526,10 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
     errdefer cfg.arena.deinit();
     const a = cfg.arena.allocator();
 
-    cfg.server = try readListener(a, src, root, "server", &server_keys, cfg.server, diag);
+    cfg.server = try readListener(a, src, root, "server", &(server_keys ++ [_][]const u8{"public_mode"}), cfg.server, diag);
+    if (try subTable(src, root, "server", diag)) |st| {
+        if (try optBool(src, "server", st, "public_mode", diag)) |b| cfg.public_mode = b;
+    }
     cfg.admin = try readListener(a, src, root, "admin", &admin_keys, cfg.admin, diag);
     if (try subTable(src, root, "admin", diag)) |t| {
         if (try str(src, "admin", t, "backup_dir", diag)) |bd| {
@@ -689,7 +696,8 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
         return error.InvalidValue;
     }
     if (try subTable(src, root, "access", diag)) |t| {
-        try checkKeys(src, "access", t, &[_][]const u8{"anonymous_collections"}, diag);
+        try checkKeys(src, "access", t, &[_][]const u8{ "anonymous_collections", "cookie_secure" }, diag);
+        if (try optBool(src, "access", t, "cookie_secure", diag)) |b| cfg.access.cookie_secure = b;
         if (t.get("anonymous_collections")) |v| {
             const list = try stringList(a, src, "access.anonymous_collections", v, diag);
             for (list) |c| {
@@ -705,6 +713,8 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
             cfg.access.anonymous_collections = list;
         }
     }
+
+    if (cfg.public_mode) try checkPublicMode(&cfg, src, diag);
 
     if (cfg.server.access_log) |sl| if (cfg.admin.access_log) |al| {
         if (std.mem.eql(u8, sl, al) and !std.mem.eql(u8, sl, "stderr")) {
@@ -1217,6 +1227,40 @@ fn optBool(src: []const u8, where: []const u8, t: *toml.Table, key: []const u8, 
             return error.WrongType;
         },
     };
+}
+
+/// `[server] public_mode = true`: what the public can reach must be named and must not hand out originals, and the
+/// administration interface must stay on this machine.
+fn checkPublicMode(cfg: *const Config, src: []const u8, diag: *Diagnostic) Error!void {
+    const anon = cfg.access.anonymous_collections orelse {
+        diag.set(src, "server.public_mode", "needs [access] anonymous_collections: name what the public may search (an empty list means nothing without a key)", .{});
+        return error.InvalidValue;
+    };
+    for (anon) |cname| {
+        for (cfg.collections) |col| {
+            if (!std.mem.eql(u8, col.name, cname)) continue;
+            for (col.sources) |sname| {
+                for (cfg.sources) |s| {
+                    if (!std.mem.eql(u8, s.name, sname)) continue;
+                    if (s.optionBool("serve_originals") orelse false) {
+                        diag.set(src, "server.public_mode", "source \"{s}\" is in the public collection \"{s}\" and has serve_originals = true: the public could open its files", .{ sname, cname });
+                        return error.InvalidValue;
+                    }
+                }
+            }
+        }
+    }
+    if (cfg.admin_configured) {
+        const ip = std.Io.net.IpAddress.parse(cfg.admin.address, 1) catch return;
+        const loopback = switch (ip) {
+            .ip4 => |v| v.bytes[0] == 127,
+            .ip6 => |v| std.mem.allEqual(u8, v.bytes[0..15], 0) and v.bytes[15] == 1,
+        };
+        if (!loopback) {
+            diag.set(src, "server.public_mode", "the administration interface must listen on a loopback address (admin.address is {s})", .{cfg.admin.address});
+            return error.InvalidValue;
+        }
+    }
 }
 
 fn readListener(a: Allocator, src: []const u8, root: *toml.Table, name: []const u8, keys: []const []const u8, def: Listener, diag: *Diagnostic) Error!Listener {
@@ -1934,4 +1978,24 @@ test "filters.allow is read" {
     defer c.deinit();
     try testing.expectEqual(@as(usize, 2), c.filters.allow.len);
     try testing.expectEqualStrings("wallpapers.com", c.filters.allow[0]);
+}
+
+test "public_mode refuses what would give the public more than intended" {
+    var d: Diagnostic = .{};
+    const base = "[storage]\ndata_dir = \"/tmp/x\"\n[server]\npublic_mode = true\n";
+    const files = "[[source]]\nname = \"books\"\nkind = \"files\"\npath = \"/b\"\nserve_originals = true\n[[source]]\nname = \"crawled\"\nkind = \"crawl\"\nseeds_file = \"/s.toml\"\n[[collection]]\nname = \"web\"\nsources = [\"crawled\"]\n[[collection]]\nname = \"library\"\nsources = [\"books\"]\n";
+    // Nothing named for the public.
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ files, &d));
+    // The public sees the web collection; the originals of the books are not theirs: fine.
+    var ok = try loadFromSlice(testing.allocator, "t.toml", base ++ files ++ "[access]\nanonymous_collections = [\"web\"]\n", &d);
+    ok.deinit();
+    // The public may search the library whose files are served: refused.
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ files ++ "[access]\nanonymous_collections = [\"library\"]\n", &d));
+    // The administration interface must be on loopback.
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ files ++ "[access]\nanonymous_collections = [\"web\"]\n[admin]\naddress = \"0.0.0.0\"\nport = 8081\n", &d));
+    var loop = try loadFromSlice(testing.allocator, "t.toml", base ++ files ++ "[access]\nanonymous_collections = [\"web\"]\n[admin]\naddress = \"127.0.0.1\"\nport = 8081\n", &d);
+    loop.deinit();
+    // Off by default: the same file without public_mode loads.
+    var off = try loadFromSlice(testing.allocator, "t.toml", "[storage]\ndata_dir = \"/tmp/x\"\n" ++ files, &d);
+    off.deinit();
 }

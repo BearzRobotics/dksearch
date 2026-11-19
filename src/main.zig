@@ -178,6 +178,7 @@ fn run(init: std.process.Init) u8 {
     if (eq(first, "models")) return modelsCmd(io, gpa, &args);
     if (eq(first, "fetch-banlist")) return fetchBanlistCmd(io, gpa, &args);
     if (eq(first, "find-image")) return findImageCmd(io, gpa, &args);
+    if (eq(first, "export")) return exportCmd(io, gpa, &args);
     if (eq(first, "node-key")) {
         var config_path: ?[]const u8 = null;
         while (args.next()) |a| {
@@ -589,6 +590,158 @@ fn findImageCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
         return exit_ok;
     }
     for (page.hits) |h| out(io, "{d}\t{s}\t{s}\t{s}\n", .{ h.distance, h.connector, h.url orelse "-", h.title orelse "-" });
+    return exit_ok;
+}
+
+/// `dksearch export --source NAME ... --out FILE`: the documents of some sources, with their texts, in a file that a
+/// `dump` source with `format = "export"` reads on another machine. Documents of banned domains are left out.
+fn exportCmd(io: Io, gpa: std.mem.Allocator, args: anytype) u8 {
+    var config_path: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    var force = false;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(gpa);
+    while (args.next()) |a| {
+        if (eq(a, "--config")) {
+            config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+        } else if (std.mem.startsWith(u8, a, "--config=")) {
+            config_path = a["--config=".len..];
+        } else if (eq(a, "--source")) {
+            names.append(gpa, args.next() orelse return usageError(io, "--source needs a NAME")) catch return exit_failure;
+        } else if (eq(a, "--out")) {
+            out_path = args.next() orelse return usageError(io, "--out needs a FILE");
+        } else if (eq(a, "--force")) {
+            force = true;
+        } else {
+            err(io, "unknown option for export: {s}", .{a});
+            return exit_usage;
+        }
+    }
+    const target = out_path orelse return usageError(io, "export needs --out FILE (named ...dksearch.jsonl)");
+    if (names.items.len == 0) return usageError(io, "export needs at least one --source NAME");
+    if (!std.ascii.endsWithIgnoreCase(target, dk.exportfile.suffix)) {
+        err(io, "the file must be named ...{s}, so that a dump source finds it", .{dk.exportfile.suffix});
+        return exit_usage;
+    }
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    for (names.items) |n| {
+        var known = false;
+        for (cfg.sources) |s| {
+            if (std.mem.eql(u8, s.name, n)) known = true;
+        }
+        if (!known) {
+            err(io, "there is no source named {s} in the configuration", .{n});
+            return exit_usage;
+        }
+    }
+    if (!force) {
+        if (Io.Dir.cwd().access(io, target, .{})) |_| {
+            err(io, "{s} exists; use --force to replace it", .{target});
+            return exit_usage;
+        } else |_| {}
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = Paths.make(arena, cfg.data_dir) catch return exit_io;
+    var index = dk.index_sqlite.SqliteIndex.openReadOnly(paths.index) catch |e| {
+        err(io, "cannot open the index {s}: {t}", .{ paths.index, e });
+        return exit_io;
+    };
+    defer index.close();
+    var content = openContent(io, gpa, paths.content) orelse return exit_io;
+    defer content.close();
+    // Banned domains are never exported: the index leaves their documents out when it knows the lists.
+    var lists = buildDomainLists(io, arena, cfg, false, config_path) orelse return exit_failure;
+    index.setDomains(&lists);
+    const searcher = index.searcher();
+    const store = content.store();
+
+    const part = std.fmt.allocPrint(arena, "{s}.part", .{target}) catch return exit_failure;
+    const file = Io.Dir.cwd().createFile(io, part, .{ .truncate = true }) catch |e| {
+        err(io, "cannot write {s}: {t}", .{ part, e });
+        return exit_io;
+    };
+    var offset: u64 = 0;
+    var written: u64 = 0;
+    var skipped: u64 = 0;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    for (names.items) |name| {
+        var redistribution: []const u8 = "unknown";
+        for (cfg.sources) |s| {
+            if (std.mem.eql(u8, s.name, name)) {
+                if (s.rights) |r| redistribution = @tagName(r);
+            }
+        }
+        var cursor: i64 = 0;
+        var in_source: u64 = 0;
+        while (true) {
+            var page_arena = std.heap.ArenaAllocator.init(gpa);
+            defer page_arena.deinit();
+            const pa = page_arena.allocator();
+            const rows = searcher.exportPage(pa, name, cursor, 200) catch |e| {
+                err(io, "reading {s} failed: {t}", .{ name, e });
+                file.close(io);
+                return exit_failure;
+            };
+            if (rows.len == 0) break;
+            for (rows) |row| {
+                cursor = row.cursor;
+                const text = store.get(pa, row.id) catch {
+                    skipped += 1; // no retained text: nothing to copy
+                    continue;
+                };
+                if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+                    skipped += 1;
+                    continue;
+                }
+                const line = dk.exportfile.encode(pa, .{
+                    .id = std.fmt.bytesToHex(row.id, .lower)[0..],
+                    .source = name,
+                    .url = row.url,
+                    .title = row.title,
+                    .text = text,
+                    .language = row.language,
+                    .content_type = row.content_type,
+                    .modified_at = row.modified_at,
+                    .published_at = row.published_at,
+                    .author = row.author,
+                    .redistribution = redistribution,
+                }) catch return exit_failure;
+                buf.appendSlice(gpa, line) catch return exit_failure;
+                buf.append(gpa, '\n') catch return exit_failure;
+                written += 1;
+                in_source += 1;
+                if (buf.items.len >= 1024 * 1024) {
+                    file.writePositionalAll(io, buf.items, offset) catch |e| {
+                        err(io, "cannot write {s}: {t}", .{ part, e });
+                        file.close(io);
+                        return exit_io;
+                    };
+                    offset += buf.items.len;
+                    buf.clearRetainingCapacity();
+                }
+            }
+        }
+        err(io, "{s}: {d} documents", .{ name, in_source });
+    }
+    if (buf.items.len > 0) {
+        file.writePositionalAll(io, buf.items, offset) catch |e| {
+            err(io, "cannot write {s}: {t}", .{ part, e });
+            file.close(io);
+            return exit_io;
+        };
+        offset += buf.items.len;
+    }
+    file.close(io);
+    Io.Dir.cwd().rename(part, Io.Dir.cwd(), target, io) catch |e| {
+        err(io, "cannot name the finished file {s}: {t}", .{ target, e });
+        return exit_io;
+    };
+    out(io, "wrote {s}: {d} documents, {d} bytes ({d} without a retained text left out)\n", .{ target, written, offset, skipped });
     return exit_ok;
 }
 
@@ -1429,7 +1582,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     defer source_stats.deinit();
     var retrieve_cache = dk.retrievecache.Cache.init(gpa, io, @as(usize, cfg.search.retrieve_cache_mb) * 1024 * 1024);
     defer retrieve_cache.deinit();
-    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .relay = if (cfg.images.remote) &image_relay else null, .trusted_first = cfg.search.trusted_first, .trusted_min_boost = cfg.search.trusted_min_boost, .safe_default = cfg.safe_search.enabled, .unlock = if (unlock_state != null) &unlock_state.? else null, .per_domain = cfg.search.per_domain, .lists = lists_ptr, .answers = if (ollama_client != null) &answer_service else null, .fallback = if (fallback_on) &fallback_settings else null, .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
+    dkhttp.server.servePublic(gpa, io, &listener, searcher, .{ .cookie_secure = cfg.access.cookie_secure, .relay = if (cfg.images.remote) &image_relay else null, .trusted_first = cfg.search.trusted_first, .trusted_min_boost = cfg.search.trusted_min_boost, .safe_default = cfg.safe_search.enabled, .unlock = if (unlock_state != null) &unlock_state.? else null, .per_domain = cfg.search.per_domain, .lists = lists_ptr, .answers = if (ollama_client != null) &answer_service else null, .fallback = if (fallback_on) &fallback_settings else null, .identity = if (node_identity) |*id| id else null, .replay = if (node_identity != null) &replay else null, .embed = if (embed_client != null) &embed_service else null, .source_stats = &source_stats, .default_collection = cfg.search.default_collection, .docserver = if (doc_service) |*d| d else null, .peers = peer_service, .retrieve_cache = if (cfg.search.retrieve_cache_mb > 0) &retrieve_cache else null, .collections = cfg.collections, .anonymous = cfg.access.anonymous_collections, .keys = &key_store, .regex = if (regex_service) |*r| r else null, .content = if (content_pool) |*p| p.store() else null, .originals = if (originals_service) |*o| o else null, .zims = if (zim_service) |*z| z else null, .sources = &source_store }, if (public_log) |*l| l else null, limits, &stats, &stop_control) catch |e| {
         err(io, "server stopped: {t}", .{e});
         result = exit_failure;
     };

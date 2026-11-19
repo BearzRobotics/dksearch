@@ -74,6 +74,20 @@ pub const commands = [_]Command{
         ,
     },
     .{
+        .name = "export",
+        .synopsis = "export --source NAME [--source NAME ...] --out FILE.dksearch.jsonl [--force] [--config FILE]",
+        .summary = "Write the documents of some sources to a file to copy to another machine",
+        .detail =
+        \\Writes the documents of the named sources, with their full texts, one JSON object per
+        \\line, to FILE (its name must end in .dksearch.jsonl). Copy it to another machine and
+        \\import it there with a source of kind "dump" and format = "export" (path = the file or
+        \\its folder). Documents of banned domains are left out; the file is written to FILE.part
+        \\and named only when finished. Compress it with zstd for the copy if you like: a name
+        \\ending in .dksearch.jsonl.zst is read too. It does not need the server to be stopped.
+        \\
+        ,
+    },
+    .{
         .name = "find-image",
         .synopsis = "find-image FILE [--distance BITS] [--limit N] [--config FILE]",
         .summary = "Find the indexed pictures that look like a picture",
