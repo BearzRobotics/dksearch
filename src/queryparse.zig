@@ -68,8 +68,8 @@ pub const Options = struct {
     expander: ?Expander = null,
     /// Leaves out of the required words those that are too common to be worth it (see `Common`); null keeps every word.
     common: ?Common = null,
-    /// Also search each plain word as the beginning of its other forms (see wordforms.zig).
-    word_forms: bool = false,
+    /// Also search each plain word as the other forms of it that the index has (see wordforms.zig); null: as typed.
+    forms: ?Forms = null,
 };
 
 /// Looks words up in the index's vocabulary. `f` returns the words within `max_edits` of `word` (not `word`
@@ -98,8 +98,9 @@ const Lx = struct {
     ignored: ?*std.ArrayList([]const u8) = null,
     /// Where the words searched for in the text are noted (for making excerpts), without repeats.
     terms: ?*std.ArrayList(snippets.Term) = null,
-    /// A plain word is also searched as the beginning of its other forms ("program" finds "programming"), see wordforms.zig.
-    forms: bool = false,
+    /// Where the index's own words that are other forms of a plain word are looked up ("program" finds "programming"), see
+    /// wordforms.zig. Null: words are searched as typed.
+    forms: ?Forms = null,
 };
 
 /// Question and filler words that are never worth requiring in a query that has other words ("how to program in c" is a
@@ -120,6 +121,12 @@ pub fn isFiller(word: []const u8) bool {
 /// documents): such a word is left out of the required terms of a query that has other words. The reason: ranking has
 /// to read every occurrence of every required word, and a word like "in" has tens of thousands of long position
 /// lists, which made searches such as "how to program in c" take many seconds for nothing a person wanted.
+/// Looks up the words of the index that begin with `stem`, the commonest first (at most `limit`).
+pub const Forms = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, arena: Allocator, stem: []const u8, limit: u32) Allocator.Error![]const []const u8,
+};
+
 pub const Common = struct {
     ctx: *anyopaque,
     isCommon: *const fn (ctx: *anyopaque, word: []const u8) bool,
@@ -693,7 +700,7 @@ pub fn parseWith(arena: Allocator, text: []const u8, options: Options) Error!Par
     var fts: std.ArrayList(u8) = .empty;
     var ignored: std.ArrayList([]const u8) = .empty;
     var terms: std.ArrayList(snippets.Term) = .empty;
-    var lx: Lx = .{ .lexicon = options.lexicon, .stops = options.lexicon != null and options.lexicon.?.stops.count() > 0, .expander = options.expander, .common = options.common, .ignored = &ignored, .terms = &terms, .forms = options.word_forms };
+    var lx: Lx = .{ .lexicon = options.lexicon, .stops = options.lexicon != null and options.lexicon.?.stops.count() > 0, .expander = options.expander, .common = options.common, .ignored = &ignored, .terms = &terms, .forms = options.forms };
     var has_terms = try emitOr(arena, &fts, lx, root);
     var heavy = false;
     if (!has_terms and (lx.stops or lx.common != null)) {
@@ -755,25 +762,37 @@ fn emitTerm(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, t: Term) Allocato
             };
             const syn: []const []const u8 = if (lx.lexicon) |l| l.synonymsOf(t.text) else &.{};
             var stem_buf: [wordforms.max_word]u8 = undefined;
-            const stem: ?[]const u8 = if (lx.forms) wordforms.stemPrefix(&stem_buf, t.text) else null;
-            if (stem) |st| {
-                // The words that begin with the stem ("program" finds "programming"), and the synonyms. The prefix covers the
-                // word itself: asking for both would count every occurrence twice and favour pages that repeat the exact word.
-                if (syn.len > 0) try out.append(arena, '(');
-                try quoted(arena, out, st);
-                try out.append(arena, '*');
-                for (syn) |sw| {
-                    try out.appendSlice(arena, " OR ");
-                    try quoted(arena, out, sw);
+            if (lx.forms) |fl| if (t.column == null) if (wordforms.stemPrefix(&stem_buf, t.text)) |st| {
+                // The word, and the other forms of it that the index has ("program" finds "programming"), each as its own
+                // word so that each counts by how rare it is.
+                const typed = try std.ascii.allocLowerString(arena, t.text);
+                var picked: std.ArrayList([]const u8) = .empty;
+                try picked.append(arena, typed);
+                const found = try fl.f(fl.ctx, arena, st, wordforms.max_forms * 6);
+                for (found) |w| {
+                    if (picked.items.len >= wordforms.max_forms) break;
+                    if (std.mem.eql(u8, w, typed) or !wordforms.isForm(st, w)) continue;
+                    try picked.append(arena, w);
                 }
-                if (syn.len > 0) try out.append(arena, ')');
-                // The excerpt looks for any word that begins with the stem.
-                var pt = t;
-                pt.kind = .prefix;
-                pt.text = try arena.dupe(u8, st);
-                try noteTerms(arena, lx, pt);
-                return true;
-            }
+                if (picked.items.len > 1 or syn.len > 0) {
+                    try out.append(arena, '(');
+                    for (picked.items, 0..) |w, i| {
+                        if (i > 0) try out.appendSlice(arena, " OR ");
+                        try quoted(arena, out, w);
+                    }
+                    for (syn) |sw| {
+                        try out.appendSlice(arena, " OR ");
+                        try quoted(arena, out, sw);
+                    }
+                    try out.append(arena, ')');
+                    for (picked.items) |w| {
+                        var wt = t;
+                        wt.text = w;
+                        try noteTerms(arena, lx, wt);
+                    }
+                    return true;
+                }
+            };
             if (syn.len == 0) {
                 try quoted(arena, out, t.text);
             } else {
@@ -943,7 +962,7 @@ fn emitAnd(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, a: *const And) All
     // What is excluded is taken as typed: a very common word someone asks to leave out stays a word to leave out.
     var negative_lx = lx;
     negative_lx.common = null;
-    negative_lx.forms = false; // a word to leave out is left out as typed
+    negative_lx.forms = null; // a word to leave out is left out as typed
     negative_lx.terms = null; // and is not a word to look for in an excerpt
     if (a.negative.items.len > 0) try out.append(arena, '(');
     for (a.positive.items) |u| {
@@ -1412,17 +1431,34 @@ test "very common words are not required when the query has other words; the pag
     try testing.expectEqualStrings("\"how\" AND \"to\" AND \"program\" AND \"in\" AND \"C\"", plain.fts);
 }
 
-test "word forms: a plain word is also the beginning of its other forms, in the search and in the excerpt" {
+const FormsSet = struct {
+    words: []const []const u8,
+    fn find(ctx: *anyopaque, arena: Allocator, stem: []const u8, limit: u32) Allocator.Error![]const []const u8 {
+        _ = arena;
+        _ = limit;
+        _ = stem;
+        const self: *const FormsSet = @ptrCast(@alignCast(ctx));
+        return self.words;
+    }
+};
+
+test "word forms: a plain word is also the other forms of it that the index has, each as its own word" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const p = try parseWith(a, "how to program in C", .{ .common = .{ .ctx = @constCast(&CommonSet{ .words = &.{} }), .isCommon = CommonSet.is }, .word_forms = true });
-    try testing.expectEqualStrings("\"program\"* AND \"C\"", p.fts);
-    try testing.expectEqual(@as(usize, 2), p.terms.len);
-    try testing.expect(p.terms[0].prefix and std.mem.eql(u8, p.terms[0].text, "program"));
-    // Phrases, title-only words checked elsewhere, words to leave out and short words stay as typed.
-    const phrase = try parseWith(a, "\"program\" -programming", .{ .word_forms = true });
-    try testing.expect(std.mem.indexOf(u8, phrase.fts, "NOT (\"programming\")") != null and std.mem.indexOf(u8, phrase.fts, "*") == null);
+    var set: FormsSet = .{ .words = &.{ "programming", "programs", "programmatic", "program", "progress" } };
+    const forms: Forms = .{ .ctx = &set, .f = FormsSet.find };
+    const p = try parseWith(a, "how to program in C", .{ .common = .{ .ctx = @constCast(&CommonSet{ .words = &.{} }), .isCommon = CommonSet.is }, .forms = forms });
+    // The typed word first, then its forms (not "programmatic" or "progress"), then the short word as typed.
+    try testing.expectEqualStrings("(\"program\" OR \"programming\" OR \"programs\") AND \"C\"", p.fts);
+    try testing.expectEqual(@as(usize, 4), p.terms.len);
+    try testing.expectEqualStrings("program", p.terms[0].text);
+    // Nothing found beyond the word itself: it is searched as typed. Phrases and words to leave out stay as typed.
+    var none: FormsSet = .{ .words = &.{"program"} };
+    const alone = try parseWith(a, "program", .{ .forms = .{ .ctx = &none, .f = FormsSet.find } });
+    try testing.expectEqualStrings("\"program\"", alone.fts);
+    const phrase = try parseWith(a, "\"program\" -programming", .{ .forms = forms });
+    try testing.expect(std.mem.indexOf(u8, phrase.fts, "NOT (\"programming\")") != null and std.mem.indexOf(u8, phrase.fts, " OR ") == null);
     // Off by default.
     const plain = try parseWith(a, "programming", .{});
     try testing.expectEqualStrings("\"programming\"", plain.fts);

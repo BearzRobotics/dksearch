@@ -1085,6 +1085,28 @@ pub const SqliteIndex = struct {
     /// The words of the index within `max_edits` edits of `word`, closest first and, among equals, the most common first.
     /// The words that begin like `word` are looked at first (most typos keep the first letter); if there are none, all
     /// words of about the same length are. Time-limited like a search.
+    /// The words of the index that begin with `stem`, the commonest (in most documents) first.
+    fn formsCb(ctx: *anyopaque, arena: Allocator, stem: []const u8, limit: u32) Allocator.Error![]const []const u8 {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ctx));
+        return self.formsOf(arena, stem, limit) catch &.{};
+    }
+
+    fn formsOf(self: *SqliteIndex, arena: Allocator, stem: []const u8, limit: u32) search.Error![]const []const u8 {
+        if (stem.len == 0 or stem.len > 40) return &.{};
+        const upper = try arena.dupe(u8, stem);
+        upper[upper.len - 1] +%= 1;
+        const st = Stmt.prepare(self.db, "SELECT term FROM fts_vocab WHERE term >= ?1 AND term < ?2 ORDER BY doc DESC LIMIT ?3") catch |e| return searchError(e);
+        defer st.deinit();
+        st.text(1, stem) catch |e| return searchError(e);
+        st.text(2, upper) catch |e| return searchError(e);
+        st.int(3, limit) catch |e| return searchError(e);
+        var out: std.ArrayList([]const u8) = .empty;
+        while (st.step() catch |e| return searchError(e)) {
+            if (st.colText(0)) |term| try out.append(arena, try arena.dupe(u8, term));
+        }
+        return out.items;
+    }
+
     fn expandCb(ctx: *anyopaque, arena: Allocator, word: []const u8, max_edits: u8) Allocator.Error![]const []const u8 {
         const self: *SqliteIndex = @ptrCast(@alignCast(ctx));
         return self.expandWord(arena, word, max_edits) catch &.{};
@@ -1220,7 +1242,7 @@ pub const SqliteIndex = struct {
     }
 
     fn parseQuery(self: *SqliteIndex, arena: Allocator, text: []const u8, fuzzy_words: bool, now: i64) search.Error!queryparse.Parsed {
-        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now, .lexicon = self.lexicon, .word_forms = self.word_forms, .common = if (self.common_percent > 0 and self.has_vocab) .{ .ctx = self, .isCommon = commonCb } else null, .expander = if (self.has_vocab) .{ .ctx = @constCast(self), .f = expandCb } else null }) catch |e| switch (e) {
+        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now, .lexicon = self.lexicon, .forms = if (self.word_forms and self.has_vocab) .{ .ctx = @constCast(self), .f = formsCb } else null, .common = if (self.common_percent > 0 and self.has_vocab) .{ .ctx = self, .isCommon = commonCb } else null, .expander = if (self.has_vocab) .{ .ctx = @constCast(self), .f = expandCb } else null }) catch |e| switch (e) {
             error.EmptyQuery => error.EmptyQuery,
             error.InvalidQuery => error.InvalidQuery,
             error.OutOfMemory => error.OutOfMemory,
@@ -2990,6 +3012,11 @@ test "other forms of a word are found, in the excerpt too; off, the word is foun
     const on = try searchAll(a, &idx, "program c");
     try testing.expectEqual(@as(usize, 1), on.hits.len);
     try testing.expect(std.mem.indexOf(u8, on.hits[0].snippet.?, "\x02programming\x03") != null);
+    // "comprehensive" only starts like "comprehension": it is not another form of it.
+    _ = try put(&idx, "t", "3", "Glossary", "list comprehension: a compact way to make a list");
+    _ = try put(&idx, "t", "4", "Review", "a comprehensive review of gardening");
+    const comp = try searchAll(a, &idx, "comprehension");
+    try testing.expectEqual(@as(usize, 1), comp.hits.len);
     idx.setWordForms(false);
     const off = try searchAll(a, &idx, "program c");
     try testing.expectEqual(@as(usize, 0), off.hits.len);

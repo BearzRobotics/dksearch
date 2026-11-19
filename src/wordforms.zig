@@ -35,6 +35,25 @@ pub fn stemPrefix(buf: *[max_word]u8, word: []const u8) ?[]const u8 {
     return buf[0..n];
 }
 
+/// The most forms of a word one query asks for (the typed word first, then the commonest forms in the index).
+pub const max_forms = 8;
+
+/// Endings that make another form of a word: "program" + "ming", "programs", "programmers", "comprehension"s, but not
+/// "comprehensive", "programmatic" or "progress".
+const endings = [_][]const u8{ "", "s", "es", "e", "ed", "d", "ing", "ings", "er", "ers", "or", "ors", "ion", "ions", "ation", "ations", "ly", "ment", "ments", "ness", "y", "ies", "ied", "al", "ally" };
+
+/// Whether `term` (a word of the index, lower case) is another form of the word with this `stem`: the stem followed by an
+/// ending from the list, with the last letter doubled where the ending was added ("programm" + "ing").
+pub fn isForm(stem: []const u8, term: []const u8) bool {
+    if (term.len < stem.len or !std.mem.startsWith(u8, term, stem)) return false;
+    const rest = term[stem.len..];
+    for (endings) |e| if (std.mem.eql(u8, rest, e)) return true;
+    if (rest.len > 0 and stem.len > 0 and rest[0] == stem[stem.len - 1] and !isVowel(rest[0])) {
+        for (endings[4..]) |e| if (e.len > 0 and std.mem.eql(u8, rest[1..], e)) return true;
+    }
+    return false;
+}
+
 fn isVowel(c: u8) bool {
     return switch (c) {
         'a', 'e', 'i', 'o', 'u' => true,
@@ -73,4 +92,13 @@ test "short words, words that are not plain letters and words with nothing to st
     // Not plurals.
     try testing.expectEqualStrings("class", stemOf("class").?);
     try testing.expectEqualStrings("analysis", stemOf("analysis").?);
+}
+
+test "other forms are the stem with an ending; words that only start the same are not" {
+    try testing.expect(isForm("program", "program") and isForm("program", "programs") and isForm("program", "programming"));
+    try testing.expect(isForm("program", "programmer") and isForm("program", "programmers") and isForm("program", "programmed"));
+    try testing.expect(isForm("comprehens", "comprehension") and isForm("comprehens", "comprehensions"));
+    try testing.expect(!isForm("comprehens", "comprehensive") and !isForm("program", "programmatic") and !isForm("program", "progress"));
+    try testing.expect(isForm("schedul", "schedule") and isForm("schedul", "scheduling") and isForm("schedul", "scheduler"));
+    try testing.expect(!isForm("program", "prog") and !isForm("start", "starting-point") and !isForm("start", "startup"));
 }
