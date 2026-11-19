@@ -1568,7 +1568,7 @@ test "code = true: source and configuration files are indexed with their languag
     var ctl: api.Control = .{};
     const r = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc.connector(), "notes", &ctl, E2e.now);
     try testing.expectEqual(@as(u64, 3), r.submitted); // tool.py, Makefile, readme.txt
-    try testing.expectEqual(@as(usize, 2), try e.hits("frobnicate")); // the script and the notes
+    try testing.expectEqual(@as(usize, 3), try e.hits("frobnicate")); // the script, the notes, and the Makefile's "frobnicator" (another form of the word)
     try testing.expectEqual(@as(usize, 0), try e.hits("wombat")); // node_modules is not entered
     const page = try e.idx.searcher().search(e.arena.allocator(), .{ .text = "frobnicate", .filters = &.{.{ .field = .tag, .text = "python" }} });
     try testing.expectEqual(@as(usize, 1), page.hits.len);

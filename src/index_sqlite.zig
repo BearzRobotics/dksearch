@@ -123,6 +123,8 @@ pub const SqliteIndex = struct {
     /// A plain word in more than this share (percent) of the documents is not required by a query that has other words
     /// (0: every word is required). It matters only for an index of a few thousand documents or more.
     common_percent: u32 = 15,
+    /// Words are also searched as the beginning of their other forms (`[search] word_forms`).
+    word_forms: bool = true,
     doc_total: u64 = 0,
     doc_total_at: i96 = 0,
     /// Whether the index stems words (`porter`): then excerpts are made by SQLite, which knows the stems.
@@ -190,6 +192,10 @@ pub const SqliteIndex = struct {
 
     pub fn setFuzzyMode(self: *SqliteIndex, mode: FuzzyMode) void {
         self.fuzzy_mode = mode;
+    }
+
+    pub fn setWordForms(self: *SqliteIndex, on: bool) void {
+        self.word_forms = on;
     }
 
     pub fn setCommonPercent(self: *SqliteIndex, percent: u32) void {
@@ -1214,7 +1220,7 @@ pub const SqliteIndex = struct {
     }
 
     fn parseQuery(self: *SqliteIndex, arena: Allocator, text: []const u8, fuzzy_words: bool, now: i64) search.Error!queryparse.Parsed {
-        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now, .lexicon = self.lexicon, .common = if (self.common_percent > 0 and self.has_vocab) .{ .ctx = self, .isCommon = commonCb } else null, .expander = if (self.has_vocab) .{ .ctx = @constCast(self), .f = expandCb } else null }) catch |e| switch (e) {
+        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now, .lexicon = self.lexicon, .word_forms = self.word_forms, .common = if (self.common_percent > 0 and self.has_vocab) .{ .ctx = self, .isCommon = commonCb } else null, .expander = if (self.has_vocab) .{ .ctx = @constCast(self), .f = expandCb } else null }) catch |e| switch (e) {
             error.EmptyQuery => error.EmptyQuery,
             error.InvalidQuery => error.InvalidQuery,
             error.OutOfMemory => error.OutOfMemory,
@@ -1622,6 +1628,10 @@ pub const SearchPool = struct {
 
     pub fn setFuzzyMode(self: *SearchPool, mode: FuzzyMode) void {
         for (self.slots) |*sl| sl.index.setFuzzyMode(mode);
+    }
+
+    pub fn setWordForms(self: *SearchPool, on: bool) void {
+        for (self.slots) |*sl| sl.index.setWordForms(on);
     }
 
     pub fn setCommonPercent(self: *SearchPool, percent: u32) void {
@@ -2654,6 +2664,7 @@ test "porter tokenizer: stems English words; the default does not" {
     for ([_]Tokenizer{ .unicode61, .porter }) |tk| {
         var idx = try SqliteIndex.open(":memory:", .{ .tokenizer = tk });
         defer idx.close();
+        idx.setWordForms(false); // this test is about the tokenizer: the words are searched as typed
         try idx.indexer().add(doc.idFromSource("t", "1"), .{ .connector = "t", .source_id = "1", .title = "Gardening", .text = "The keeper was running along the shores and watching lighthouses." });
         const run = try idx.searcher().search(a, .{ .text = "run" });
         const lighthouse = try idx.searcher().search(a, .{ .text = "lighthouse" });
@@ -2966,4 +2977,20 @@ test "pages in another language than the browser's rank lower, but stay; a named
     try testing.expectEqual(@as(usize, 2), limited.hits.len);
     const named = try idx.searcher().search(a, .{ .text = "lighthouse", .per_domain = 2, .filters = &.{.{ .field = .domain, .text = "many.example.org" }} });
     try testing.expectEqual(@as(usize, 5), named.hits.len);
+}
+
+test "other forms of a word are found, in the excerpt too; off, the word is found as typed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{ .sync = .off });
+    defer idx.close();
+    _ = try put(&idx, "t", "1", "Learn C", "an introduction to programming in the c language for beginners");
+    _ = try put(&idx, "t", "2", "Other", "gardening for beginners");
+    const on = try searchAll(a, &idx, "program c");
+    try testing.expectEqual(@as(usize, 1), on.hits.len);
+    try testing.expect(std.mem.indexOf(u8, on.hits[0].snippet.?, "\x02programming\x03") != null);
+    idx.setWordForms(false);
+    const off = try searchAll(a, &idx, "program c");
+    try testing.expectEqual(@as(usize, 0), off.hits.len);
 }
