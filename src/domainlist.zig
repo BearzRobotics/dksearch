@@ -43,6 +43,23 @@ pub const Set = struct {
         return true;
     }
 
+    /// Takes out `domain` and every entry under it (`wallpapers.com` and `cdn.wallpapers.com`). Returns how many went.
+    /// Hashed entries cannot be recognised and stay.
+    pub fn removeUnder(self: *Set, arena: Allocator, domain: []const u8) Allocator.Error!usize {
+        const d = normalize(domain) orelse return 0;
+        var buf: [253]u8 = undefined;
+        const lower = std.ascii.lowerString(&buf, d);
+        var doomed: std.ArrayList([]const u8) = .empty;
+        defer doomed.deinit(arena);
+        var it = self.map.keyIterator();
+        while (it.next()) |k| {
+            const key = k.*;
+            if (std.mem.eql(u8, key, lower) or (key.len > lower.len and std.mem.endsWith(u8, key, lower) and key[key.len - lower.len - 1] == '.')) try doomed.append(arena, key);
+        }
+        for (doomed.items) |k| _ = self.map.remove(k);
+        return doomed.items.len;
+    }
+
     /// Whether `host` is in the set or under a domain of it.
     pub fn matches(self: *const Set, host_in: []const u8) bool {
         if (self.isEmpty() or host_in.len == 0 or host_in.len > 253) return false;
@@ -428,4 +445,16 @@ test "list text is checked line by line" {
     try testing.expectEqual(@as(?usize, 3), firstBadLine("ok.example\n\nwhat is this\nlater.example\n"));
     try testing.expectEqual(@as(?usize, 1), firstBadLine("nodots\n"));
     try testing.expectEqual(@as(?usize, 2), firstBadLine("a.example\n<html>\n"));
+}
+
+test "removeUnder takes out a domain and the entries below it, and nothing else" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var set: Set = .{};
+    for ([_][]const u8{ "wallpapers.com", "cdn.wallpapers.com", "notwallpapers.com", "other.example", "a.b.wallpapers.com" }) |d| _ = try set.add(a, d);
+    try testing.expectEqual(@as(usize, 3), try set.removeUnder(a, "Wallpapers.com"));
+    try testing.expect(!set.matches("wallpapers.com") and !set.matches("www.wallpapers.com"));
+    try testing.expect(set.matches("notwallpapers.com") and set.matches("other.example"));
+    try testing.expectEqual(@as(usize, 0), try set.removeUnder(a, "nothing.example"));
 }

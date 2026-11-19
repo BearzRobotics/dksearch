@@ -352,6 +352,9 @@ pub const Answers = struct {
 pub const Filters = struct {
     blocklist: []const []const u8 = &.{},
     blocklist_files: []const []const u8 = &.{},
+    /// Domains kept out of `blocklist` and `blocklist_files` (the downloaded lists make mistakes): they, and what is under
+    /// them, are not banned by those. The `ban` file and the administration interface's own ban list still apply.
+    allow: []const []const u8 = &.{},
     demote: []const []const u8 = &.{},
     demote_files: []const []const u8 = &.{},
     /// A TOML list of domains banned for everyone (`ban = "ban.toml"`, relative to the configuration file).
@@ -763,10 +766,11 @@ fn optStrings(a: Allocator, src: []const u8, section: []const u8, t: *toml.Table
 
 fn readFilters(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!Filters {
     const t = (try subTable(src, root, "filters", diag)) orelse return .{};
-    try checkKeys(src, "filters", t, &[_][]const u8{ "blocklist", "blocklist_files", "demote", "demote_files", "demote_percent", "ban" }, diag);
+    try checkKeys(src, "filters", t, &[_][]const u8{ "blocklist", "blocklist_files", "allow", "demote", "demote_files", "demote_percent", "ban" }, diag);
     var f: Filters = .{};
     f.blocklist = try optStrings(a, src, "filters", t, "blocklist", diag);
     f.blocklist_files = try optStrings(a, src, "filters", t, "blocklist_files", diag);
+    f.allow = try optStrings(a, src, "filters", t, "allow", diag);
     f.demote = try optStrings(a, src, "filters", t, "demote", diag);
     f.demote_files = try optStrings(a, src, "filters", t, "demote_files", diag);
     if (try intIn(src, "filters", t, "demote_percent", 1, 99, diag)) |n| f.demote_percent = @intCast(n);
@@ -1922,4 +1926,12 @@ test "the picture relay settings are read and checked" {
     try testing.expect(!plain.images.remote and plain.images.relay_max_mb == 8);
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nrelay_max_mb = 0\n", &d));
     try testing.expectError(error.UnknownKey, loadFromSlice(testing.allocator, "t.toml", base ++ "[images]\nproxy = true\n", &d));
+}
+
+test "filters.allow is read" {
+    var d: Diagnostic = .{};
+    var c = try loadFromSlice(testing.allocator, "t.toml", "[storage]\ndata_dir = \"/tmp/x\"\n[filters]\nblocklist_files = [\"/l/b.txt\"]\nallow = [\"wallpapers.com\", \"z-lib.io\"]\n", &d);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 2), c.filters.allow.len);
+    try testing.expectEqualStrings("wallpapers.com", c.filters.allow[0]);
 }

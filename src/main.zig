@@ -1805,8 +1805,16 @@ fn buildDomainLists(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, announ
         .{ .set = &lists.safe, .entries = cfg.safe_search.ban, .files = cfg.safe_search.ban_files, .relative = false, .on = cfg.safe_search.enabled },
         .{ .set = &lists.safe, .entries = &.{}, .files = safe_files, .relative = true, .on = cfg.safe_search.enabled },
     };
-    for (loads) |l| {
+    var allowed_out: usize = 0;
+    for (loads, 0..) |l, li| {
         if (!l.on) continue;
+        // Right after the lists of other people (the first load) the owner's allow list takes its domains out again.
+        if (li == 1) for (cfg.filters.allow) |d| {
+            allowed_out += lists.blocked.removeUnder(la, d) catch {
+                err(io, "out of memory", .{});
+                return null;
+            };
+        };
         for (l.entries) |e| _ = l.set.add(la, e) catch {
             err(io, "out of memory", .{});
             return null;
@@ -1831,6 +1839,7 @@ fn buildDomainLists(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, announ
         };
     }
     if (announce) {
+        if (cfg.filters.allow.len > 0) err(io, "allow list: {d} domains kept out of the blocklists ({d} entries removed)", .{ cfg.filters.allow.len, allowed_out });
         if (cfg.safe_search.enabled) err(io, "safe search is on for visitors: {d} domains hidden unless unlocked; {d} banned for everyone ({d} demoted)", .{ lists.safe.count(), lists.blocked.count(), lists.demoted.count() }) else if (!lists.blocked.isEmpty() or !lists.demoted.isEmpty()) err(io, "domain lists: {d} blocked, {d} demoted", .{ lists.blocked.count(), lists.demoted.count() });
     }
     return lists;
