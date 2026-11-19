@@ -27,6 +27,8 @@ pub const Rules = struct {
     rules: []const Rule = &.{},
     /// Seconds asked for between requests, if the file says so.
     crawl_delay_s: ?u32 = null,
+    /// The sitemaps the file names (`Sitemap:` lines, which belong to no group), at most eight.
+    sitemaps: []const []const u8 = &.{},
 
     /// Nothing is disallowed (used for a missing robots.txt).
     pub const allow_all: Rules = .{};
@@ -71,6 +73,7 @@ pub fn parse(arena: Allocator, text_in: []const u8, token: []const u8) Allocator
     var specific_delay: ?u32 = null;
     var star_delay: ?u32 = null;
     var any_specific = false;
+    var sitemaps: std.ArrayList([]const u8) = .empty;
 
     // The current group: which agents it names, and whether it has rules yet
     // (a user-agent line after a rule starts a new group).
@@ -104,6 +107,8 @@ pub fn parse(arena: Allocator, text_in: []const u8, token: []const u8) Allocator
             const rule: Rule = .{ .allow = std.ascii.eqlIgnoreCase(field, "allow"), .pattern = try arena.dupe(u8, value) };
             if (in_specific) try specific.append(arena, rule);
             if (in_star) try star.append(arena, rule);
+        } else if (std.ascii.eqlIgnoreCase(field, "sitemap")) {
+            if (sitemaps.items.len < 8 and value.len <= 2000 and (std.ascii.startsWithIgnoreCase(value, "http://") or std.ascii.startsWithIgnoreCase(value, "https://"))) try sitemaps.append(arena, try arena.dupe(u8, value));
         } else if (std.ascii.eqlIgnoreCase(field, "crawl-delay")) {
             group_has_rules = true;
             const secs = parseDelay(value) orelse continue;
@@ -111,8 +116,8 @@ pub fn parse(arena: Allocator, text_in: []const u8, token: []const u8) Allocator
             if (in_star) star_delay = secs;
         }
     }
-    if (any_specific) return .{ .rules = specific.items, .crawl_delay_s = specific_delay };
-    return .{ .rules = star.items, .crawl_delay_s = star_delay };
+    if (any_specific) return .{ .rules = specific.items, .crawl_delay_s = specific_delay, .sitemaps = sitemaps.items };
+    return .{ .rules = star.items, .crawl_delay_s = star_delay, .sitemaps = sitemaps.items };
 }
 
 /// Whole seconds; a fractional value is rounded up, anything unusable is null.
@@ -258,4 +263,14 @@ test "hostile patterns finish quickly and never crash" {
         const x = try rulesFor(arena.allocator(), &buf);
         _ = x.allowed("/ab/ba");
     }
+}
+
+test "the sitemaps a robots.txt names are kept, whatever the group, and only http(s) ones" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = try rulesFor(arena.allocator(), "Sitemap: https://x.org/a.xml\nUser-agent: *\nDisallow: /p\nsitemap: https://x.org/b.xml.gz\nSitemap: ftp://x.org/c.xml\nSitemap: not a url\n");
+    try testing.expectEqual(@as(usize, 2), r.sitemaps.len);
+    try testing.expectEqualStrings("https://x.org/a.xml", r.sitemaps[0]);
+    try testing.expectEqualStrings("https://x.org/b.xml.gz", r.sitemaps[1]);
+    try testing.expect(!r.allowed("/p"));
 }

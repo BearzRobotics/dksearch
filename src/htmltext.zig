@@ -243,6 +243,8 @@ pub const Scan = struct {
     links: []const []const u8 = &.{},
     /// Pictures of the page (`<img>` and the `og:image` of the page), when asked for (`scanWith`).
     images: []const PageImage = &.{},
+    /// Addresses of the page's feeds (`<link rel="alternate" type="application/rss+xml|atom+xml" href>`), at most three.
+    feeds: []const []const u8 = &.{},
 };
 
 /// A picture of a page: where it is (as written in the page: it may be relative), what the page says it shows.
@@ -264,6 +266,7 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
     var out: Scan = .{};
     var links: std.ArrayList([]const u8) = .empty;
     var images: std.ArrayList(PageImage) = .empty;
+    var feeds: std.ArrayList([]const u8) = .empty;
     var missing_end: [dropped_tags.len]bool = @splat(false);
     var budget: Budget = .{};
     var i: usize = 0;
@@ -322,6 +325,17 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
                 continue;
             };
         }
+        if (feeds.items.len < 3 and std.ascii.eqlIgnoreCase(t.name, "link")) {
+            const rel = attr(body, "rel") orelse "";
+            const ty = attr(body, "type") orelse "";
+            if (hasToken(rel, "alternate") and (std.ascii.startsWithIgnoreCase(ty, "application/rss+xml") or std.ascii.startsWithIgnoreCase(ty, "application/atom+xml"))) {
+                if (attr(body, "href")) |href| {
+                    const trimmed = std.mem.trim(u8, href, " \t\r\n");
+                    if (trimmed.len > 0 and trimmed.len <= 2000) try feeds.append(arena, try decodeEntities(arena, trimmed));
+                }
+            }
+            continue;
+        }
         if (std.ascii.eqlIgnoreCase(t.name, "meta")) {
             const name = attr(body, "name") orelse continue;
             if (!std.ascii.eqlIgnoreCase(name, "robots") and !std.ascii.eqlIgnoreCase(name, "dksearch")) continue;
@@ -338,6 +352,7 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
     }
     if (!out.nofollow) out.links = links.items;
     out.images = images.items;
+    out.feeds = feeds.items;
     return out;
 }
 
@@ -548,4 +563,15 @@ test "pictures of a page: img and og:image, relative addresses kept as written, 
     // Not asked for: none; the limit is kept.
     try testing.expectEqual(@as(usize, 0), (try scan(a, html, 10)).images.len);
     try testing.expectEqual(@as(usize, 1), (try scanWith(a, html, 10, 1)).images.len);
+}
+
+test "the feeds a page names are found, in order, and a stylesheet link is not one" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const html = "<head><link rel=\"stylesheet\" href=\"/s.css\"><link rel=\"alternate\" type=\"application/rss+xml\" title=\"Posts\" href=\"/feed.xml\">" ++
+        "<link rel=\"alternate\" type=\"application/atom+xml\" href=\"https://e.org/atom\"><link rel=\"alternate\" hreflang=\"fr\" href=\"/fr\"></head><body></body>";
+    const s = try scan(ar.allocator(), html, 10);
+    try testing.expectEqual(@as(usize, 2), s.feeds.len);
+    try testing.expectEqualStrings("/feed.xml", s.feeds[0]);
+    try testing.expectEqualStrings("https://e.org/atom", s.feeds[1]);
 }

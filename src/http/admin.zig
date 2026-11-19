@@ -2071,7 +2071,7 @@ pub const App = struct {
         return handler.htmlResponse(arena, .ok, aw.written());
     }
 
-    const ReportRow = struct { host: []const u8, fetched: u32, stored: u32, unchanged: u32, robots: u32, http_error: u32, network: u32, too_large: u32, certificate: u32, other: u32, refusals: u32, last_status: u32, verdict: []const u8 };
+    const ReportRow = struct { host: []const u8, fetched: u32, stored: u32, unchanged: u32, robots: u32, http_error: u32, network: u32, too_large: u32, certificate: u32, other: u32, refusals: u32, last_status: u32, traps: u32, verdict: []const u8 };
 
     fn writeCrawlReport(self: *App, arena: Allocator, w: *Io.Writer, params: query.Params) !void {
         try w.writeAll("<p class=\"muted\">What each site gave in the last run of a crawl source, and why the ones that gave little did not: blocked by a bot check (403), disallowed by <code>robots.txt</code>, rate limited, or unreachable. A site that blocks crawlers is respected, not worked around. The report is written when a run ends or is stopped.</p>");
@@ -2124,14 +2124,14 @@ pub const App = struct {
             }
             var f = std.mem.splitScalar(u8, line, '\t');
             const host = f.next() orelse continue;
-            var nums: [11]u32 = undefined;
+            var nums: [12]u32 = undefined;
             var ok = true;
             for (&nums) |*n| n.* = std.fmt.parseInt(u32, f.next() orelse {
                 ok = false;
                 break;
             }, 10) catch 0;
             if (!ok) continue;
-            try rows.append(arena, .{ .host = host, .fetched = nums[0], .stored = nums[1], .unchanged = nums[2], .robots = nums[3], .http_error = nums[4], .network = nums[5], .too_large = nums[6], .certificate = nums[7], .other = nums[8], .refusals = nums[9], .last_status = nums[10], .verdict = f.next() orelse "" });
+            try rows.append(arena, .{ .host = host, .fetched = nums[0], .stored = nums[1], .unchanged = nums[2], .robots = nums[3], .http_error = nums[4], .network = nums[5], .too_large = nums[6], .certificate = nums[7], .other = nums[8], .refusals = nums[9], .last_status = nums[10], .traps = nums[11], .verdict = f.next() orelse "" });
         }
         var stored_total: u64 = 0;
         var trouble: usize = 0;

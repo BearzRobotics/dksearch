@@ -32,6 +32,8 @@ const htmltext = @import("../htmltext.zig");
 const robots = @import("crawl/robots.zig");
 const fetch = @import("crawl/fetch.zig");
 const hidden = @import("crawl/hidden.zig");
+const frontier = @import("crawl/frontier.zig");
+const feedlinks = @import("crawl/feedlinks.zig");
 const toml = @import("toml");
 const domainlist = @import("../domainlist.zig");
 const cabundle = @import("crawl/cabundle.zig");
@@ -75,9 +77,13 @@ const checkpoint_every = 10;
 const save_every_pages = 25;
 const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
+const accept_feed = "application/rss+xml,application/atom+xml,application/xml;q=0.9,text/xml;q=0.8";
+const max_feed_bytes = 2 * 1024 * 1024;
+/// The most entries taken from one site's feed.
+const feed_cap = 100;
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page", "report_file" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page", "report_file", "robots_sitemaps", "use_feeds" };
 
 // ------------------------------------------------------------ validation
 
@@ -177,6 +183,8 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     try boolOption(source, "allow_unbanned_onions", diag);
     try boolOption(source, "recrawl_adaptive", diag);
     try boolOption(source, "index_images", diag);
+    try boolOption(source, "robots_sitemaps", diag);
+    try boolOption(source, "use_feeds", diag);
     try intOption(source, "max_images_per_page", 1, 50, diag);
     try intOption(source, "recrawl_min_hours", 1, 24 * 30, diag);
     try intOption(source, "recrawl_max_days", 1, 365, diag);
@@ -251,6 +259,11 @@ pub const CrawlConnector = struct {
     /// Where the report of each run is written (a tab-separated file, one line per site): `report_file`, or the
     /// validators file's name with `.report.tsv` added; none when neither is set.
     report_file: ?[]const u8,
+    /// Take the pages of the sitemaps that a site's robots.txt names, for the sites listed as seeds (docs/decisions/0058).
+    robots_sitemaps: bool,
+    /// Take the newest entries of the feed (RSS or Atom) that the first page of a listed site names, so new pages are
+    /// found without waiting for a deep crawl to reach them (docs/decisions/0058).
+    use_feeds: bool,
     /// The first extra wait after a refusal (429 or 503), when the site did not say how long: at least this, then doubled.
     backoff_ms: u32 = 2000,
     checkpoint_buf: std.ArrayList(u8) = .empty,
@@ -299,6 +312,8 @@ pub const CrawlConnector = struct {
             .language = language,
             .validators_file = validators_file,
             .report_file = report_file,
+            .robots_sitemaps = source.optionBool("robots_sitemaps") orelse false,
+            .use_feeds = source.optionBool("use_feeds") orelse false,
             .tor = if (source.optionString("tor_socks")) |v| hidden.parseProxy(v) else null,
             .i2p = if (source.optionString("i2p_proxy")) |v| hidden.parseProxy(v) else null,
             .hidden_links = source.optionBool("hidden_links") orelse false,
@@ -555,6 +570,13 @@ pub const CrawlConnector = struct {
             }
             o.clearRetainingCapacity();
         }
+        // Within a seed the pages near the top of the site come first (they are the ones that get the page budget when it
+        // runs out), the deep and parameterised ones last.
+        for (buckets) |*b| std.mem.sort(Task, b.items, {}, struct {
+            fn better(_: void, x: Task, y: Task) bool {
+                return frontier.score(x.url) < frontier.score(y.url);
+            }
+        }.better);
         const merged = try self.gpa.alloc(Task, total);
         var at: usize = 0;
         var round: usize = 0;
@@ -667,10 +689,10 @@ pub const CrawlConnector = struct {
         }.more);
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.gpa);
-        out.print(self.gpa, "# crawl report of {s} at {d}\n# host\tfetched\tstored\tunchanged\trobots\thttp_error\tnetwork\ttoo_large\tcertificate\tother\trefusals\tlast_status\tverdict\n", .{ self.name, Io.Clock.real.now(self.io).toSeconds() }) catch return;
+        out.print(self.gpa, "# crawl report of {s} at {d}\n# host\tfetched\tstored\tunchanged\trobots\thttp_error\tnetwork\ttoo_large\tcertificate\tother\trefusals\tlast_status\ttraps\tverdict\n", .{ self.name, Io.Clock.real.now(self.io).toSeconds() }) catch return;
         for (rows.items) |r| {
             const s = r.s;
-            out.print(self.gpa, "{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{s}\n", .{ r.host, s.fetched, s.stored, s.unchanged, s.robots, s.http_error, s.network, s.too_large, s.certificate, s.other, s.refusals, s.last_status, verdictOf(s) }) catch return;
+            out.print(self.gpa, "{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{s}\n", .{ r.host, s.fetched, s.stored, s.unchanged, s.robots, s.http_error, s.network, s.too_large, s.certificate, s.other, s.refusals, s.last_status, s.traps, verdictOf(s) }) catch return;
         }
         const tmp = std.fmt.allocPrint(self.gpa, "{s}.tmp", .{path}) catch return;
         defer self.gpa.free(tmp);
@@ -962,7 +984,14 @@ const Host = struct {
     not_before_ns: i96 = 0,
     ok_streak: u32 = 0,
     gave_up: bool = false,
+    /// The sitemaps named by robots.txt have been taken (once per site and run).
+    sitemaps_done: std.atomic.Value(bool) = .init(false),
+    /// The site's feed has been taken (once per site and run).
+    feeds_done: std.atomic.Value(bool) = .init(false),
 };
+
+/// The most pages taken from the sitemaps of one site's robots.txt.
+const robots_sitemap_cap = 5000;
 
 /// How many times a page refused with 429 or 503 is asked for (the first request included).
 const max_refusal_attempts = 3;
@@ -989,12 +1018,14 @@ const HostStats = struct {
     certificate: u32 = 0,
     other: u32 = 0,
     refusals: u32 = 0,
+    /// Addresses found on the site's pages that were not followed because they lead nowhere new (see `frontier.isTrap`).
+    traps: u32 = 0,
     /// The last answer that was an error (400 and above), 0 for none.
     last_status: u16 = 0,
     gave_up: bool = false,
 };
 
-const StatKind = enum { fetched, stored, unchanged, robots, http_error, network, too_large, certificate, other, refusals };
+const StatKind = enum { fetched, stored, unchanged, robots, http_error, network, too_large, certificate, other, refusals, traps };
 
 /// Why a site gave what it gave, in words, from its counts.
 pub fn verdictOf(s: HostStats) []const u8 {
@@ -1418,6 +1449,7 @@ const Run = struct {
             .certificate => stats.certificate +|= 1,
             .other => stats.other +|= 1,
             .refusals => stats.refusals +|= 1,
+            .traps => stats.traps +|= 1,
         }
     }
 
@@ -1566,13 +1598,87 @@ const Run = struct {
         if (t.depth >= self.conn.max_depth) return stored.result;
         for (stored.links) |link| {
             if (out.items.len >= max_level_items) break;
-            const target = (try resolveRedirect(a, got.url, link)) orelse continue;
+            const resolved = (try resolveRedirect(a, got.url, link)) orelse continue;
+            // One page, one address; and no following of what leads nowhere new.
+            const target = try frontier.tidy(a, resolved);
+            if (frontier.isTrap(target)) {
+                self.bump(target, .traps);
+                continue;
+            }
             const tu = parseUrl(target) orelse continue;
             if (!self.mayVisit(t.site, tu.host) or looksBinary(tu.uri.path)) continue;
             const keep = (try self.firstVisit(target)) orelse continue;
             try out.append(gpa, .{ .url = keep, .depth = t.depth + 1, .seed = t.seed, .site = t.site });
         }
+        if (self.conn.robots_sitemaps and t.root and t.depth == 0) try self.robotsSitemaps(a, t, got.url, out);
+        if (self.conn.use_feeds and t.root and t.depth == 0 and stored.feeds.len > 0) try self.feedPages(a, t, got.url, stored.feeds, out);
         return stored.result;
+    }
+
+    /// The newest entries of the feed a listed site's first page names (the first that is not a comments feed), once per
+    /// site: they join the next level as pages at the depth limit. A feed on another site is not read.
+    fn feedPages(self: *Run, a: Allocator, t: CrawlConnector.Task, page_url: []const u8, feeds: []const []const u8, out: *std.ArrayList(CrawlConnector.Task)) error{OutOfMemory}!void {
+        const u = parseUrl(page_url) orelse return;
+        const host = self.hostFor(u, true) catch return;
+        if (host.feeds_done.swap(true, .acq_rel)) return;
+        var chosen: ?[]const u8 = null;
+        for (feeds) |f| {
+            if (std.ascii.findIgnoreCase(f, "comment") != null) continue;
+            chosen = (try resolveRedirect(a, page_url, f)) orelse continue;
+            break;
+        }
+        const feed_url = chosen orelse return;
+        const fu = parseUrl(feed_url) orelse return;
+        if (!sameSite(fu.host, t.site)) return;
+        var tmp = std.heap.ArenaAllocator.init(self.conn.gpa);
+        defer tmp.deinit();
+        const ta = tmp.allocator();
+        const got = switch (try self.get(ta, feed_url, t.site, accept_feed, max_feed_bytes, true, null)) {
+            .stopped, .skipped, .unchanged => return,
+            .page => |p| p,
+        };
+        const entries = try feedlinks.links(ta, self.conn.gpa, got.resp.body, feed_cap);
+        for (entries) |entry| {
+            if (out.items.len >= max_level_items) break;
+            const resolved = (try resolveRedirect(a, got.url, entry)) orelse continue;
+            const target = try frontier.tidy(a, resolved);
+            if (frontier.isTrap(target)) {
+                self.bump(target, .traps);
+                continue;
+            }
+            const tu = parseUrl(target) orelse continue;
+            if (!sameSite(tu.host, t.site) or looksBinary(tu.uri.path)) continue;
+            const keep = (try self.firstVisit(target)) orelse continue;
+            try out.append(self.conn.gpa, .{ .url = keep, .depth = self.conn.max_depth, .seed = t.seed, .site = t.site });
+        }
+    }
+
+    /// The pages of the sitemaps that the robots.txt of a listed site names, taken once per site: they join the next level
+    /// as pages at the depth limit (fetched, their links not followed).
+    fn robotsSitemaps(self: *Run, a: Allocator, t: CrawlConnector.Task, page_url: []const u8, out: *std.ArrayList(CrawlConnector.Task)) error{OutOfMemory}!void {
+        const u = parseUrl(page_url) orelse return;
+        const host = self.hostFor(u, true) catch return;
+        if (host.sitemaps_done.swap(true, .acq_rel)) return;
+        var pages: std.ArrayList([]const u8) = .empty;
+        var n_files: u32 = 0;
+        for (host.rules.sitemaps) |sm| {
+            const su = parseUrl(sm) orelse continue;
+            if (!sameSite(su.host, t.site)) continue;
+            if (try self.sitemapPages(a, sm, t.site, 0, &n_files, &pages)) return;
+            if (pages.items.len >= robots_sitemap_cap) break;
+        }
+        var added: usize = 0;
+        for (pages.items) |page| {
+            if (added >= robots_sitemap_cap or out.items.len >= max_level_items) break;
+            const target = try frontier.tidy(a, page);
+            if (frontier.isTrap(target)) {
+                self.bump(target, .traps);
+                continue;
+            }
+            const keep = (try self.firstVisit(target)) orelse continue;
+            try out.append(self.conn.gpa, .{ .url = keep, .depth = self.conn.max_depth, .seed = t.seed, .site = t.site });
+            added += 1;
+        }
     }
 
     /// Remembers a page's validators and its schedule: when it is next due.
@@ -1672,7 +1778,7 @@ const Run = struct {
         return true;
     }
 
-    const Stored = struct { result: Result, links: []const []const u8 = &.{} };
+    const Stored = struct { result: Result, links: []const []const u8 = &.{}, feeds: []const []const u8 = &.{} };
 
     fn store(self: *Run, a: Allocator, url: []const u8, got: fetch.Response) error{OutOfMemory}!Stored {
         const ct = parseContentType(got.content_type);
@@ -1725,7 +1831,7 @@ const Run = struct {
             error.Stopped => return .{ .result = .stopped },
             else => {}, // not fatal: the next page tries again
         };
-        return .{ .result = .stored, .links = scanned.links };
+        return .{ .result = .stored, .links = scanned.links, .feeds = scanned.feeds };
     }
 };
 
@@ -1864,6 +1970,8 @@ const net = Io.net;
 
 test {
     _ = hidden;
+    _ = frontier;
+    _ = feedlinks;
 }
 
 test "validate requires a user agent and a seeds file, and checks ranges" {
@@ -2939,7 +3047,7 @@ test "a site that refuses with 429 is slowed down for, asked again, and then ans
     try testing.expectEqual(@as(usize, 1), got.ids.items.len);
     try testing.expectEqual(@as(usize, 3), srv.count("/a")); // refused twice, answered the third time
     try testing.expect(std.mem.indexOf(u8, report, "# crawl report of web") != null);
-    try testing.expect(std.mem.indexOf(u8, report, "127.0.0.1\t1\t1\t0\t0\t0\t0\t0\t0\t0\t2\t429\trate limited (429/503): slowed down") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "127.0.0.1\t1\t1\t0\t0\t0\t0\t0\t0\t0\t2\t429\t0\trate limited (429/503): slowed down") != null);
 }
 
 test "a site that keeps refusing is given up on after three tries; one that asks to be left alone is not asked again" {
@@ -3019,4 +3127,125 @@ test "the report file's name follows the validators file unless one is given" {
     defer testing.allocator.free(p2);
     try testing.expectEqualStrings("/tmp/r.tsv", p2);
     try testing.expect(reportPathOf(testing.allocator, .{ .name = "w", .kind = "crawl", .options = &.{} }) == null);
+}
+
+// ------------------------------------------------------------- the frontier
+
+test "links are tidied (one page, one address), traps are not followed, and the top of a site comes first" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/", .body = "<a href=\"/deep/a/b/c\">d</a><a href=\"/top?utm_source=news\">t1</a><a href=\"/top?fbclid=abc\">t2</a><a href=\"/mid/x\">m</a>" ++
+            "<a href=\"/search?q=linux\">s</a><a href=\"/x/x/x\">loop</a><a href=\"/wiki?action=edit\">e</a><a href=\"/ok#frag\">ok</a>" },
+        .{ .path = "/top", .body = "<p>top</p>" },
+        .{ .path = "/mid/x", .body = "<p>mid</p>" },
+        .{ .path = "/deep/a/b/c", .body = "<p>deep</p>" },
+        .{ .path = "/ok", .body = "<p>ok</p>" },
+        .{ .path = "/search", .body = "<p>no</p>" },
+        .{ .path = "/x/x/x", .body = "<p>no</p>" },
+        .{ .path = "/wiki", .body = "<p>no</p>" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b: [96]u8 = undefined;
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    try crawlWith(&srv, &tmp, srv.url(&b, "/"), 1, 50, &got, &ctl);
+    // One request for /top (both tracking variants are the same address), none for the traps.
+    try testing.expectEqual(@as(usize, 1), srv.count("/top"));
+    try testing.expectEqual(@as(usize, 0), srv.count("/search"));
+    try testing.expectEqual(@as(usize, 0), srv.count("/x/x/x"));
+    try testing.expectEqual(@as(usize, 0), srv.count("/wiki?action=edit"));
+    try testing.expectEqual(@as(usize, 1), srv.count("/ok")); // the fragment is not part of the address
+    try testing.expectEqual(@as(usize, 1), srv.count("/deep/a/b/c"));
+    // Near the top first: /ok and /top (one segment) before /mid/x (two) before /deep/a/b/c (four).
+    var order: std.ArrayList([]const u8) = .empty;
+    defer order.deinit(testing.allocator);
+    for (srv.paths.items) |pth| if (!std.mem.eql(u8, pth, "/robots.txt") and !std.mem.eql(u8, pth, "/")) try order.append(testing.allocator, pth);
+    try testing.expect(order.items.len == 4);
+    try testing.expectEqualStrings("/deep/a/b/c", order.items[3]);
+    try testing.expectEqualStrings("/mid/x", order.items[2]);
+}
+
+test "the sitemaps a robots.txt names are taken for a listed site when asked for, and not otherwise" {
+    var srv: TestServer = undefined;
+    try srv.open();
+    defer srv.stop();
+    var rb: [160]u8 = undefined;
+    const robots_txt = try std.fmt.bufPrint(&rb, "User-agent: *\nAllow: /\nSitemap: http://127.0.0.1:{d}/sm.xml\n", .{srv.port});
+    var sb: [400]u8 = undefined;
+    const sitemap = try std.fmt.bufPrint(&sb, "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><url><loc>http://127.0.0.1:{d}/p1</loc></url><url><loc>http://127.0.0.1:{d}/p2?utm_source=x</loc></url><url><loc>http://127.0.0.1:{d}/search?q=trap</loc></url></urlset>", .{ srv.port, srv.port, srv.port });
+    try srv.serve(&.{
+        .{ .path = "/robots.txt", .content_type = "text/plain", .body = robots_txt },
+        .{ .path = "/sm.xml", .content_type = "application/xml", .body = sitemap },
+        .{ .path = "/", .body = "<p>home</p>" },
+        .{ .path = "/p1", .body = "<p>one</p>" },
+        .{ .path = "/p2", .body = "<p>two</p>" },
+        .{ .path = "/search", .body = "<p>no</p>" },
+    });
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ub: [96]u8 = undefined;
+    // Off by default: the home page only.
+    var plain: Collect = .{};
+    defer plain.deinit();
+    var ctl: api.Control = .{};
+    try crawlWith(&srv, &tmp, srv.url(&ub, "/"), 1, 50, &plain, &ctl);
+    try testing.expectEqual(@as(usize, 1), plain.ids.items.len);
+    try testing.expectEqual(@as(usize, 0), srv.count("/p1"));
+    // On: the pages of the sitemap join the crawl (tidied, the trap left out).
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var conn = try testConnector(&tmp2, srv.url(&ub, "/"), "t/1");
+    defer conn.deinit();
+    conn.max_depth = 1;
+    conn.max_pages = 50;
+    conn.robots_sitemaps = true;
+    var with: Collect = .{};
+    defer with.deinit();
+    var ctl2: api.Control = .{};
+    _ = try conn.connector().run(with.sink(), &ctl2, null);
+    try testing.expectEqual(@as(usize, 3), with.ids.items.len); // home, p1, p2
+    try testing.expectEqual(@as(usize, 1), srv.count("/p1"));
+    try testing.expectEqual(@as(usize, 1), srv.count("/p2"));
+    try testing.expectEqual(@as(usize, 0), srv.count("/search"));
+}
+
+test "the feed a listed site's first page names brings in its newest entries, once, on its own site only; off by default" {
+    var srv: TestServer = undefined;
+    try srv.open();
+    defer srv.stop();
+    var fb: [600]u8 = undefined;
+    const feed = try std.fmt.bufPrint(&fb, "<rss version=\"2.0\"><channel><title>B</title><item><link>http://127.0.0.1:{d}/new1</link></item><item><link>/new2?utm_source=rss</link></item><item><link>http://other.example/x</link></item></channel></rss>", .{srv.port});
+    try srv.serve(&.{
+        .{ .path = "/", .body = "<head><link rel=\"alternate\" type=\"application/rss+xml\" href=\"/feed.xml\"></head><body><p>home</p></body>" },
+        .{ .path = "/feed.xml", .content_type = "application/rss+xml", .body = feed },
+        .{ .path = "/new1", .body = "<p>one</p>" },
+        .{ .path = "/new2", .body = "<p>two</p>" },
+    });
+    var ub: [96]u8 = undefined;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var plain: Collect = .{};
+    defer plain.deinit();
+    var ctl: api.Control = .{};
+    try crawlWith(&srv, &tmp, srv.url(&ub, "/"), 1, 50, &plain, &ctl);
+    try testing.expectEqual(@as(usize, 1), plain.ids.items.len);
+    try testing.expectEqual(@as(usize, 0), srv.count("/feed.xml")); // not read unless asked
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var conn = try testConnector(&tmp2, srv.url(&ub, "/"), "t/1");
+    defer conn.deinit();
+    conn.max_depth = 1;
+    conn.max_pages = 50;
+    conn.use_feeds = true;
+    var with: Collect = .{};
+    defer with.deinit();
+    var ctl2: api.Control = .{};
+    _ = try conn.connector().run(with.sink(), &ctl2, null);
+    try testing.expectEqual(@as(usize, 3), with.ids.items.len); // home, new1, new2
+    try testing.expectEqual(@as(usize, 1), srv.count("/feed.xml"));
+    try testing.expectEqual(@as(usize, 1), srv.count("/new1"));
+    try testing.expectEqual(@as(usize, 1), srv.count("/new2"));
 }
