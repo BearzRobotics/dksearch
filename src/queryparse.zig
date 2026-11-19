@@ -101,6 +101,20 @@ const Lx = struct {
 /// documents): such a word is left out of the required terms of a query that has other words. The reason: ranking has
 /// to read every occurrence of every required word, and a word like "in" has tens of thousands of long position
 /// lists, which made searches such as "how to program in c" take many seconds for nothing a person wanted.
+/// Question and filler words that are never worth requiring in a query that has other words ("how to program in c" is a
+/// search for `program` and `c`): they say what kind of answer is wanted, not what it is about, and a page about the
+/// thing rarely says "how". Quoted phrases, `title:` words and words someone excludes are not touched, and a query of
+/// nothing else is searched as typed.
+pub fn isFiller(word: []const u8) bool {
+    const fillers = [_][]const u8{
+        "how",    "what",  "why",  "when", "where", "which", "who", "is",   "are", "was", "were", "do", "does", "did", "can",  "could",
+        "should", "would", "will", "i",    "me",    "my",    "you", "your", "to",  "in",  "on",   "at", "of",   "for", "with", "a",
+        "an",     "the",
+    };
+    for (fillers) |f| if (std.ascii.eqlIgnoreCase(f, word)) return true;
+    return false;
+}
+
 pub const Common = struct {
     ctx: *anyopaque,
     isCommon: *const fn (ctx: *anyopaque, word: []const u8) bool,
@@ -724,7 +738,7 @@ fn emitTerm(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, t: Term) Allocato
     switch (t.kind) {
         .word => {
             if (lx.stops and (lx.lexicon.?).isStop(t.text)) return false;
-            if (lx.common) |c| if (t.column == null and c.isCommon(c.ctx, t.text)) {
+            if (lx.common) |c| if (t.column == null and (isFiller(t.text) or c.isCommon(c.ctx, t.text))) {
                 if (lx.ignored) |list| {
                     var seen = false;
                     for (list.items) |w| if (std.ascii.eqlIgnoreCase(w, t.text)) {
@@ -1338,15 +1352,24 @@ test "very common words are not required when the query has other words; the pag
     var set: CommonSet = .{ .words = &.{ "to", "in", "the" } };
     const common: Common = .{ .ctx = &set, .isCommon = CommonSet.is };
     const p = try parseWith(a, "how to program in C", .{ .common = common });
-    try testing.expectEqualStrings("\"how\" AND \"program\" AND \"C\"", p.fts);
-    try testing.expectEqual(@as(usize, 2), p.ignored.len);
-    try testing.expectEqualStrings("to", p.ignored[0]);
-    try testing.expectEqualStrings("in", p.ignored[1]);
+    // "how" is a question word, "to" and "in" are very common: none of them is required.
+    try testing.expectEqualStrings("\"program\" AND \"C\"", p.fts);
+    try testing.expectEqual(@as(usize, 3), p.ignored.len);
+    try testing.expectEqualStrings("how", p.ignored[0]);
+    try testing.expectEqualStrings("to", p.ignored[1]);
+    try testing.expectEqualStrings("in", p.ignored[2]);
     try testing.expect(!p.heavy);
     // The words to find in an excerpt are the ones searched for (lower case), not the left out ones.
-    try testing.expectEqual(@as(usize, 3), p.terms.len);
-    try testing.expectEqualStrings("how", p.terms[0].text);
-    try testing.expectEqualStrings("c", p.terms[2].text);
+    try testing.expectEqual(@as(usize, 2), p.terms.len);
+    try testing.expectEqualStrings("program", p.terms[0].text);
+    try testing.expectEqualStrings("c", p.terms[1].text);
+    // Question words go even where the index has not said they are common, and a query of them alone is searched as typed.
+    var none: CommonSet = .{ .words = &.{} };
+    const q2 = try parseWith(a, "what is a monad", .{ .common = .{ .ctx = &none, .isCommon = CommonSet.is } });
+    try testing.expectEqualStrings("\"monad\"", q2.fts);
+    try testing.expectEqual(@as(usize, 3), q2.ignored.len);
+    const only_q = try parseWith(a, "what is", .{ .common = .{ .ctx = &none, .isCommon = CommonSet.is } });
+    try testing.expectEqualStrings("\"what\" AND \"is\"", only_q.fts);
     // A quoted phrase is exact, a word someone excludes stays excluded, a title-only word is kept.
     const phrase = try parseWith(a, "\"how to\" program", .{ .common = common });
     try testing.expect(std.mem.indexOf(u8, phrase.fts, "\"how to\"") != null and phrase.ignored.len == 0);

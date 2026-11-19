@@ -1901,12 +1901,15 @@ test "very common words are left out of a query that has others; the excerpt is 
     idx.setCommonPercent(0);
     const strict = try searchAll(a, &idx, "the cat in");
     try testing.expect(strict.hits.len == 1 and strict.ignored.len == 0);
-    // A small index has no common words: everything is required as typed.
+    // A small index has no common words, but question and filler words ("the", "how", "what") are never required: the
+    // page is found all the same, and says "the" was left out. A word that is not a filler is required as typed.
     var tiny = try SqliteIndex.open(":memory:", .{ .sync = .off });
     defer tiny.close();
     _ = try put(&tiny, "t", "x", "x", "the cat in the hat");
     const small = try searchAll(a, &tiny, "the cat");
-    try testing.expect(small.hits.len == 1 and small.ignored.len == 0);
+    try testing.expect(small.hits.len == 1 and small.ignored.len == 1);
+    const missing = try searchAll(a, &tiny, "the dog");
+    try testing.expectEqual(@as(usize, 0), missing.hits.len);
 }
 
 test "pictures are found by hash distance, nearest first, and forgotten with their document" {
