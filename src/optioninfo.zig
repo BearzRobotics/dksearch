@@ -36,7 +36,7 @@ const files = [_]Option{
     .{ .key = "max_pdf_bytes", .label = "Largest PDF (bytes)", .type = .number, .min = 1, .max = 8589934592, .default = "536870912", .help = "PDFs larger than this are skipped. The file is read by pdftotext, not held in memory here." },
     .{ .key = "pdf_timeout_seconds", .label = "Time for one PDF (seconds)", .type = .number, .min = 1, .max = 3600, .default = "120", .help = "How long pdftotext may take on one file. Huge books need more." },
     .{ .key = "code", .label = "Also index source code and configuration files", .type = .flag, .help = "zig, c, rust, go, python, javascript, shell, sql, toml, yaml and many other source and configuration files, as text: the file name is the title and each gets a code tag and its language as a tag (tag:python). Directories named node_modules, vendor, build, dist, target, zig-out and __pycache__ are not entered." },
-    .{ .key = "office", .label = "Also index Word, Excel, PowerPoint, OpenDocument and EPUB files", .type = .flag, .help = "docx, odt, xlsx, ods, pptx, odp and epub, by their text and their own title and author. No outside program needed." },
+    .{ .key = "office", .label = "Also index Word, Excel, PowerPoint, OpenDocument and EPUB files", .type = .flag, .default_on = true, .help = "docx, odt, xlsx, ods, pptx, odp and epub, by their text and their own title and author. No outside program needed. On by default; the older binary formats (doc, xls, ppt, rtf) are not read." },
     .{ .key = "html", .label = "Also index HTML files", .type = .flag, .help = "html and htm files as web pages (UTF-8 only)." },
     .{ .key = "media", .label = "Also index audio and video", .type = .flag, .help = "By their tags, with subtitle and lyrics files next to them. Needs the ffprobe program (Ubuntu: sudo apt install ffmpeg)." },
     .{ .key = "images", .label = "Index pictures", .type = .flag, .help = "Index JPEG, PNG, GIF, WebP, BMP, SVG, AVIF and TIFF files so they can be found: by the words of their folders and file name, their size and orientation and their EXIF description and camera. JPEG, PNG, GIF, WebP and BMP also get a fingerprint for finding the same picture (Find by image in the administration). The search page's Images button shows them as a gallery, from the original files (turn on serve_originals to see the pictures). Nothing is stored of the picture itself." },
@@ -314,13 +314,13 @@ test "posted fields become option lines: text escaped, numbers typed, flags on o
         .{ "opt_language", "" },
     } };
     const text = try compose(a, "files", params, "future_option = 5\n");
-    try testing.expectEqualStrings("path = \"/home/me/my \\\"notes\\\"\"\npdf_text = true\npdf_workers = \"lots\"\nmax_file_bytes = 8388608\nfuture_option = 5\n", text);
+    try testing.expectEqualStrings("path = \"/home/me/my \\\"notes\\\"\"\npdf_text = true\npdf_workers = \"lots\"\noffice = false\nmax_file_bytes = 8388608\nfuture_option = 5\n", text);
     // A flag that is on by default is written only when turned off.
     try testing.expectEqualStrings("path = \"/x.zim\"\nserve_articles = false\n", try compose(a, "zim", FakeParams{ .pairs = &.{.{ "opt_path", "/x.zim" }} }, ""));
     try testing.expectEqualStrings("path = \"/x.zim\"\n", try compose(a, "zim", FakeParams{ .pairs = &.{ .{ "opt_path", "/x.zim" }, .{ "opt_serve_articles", "1" } } }, ""));
     // Line breaks cannot start a new setting.
     const evil = try compose(a, "files", FakeParams{ .pairs = &.{.{ "opt_path", "/x\nretain_text = false" }} }, "");
-    try testing.expectEqualStrings("path = \"/x retain_text = false\"\n", evil);
+    try testing.expectEqualStrings("path = \"/x retain_text = false\"\noffice = false\n", evil);
 }
 
 test "existing options fill the fields; what the table does not know is kept" {
@@ -347,5 +347,5 @@ test "existing options fill the fields; what the table does not know is kept" {
     try testing.expectEqualStrings("mystery = \"x y\"", s.rest);
     // And composing what was split gives back the same settings.
     const back = try compose(a, "files", FakeParams{ .pairs = &.{ .{ "opt_path", "/home/me/notes" }, .{ "opt_pdf_text", "1" }, .{ "opt_max_file_bytes", "8388608" }, .{ "opt_language", "en" } } }, s.rest);
-    try testing.expectEqualStrings("path = \"/home/me/notes\"\npdf_text = true\nmax_file_bytes = 8388608\nlanguage = \"en\"\nmystery = \"x y\"\n", back);
+    try testing.expectEqualStrings("path = \"/home/me/notes\"\npdf_text = true\noffice = false\nmax_file_bytes = 8388608\nlanguage = \"en\"\nmystery = \"x y\"\n", back);
 }

@@ -3020,9 +3020,9 @@ const kind_infos = [_]KindInfo{
     .{
         .kind = "files",
         .title = "A folder of text files",
-        .blurb = "Indexes the .txt and Markdown files in a folder on this machine, such as your notes.",
+        .blurb = "Indexes the files of a folder on this machine: text and Markdown, Word, Excel, PowerPoint and OpenDocument files, and e-books by default; PDFs, web pages, source code, pictures and audio or video when you switch them on in the next step.",
         .needs = "The folder's path.",
-        .template = "path = \"/home/me/notes\"   # the folder to index (change this)\n# pdf_text = true         # also index PDFs (needs the pdftotext program: sudo apt install poppler-utils)\n# office = true          # also index Word, OpenDocument and EPUB files (no outside program needed)\n# html = true            # also index .html files as web pages\n# media = true           # also index audio and video by their tags (needs ffprobe: sudo apt install ffmpeg)\n# serve_originals = true  # let results open the original file in the browser (restart the server after changing)\n",
+        .template = "path = \"/home/me/notes\"   # the folder to index (change this)\n# pdf_text = true         # also index PDFs (needs the pdftotext program: sudo apt install poppler-utils)\n# office = false         # (on by default) Word, OpenDocument and EPUB files (no outside program needed)\n# html = true            # also index .html files as web pages\n# media = true           # also index audio and video by their tags (needs ffprobe: sudo apt install ffmpeg)\n# serve_originals = true  # let results open the original file in the browser (restart the server after changing)\n",
     },
     .{
         .kind = "wikipedia",
@@ -3106,7 +3106,7 @@ fn writeKindChooser(w: *Io.Writer) !void {
         if (!kindAvailable(k.kind)) continue;
         try w.print("<a class=\"choice\" href=\"/sources/edit?kind={s}\"><strong>{s}</strong><span>{s}</span><small>Needs: {s}</small></a>", .{ k.kind, k.title, k.blurb, k.needs });
     }
-    try w.writeAll("</div><p><a class=\"btn secondary\" href=\"/sources\">Cancel</a></p>\n");
+    try w.writeAll("</div><p class=\"muted\">Looking for ZIM files to download (Wikipedia and more, with filters for language and pictures)? Use <a href=\"/zim\">ZIM files</a> in the Library menu; the file it downloads is then added here as a ZIM source.</p><p><a class=\"btn secondary\" href=\"/sources\">Cancel</a></p>\n");
 }
 
 fn kindAvailable(kind: []const u8) bool {

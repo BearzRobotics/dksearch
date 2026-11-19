@@ -191,7 +191,7 @@ pub const FilesConnector = struct {
             .pdf_workers = @intCast(source.optionInt("pdf_workers") orelse default_pdf_workers),
             .max_pdf_bytes = @intCast(source.optionInt("max_pdf_bytes") orelse @as(i64, @intCast(default_max_pdf_bytes))),
             .pdf_timeout_s = @intCast(source.optionInt("pdf_timeout_seconds") orelse default_pdf_timeout_seconds),
-            .office = source.optionBool("office") orelse false,
+            .office = source.optionBool("office") orelse true,
             .html = source.optionBool("html") orelse false,
             .code = source.optionBool("code") orelse false,
             .images = source.optionBool("images") orelse false,
@@ -1607,12 +1607,12 @@ test "office = true and html = true: Word, OpenDocument, EPUB and HTML files are
     var ctl: api.Control = .{};
 
     var pb0: [200]u8 = undefined;
-    const off = try treeSource(&tmp, &pb0, &.{});
+    const off = try treeSource(&tmp, &pb0, &.{.{ .key = "office", .value = .{ .boolean = false } }});
     defer testing.allocator.free(off.options);
     var fc_off = try FilesConnector.init(testing.allocator, testing.io, off);
     defer fc_off.deinit();
     const r0 = try runner.runImport(e.arena.allocator(), &e.state, &e.pipe, fc_off.connector(), "notes", &ctl, E2e.now);
-    try testing.expectEqual(@as(u64, 1), r0.submitted); // only readme.txt
+    try testing.expectEqual(@as(u64, 1), r0.submitted); // only readme.txt (office switched off; html is off anyway)
 
     var pb: [200]u8 = undefined;
     const on = try treeSource(&tmp, &pb, &.{ .{ .key = "office", .value = .{ .boolean = true } }, .{ .key = "html", .value = .{ .boolean = true } } });
