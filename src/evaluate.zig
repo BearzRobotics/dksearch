@@ -166,7 +166,20 @@ pub const Report = struct {
 
 pub const EvalError = error{ OutOfMemory, InvalidK };
 
+/// How the search is asked: like a person's search on the page, so the numbers say what they would see.
+pub const Options = struct {
+    /// The languages the reader prefers (`Accept-Language`): other languages rank lower.
+    prefer_languages: []const []const u8 = &.{},
+    /// At most this many results from one domain (`[search] per_domain`).
+    per_domain: u32 = 3,
+};
+
 pub fn evaluate(arena: Allocator, searcher: search.Searcher, judgments: []const Judgment, k: u32) EvalError!Report {
+    return evaluateWith(arena, searcher, judgments, k, .{});
+}
+
+/// The pictures are left out and a page that is in the index twice (two sources) counts once, as on the results page.
+pub fn evaluateWith(arena: Allocator, searcher: search.Searcher, judgments: []const Judgment, k: u32, opts: Options) EvalError!Report {
     if (k < 1 or k > max_k) return error.InvalidK;
     var results: std.ArrayList(QueryResult) = .empty;
     var sum: Summary = .{};
@@ -183,7 +196,8 @@ pub fn evaluate(arena: Allocator, searcher: search.Searcher, judgments: []const 
             ranks[i] = null;
             keys[i] = rel.key;
         }
-        const page = searcher.search(arena, .{ .text = j.query, .limit = max_k }) catch |e| switch (e) {
+        const no_pictures = [_]search.Filter{.{ .field = .kind, .negate = true, .text = "image" }};
+        const page = searcher.search(arena, .{ .text = j.query, .limit = max_k, .filters = &no_pictures, .per_domain = opts.per_domain, .prefer_languages = opts.prefer_languages }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 r.failed = true;
@@ -196,17 +210,23 @@ pub fn evaluate(arena: Allocator, searcher: search.Searcher, judgments: []const 
 
         // Which judged document (if any) is each hit, and at what rank.
         var gains: std.ArrayList(u32) = .empty; // grade of each hit within k, 0 if unjudged
-        for (page.hits, 0..) |h, pos| {
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var shown: usize = 0;
+        for (page.hits) |h| {
+            if (h.url) |u| {
+                if ((try seen.getOrPut(arena, u)).found_existing) continue;
+            }
+            defer shown += 1;
             const idhex = std.fmt.bytesToHex(h.id, .lower);
             var grade: u32 = 0;
             for (j.relevant, 0..) |rel, i| {
                 const hit_match = (h.url != null and std.mem.eql(u8, h.url.?, rel.key)) or std.ascii.eqlIgnoreCase(&idhex, rel.key);
                 if (hit_match) {
-                    if (ranks[i] == null) ranks[i] = @intCast(pos + 1);
+                    if (ranks[i] == null) ranks[i] = @intCast(shown + 1);
                     grade = @max(grade, rel.grade);
                 }
             }
-            if (pos < k) try gains.append(arena, grade);
+            if (shown < k) try gains.append(arena, grade);
         }
 
         var dcg: f64 = 0;

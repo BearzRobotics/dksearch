@@ -293,7 +293,7 @@ pub const commands = [_]Command{
     },
     .{
         .name = "eval",
-        .synopsis = "eval [--config FILE] [-k N] [--json] JUDGMENTS",
+        .synopsis = "eval [--config FILE] [-k N] [--language CODES] [--json] JUDGMENTS",
         .summary = "Measure how well the ranking finds the documents you judged relevant",
         .detail =
         \\JUDGMENTS is a text file with one JSON object per line, naming a query and the
@@ -305,6 +305,10 @@ pub const commands = [_]Command{
         \\Runs each query against the index and prints precision and recall at N (default
         \\10, at most 100), the reciprocal rank of the first relevant hit, nDCG, and where
         \\each judged document ranked. --json prints the same as one JSON object.
+        \\
+        \\The search is asked as the results page asks it: pictures are left out, a page
+        \\held twice counts once, [search] per_domain applies, and pages in a language other
+        \\than --language (default en; "none" for no preference) rank lower.
         \\
         ,
     },

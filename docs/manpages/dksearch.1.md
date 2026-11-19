@@ -111,9 +111,9 @@ Usage: dksearch help [COMMAND | start | config | admin]
 eval
 Measure the ranking. JUDGMENTS is a text file with one JSON object per line, naming a query and the documents relevant to it, by URL or by document id: `{"query": "lighthouse keeper", "relevant": ["https://example.org/keeper"]}`, or with grades from 1 up, `{"query": "tides", "relevant": {"https://example.org/tides": 3, "https://example.org/moon": 1}}`. Blank lines and lines starting with `#` are skipped. Each query is run against the index as **serve** would run it, and the command prints, per query and as means, precision and recall in the first K hits, the reciprocal rank of the first relevant hit, and nDCG (with gain 2^grade-1), then lists judged documents that were outside the first K with their rank (searched to 100). A query the search cannot run (no searchable terms) is reported as failed and scores zero. Nothing is written. Use it to compare settings, such as the tokenizer, on judgments you trust; a handful of queries shows direction, not proof.
 
-Usage: dksearch eval [--config FILE] [-k N] [--json] JUDGMENTS
+Usage: dksearch eval [--config FILE] [-k N] [--language CODES] [--json] JUDGMENTS
 
-Arguments: JUDGMENTS, the file described above. **-k** is the cutoff, 1-100, default 10. **--json** prints one JSON object instead of the table.
+Arguments: JUDGMENTS, the file described above. **-k** is the cutoff, 1-100, default 10. **--language** is the language the reader prefers (as the browser's Accept-Language: `en`, `en,fr`; `none` for no preference), default `en`. **--json** prints one JSON object instead of the table. The search is asked as the results page asks it: pictures are left out, a page in the index twice counts once, and `[search] per_domain` applies, so the numbers say what a person would see.
 
 Examples: dksearch eval --config dksearch.toml judgments.jsonl
 

@@ -345,8 +345,11 @@ fn run(init: std.process.Init) u8 {
         var file: ?[]const u8 = null;
         var k: u32 = 10;
         var json = false;
+        var language: []const u8 = "en";
         while (args.next()) |a| {
-            if (eq(a, "--config")) {
+            if (eq(a, "--language")) {
+                language = args.next() orelse return usageError(io, "--language needs a language code such as en (or none)");
+            } else if (eq(a, "--config")) {
                 config_path = args.next() orelse return usageError(io, "--config needs a FILE");
             } else if (std.mem.startsWith(u8, a, "--config=")) {
                 config_path = a["--config=".len..];
@@ -1934,7 +1937,8 @@ fn evalCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, judgments_p
     };
     var index = openIndex(io, paths.index, &cfg, false) orelse return exit_io;
     defer index.close();
-    const report = dk.evaluate.evaluate(a, index.searcher(), judgments, k) catch |e| switch (e) {
+    const prefer: []const []const u8 = if (eq(language, "none")) &.{} else (dk.langprefer.parseAcceptLanguage(a, language) catch &.{});
+    const report = dk.evaluate.evaluateWith(a, index.searcher(), judgments, k, .{ .prefer_languages = prefer, .per_domain = cfg.search.per_domain }) catch |e| switch (e) {
         error.InvalidK => return usageError(io, "-k must be from 1 to 100"),
         error.OutOfMemory => {
             err(io, "out of memory", .{});
