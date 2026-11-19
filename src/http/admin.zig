@@ -176,7 +176,7 @@ pub const App = struct {
 
     // --------------------------------------------------------- routing
 
-    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, action_embed, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, action_blocklists, action_restart, action_owner_password, action_thumbs_clear, action_zim_unqueue, zim_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
+    const Route = enum { dashboard, jobs, jobs_skipped, api_jobs_skipped, sources_page, sources_new, source_edit, action_sources, settings_page, action_settings, maintenance, action_maintenance, docs_page, action_embed, findimage_page, action_findimage, safesearch_page, action_safe_toggle, action_safe_pin, action_safe_lists, action_blocklists, action_restart, action_owner_password, action_thumbs_clear, action_zim_unqueue, zim_page, crawl_page, action_zim, action_zim_folder, models_page, action_model_pull, action_model_remove, action_model_use, access_page, action_peer_test, action_peer_edit, action_collection_edit, action_key_add, action_key_remove, api_maintenance, login, logout, style, script, api_status, api_sources, api_jobs, action_import, action_cancel, api_imports, api_imports_cancel, search_test, api_search, other };
 
     fn routeOf(path: []const u8) Route {
         const table = [_]struct { []const u8, Route }{
@@ -203,6 +203,7 @@ pub const App = struct {
             .{ "/actions/collection-edit", .action_collection_edit },
             .{ "/actions/key-remove", .action_key_remove },
             .{ "/zim", .zim_page },
+            .{ "/crawl", .crawl_page },
             .{ "/docs", .docs_page },
             .{ "/actions/embed", .action_embed },
             .{ "/findimage", .findimage_page },
@@ -307,6 +308,7 @@ pub const App = struct {
             .action_thumbs_clear => self.thumbsClearAction(arena, req, auth),
             .action_zim_unqueue => self.zimUnqueueAction(arena, req, auth),
             .zim_page => self.pageZim(arena, csrf, t.params),
+            .crawl_page => self.pageCrawl(arena, csrf, t.params),
             .models_page => self.pageModels(arena, csrf, null, t.params.get("remove")),
             .action_model_pull => self.modelAction(arena, req, auth, .pull),
             .action_model_remove => self.modelAction(arena, req, auth, .remove),
@@ -2059,6 +2061,119 @@ pub const App = struct {
         return handler.htmlResponse(arena, .ok, aw.written());
     }
 
+    /// The report of the last run of a crawl source: what each site gave, and why the ones that gave nothing did not.
+    fn pageCrawl(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
+        var aw: Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        writePage(w, "Crawl report", csrf, "crawl") catch return error.OutOfMemory;
+        self.writeCrawlReport(arena, w, params) catch return error.OutOfMemory;
+        w.writeAll("</main></body></html>\n") catch return error.OutOfMemory;
+        return handler.htmlResponse(arena, .ok, aw.written());
+    }
+
+    const ReportRow = struct { host: []const u8, fetched: u32, stored: u32, unchanged: u32, robots: u32, http_error: u32, network: u32, too_large: u32, certificate: u32, other: u32, refusals: u32, last_status: u32, verdict: []const u8 };
+
+    fn writeCrawlReport(self: *App, arena: Allocator, w: *Io.Writer, params: query.Params) !void {
+        try w.writeAll("<p class=\"muted\">What each site gave in the last run of a crawl source, and why the ones that gave little did not: blocked by a bot check (403), disallowed by <code>robots.txt</code>, rate limited, or unreachable. A site that blocks crawlers is respected, not worked around. The report is written when a run ends or is stopped.</p>");
+        if (!@hasDecl(dk.connectors.crawl, "reportPathOf")) {
+            try w.writeAll("<p class=\"notice\">This build has no crawler.</p>");
+            return;
+        }
+        // The crawl sources that keep a report.
+        const Entry = struct { name: []const u8, path: []const u8 };
+        var entries: std.ArrayList(Entry) = .empty;
+        for (self.sources()) |s| {
+            if (!std.mem.eql(u8, s.kind, "crawl")) continue;
+            const p = (dk.connectors.crawl.reportPathOf(arena, s) orelse continue) catch return error.OutOfMemory;
+            try entries.append(arena, .{ .name = s.name, .path = p });
+        }
+        if (entries.items.len == 0) {
+            try w.writeAll("<p class=\"notice\">No crawl source keeps a report yet. Give a crawl source a <code>validators_file</code> (or a <code>report_file</code>) and run it.</p>");
+            return;
+        }
+        var chosen = entries.items[0];
+        if (params.get("source")) |want| for (entries.items) |e| if (std.mem.eql(u8, e.name, want)) {
+            chosen = e;
+        };
+        try w.writeAll("<p>");
+        for (entries.items) |e| {
+            const here = std.mem.eql(u8, e.name, chosen.name);
+            try w.writeAll("<a class=\"btn");
+            if (!here) try w.writeAll(" secondary");
+            try w.writeAll("\" href=\"/crawl?source=");
+            try query.writeEncoded(w, e.name);
+            try w.writeAll("\">");
+            try html.writeEscaped(w, e.name);
+            try w.writeAll("</a> ");
+        }
+        try w.writeAll("</p>");
+        const text = Io.Dir.cwd().readFileAlloc(self.io, chosen.path, arena, .limited(16 * 1024 * 1024)) catch {
+            try w.writeAll("<p class=\"notice\">There is no report for <strong>");
+            try html.writeEscaped(w, chosen.name);
+            try w.writeAll("</strong> yet: it is written when a run of the source ends or is stopped.</p>");
+            return;
+        };
+        var rows: std.ArrayList(ReportRow) = .empty;
+        var when: ?i64 = null;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (line[0] == '#') {
+                if (std.mem.indexOf(u8, line, " at ")) |i| when = std.fmt.parseInt(i64, std.mem.trim(u8, line[i + 4 ..], " \r"), 10) catch when;
+                continue;
+            }
+            var f = std.mem.splitScalar(u8, line, '\t');
+            const host = f.next() orelse continue;
+            var nums: [11]u32 = undefined;
+            var ok = true;
+            for (&nums) |*n| n.* = std.fmt.parseInt(u32, f.next() orelse {
+                ok = false;
+                break;
+            }, 10) catch 0;
+            if (!ok) continue;
+            try rows.append(arena, .{ .host = host, .fetched = nums[0], .stored = nums[1], .unchanged = nums[2], .robots = nums[3], .http_error = nums[4], .network = nums[5], .too_large = nums[6], .certificate = nums[7], .other = nums[8], .refusals = nums[9], .last_status = nums[10], .verdict = f.next() orelse "" });
+        }
+        var stored_total: u64 = 0;
+        var trouble: usize = 0;
+        for (rows.items) |r| {
+            stored_total += r.stored;
+            if (!std.mem.eql(u8, r.verdict, "ok")) trouble += 1;
+        }
+        try w.print("<div class=\"statgrid\"><div class=\"stat\"><span class=\"stat-n\">{d}</span><span class=\"stat-l\">sites reached or tried</span></div><div class=\"stat\"><span class=\"stat-n\">{d}</span><span class=\"stat-l\">pages stored</span></div><div class=\"stat\"><span class=\"stat-n\">{d}</span><span class=\"stat-l\">sites that need a look</span></div></div>", .{ rows.items.len, stored_total, trouble });
+        if (when) |t| {
+            try w.writeAll("<p class=\"muted small\">The run ended ");
+            try writeDuration(w, @intCast(@max(0, unixNow(self.io) - t)));
+            try w.writeAll(" ago.</p>");
+        }
+        // Sites that need a look: the ones with most pages asked for first.
+        if (trouble > 0) {
+            try w.writeAll("<section class=\"card\"><h2>Sites that need a look</h2><table><thead><tr><th>Site</th><th>Why</th><th>Stored</th><th>Errors</th><th>robots</th><th>Last status</th></tr></thead><tbody>");
+            var shown: usize = 0;
+            for (rows.items) |r| {
+                if (std.mem.eql(u8, r.verdict, "ok")) continue;
+                if (shown >= 200) break;
+                shown += 1;
+                try w.writeAll("<tr><td><code>");
+                try html.writeEscaped(w, r.host);
+                try w.writeAll("</code></td><td>");
+                try html.writeEscaped(w, r.verdict);
+                try w.print("</td><td>{d}</td><td>{d}</td><td>{d}</td><td>{d}</td></tr>", .{ r.stored, r.http_error + r.network + r.certificate + r.too_large, r.robots, r.last_status });
+            }
+            try w.writeAll("</tbody></table></section>");
+        }
+        try w.writeAll("<section class=\"card\"><h2>Sites with most pages</h2><table><thead><tr><th>Site</th><th>Stored</th><th>Fetched</th><th>Unchanged</th><th>Skipped</th></tr></thead><tbody>");
+        var listed: usize = 0;
+        for (rows.items) |r| {
+            if (r.stored == 0) break; // sorted by stored pages: the rest stored nothing
+            if (listed >= 100) break;
+            listed += 1;
+            try w.writeAll("<tr><td><code>");
+            try html.writeEscaped(w, r.host);
+            try w.print("</code></td><td>{d}</td><td>{d}</td><td>{d}</td><td>{d}</td></tr>", .{ r.stored, r.fetched, r.unchanged, r.robots + r.http_error + r.network + r.too_large + r.certificate + r.other });
+        }
+        try w.writeAll("</tbody></table></section>");
+    }
+
     fn pageZim(self: *App, arena: Allocator, csrf: ?[]const u8, params: query.Params) error{OutOfMemory}!Response {
         var aw: Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
@@ -2787,6 +2902,7 @@ const nav_items = [_]struct { []const u8, []const u8, []const u8, []const u8, []
     .{ "jobs", "/jobs", "Jobs", "Overview", "activity" },
     .{ "sources", "/sources", "Sources", "Library", "database" },
     .{ "zim", "/zim", "ZIM files", "Library", "book" },
+    .{ "crawl", "/crawl", "Crawl report", "Library", "activity" },
     .{ "settings", "/settings", "Settings", "Search", "sliders" },
     .{ "safesearch", "/safesearch", "Safe search", "Search", "shield" },
     .{ "access", "/access", "Access", "Search", "key" },

@@ -77,7 +77,7 @@ const max_user_agent = 200;
 const accept_pages = "text/html,application/xhtml+xml,text/plain;q=0.9";
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page", "report_file" };
 
 // ------------------------------------------------------------ validation
 
@@ -184,6 +184,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
         diag.set("", key(&kbuf, source, "recrawl_adaptive"), "needs validators_file (where the crawler keeps what it learned about each page)", .{});
         return error.InvalidValue;
     }
+    _ = try needString(source, "report_file", false, diag);
     _ = try needString(source, "seeds_sections", false, diag);
     _ = try needString(source, "seeds_skip", false, diag);
     inline for (.{ "tor_socks", "i2p_proxy" }) |k| if (try needString(source, k, false, diag)) |v| if (hidden.parseProxy(v) == null) {
@@ -197,6 +198,14 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
 }
 
 // ------------------------------------------------------------- the connector
+
+/// Where the report of a crawl source is kept: its `report_file`, else its validators file with `.report.tsv` added, else
+/// nowhere. The result is allocated from `gpa` (null: no report).
+pub fn reportPathOf(gpa: Allocator, source: config.Source) ?Allocator.Error![]const u8 {
+    if (source.optionString("report_file")) |p| return gpa.dupe(u8, p);
+    if (source.optionString("validators_file")) |p| return std.fmt.allocPrint(gpa, "{s}.report.tsv", .{p});
+    return null;
+}
 
 pub const CrawlConnector = struct {
     gpa: Allocator,
@@ -239,6 +248,11 @@ pub const CrawlConnector = struct {
     seeds_skip: ?[]const u8,
     /// Follow links from other sites into the hidden networks (a source whose seeds are there already stays there).
     hidden_links: bool,
+    /// Where the report of each run is written (a tab-separated file, one line per site): `report_file`, or the
+    /// validators file's name with `.report.tsv` added; none when neither is set.
+    report_file: ?[]const u8,
+    /// The first extra wait after a refusal (429 or 503), when the site did not say how long: at least this, then doubled.
+    backoff_ms: u32 = 2000,
     checkpoint_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(gpa: Allocator, io: Io, source: config.Source) Allocator.Error!CrawlConnector {
@@ -263,6 +277,8 @@ pub const CrawlConnector = struct {
         const language = if (source.optionString("language")) |l| try gpa.dupe(u8, l) else null;
         errdefer if (language) |l| gpa.free(l);
         const validators_file = if (source.optionString("validators_file")) |l| try gpa.dupe(u8, l) else null;
+        errdefer if (validators_file) |l| gpa.free(l);
+        const report_file = if (reportPathOf(gpa, source)) |p| (p catch return error.OutOfMemory) else null;
         return .{
             .gpa = gpa,
             .io = io,
@@ -282,6 +298,7 @@ pub const CrawlConnector = struct {
             .ca = ca,
             .language = language,
             .validators_file = validators_file,
+            .report_file = report_file,
             .tor = if (source.optionString("tor_socks")) |v| hidden.parseProxy(v) else null,
             .i2p = if (source.optionString("i2p_proxy")) |v| hidden.parseProxy(v) else null,
             .hidden_links = source.optionBool("hidden_links") orelse false,
@@ -315,6 +332,7 @@ pub const CrawlConnector = struct {
         }
         if (self.language) |l| self.gpa.free(l);
         if (self.validators_file) |l| self.gpa.free(l);
+        if (self.report_file) |l| self.gpa.free(l);
         if (self.seeds_sections) |l| self.gpa.free(l);
         if (self.seeds_skip) |l| self.gpa.free(l);
         self.checkpoint_buf.deinit(self.gpa);
@@ -445,6 +463,7 @@ pub const CrawlConnector = struct {
 
         if (sh.out_of_memory.load(.monotonic)) return error.OutOfMemory;
         if (self.validators_file) |path| self.saveValidators(path, &sh);
+        if (self.report_file) |path| self.saveReport(path, &sh);
         sh.mutex.lockUncancelable(self.io);
         const done = sh.last_done;
         sh.mutex.unlock(self.io);
@@ -620,6 +639,39 @@ pub const CrawlConnector = struct {
         while (it.next()) |e| add(&out, self.gpa, e.key_ptr.*, e.value_ptr.*);
         var old_it = sh.old.iterator();
         while (old_it.next()) |e| if (!sh.fresh.contains(e.key_ptr.*)) add(&out, self.gpa, e.key_ptr.*, e.value_ptr.*);
+        const tmp = std.fmt.allocPrint(self.gpa, "{s}.tmp", .{path}) catch return;
+        defer self.gpa.free(tmp);
+        const cwd = Io.Dir.cwd();
+        cwd.writeFile(self.io, .{ .sub_path = tmp, .data = out.items }) catch return;
+        cwd.rename(tmp, cwd, path, self.io) catch {
+            cwd.deleteFile(self.io, tmp) catch {};
+        };
+    }
+
+    /// Writes the report of the run: one line per site, `host`, the counts, the last error status and a verdict in words,
+    /// the sites with most pages stored first. The first line is a comment with the source and the time. Replaced
+    /// atomically; a failure only means there is no report.
+    fn saveReport(self: *CrawlConnector, path: []const u8, sh: *Shared) void {
+        const Row = struct { host: []const u8, s: HostStats };
+        var rows: std.ArrayList(Row) = .empty;
+        defer rows.deinit(self.gpa);
+        sh.mutex.lockUncancelable(self.io);
+        defer sh.mutex.unlock(self.io);
+        var it = sh.stats.iterator();
+        while (it.next()) |e| rows.append(self.gpa, .{ .host = e.key_ptr.*, .s = e.value_ptr.* }) catch return;
+        std.mem.sort(Row, rows.items, {}, struct {
+            fn more(_: void, a: Row, b: Row) bool {
+                if (a.s.stored != b.s.stored) return a.s.stored > b.s.stored;
+                return std.mem.lessThan(u8, a.host, b.host);
+            }
+        }.more);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        out.print(self.gpa, "# crawl report of {s} at {d}\n# host\tfetched\tstored\tunchanged\trobots\thttp_error\tnetwork\ttoo_large\tcertificate\tother\trefusals\tlast_status\tverdict\n", .{ self.name, Io.Clock.real.now(self.io).toSeconds() }) catch return;
+        for (rows.items) |r| {
+            const s = r.s;
+            out.print(self.gpa, "{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{s}\n", .{ r.host, s.fetched, s.stored, s.unchanged, s.robots, s.http_error, s.network, s.too_large, s.certificate, s.other, s.refusals, s.last_status, verdictOf(s) }) catch return;
+        }
         const tmp = std.fmt.allocPrint(self.gpa, "{s}.tmp", .{path}) catch return;
         defer self.gpa.free(tmp);
         const cwd = Io.Dir.cwd();
@@ -902,7 +954,63 @@ const Host = struct {
     busy: std.atomic.Value(bool) = .init(false),
     /// Whether the name resolves to a private, loopback or link-local address; asked once, under `lock`.
     resolves_private: ?bool = null,
+    /// Politeness learned from the site's own answers (docs/decisions/0057): extra spacing on top of `delay_ms`, doubled
+    /// at every refusal (429 or 503) and halved after a run of good answers; no request before `not_before_ns`
+    /// (monotonic) after a refusal asked for a wait; and a site that asks to be left alone for longer than we will wait is
+    /// given up for the rest of the run.
+    extra_delay_ms: u32 = 0,
+    not_before_ns: i96 = 0,
+    ok_streak: u32 = 0,
+    gave_up: bool = false,
 };
+
+/// How many times a page refused with 429 or 503 is asked for (the first request included).
+const max_refusal_attempts = 3;
+/// The longest `Retry-After` that is waited for; a site that asks for more is left alone for the rest of the run.
+const max_retry_after_s = 120;
+/// The most extra spacing a refusing site can make us add to every request.
+const max_extra_delay_ms = 60_000;
+
+/// The seconds of a `Retry-After` header; null for a date or anything else (the backoff then decides).
+pub fn parseRetryAfter(value: ?[]const u8) ?u64 {
+    const v = std.mem.trim(u8, value orelse return null, " \t");
+    return std.fmt.parseInt(u64, v, 10) catch null;
+}
+
+/// What the report counts for each site (docs/decisions/0057).
+const HostStats = struct {
+    fetched: u32 = 0,
+    stored: u32 = 0,
+    unchanged: u32 = 0,
+    robots: u32 = 0,
+    http_error: u32 = 0,
+    network: u32 = 0,
+    too_large: u32 = 0,
+    certificate: u32 = 0,
+    other: u32 = 0,
+    refusals: u32 = 0,
+    /// The last answer that was an error (400 and above), 0 for none.
+    last_status: u16 = 0,
+    gave_up: bool = false,
+};
+
+const StatKind = enum { fetched, stored, unchanged, robots, http_error, network, too_large, certificate, other, refusals };
+
+/// Why a site gave what it gave, in words, from its counts.
+pub fn verdictOf(s: HostStats) []const u8 {
+    if (s.gave_up) return "asks to be left alone (Retry-After); given up this run";
+    if (s.stored == 0 and s.fetched == 0) {
+        if (s.robots > 0 and s.http_error == 0 and s.network == 0) return "robots.txt disallows it";
+        if (s.http_error > 0 and (s.last_status == 403 or s.last_status == 401)) return "blocked by the site (403): often a bot check, not bypassed";
+        if (s.http_error > 0 and s.last_status == 429) return "rate limited (429)";
+        if (s.network > 0 or s.certificate > 0) return "unreachable or certificate error";
+        if (s.http_error > 0) return "errors from the site";
+        return "nothing reached";
+    }
+    if (s.refusals > 0) return "rate limited (429/503): slowed down";
+    if (s.stored == 0) return "pages fetched but none stored (no text or not a page)";
+    return "ok";
+}
 
 /// What the workers of one run share. `mutex` guards the host table, the visited set and the position
 /// bookkeeping; the counters are atomic.
@@ -941,6 +1049,8 @@ const Shared = struct {
     /// Pages left alone because their own interval had not passed (`recrawl_adaptive`).
     not_due: std.atomic.Value(u64) = .init(0),
     hosts: std.StringHashMapUnmanaged(*Host) = .empty,
+    /// What happened to the pages of each site (by lower-case host name), for the report. Under `mutex`.
+    stats: std.StringHashMapUnmanaged(HostStats) = .empty,
     /// Every URL fetched or queued this run, so none is requested twice.
     visited: std.StringHashMapUnmanaged(void) = .empty,
     /// Page requests made (robots.txt excluded), against `max_pages`.
@@ -1022,13 +1132,16 @@ const Run = struct {
     fn waitTurn(self: *Run, host: *Host) bool {
         const io = self.conn.io;
         const delay_s: u64 = if (host.rules.crawl_delay_s) |s| @min(s, max_crawl_delay_s) else 0;
-        const gap_ns: i96 = @as(i96, @max(self.conn.delay_ms, @as(u32, @intCast(delay_s * 1000)))) * std.time.ns_per_ms;
-        const last = host.last orelse return !self.control.isCancelled();
+        const gap_ns: i96 = (@as(i96, @max(self.conn.delay_ms, @as(u32, @intCast(delay_s * 1000)))) + host.extra_delay_ms) * std.time.ns_per_ms;
+        const last = host.last orelse (if (host.not_before_ns == 0) return !self.control.isCancelled() else null);
         while (true) {
             if (self.control.isCancelled()) return false;
-            const elapsed = last.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds;
-            if (elapsed >= gap_ns) return true;
-            const left_ms: i64 = @intCast(@divTrunc(gap_ns - elapsed, std.time.ns_per_ms) + 1);
+            const now = Io.Timestamp.now(io, .awake);
+            var left_ns: i96 = 0;
+            if (last) |l| left_ns = gap_ns - l.durationTo(now).nanoseconds;
+            if (host.not_before_ns > now.nanoseconds) left_ns = @max(left_ns, host.not_before_ns - now.nanoseconds);
+            if (left_ns <= 0) return true;
+            const left_ms: i64 = @intCast(@divTrunc(left_ns, std.time.ns_per_ms) + 1);
             io.sleep(.fromMilliseconds(@min(left_ms, 200)), .awake) catch return false;
         }
     }
@@ -1146,6 +1259,7 @@ const Run = struct {
     fn get(self: *Run, a: Allocator, start: []const u8, site_host: []const u8, accept: []const u8, max_bytes: usize, listed: bool, cond: ?Validator) error{OutOfMemory}!Fetched {
         var url = try withoutFragment(a, start);
         var hops: u32 = 0;
+        var refusals_seen: u32 = 0;
         const fetched_now = self.sh.fetched.fetchAdd(1, .monotonic) + 1;
         // The progress follows every page, not only the start of each breadth-first level (it lagged by a whole level).
         if (self.conn.max_depth != 0) self.control.setProgress(fetched_now, self.conn.max_pages);
@@ -1166,6 +1280,7 @@ const Run = struct {
                 host.busy.store(false, .monotonic);
                 host.lock.unlock(self.conn.io);
             }
+            if (host.gave_up) return self.skip(.http_status);
             // A name of a hidden network goes to the proxy by name, over http only, and is never resolved here; with no
             // proxy for it, it is not contacted at all.
             const via = self.conn.routeFor(u.host) orelse return self.skip(.limit);
@@ -1203,7 +1318,24 @@ const Run = struct {
                 else => return self.skip(.http_status),
             };
 
-            if (got.status == 304 and cond != null and hops == 0) return .unchanged;
+            // A site that refuses (429, 503) is slowed down for, asked again a few times, and given up if it asks to be left alone.
+            if (got.status == 429 or got.status == 503) {
+                refusals_seen += 1;
+                self.noteRefusal(host, got.retry_after);
+                self.bump(url, .refusals);
+                self.noteStatus(url, got.status);
+                if (host.gave_up) {
+                    self.markGaveUp(url);
+                    return self.skip(.http_status);
+                }
+                if (refusals_seen >= max_refusal_attempts) return self.skip(.http_status);
+                continue;
+            }
+            if (got.status >= 400) self.noteStatus(url, got.status) else if (got.status >= 200) self.noteOk(host);
+            if (got.status == 304 and cond != null and hops == 0) {
+                self.bump(url, .unchanged);
+                return .unchanged;
+            }
             if (got.status >= 300 and got.status < 400) {
                 hops += 1;
                 const loc = got.location orelse return self.skip(.redirect);
@@ -1214,6 +1346,7 @@ const Run = struct {
                 continue;
             }
             if (got.status < 200 or got.status >= 300) return self.skip(.http_status);
+            self.bump(url, .fetched);
             return .{ .page = .{ .url = url, .resp = got } };
         }
     }
@@ -1234,7 +1367,91 @@ const Run = struct {
 
     fn skip(self: *Run, why: api.Reason) Fetched {
         self.control.rejectAt(why, self.current_buf[0..self.current_len]);
+        self.bump(self.current_buf[0..self.current_len], switch (why) {
+            .robots => .robots,
+            .http_status => .http_error,
+            .network => .network,
+            .too_large => .too_large,
+            .certificate => .certificate,
+            else => .other,
+        });
         return .skipped;
+    }
+
+    /// The site's own answer to a refusal: more spacing from now on, a wait if it asked for one, and giving up if it asked
+    /// for more than is worth waiting.
+    fn noteRefusal(self: *Run, host: *Host, retry_after: ?[]const u8) void {
+        const asked_s = parseRetryAfter(retry_after) orelse 0;
+        host.ok_streak = 0;
+        host.extra_delay_ms = if (host.extra_delay_ms == 0) @max(self.conn.delay_ms, self.conn.backoff_ms) else @min(host.extra_delay_ms * 2, max_extra_delay_ms);
+        if (asked_s > max_retry_after_s) {
+            host.gave_up = true;
+            return;
+        }
+        const wait_ms: i96 = @max(@as(i96, @intCast(asked_s)) * 1000, host.extra_delay_ms);
+        host.not_before_ns = Io.Timestamp.now(self.conn.io, .awake).nanoseconds + wait_ms * std.time.ns_per_ms;
+    }
+
+    /// A good answer: after a run of them the extra spacing is halved (and dropped when small).
+    fn noteOk(self: *Run, host: *Host) void {
+        _ = self;
+        host.ok_streak += 1;
+        if (host.ok_streak >= 20 and host.extra_delay_ms > 0) {
+            host.extra_delay_ms /= 2;
+            if (host.extra_delay_ms < 250) host.extra_delay_ms = 0;
+            host.ok_streak = 0;
+        }
+    }
+
+    /// Counts one thing that happened to a page of the site of `url`, for the report.
+    fn bump(self: *Run, url: []const u8, what: StatKind) void {
+        const stats = self.statsFor(url) orelse return;
+        defer self.sh.mutex.unlock(self.conn.io);
+        switch (what) {
+            .fetched => stats.fetched +|= 1,
+            .stored => stats.stored +|= 1,
+            .unchanged => stats.unchanged +|= 1,
+            .robots => stats.robots +|= 1,
+            .http_error => stats.http_error +|= 1,
+            .network => stats.network +|= 1,
+            .too_large => stats.too_large +|= 1,
+            .certificate => stats.certificate +|= 1,
+            .other => stats.other +|= 1,
+            .refusals => stats.refusals +|= 1,
+        }
+    }
+
+    fn noteStatus(self: *Run, url: []const u8, status: u16) void {
+        const stats = self.statsFor(url) orelse return;
+        defer self.sh.mutex.unlock(self.conn.io);
+        stats.last_status = status;
+    }
+
+    fn markGaveUp(self: *Run, url: []const u8) void {
+        const stats = self.statsFor(url) orelse return;
+        defer self.sh.mutex.unlock(self.conn.io);
+        stats.gave_up = true;
+    }
+
+    /// The counts of the site of `url`, with the run's mutex held (the caller unlocks it); null if the address is no URL.
+    fn statsFor(self: *Run, url: []const u8) ?*HostStats {
+        const u = parseUrl(url) orelse return null;
+        var buf: [260]u8 = undefined;
+        if (u.host.len > buf.len) return null;
+        const lowered = std.ascii.lowerString(buf[0..u.host.len], u.host);
+        const io = self.conn.io;
+        self.sh.mutex.lockUncancelable(io);
+        if (self.sh.stats.getPtr(lowered)) |p| return p;
+        const owned = self.arena.dupe(u8, lowered) catch {
+            self.sh.mutex.unlock(io);
+            return null;
+        };
+        const gop = self.sh.stats.getOrPut(self.arena, owned) catch {
+            self.sh.mutex.unlock(io);
+            return null;
+        };
+        gop.value_ptr.* = .{};
+        return gop.value_ptr;
     }
 
     /// True the first time `url` is seen this run; remembers it. Also false
@@ -1335,7 +1552,8 @@ const Run = struct {
         const stored = try self.store(a, got.url, got.resp);
         switch (stored.result) {
             .stopped => return .stopped,
-            .stored, .skipped => {},
+            .stored => self.bump(got.url, .stored),
+            .skipped => {},
         }
         if (adaptive) {
             // Compare the body with what it was last time: a different one shortens the interval, the same one lengthens it.
@@ -2677,4 +2895,128 @@ test "gzip-compressed sitemaps are read, and a decompression bomb is refused" {
     try crawlWith(&srv, &tmp, try std.fmt.bufPrint(&line, "sitemap {s}\n", .{srv.url(&b, "/bomb.xml.gz")}), 0, 100, &got2, &ctl2);
     try testing.expectEqual(@as(usize, 0), got2.ids.items.len);
     try testing.expect(ctl2.rejected.load(.monotonic) >= 1);
+}
+
+// ------------------------------------------------------------- politeness and the report
+
+/// Crawls `paths` of the test server (depth 0) and returns the report file the run wrote.
+fn reportFor(srv: *TestServer, tmp: *testing.TmpDir, paths: []const []const u8, got: *Collect, ctl: *api.Control) ![]u8 {
+    var seeds: std.ArrayList(u8) = .empty;
+    defer seeds.deinit(testing.allocator);
+    var b: [8][96]u8 = undefined;
+    for (paths, 0..) |p, i| try seeds.print(testing.allocator, "{s}\n", .{srv.url(&b[i], p)});
+    var conn = try testConnector(tmp, seeds.items, "t/1");
+    defer conn.deinit();
+    conn.max_depth = 0;
+    conn.backoff_ms = 20;
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    conn.report_file = try std.fmt.allocPrint(testing.allocator, "{s}/report.tsv", .{dir});
+    _ = try conn.connector().run(got.sink(), ctl, null);
+    return tmp.dir.readFileAlloc(testing.io, "report.tsv", testing.allocator, .limited(1 << 20));
+}
+
+test "Retry-After is read as seconds; anything else is left to the backoff" {
+    try testing.expectEqual(@as(?u64, 5), parseRetryAfter("5"));
+    try testing.expectEqual(@as(?u64, 120), parseRetryAfter(" 120 "));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfter("Wed, 21 Oct 2026 07:28:00 GMT"));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfter(null));
+}
+
+test "a site that refuses with 429 is slowed down for, asked again, and then answers; the report says so" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/a", .body = "<html><title>A</title><p>after the pause</p></html>", .refuse_first = 2, .retry_after = "0" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    const report = try reportFor(&srv, &tmp, &.{"/a"}, &got, &ctl);
+    defer testing.allocator.free(report);
+    try testing.expectEqual(@as(usize, 1), got.ids.items.len);
+    try testing.expectEqual(@as(usize, 3), srv.count("/a")); // refused twice, answered the third time
+    try testing.expect(std.mem.indexOf(u8, report, "# crawl report of web") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "127.0.0.1\t1\t1\t0\t0\t0\t0\t0\t0\t0\t2\t429\trate limited (429/503): slowed down") != null);
+}
+
+test "a site that keeps refusing is given up on after three tries; one that asks to be left alone is not asked again" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/always", .body = "x", .refuse_first = 100, .retry_after = "0" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    const report = try reportFor(&srv, &tmp, &.{"/always"}, &got, &ctl);
+    defer testing.allocator.free(report);
+    try testing.expectEqual(@as(usize, 0), got.ids.items.len);
+    try testing.expectEqual(@as(usize, 3), srv.count("/always"));
+    try testing.expect(std.mem.indexOf(u8, report, "rate limited (429)") != null);
+
+    var srv2: TestServer = undefined;
+    try srv2.start(&.{
+        .{ .path = "/long", .body = "x", .refuse_first = 100, .retry_after = "9999" },
+        .{ .path = "/next", .body = "<p>next</p>" },
+    });
+    defer srv2.stop();
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var got2: Collect = .{};
+    defer got2.deinit();
+    var ctl2: api.Control = .{};
+    const report2 = try reportFor(&srv2, &tmp2, &.{ "/long", "/next" }, &got2, &ctl2);
+    defer testing.allocator.free(report2);
+    try testing.expectEqual(@as(usize, 1), srv2.count("/long")); // asked once
+    try testing.expectEqual(@as(usize, 0), srv2.count("/next")); // the site was given up for the run
+    try testing.expectEqual(@as(usize, 0), got2.ids.items.len);
+    try testing.expect(std.mem.indexOf(u8, report2, "asks to be left alone") != null);
+}
+
+test "the report tells a blocked site (403), a robots.txt refusal and a good site apart" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{.{ .path = "/blocked", .status = 403, .body = "Just a moment..." }});
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    const report = try reportFor(&srv, &tmp, &.{"/blocked"}, &got, &ctl);
+    defer testing.allocator.free(report);
+    try testing.expect(std.mem.indexOf(u8, report, "blocked by the site (403)") != null);
+
+    var srv2: TestServer = undefined;
+    try srv2.start(&.{ .{ .path = "/robots.txt", .content_type = "text/plain", .body = "User-agent: *\nDisallow: /\n" }, .{ .path = "/x", .body = "<p>x</p>" } });
+    defer srv2.stop();
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var got2: Collect = .{};
+    defer got2.deinit();
+    var ctl2: api.Control = .{};
+    const report2 = try reportFor(&srv2, &tmp2, &.{"/x"}, &got2, &ctl2);
+    defer testing.allocator.free(report2);
+    try testing.expect(std.mem.indexOf(u8, report2, "robots.txt disallows it") != null);
+
+    try testing.expectEqualStrings("ok", verdictOf(.{ .fetched = 5, .stored = 5 }));
+    try testing.expectEqualStrings("unreachable or certificate error", verdictOf(.{ .network = 3 }));
+}
+
+test "the report file's name follows the validators file unless one is given" {
+    var opts = [_]config.Option{
+        .{ .key = "validators_file", .value = .{ .string = "/var/lib/x/curated.validators" } },
+    };
+    const p = try reportPathOf(testing.allocator, .{ .name = "w", .kind = "crawl", .options = &opts }).?;
+    defer testing.allocator.free(p);
+    try testing.expectEqualStrings("/var/lib/x/curated.validators.report.tsv", p);
+    var opts2 = [_]config.Option{ .{ .key = "report_file", .value = .{ .string = "/tmp/r.tsv" } }, .{ .key = "validators_file", .value = .{ .string = "/v" } } };
+    const p2 = try reportPathOf(testing.allocator, .{ .name = "w", .kind = "crawl", .options = &opts2 }).?;
+    defer testing.allocator.free(p2);
+    try testing.expectEqualStrings("/tmp/r.tsv", p2);
+    try testing.expect(reportPathOf(testing.allocator, .{ .name = "w", .kind = "crawl", .options = &.{} }) == null);
 }

@@ -23,6 +23,9 @@ pub const Route = struct {
     stall_ms: i64 = 0,
     /// Sent as `ETag`; a request with the same `If-None-Match` is answered 304 without a body.
     etag: ?[]const u8 = null,
+    /// Answer 429 (with `retry_after`, if set) to the first this-many requests of this path, then as the route says.
+    refuse_first: u32 = 0,
+    retry_after: ?[]const u8 = null,
 };
 
 pub const TestServer = struct {
@@ -142,11 +145,15 @@ pub const TestServer = struct {
             try w.interface.flush();
             return;
         };
-        try w.interface.print("HTTP/1.1 {d} X\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: close\r\n", .{ rt.status, rt.content_type, rt.body.len });
+        const refused = rt.refuse_first > 0 and s.count(path) <= rt.refuse_first;
+        const status: u16 = if (refused) 429 else rt.status;
+        const body: []const u8 = if (refused) "" else rt.body;
+        try w.interface.print("HTTP/1.1 {d} X\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: close\r\n", .{ status, rt.content_type, body.len });
+        if (refused) if (rt.retry_after) |ra| try w.interface.print("retry-after: {s}\r\n", .{ra});
         if (rt.etag) |tag| try w.interface.print("etag: {s}\r\n", .{tag});
         if (rt.location) |l| try w.interface.print("location: {s}\r\n", .{l});
         try w.interface.writeAll("\r\n");
-        try w.interface.writeAll(rt.body);
+        try w.interface.writeAll(body);
         try w.interface.flush();
     }
 };

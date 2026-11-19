@@ -33,6 +33,8 @@ pub const Response = struct {
     /// `ETag` and `Last-Modified` of the answer, to ask again conditionally next time.
     etag: ?[]const u8 = null,
     last_modified: ?[]const u8 = null,
+    /// `Retry-After` of the answer (seconds or a date, as the site wrote it): how long a refusing site asks to be left alone.
+    retry_after: ?[]const u8 = null,
     /// `dk-node` and `dk-sig` of the answer: the node that says it made it and its signature (see identity.zig).
     node: ?[]const u8 = null,
     node_sig: ?[]const u8 = null,
@@ -155,6 +157,7 @@ fn run(client: *http.Client, arena: Allocator, req: Request) Failure!Response {
     while (hit.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "etag") and h.value.len <= 300) out.etag = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "last-modified") and h.value.len <= 100) out.last_modified = try arena.dupe(u8, h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "retry-after") and h.value.len <= 100) out.retry_after = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "dk-node") and h.value.len <= 64) out.node = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "dk-sig") and h.value.len <= 120) out.node_sig = try arena.dupe(u8, h.value);
     }
