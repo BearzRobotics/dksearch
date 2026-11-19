@@ -77,12 +77,29 @@ pub fn tidy(arena: Allocator, url: []const u8) Allocator.Error![]const u8 {
     if (path.len == 0) {
         try out.append(arena, '/');
     } else {
-        var prev_slash = false;
-        for (path) |c| {
-            if (c == '/' and prev_slash) continue;
-            prev_slash = c == '/';
-            try out.append(arena, c);
+        // Empty segments and `.` are dropped, `..` takes the segment before it with it (`/a/./b//c/../d/` is `/a/b/d/`).
+        var segs: std.ArrayList([]const u8) = .empty;
+        var trailing = path[path.len - 1] == '/';
+        var parts = std.mem.splitScalar(u8, path, '/');
+        while (parts.next()) |seg| {
+            if (seg.len == 0) continue;
+            if (std.mem.eql(u8, seg, ".")) {
+                trailing = true;
+                continue;
+            }
+            if (std.mem.eql(u8, seg, "..")) {
+                _ = segs.pop();
+                trailing = true;
+                continue;
+            }
+            try segs.append(arena, seg);
+            trailing = path[path.len - 1] == '/';
         }
+        for (segs.items) |seg| {
+            try out.append(arena, '/');
+            try out.appendSlice(arena, seg);
+        }
+        if (segs.items.len == 0 or trailing) try out.append(arena, '/');
     }
     // The query: noise taken out, the rest in order.
     if (p.query.len > 0) {
@@ -193,6 +210,12 @@ test "tidy: one page, one address" {
     // The same page reached with the parameters in another order is one address.
     try tidyTo("https://e.org/s?z=1&a=2", "https://e.org/s?a=2&z=1");
     try tidyTo("https://e.org/s?a=2&z=1", "https://e.org/s?a=2&z=1");
+    // Dot segments: `/./features/` is `/features/`, `..` goes up one.
+    try tidyTo("https://www.dragonflybsd.org/./features/", "https://www.dragonflybsd.org/features/");
+    try tidyTo("https://e.org/a/./b//c/../d/", "https://e.org/a/b/d/");
+    try tidyTo("https://e.org/a/b/..", "https://e.org/a/");
+    try tidyTo("https://e.org/a/b/c.html", "https://e.org/a/b/c.html");
+    try tidyTo("https://e.org/../x", "https://e.org/x");
 }
 
 test "isTrap: loops, depth, on-the-fly pages and wiki special pages" {
