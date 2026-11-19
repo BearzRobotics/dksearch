@@ -356,3 +356,7 @@ ol.steps li > strong:first-of-type { margin-left: 0.15rem; }
 .gallery .cap { display: block; padding: 0.3rem 0.5rem; font-size: 0.78rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .gallery a:hover, .gallery a:focus-visible { border-color: var(--accent); }
 form.search button.secondary { background: none; color: var(--fg); border: 1px solid var(--border); }
+
+form.unlock { margin: 0.4rem 0; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+form.unlock input[type=password] { width: 5rem; padding: 0.25rem 0.4rem; }
+form.unlock button { padding: 0.25rem 0.7rem; }

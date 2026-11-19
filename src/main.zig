@@ -1169,6 +1169,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         .max_connections = cfg.server.max_connections,
         .max_requests_per_connection = cfg.server.max_requests_per_connection,
         .shutdown_grace_ms = cfg.server.shutdown_grace_ms,
+        .max_body_bytes = dkhttp.server.public_form_body_bytes, // the safe-search PIN form
     };
     var stats: dkhttp.server.Stats = .{};
     var admin_stats: dkhttp.server.Stats = .{};

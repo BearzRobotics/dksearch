@@ -31,19 +31,47 @@ pub const Unlock = struct {
     /// Failed PIN attempts in the current window, and when the window ends (monotonic nanoseconds).
     failures: u32 = 0,
     window_end_ns: i96 = 0,
+    /// Where the PIN file is, and when it was last looked at: a PIN set or changed while the server runs (the command,
+    /// or another process) is picked up within a few seconds, no restart needed.
+    dir: Io.Dir,
+    checked_ns: i96 = 0,
 
     /// Loads the PIN file from `dir` (a missing file means no PIN: nothing can be unlocked).
     pub fn init(gpa: Allocator, io: Io, dir: Io.Dir, hours: u32) secrets.Error!Unlock {
         const pin = try secrets.load(gpa, io, dir, pin_file_name);
-        return .{ .gpa = gpa, .io = io, .pin = pin, .hours = hours };
+        return .{ .gpa = gpa, .io = io, .pin = pin, .hours = hours, .dir = dir, .checked_ns = Io.Timestamp.now(io, .awake).nanoseconds };
     }
 
     pub fn deinit(self: *Unlock) void {
         self.pin.deinit(self.gpa);
     }
 
-    pub fn hasPin(self: *const Unlock) bool {
+    pub fn hasPin(self: *Unlock) bool {
+        self.refresh();
         return self.pin.password_hash != null;
+    }
+
+    /// Re-reads the PIN file (at most every two seconds). If the PIN differs from the one in use, the new one is used
+    /// and every unlocked browser is locked again. An unreadable file changes nothing.
+    fn refresh(self: *Unlock) void {
+        const t = self.now();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (t - self.checked_ns < 2 * std.time.ns_per_s) return;
+        self.checked_ns = t;
+        var fresh = secrets.load(self.gpa, self.io, self.dir, pin_file_name) catch return;
+        const same = if (fresh.password_hash) |f|
+            (if (self.pin.password_hash) |o| std.mem.eql(u8, f, o) else false)
+        else
+            self.pin.password_hash == null;
+        if (same) {
+            fresh.deinit(self.gpa);
+            return;
+        }
+        self.pin.deinit(self.gpa);
+        self.pin = fresh;
+        self.sessions = @splat(null);
+        self.failures = 0;
     }
 
     fn now(self: *const Unlock) i96 {
@@ -223,4 +251,20 @@ test "the PIN can be changed and removed while running; unlocks made with the ol
     var gone = try Unlock.init(testing.allocator, testing.io, tmp.dir, 8);
     defer gone.deinit();
     try testing.expect(!gone.hasPin());
+}
+
+test "a PIN set by another process while the server runs is picked up without a restart" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var u = try Unlock.init(testing.allocator, testing.io, tmp.dir, 8);
+    defer u.deinit();
+    try testing.expect(!u.hasPin());
+    // Another process (the command) writes the PIN file.
+    var other: secrets.Secrets = .{};
+    defer other.deinit(testing.allocator);
+    try other.setPassword(testing.allocator, testing.io, "3239");
+    try secrets.save(testing.io, tmp.dir, pin_file_name, other);
+    u.checked_ns = 0; // the two seconds have passed
+    try testing.expect(u.hasPin());
+    try testing.expect(u.tryUnlock("3239") == .ok);
 }

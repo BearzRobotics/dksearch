@@ -3568,7 +3568,7 @@ test "safe search: on for visitors, a PIN unlocks a browser for a while, an adul
     try testing.expect(fake.last.?.safe_search);
     // The page says so, with a way to unlock.
     const home = handleSigned(a, fake.searcher(), services, .GET, "/", null, .{});
-    try testing.expect(std.mem.indexOf(u8, home.body, "Safe search is on.") != null and std.mem.indexOf(u8, home.body, "href=\"/unlock\"") != null);
+    try testing.expect(std.mem.indexOf(u8, home.body, "Safe search is on.") != null and std.mem.indexOf(u8, home.body, "action=\"/unlock\"") != null and std.mem.indexOf(u8, home.body, "name=\"pin\"") != null);
     // The unlock form: a wrong PIN is told so and sets nothing; the right one sets a cookie.
     try testing.expectEqual(http.Status.ok, handleSigned(a, fake.searcher(), services, .GET, "/unlock", null, .{}).status);
     const wrong = handleSigned(a, fake.searcher(), services, .POST, "/unlock", null, .{ .body = "pin=0000" });

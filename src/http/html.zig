@@ -420,7 +420,7 @@ fn writeSafeNote(w: *Writer, note: SafeNote) Writer.Error!void {
     switch (note) {
         .none => {},
         .on => try w.writeAll("<p class=\"muted small\">Safe search is on.</p>\n"),
-        .on_unlockable => try w.writeAll("<p class=\"muted small\">Safe search is on. <a href=\"/unlock\">Unlock</a></p>\n"),
+        .on_unlockable => try w.writeAll("<form class=\"inline unlock\" action=\"/unlock\" method=\"post\"><span class=\"muted small\">Safe search is on.</span> <label class=\"muted small\">PIN <input type=\"password\" name=\"pin\" inputmode=\"numeric\" autocomplete=\"off\" size=\"6\" aria-label=\"PIN to unlock safe search\"></label> <button type=\"submit\" class=\"secondary\">Unlock</button></form>\n"),
         .unlocked => try w.writeAll("<p class=\"muted small\">Safe search is off in this browser. <form class=\"inline\" action=\"/lock\" method=\"post\"><button type=\"submit\" class=\"btn secondary\">Turn it back on</button></form></p>\n"),
     }
 }

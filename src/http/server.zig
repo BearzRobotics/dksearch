@@ -249,6 +249,10 @@ pub fn serve(gpa: Allocator, io: Io, listener: *net.Server, searcher: dk.search.
     return servePublic(gpa, io, listener, searcher, .{}, null, limits, stats, control);
 }
 
+/// The body the public listener accepts: the safe-search PIN form is the only thing posted to it (the handler refuses a
+/// POST to any other address).
+pub const public_form_body_bytes: u32 = 1024;
+
 /// The public search interface, with an optional regular-expression service
 /// and an optional access log.
 pub fn servePublic(gpa: Allocator, io: Io, listener: *net.Server, searcher: dk.search.Searcher, services: handler.Services, access_log: ?*AccessLog, limits: Limits, stats: *Stats, control: *Control) ServeError!void {
@@ -843,4 +847,25 @@ test "a port that already has a listener is refused, a free one is not" {
     try testing.expectError(error.AddressInUse, listen(testing.io, try net.IpAddress.parse("127.0.0.1", port)));
     var other = try listen(testing.io, try net.IpAddress.parse("127.0.0.1", 0));
     other.deinit(testing.io);
+}
+
+test "the public listener accepts the small PIN form body, and the handler answers it (not 'request body not accepted')" {
+    const post = "POST /unlock HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 8\r\nConnection: close\r\n\r\npin=3239";
+    const d: Dispatcher = .{ .ptr = &PublicApp.dummy_for_tests, .handle = PublicApp.handleForTests, .label = PublicApp.label };
+    var closed: Harness = undefined;
+    try closed.startDispatch(d, null, .{});
+    defer closed.stop();
+    const refused = try closed.exchange(post);
+    defer testing.allocator.free(refused);
+    try testing.expect(std.mem.indexOf(u8, refused, "request body not accepted") != null);
+    var open: Harness = undefined;
+    try open.startDispatch(d, null, .{ .max_body_bytes = public_form_body_bytes });
+    defer open.stop();
+    const got = try open.exchange(post);
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "request body not accepted") == null);
+    // Bigger than the form needs: still refused.
+    const big = try open.exchange("POST /unlock HTTP/1.1\r\nHost: x\r\nContent-Length: 2000\r\nConnection: close\r\n\r\n");
+    defer testing.allocator.free(big);
+    try testing.expect(std.mem.startsWith(u8, big, "HTTP/1.1 413"));
 }
