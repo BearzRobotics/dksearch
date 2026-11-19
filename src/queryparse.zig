@@ -757,17 +757,16 @@ fn emitTerm(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, t: Term) Allocato
             var stem_buf: [wordforms.max_word]u8 = undefined;
             const stem: ?[]const u8 = if (lx.forms) wordforms.stemPrefix(&stem_buf, t.text) else null;
             if (stem) |st| {
-                // The word and the words that begin with its stem (and the synonyms): "program" finds "programming".
-                try out.append(arena, '(');
-                try quoted(arena, out, t.text);
-                try out.appendSlice(arena, " OR ");
+                // The words that begin with the stem ("program" finds "programming"), and the synonyms. The prefix covers the
+                // word itself: asking for both would count every occurrence twice and favour pages that repeat the exact word.
+                if (syn.len > 0) try out.append(arena, '(');
                 try quoted(arena, out, st);
                 try out.append(arena, '*');
                 for (syn) |sw| {
                     try out.appendSlice(arena, " OR ");
                     try quoted(arena, out, sw);
                 }
-                try out.append(arena, ')');
+                if (syn.len > 0) try out.append(arena, ')');
                 // The excerpt looks for any word that begins with the stem.
                 var pt = t;
                 pt.kind = .prefix;
@@ -1418,7 +1417,7 @@ test "word forms: a plain word is also the beginning of its other forms, in the 
     defer ar.deinit();
     const a = ar.allocator();
     const p = try parseWith(a, "how to program in C", .{ .common = .{ .ctx = @constCast(&CommonSet{ .words = &.{} }), .isCommon = CommonSet.is }, .word_forms = true });
-    try testing.expectEqualStrings("(\"program\" OR \"program\"*) AND \"C\"", p.fts);
+    try testing.expectEqualStrings("\"program\"* AND \"C\"", p.fts);
     try testing.expectEqual(@as(usize, 2), p.terms.len);
     try testing.expect(p.terms[0].prefix and std.mem.eql(u8, p.terms[0].text, "program"));
     // Phrases, title-only words checked elsewhere, words to leave out and short words stay as typed.

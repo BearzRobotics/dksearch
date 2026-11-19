@@ -8,7 +8,7 @@ Status: accepted
 
 ## Decision
 
-With `[search] word_forms` (on by default) a plain word of at least five letters is searched as `"word" OR "stem"*`, where the stem comes from a plain English suffix strip (`wordforms.zig`: ing, ed, er, es, s, ion, ly, ment, ness...; doubled consonants and a final e are dropped; stems of fewer than five letters are not used). Quoted phrases, `-` words, short words and words with a field stay as typed. The excerpt looks for any word that begins with the stem.
+With `[search] word_forms` (on by default) a plain word of at least five letters is searched as `"stem"*` (which covers the word itself; asking for both would count every occurrence twice and favour pages that repeat the exact word), where the stem comes from a plain English suffix strip (`wordforms.zig`: ing, ed, er, es, s, ion, ly, ment, ness...; doubled consonants and a final e are dropped; stems of fewer than five letters are not used). Quoted phrases, `-` words, short words and words with a field stay as typed. The excerpt looks for any word that begins with the stem.
 
 ## Consequences
 
