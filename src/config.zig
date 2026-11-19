@@ -243,7 +243,7 @@ pub const SearchSettings = struct {
     /// ("how to program in c" is searched as "how program c"); the page says which were left out. 0 requires every word.
     common_word_percent: u32 = 15,
     /// Also search each word as the beginning of its other forms ("program" finds "programming").
-    word_forms: bool = true,
+    word_forms: bool = false,
     /// Typo tolerance: "auto" retries an exact search that finds fewer than 3
     /// results with words one typo away; "always" expands every word; "off".
     fuzzy: FuzzyMode = .auto,

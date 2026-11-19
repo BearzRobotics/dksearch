@@ -1,6 +1,6 @@
 # 0063: Other forms of a word are found by the query, not by the index
 
-Status: accepted
+Status: accepted as an opt-in option (off by default); measured and found to make ranking worse
 
 ## Context
 
@@ -15,3 +15,7 @@ With `[search] word_forms` (on by default) a plain word of at least five letters
 ## Consequences
 
 No rebuild and no change to the index; one small vocabulary lookup per word. English only. Turn it off with `word_forms = false`.
+
+## Measurement
+
+With the golden queries of the playground index (`dksearch eval`, 11 queries, pictures left out, one result per page, English preferred): word forms off, mean reciprocal rank 0.657 and mean nDCG@10 0.718; on, 0.348 and 0.420. The searches that lost were those where the right page matches every word once and other pages repeat one word's forms many times ("linux kernel scheduler": pages about Kubernetes scheduling, which repeat schedule/scheduling/scheduler, outranked the kernel documentation). Best-match scoring adds up the weights of the forms as if they were different words, where a stemming index counts one word. So the default is off and the answer to "program does not find programming" is an index that stems (`[index] tokenizer = "porter"`), measured separately.

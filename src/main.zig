@@ -1939,6 +1939,17 @@ fn evalCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, judgments_p
     };
     var index = openIndex(io, paths.index, &cfg, false) orelse return exit_io;
     defer index.close();
+    // The search settings of the configuration, as `serve` applies them, so the numbers are those of the running search.
+    index.setWeights(cfg.search.title_weight, cfg.search.body_weight);
+    index.setRecency(cfg.search.recency_boost, cfg.search.recency_half_life_days);
+    index.setFuzzyMode(switch (cfg.search.fuzzy) {
+        .off => .off,
+        .auto => .auto,
+        .always => .always,
+    });
+    index.setCommonPercent(cfg.search.common_word_percent);
+    index.setWordForms(cfg.search.word_forms);
+    index.setSimpleSyntax(!cfg.search.advanced_syntax);
     const prefer: []const []const u8 = if (eq(language, "none")) &.{} else (dk.langprefer.parseAcceptLanguage(a, language) catch &.{});
     const report = dk.evaluate.evaluateWith(a, index.searcher(), judgments, k, .{ .prefer_languages = prefer, .per_domain = cfg.search.per_domain }) catch |e| switch (e) {
         error.InvalidK => return usageError(io, "-k must be from 1 to 100"),

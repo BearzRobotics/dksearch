@@ -124,7 +124,7 @@ pub const SqliteIndex = struct {
     /// (0: every word is required). It matters only for an index of a few thousand documents or more.
     common_percent: u32 = 15,
     /// Words are also searched as the beginning of their other forms (`[search] word_forms`).
-    word_forms: bool = true,
+    word_forms: bool = false,
     doc_total: u64 = 0,
     doc_total_at: i96 = 0,
     /// Whether the index stems words (`porter`): then excerpts are made by SQLite, which knows the stems.
@@ -3007,6 +3007,7 @@ test "other forms of a word are found, in the excerpt too; off, the word is foun
     const a = arena.allocator();
     var idx = try SqliteIndex.open(":memory:", .{ .sync = .off });
     defer idx.close();
+    idx.setWordForms(true);
     _ = try put(&idx, "t", "1", "Learn C", "an introduction to programming in the c language for beginners");
     _ = try put(&idx, "t", "2", "Other", "gardening for beginners");
     const on = try searchAll(a, &idx, "program c");
