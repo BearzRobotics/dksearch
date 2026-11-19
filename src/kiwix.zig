@@ -33,6 +33,8 @@ pub const Entry = struct {
     /// `maxi` (everything), `nopic` or `mini` (introductions), or empty.
     flavour: []const u8 = "",
     category: []const u8 = "",
+    /// The catalogue's tags, `;`-separated (`_pictures:yes;_videos:no;_details:yes;wikipedia`).
+    tags: []const u8 = "",
     article_count: u64 = 0,
     /// When this version was made (`2026-10-31T00:00:00Z`).
     issued: []const u8 = "",
@@ -40,6 +42,13 @@ pub const Entry = struct {
     size: u64 = 0,
     /// The address of the Metalink, which names the file, its checksum and mirrors.
     meta4_url: []const u8 = "",
+
+    /// Whether the catalogue tags this book with `tag` (`_pictures:yes`).
+    pub fn hasTag(self: Entry, tag: []const u8) bool {
+        var it = std.mem.splitScalar(u8, self.tags, ';');
+        while (it.next()) |t| if (std.mem.eql(u8, t, tag)) return true;
+        return false;
+    }
 
     /// The file name, from the Metalink address (`wikipedia_en_ray-charles_mini_2026-10.zim`).
     pub fn fileName(self: Entry) ?[]const u8 {
@@ -138,6 +147,61 @@ pub fn sourceNameFor(buf: []u8, file_name: []const u8) []const u8 {
     return buf[0..n];
 }
 
+/// A choice for a filter: the value the catalogue takes, its name and how many books it has (0: not told).
+pub const Choice = struct { value: []const u8, label: []const u8, count: u64 = 0 };
+
+const ns_thr = "http://purl.org/syndication/thread/1.0";
+
+/// Reads the catalogue's list of languages (`/catalog/v2/languages`: a code and a name each) or categories
+/// (`/catalog/v2/categories`: a name each, which is also the value).
+pub fn parseChoices(arena: Allocator, bytes: []const u8) ParseError![]const Choice {
+    var src: Io.Reader = .fixed(bytes);
+    var rd = xml.Reader.init(arena, &src, .{ .doctype = .reject, .max_token_bytes = 1024 * 1024 }, null);
+    defer rd.deinit();
+    var out: std.ArrayList(Choice) = .empty;
+    var cur: Choice = .{ .value = "", .label = "" };
+    var in_entry = false;
+    const Field = enum { none, title, code, count };
+    var field: Field = .none;
+    while (true) {
+        const ev = rd.next() catch return error.BadCatalog;
+        switch (ev) {
+            .start_element => |s| {
+                field = .none;
+                if (s.name.is(ns_atom, "entry")) {
+                    in_entry = true;
+                    cur = .{ .value = "", .label = "" };
+                } else if (in_entry) {
+                    if (s.name.is(ns_atom, "title")) field = .title else if (s.name.is(ns_dcterms, "language")) field = .code else if (s.name.is(ns_thr, "count")) field = .count;
+                }
+            },
+            .end_element => |e| {
+                field = .none;
+                if (e.name.is(ns_atom, "entry")) {
+                    in_entry = false;
+                    if (cur.label.len > 0) {
+                        if (cur.value.len == 0) cur.value = cur.label; // a category's name is its value
+                        if (out.items.len < 2000) try out.append(arena, cur);
+                    }
+                }
+            },
+            .text => |t| {
+                const v = std.mem.trim(u8, t, " \t\r\n");
+                if (v.len == 0) continue;
+                switch (field) {
+                    .none => {},
+                    .title => cur.label = try arena.dupe(u8, v),
+                    .code => cur.value = try arena.dupe(u8, v),
+                    .count => cur.count = std.fmt.parseInt(u64, v, 10) catch 0,
+                }
+            },
+            .end_of_document => break,
+            else => {},
+        }
+    }
+    return out.items;
+}
+
 /// Reads one page of the OPDS catalogue.
 pub fn parseCatalog(arena: Allocator, bytes: []const u8) ParseError!Catalog {
     var src: Io.Reader = .fixed(bytes);
@@ -148,7 +212,7 @@ pub fn parseCatalog(arena: Allocator, bytes: []const u8) ParseError!Catalog {
     var cur: Entry = .{};
     var in_entry = false;
     var in_person: u32 = 0; // inside author or publisher, whose `name` is not the book's
-    const Field = enum { none, title, summary, language, name, flavour, category, article_count, issued, total };
+    const Field = enum { none, title, summary, language, name, flavour, category, tags, article_count, issued, total };
     var field: Field = .none;
     while (true) {
         const ev = rd.next() catch return error.BadCatalog;
@@ -164,7 +228,7 @@ pub fn parseCatalog(arena: Allocator, bytes: []const u8) ParseError!Catalog {
                 } else if (s.name.is(ns_atom, "author") or s.name.is(ns_atom, "publisher")) {
                     in_person += 1;
                 } else if (in_person == 0) {
-                    if (s.name.is(ns_atom, "title")) field = .title else if (s.name.is(ns_atom, "summary")) field = .summary else if (s.name.is(ns_atom, "language")) field = .language else if (s.name.is(ns_atom, "name")) field = .name else if (s.name.is(ns_atom, "flavour")) field = .flavour else if (s.name.is(ns_atom, "category")) field = .category else if (s.name.is(ns_atom, "articleCount")) field = .article_count else if (s.name.is(ns_dcterms, "issued")) field = .issued else if (s.name.is(ns_atom, "link")) {
+                    if (s.name.is(ns_atom, "title")) field = .title else if (s.name.is(ns_atom, "summary")) field = .summary else if (s.name.is(ns_atom, "language")) field = .language else if (s.name.is(ns_atom, "name")) field = .name else if (s.name.is(ns_atom, "flavour")) field = .flavour else if (s.name.is(ns_atom, "category")) field = .category else if (s.name.is(ns_atom, "tags")) field = .tags else if (s.name.is(ns_atom, "articleCount")) field = .article_count else if (s.name.is(ns_dcterms, "issued")) field = .issued else if (s.name.is(ns_atom, "link")) {
                         const rel = attrOf(s.attributes, "rel") orelse "";
                         if (std.mem.eql(u8, rel, rel_acquisition)) {
                             if (attrOf(s.attributes, "href")) |h| cur.meta4_url = try arena.dupe(u8, h);
@@ -195,6 +259,7 @@ pub fn parseCatalog(arena: Allocator, bytes: []const u8) ParseError!Catalog {
                     .name => cur.name = try arena.dupe(u8, v),
                     .flavour => cur.flavour = try arena.dupe(u8, v),
                     .category => cur.category = try arena.dupe(u8, v),
+                    .tags => cur.tags = try arena.dupe(u8, v),
                     .article_count => cur.article_count = std.fmt.parseInt(u64, v, 10) catch 0,
                     .issued => cur.issued = try arena.dupe(u8, v),
                 }
@@ -761,4 +826,31 @@ test "source names for downloaded files, and free space can be asked" {
     try testing.expectEqualStrings("zim", sourceNameFor(&buf, "____.zim"));
     if (freeBytes(".")) |n| try testing.expect(n > 0);
     try testing.expect(freeBytes("/nonexistent-dksearch-dir") == null);
+}
+
+test "the language and category lists give a value, a name and a count" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const langs = try parseChoices(ar.allocator(),
+        \\<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/terms/" xmlns:thr="http://purl.org/syndication/thread/1.0">
+        \\<title>List of languages</title>
+        \\<entry><title>Abkhazian</title><dc:language>abk</dc:language><thr:count>2</thr:count></entry>
+        \\<entry><title>English</title><dc:language>eng</dc:language><thr:count>1315</thr:count></entry></feed>
+    );
+    try testing.expectEqual(@as(usize, 2), langs.len);
+    try testing.expectEqualStrings("eng", langs[1].value);
+    try testing.expectEqualStrings("English", langs[1].label);
+    try testing.expectEqual(@as(u64, 1315), langs[1].count);
+    const cats = try parseChoices(ar.allocator(),
+        \\<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>List of categories</title>
+        \\<entry><title>wikipedia</title><link rel="subsection" href="/x"/></entry><entry><title>books</title></entry></feed>
+    );
+    try testing.expectEqual(@as(usize, 2), cats.len);
+    try testing.expectEqualStrings("wikipedia", cats[0].value);
+    try testing.expectError(error.BadCatalog, parseChoices(ar.allocator(), "<feed><entry></feed>"));
+}
+
+test "tags tell whether a book has pictures" {
+    const e: Entry = .{ .tags = "_details:no;stack_exchange;_videos:no;_ftindex:yes;_pictures:yes" };
+    try testing.expect(e.hasTag("_pictures:yes") and !e.hasTag("_pictures:no") and !e.hasTag("stack"));
 }

@@ -1927,40 +1927,58 @@ pub const App = struct {
             return;
         }
 
-        const q = params.get("q") orelse "";
-        const lang = params.get("lang") orelse "eng";
+        const f: ZimFilter = .{
+            .q = params.get("q") orelse "",
+            .lang = params.get("lang") orelse "eng",
+            .category = params.get("category") orelse "",
+            .pictures = params.get("pictures") orelse "",
+            .videos = params.get("videos") orelse "",
+            .sort = params.get("sort") orelse "new",
+        };
         const start = std.fmt.parseInt(u32, params.get("start") orelse "0", 10) catch 0;
-        try w.writeAll("<form class=\"inline\" action=\"/zim\" method=\"get\"><input type=\"search\" name=\"q\" maxlength=\"100\" aria-label=\"Search the library\" placeholder=\"wikipedia, chemistry, ...\" value=\"");
-        try html.writeEscaped(w, q);
-        try w.writeAll("\"> <input type=\"text\" name=\"lang\" maxlength=\"3\" size=\"4\" aria-label=\"Language (three letters)\" value=\"");
-        try html.writeEscaped(w, lang);
-        try w.writeAll("\"> <button type=\"submit\" class=\"btn\">Search</button></form>");
-        if (q.len == 0 and params.get("go") == null) {
-            try w.writeAll("<p class=\"muted\">Type what you are looking for (for example <code>wikipedia</code>, <code>mini</code> for short versions, <code>nopic</code> for text only) and a language code such as <code>eng</code>; leave the language empty for all.</p>");
+        const go = params.get("go") != null or f.q.len > 0;
+        // The lists for the drop-downs come from the library too; without them the form still works (a code to type).
+        const languages = self.catalogChoices(arena, "languages");
+        const categories = self.catalogChoices(arena, "categories");
+        try writeZimForm(arena, w, f, languages, categories);
+        if (!go) {
+            try w.writeAll("<p class=\"muted\">Choose what you want and press Show. Nothing is asked of the library until you do.</p>");
+            try writeZimFallback(w, dir);
             return;
         }
         var url_aw: Io.Writer.Allocating = .init(arena);
         const uw = &url_aw.writer;
-        try uw.print("{s}?count=25&start={d}", .{ self.opts.kiwix_catalog_url, start });
-        if (lang.len > 0) {
+        try uw.print("{s}?count={d}&start={d}", .{ self.opts.kiwix_catalog_url, zim_page_size, start });
+        if (f.lang.len > 0) {
             try uw.writeAll("&lang=");
-            try query.writeEncoded(uw, lang);
+            try query.writeEncoded(uw, f.lang);
         }
-        if (q.len > 0) {
+        if (f.q.len > 0) {
             try uw.writeAll("&q=");
-            try query.writeEncoded(uw, q);
+            try query.writeEncoded(uw, f.q);
         }
+        if (f.category.len > 0) {
+            try uw.writeAll("&category=");
+            try query.writeEncoded(uw, f.category);
+        }
+        if (std.mem.eql(u8, f.pictures, "yes")) try uw.writeAll("&tag=_pictures:yes");
+        if (std.mem.eql(u8, f.pictures, "no")) try uw.writeAll("&tag=_pictures:no");
+        if (std.mem.eql(u8, f.videos, "no")) try uw.writeAll("&notag=_videos:yes");
         const bytes = dk.kiwix.fetchText(self.gpa, self.io, arena, url_aw.written(), 4 * 1024 * 1024, self.opts.kiwix_options) catch {
-            try w.writeAll("<p class=\"error\">The library could not be reached or gave an answer that cannot be read. Try again in a moment.</p>");
+            try w.writeAll("<p class=\"error\">The library could not be reached or gave an answer that cannot be read. Try again in a moment, or use the links below.</p>");
+            try writeZimFallback(w, dir);
             return;
         };
         const cat = dk.kiwix.parseCatalog(arena, bytes) catch {
-            try w.writeAll("<p class=\"error\">The library&rsquo;s answer could not be read.</p>");
+            try w.writeAll("<p class=\"error\">The library&rsquo;s answer could not be read. You can still use the links below.</p>");
+            try writeZimFallback(w, dir);
             return;
         };
-        try w.print("<p class=\"muted\">{d} matching files; showing {d}&ndash;{d}.</p>", .{ cat.total, @min(start + 1, cat.total), start + cat.entries.len });
-        try w.writeAll("<table><thead><tr><th>Title</th><th>Language</th><th>Kind</th><th>Articles</th><th>Size</th><th>Made</th><th></th></tr></thead><tbody>");
-        for (cat.entries) |e| {
+        const rows = try arena.dupe(dk.kiwix.Entry, cat.entries);
+        sortZim(rows, f.sort);
+        try w.print("<p class=\"muted\">{d} matching files; showing {d}&ndash;{d}, sorted within this page.</p>", .{ cat.total, @min(start + 1, cat.total), start + cat.entries.len });
+        try w.writeAll("<table><thead><tr><th>Title</th><th>Language</th><th>Pictures</th><th>Version</th><th>Articles</th><th>Size</th><th>Made</th><th></th></tr></thead><tbody>");
+        for (rows) |e| {
             const file = e.fileName() orelse continue;
             try w.writeAll("<tr><td><strong>");
             try html.writeEscaped(w, e.title);
@@ -1968,6 +1986,8 @@ pub const App = struct {
             try html.writeEscaped(w, e.summary);
             try w.writeAll("</span></td><td>");
             try html.writeEscaped(w, e.language);
+            try w.writeAll("</td><td>");
+            try w.writeAll(if (e.hasTag("_pictures:yes")) "with" else if (e.hasTag("_pictures:no")) "text only" else "&ndash;");
             try w.writeAll("</td><td>");
             try html.writeEscaped(w, e.flavour);
             try w.print("</td><td>{d}</td><td>", .{e.article_count});
@@ -1981,13 +2001,115 @@ pub const App = struct {
             try w.print("&amp;size={d}\">Download&hellip;</a></td></tr>", .{e.size});
         }
         try w.writeAll("</tbody></table>");
-        if (start + cat.entries.len < cat.total) {
-            try w.print("<p><a href=\"/zim?q=", .{});
-            try query.writeEncoded(w, q);
-            try w.writeAll("&amp;lang=");
-            try query.writeEncoded(w, lang);
-            try w.print("&amp;go=1&amp;start={d}\">More results</a></p>", .{start + cat.entries.len});
+        if (start > 0) {
+            try w.writeAll("<p><a href=\"/zim?go=1");
+            try writeZimFilterQuery(w, f);
+            try w.print("&amp;start={d}\">&larr; Previous</a></p>", .{start -| zim_page_size});
         }
+        if (start + cat.entries.len < cat.total) {
+            try w.writeAll("<p><a href=\"/zim?go=1");
+            try writeZimFilterQuery(w, f);
+            try w.print("&amp;start={d}\">More results</a></p>", .{start + cat.entries.len});
+        }
+        try writeZimFallback(w, dir);
+    }
+
+    const zim_page_size = 50;
+
+    const ZimFilter = struct { q: []const u8, lang: []const u8, category: []const u8, pictures: []const u8, videos: []const u8, sort: []const u8 };
+
+    /// One of the library's lists (`languages` or `categories`), fetched from the same server as the entries; null if it
+    /// cannot be had (the form then asks for a code instead).
+    fn catalogChoices(self: *App, arena: Allocator, name: []const u8) ?[]const dk.kiwix.Choice {
+        const base = self.opts.kiwix_catalog_url;
+        const suffix = "/entries";
+        if (!std.mem.endsWith(u8, base, suffix)) return null;
+        const url = std.fmt.allocPrint(arena, "{s}/{s}", .{ base[0 .. base.len - suffix.len], name }) catch return null;
+        const bytes = dk.kiwix.fetchText(self.gpa, self.io, arena, url, 1024 * 1024, self.opts.kiwix_options) catch return null;
+        return dk.kiwix.parseChoices(arena, bytes) catch null;
+    }
+
+    fn sortZim(rows: []dk.kiwix.Entry, how: []const u8) void {
+        const Ctx = struct {
+            fn newest(_: void, a: dk.kiwix.Entry, b: dk.kiwix.Entry) bool {
+                return std.mem.order(u8, a.issued, b.issued) == .gt;
+            }
+            fn title(_: void, a: dk.kiwix.Entry, b: dk.kiwix.Entry) bool {
+                return std.ascii.lessThanIgnoreCase(a.title, b.title);
+            }
+            fn smallest(_: void, a: dk.kiwix.Entry, b: dk.kiwix.Entry) bool {
+                return a.size < b.size;
+            }
+            fn largest(_: void, a: dk.kiwix.Entry, b: dk.kiwix.Entry) bool {
+                return a.size > b.size;
+            }
+        };
+        if (std.mem.eql(u8, how, "title")) std.mem.sort(dk.kiwix.Entry, rows, {}, Ctx.title) else if (std.mem.eql(u8, how, "small")) std.mem.sort(dk.kiwix.Entry, rows, {}, Ctx.smallest) else if (std.mem.eql(u8, how, "large")) std.mem.sort(dk.kiwix.Entry, rows, {}, Ctx.largest) else if (std.mem.eql(u8, how, "new")) std.mem.sort(dk.kiwix.Entry, rows, {}, Ctx.newest);
+    }
+
+    /// The filters as query-string parameters, for the paging links.
+    fn writeZimFilterQuery(w: *Io.Writer, f: ZimFilter) !void {
+        const pairs = [_][2][]const u8{ .{ "q", f.q }, .{ "lang", f.lang }, .{ "category", f.category }, .{ "pictures", f.pictures }, .{ "videos", f.videos }, .{ "sort", f.sort } };
+        for (pairs) |p| {
+            try w.print("&amp;{s}=", .{p[0]});
+            try query.writeEncoded(w, p[1]);
+        }
+    }
+
+    fn writeZimOption(w: *Io.Writer, value: []const u8, text: []const u8, selected: bool) !void {
+        try w.writeAll("<option value=\"");
+        try html.writeEscaped(w, value);
+        try w.writeAll(if (selected) "\" selected>" else "\">");
+        try html.writeEscaped(w, text);
+        try w.writeAll("</option>");
+    }
+
+    fn writeZimForm(arena: Allocator, w: *Io.Writer, f: ZimFilter, languages: ?[]const dk.kiwix.Choice, categories: ?[]const dk.kiwix.Choice) !void {
+        try w.writeAll("<form class=\"zimfilter\" action=\"/zim\" method=\"get\"><input type=\"hidden\" name=\"go\" value=\"1\">");
+        try w.writeAll("<label>Search <input type=\"search\" name=\"q\" maxlength=\"100\" aria-label=\"Search the library\" placeholder=\"wikipedia, chemistry, ...\" value=\"");
+        try html.writeEscaped(w, f.q);
+        try w.writeAll("\"></label> <label>Language ");
+        if (languages) |list| {
+            try w.writeAll("<select name=\"lang\">");
+            try writeZimOption(w, "", "Any language", f.lang.len == 0);
+            for (list) |c| {
+                const text = if (c.count > 0) try std.fmt.allocPrint(arena, "{s} ({d})", .{ c.label, c.count }) else c.label;
+                try writeZimOption(w, c.value, text, std.mem.eql(u8, c.value, f.lang));
+            }
+            try w.writeAll("</select>");
+        } else {
+            try w.writeAll("<input type=\"text\" name=\"lang\" maxlength=\"3\" size=\"4\" aria-label=\"Language (three letters)\" value=\"");
+            try html.writeEscaped(w, f.lang);
+            try w.writeAll("\">");
+        }
+        try w.writeAll("</label>");
+        if (categories) |list| {
+            try w.writeAll(" <label>Category <select name=\"category\">");
+            try writeZimOption(w, "", "Any category", f.category.len == 0);
+            for (list) |c| try writeZimOption(w, c.value, c.label, std.mem.eql(u8, c.value, f.category));
+            try w.writeAll("</select></label>");
+        }
+        try w.writeAll(" <label>Pictures <select name=\"pictures\">");
+        try writeZimOption(w, "", "Any", f.pictures.len == 0);
+        try writeZimOption(w, "yes", "With pictures", std.mem.eql(u8, f.pictures, "yes"));
+        try writeZimOption(w, "no", "Text only (smaller)", std.mem.eql(u8, f.pictures, "no"));
+        try w.writeAll("</select></label> <label>Videos <select name=\"videos\">");
+        try writeZimOption(w, "", "Any", f.videos.len == 0);
+        try writeZimOption(w, "no", "Without videos", std.mem.eql(u8, f.videos, "no"));
+        try w.writeAll("</select></label> <label>Sort <select name=\"sort\">");
+        try writeZimOption(w, "new", "Newest", std.mem.eql(u8, f.sort, "new"));
+        try writeZimOption(w, "title", "Title", std.mem.eql(u8, f.sort, "title"));
+        try writeZimOption(w, "small", "Smallest", std.mem.eql(u8, f.sort, "small"));
+        try writeZimOption(w, "large", "Largest", std.mem.eql(u8, f.sort, "large"));
+        try w.writeAll("</select></label> <button type=\"submit\" class=\"btn\">Show</button></form>");
+    }
+
+    /// Ways to get a file without this page, always offered: the library in a browser, the mirror listing, and adding a file
+    /// that is already in the folder as a source.
+    fn writeZimFallback(w: *Io.Writer, dir: []const u8) !void {
+        try w.writeAll("<p class=\"muted small\">Rather use a browser? Browse <a href=\"https://library.kiwix.org/\">library.kiwix.org</a> or the plain file listing at <a href=\"https://download.kiwix.org/zim/\">download.kiwix.org/zim</a>, put the file in <code>");
+        try html.writeEscaped(w, dir);
+        try w.writeAll("</code> and <a href=\"/sources/new\">add it as a ZIM source</a>.</p>");
     }
 
     // ----------------------------------------------------- AI models (Ollama)
@@ -4006,6 +4128,51 @@ test "ZIM files: the folder is chosen on the page, created, saved in the configu
     const after = try f.call(a, .GET, "/zim", .{ .cookie = cookie });
     try testing.expect(std.mem.indexOf(u8, after.body, "Choose a folder for ZIM files") == null);
     try testing.expect(std.mem.indexOf(u8, after.body, "Search the library") != null);
+}
+
+test "ZIM files: the filter form keeps its choices, sorting works, paging keeps the filters, and the fallback links are there" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var aw: Io.Writer.Allocating = .init(a);
+    const langs = [_]dk.kiwix.Choice{ .{ .value = "eng", .label = "English", .count = 1315 }, .{ .value = "fra", .label = "French", .count = 400 } };
+    const cats = [_]dk.kiwix.Choice{ .{ .value = "wikipedia", .label = "wikipedia" }, .{ .value = "books", .label = "books" } };
+    const f: App.ZimFilter = .{ .q = "ray & co", .lang = "fra", .category = "wikipedia", .pictures = "no", .videos = "no", .sort = "small" };
+    try App.writeZimForm(a, &aw.writer, f, &langs, &cats);
+    const form = aw.written();
+    try testing.expect(std.mem.indexOf(u8, form, "<option value=\"fra\" selected>French (400)</option>") != null);
+    try testing.expect(std.mem.indexOf(u8, form, "<option value=\"wikipedia\" selected>wikipedia</option>") != null);
+    try testing.expect(std.mem.indexOf(u8, form, "<option value=\"no\" selected>Text only (smaller)</option>") != null);
+    try testing.expect(std.mem.indexOf(u8, form, "<option value=\"small\" selected>Smallest</option>") != null);
+    try testing.expect(std.mem.indexOf(u8, form, "value=\"ray &amp; co\"") != null);
+    // Without the lists (library unreachable) the form still works: a code to type, no category list.
+    var aw2: Io.Writer.Allocating = .init(a);
+    try App.writeZimForm(a, &aw2.writer, f, null, null);
+    try testing.expect(std.mem.indexOf(u8, aw2.written(), "name=\"lang\" maxlength=\"3\"") != null and std.mem.indexOf(u8, aw2.written(), "name=\"category\"") == null);
+    // The paging link carries every filter, encoded.
+    var aw3: Io.Writer.Allocating = .init(a);
+    try App.writeZimFilterQuery(&aw3.writer, f);
+    try testing.expect(std.mem.indexOf(u8, aw3.written(), "&amp;q=ray%20%26%20co&amp;lang=fra&amp;category=wikipedia&amp;pictures=no&amp;videos=no&amp;sort=small") != null);
+    // Sorting.
+    var rows = [_]dk.kiwix.Entry{
+        .{ .title = "banana", .size = 30, .issued = "2026-01-01" },
+        .{ .title = "Apple", .size = 10, .issued = "2026-03-01" },
+        .{ .title = "cherry", .size = 20, .issued = "2026-02-01" },
+    };
+    App.sortZim(&rows, "small");
+    try testing.expectEqualStrings("Apple", rows[0].title);
+    App.sortZim(&rows, "large");
+    try testing.expectEqualStrings("banana", rows[0].title);
+    App.sortZim(&rows, "title");
+    try testing.expectEqualStrings("Apple", rows[0].title);
+    try testing.expectEqualStrings("cherry", rows[2].title);
+    App.sortZim(&rows, "new");
+    try testing.expectEqualStrings("Apple", rows[0].title);
+    try testing.expectEqualStrings("banana", rows[2].title);
+    // The fallback.
+    var aw4: Io.Writer.Allocating = .init(a);
+    try App.writeZimFallback(&aw4.writer, "/data/zim");
+    try testing.expect(std.mem.indexOf(u8, aw4.written(), "https://library.kiwix.org/") != null and std.mem.indexOf(u8, aw4.written(), "href=\"/sources/new\"") != null and std.mem.indexOf(u8, aw4.written(), "/data/zim") != null);
 }
 
 test "ZIM files: the confirmation shows the free space, and a download that cannot fit is refused with the numbers" {
