@@ -26,6 +26,7 @@ const doc = @import("document.zig");
 const Io = std.Io;
 const idx_api = @import("indexer.zig");
 const search = @import("search.zig");
+const langprefer = @import("langprefer.zig");
 const image_mod = @import("image.zig");
 const queryparse = @import("queryparse.zig");
 const snippets = @import("snippets.zig");
@@ -310,6 +311,21 @@ pub const SqliteIndex = struct {
     fn registerFunctions(db: *c.sqlite3) void {
         _ = c.sqlite3_create_function(db, "dk_hamming", 2, c.SQLITE_UTF8 | c.SQLITE_DETERMINISTIC, null, hammingFn, null, null);
         _ = c.sqlite3_create_function(db, "dk_edits", 3, c.SQLITE_UTF8 | c.SQLITE_DETERMINISTIC, null, editsFn, null, null);
+        _ = c.sqlite3_create_function(db, "dk_foreign", 3, c.SQLITE_UTF8 | c.SQLITE_DETERMINISTIC, null, foreignFn, null, null);
+    }
+
+    /// `dk_foreign(language, path, preferred)`: the factor a page's score is multiplied by (`langprefer.foreign_factor` when
+    /// it is in a language other than those preferred, else 1.0).
+    fn foreignFn(ctx: ?*c.sqlite3_context, argc: c_int, argv: [*c]?*c.sqlite3_value) callconv(.c) void {
+        _ = argc;
+        const pref = c.sqlite3_value_text(argv[2]);
+        if (pref == null) return c.sqlite3_result_double(ctx, 1.0);
+        const lang_p = c.sqlite3_value_text(argv[0]);
+        const path_p = c.sqlite3_value_text(argv[1]);
+        const lang: ?[]const u8 = if (lang_p == null) null else lang_p[0..@intCast(c.sqlite3_value_bytes(argv[0]))];
+        const path: ?[]const u8 = if (path_p == null) null else path_p[0..@intCast(c.sqlite3_value_bytes(argv[1]))];
+        const is_foreign = langprefer.foreign(lang, path, pref[0..@intCast(c.sqlite3_value_bytes(argv[2]))]);
+        c.sqlite3_result_double(ctx, if (is_foreign) langprefer.foreign_factor else 1.0);
     }
 
     /// `dk_edits(a, b, limit)`: the edit distance of two words if at most `limit`, else NULL.
@@ -1384,6 +1400,12 @@ pub const SqliteIndex = struct {
         };
     }
 
+    /// Whether the search names a domain (`domain:example.org`): then the results of that one site are what is wanted, all of them.
+    fn namesDomain(filters: []const search.Filter) bool {
+        for (filters) |f| if (f.field == .domain and !f.negate) return true;
+        return false;
+    }
+
     /// `own_snippets`: SQLite's excerpt function (slow on a word that occurs thousands of times in a document) is not asked
     /// for; the caller makes the excerpts.
     fn runMatch(self: *SqliteIndex, arena: Allocator, q: search.Query, filters: []const search.Filter, limit: u32, match: []const u8, interpreted: ?[]const u8, fuzzy: bool, own_snippets: bool) search.Error!search.Page {
@@ -1413,7 +1435,11 @@ pub const SqliteIndex = struct {
             rec_expr = try std.fmt.allocPrint(arena, "(1.0 + {d}.{d:0>2} / (1.0 + MAX(0, CAST(strftime('%s','now') AS INTEGER) - COALESCE(d.modified_at, d.published_at, d.indexed_at, 0)) / 86400.0 / {d}.0))", .{ self.recency_percent / 100, self.recency_percent % 100, self.recency_days });
         }
         const demote_expr: []const u8 = if (self.domains) |l| (if (!l.demoted.isEmpty() and self.has_meta) " * dk_demote(d.domain)" else "") else "";
-        try factors.print(arena, "{s} * {s}{s}", .{ src_expr, rec_expr, demote_expr });
+        var lang_expr: []const u8 = "";
+        if (self.has_meta and text_mode) if (try langprefer.csv(arena, q.prefer_languages)) |list| {
+            lang_expr = try std.fmt.allocPrint(arena, " * dk_foreign(d.language, d.path, '{s}')", .{list});
+        };
+        try factors.print(arena, "{s} * {s}{s}{s}", .{ src_expr, rec_expr, demote_expr, lang_expr });
         const bm = try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0) * {s}", .{ self.title_weight, self.body_weight, factors.items });
         const explain_cols = if (q.explain and text_mode)
             try std.fmt.allocPrint(arena, ", -bm25(fts, {d}.0, {d}.0), -bm25(fts, 1.0, 0.0), -bm25(fts, 0.0, 1.0), {s}, {s}", .{ self.title_weight, self.body_weight, src_expr, rec_expr })
@@ -1465,7 +1491,7 @@ pub const SqliteIndex = struct {
         if (tier_expr) |t| {
             try sql.print(arena, " ORDER BY {s}, {s}, d.id", .{ t, bm });
         } else try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm));
-        if (q.per_domain > 0 and text_mode and self.has_meta and q.sort == .relevance) {
+        if (q.per_domain > 0 and text_mode and self.has_meta and q.sort == .relevance and !namesDomain(filters)) {
             // Keep the best `per_domain` results of each domain (a document without a domain stands alone), in the
             // order of the full ranking. The LIMIT inside keeps the ranking function out of the outer query.
             try sql.print(arena, " LIMIT {d}", .{search.max_cursor_window});
@@ -2908,4 +2934,33 @@ test "results can be ordered by date, size or title, and conditions can be given
     idx.has_meta = false;
     try testing.expectError(error.InvalidQuery, idx.searcher().search(a, .{ .text = "kernel", .sort = .newest }));
     _ = try idx.searcher().search(a, .{ .text = "kernel", .sort = .title });
+}
+
+test "pages in another language than the browser's rank lower, but stay; a named domain is not limited per domain" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    // The same page in three languages: by its own language, by its address, and one with neither.
+    try putDoc(&idx, .{ .connector = "web", .source_id = "1", .title = "Guide ja", .text = "bootloader guide bootloader guide", .canonical_url = "https://os.example.org/ja/guide", .content_type = "text/html", .language = "ja" });
+    try putDoc(&idx, .{ .connector = "web", .source_id = "2", .title = "Guide zh", .text = "bootloader guide bootloader guide", .canonical_url = "https://os.example.org/zh-CN/guide", .content_type = "text/html" });
+    try putDoc(&idx, .{ .connector = "web", .source_id = "3", .title = "Guide en", .text = "bootloader guide", .canonical_url = "https://os.example.org/guide", .content_type = "text/html" });
+    const none = try idx.searcher().search(a, .{ .text = "bootloader guide" });
+    try testing.expectEqual(@as(usize, 3), none.hits.len);
+    const en = try idx.searcher().search(a, .{ .text = "bootloader guide", .prefer_languages = &.{"en"} });
+    try testing.expectEqual(@as(usize, 3), en.hits.len); // nothing is hidden
+    try testing.expectEqualStrings("Guide en", en.hits[0].title.?);
+    const ja = try idx.searcher().search(a, .{ .text = "bootloader guide", .prefer_languages = &.{ "ja", "en" } });
+    try testing.expectEqualStrings("Guide ja", ja.hits[0].title.?); // the language the person reads is not foreign
+    // Five pages of one domain: limited to two, unless the search names the domain.
+    for (0..5) |i| {
+        var idb: [8]u8 = undefined;
+        const sid = try std.fmt.bufPrint(&idb, "d{d}", .{i});
+        try putDoc(&idx, .{ .connector = "web", .source_id = sid, .title = "Many", .text = "lighthouse", .canonical_url = try std.fmt.allocPrint(a, "https://many.example.org/p{d}", .{i}), .content_type = "text/html" });
+    }
+    const limited = try idx.searcher().search(a, .{ .text = "lighthouse", .per_domain = 2 });
+    try testing.expectEqual(@as(usize, 2), limited.hits.len);
+    const named = try idx.searcher().search(a, .{ .text = "lighthouse", .per_domain = 2, .filters = &.{.{ .field = .domain, .text = "many.example.org" }} });
+    try testing.expectEqual(@as(usize, 5), named.hits.len);
 }

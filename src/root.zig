@@ -10,6 +10,7 @@ pub const memory = @import("memory.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const search = @import("search.zig");
 pub const evaluate = @import("evaluate.zig");
+pub const langprefer = @import("langprefer.zig");
 pub const image = @import("image.zig");
 pub const queryparse = @import("queryparse.zig");
 pub const docmeta = @import("docmeta.zig");

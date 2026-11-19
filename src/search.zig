@@ -130,6 +130,9 @@ pub const Query = struct {
     /// At most this many results from one domain (0: no limit), keeping the best of each; for a relevance-ordered
     /// search of words. Paging and counts follow the limited list.
     per_domain: u32 = 0,
+    /// The languages the person reads (primary subtags, from the browser's `Accept-Language`): pages in another language
+    /// rank lower (`langprefer.foreign_factor`), they are not left out. Empty: no preference.
+    prefer_languages: []const []const u8 = &.{},
     /// Safe search applies to this request: documents of the safe-search list's domains are left out too (set by the
     /// server from who is asking, never from the request itself).
     safe_search: bool = false,

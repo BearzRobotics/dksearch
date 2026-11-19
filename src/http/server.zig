@@ -98,6 +98,8 @@ pub const Request = struct {
     content_type: ?[]const u8 = null,
     /// The `Host` header, if any.
     host: ?[]const u8 = null,
+    /// The `Accept-Language` header, if any (the languages the person reads).
+    accept_language: ?[]const u8 = null,
     /// A peer's signature headers (`dk-node`, `dk-time`, `dk-nonce`, `dk-sig`), if all four came.
     signed: ?dk.identity.Signed = null,
     /// A `dk-nonce` sent without a signature: the caller wants the answer signed.
@@ -120,7 +122,7 @@ const PublicApp = struct {
 
     fn handle(ptr: *anyopaque, arena: Allocator, req: Request) handler.Response {
         const self: *PublicApp = @ptrCast(@alignCast(ptr));
-        return handler.handleSigned(arena, self.searcher, self.services, req.method, req.target, req.authorization, .{ .cookie = req.cookie, .body = req.body, .host = req.host, .signed = req.signed, .nonce_only = req.nonce_only });
+        return handler.handleSigned(arena, self.searcher, self.services, req.method, req.target, req.authorization, .{ .cookie = req.cookie, .body = req.body, .host = req.host, .accept_language = req.accept_language, .signed = req.signed, .nonce_only = req.nonce_only });
     }
 
     var dummy_for_tests: PublicApp = .{ .searcher = FixedSearch.searcher() };
@@ -411,6 +413,8 @@ fn connection(state: *State, slot: usize, stream: net.Stream) Io.Cancelable!void
                 dreq.cookie = a.dupe(u8, h.value) catch return;
             } else if (std.ascii.eqlIgnoreCase(h.name, "content-type") and h.value.len <= 200) {
                 dreq.content_type = a.dupe(u8, h.value) catch return;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "accept-language") and h.value.len <= 400) {
+                dreq.accept_language = a.dupe(u8, h.value) catch return;
             } else if (std.ascii.eqlIgnoreCase(h.name, "host") and h.value.len <= 300) {
                 dreq.host = a.dupe(u8, h.value) catch return;
             } else if (std.ascii.eqlIgnoreCase(h.name, "dk-node") and h.value.len <= 64) {

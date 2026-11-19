@@ -118,6 +118,8 @@ pub const Services = struct {
     owner: ?*dk.owner.OwnerLogin = null,
     /// Add `Secure` to the sign-in cookie (set it when a proxy serves the site over HTTPS).
     cookie_secure: bool = false,
+    /// What the request's `Accept-Language` said (set per request, never configured).
+    accept_language: ?[]const u8 = null,
     safe: bool = false,
     /// Results of highly boosted sources first (`[search] trusted_first`, from `trusted_min_boost` percent); a request's
     /// own `trusted=1` or `trusted=0` overrides it.
@@ -164,6 +166,7 @@ fn limitQuery(arena: Allocator, q: *dk.search.Query, services: Services) error{O
     if (q.trusted_first == null and services.trusted_first) q.trusted_first = true;
     q.trusted_min_percent = services.trusted_min_boost;
     if (q.per_domain == 0) q.per_domain = services.per_domain;
+    if (q.prefer_languages.len == 0) q.prefer_languages = try dk.langprefer.parseAcceptLanguage(arena, services.accept_language);
     const defs = try arena.alloc(dk.search.CollectionDef, services.collections.len);
     for (services.collections, defs) |c, *d| d.* = .{ .name = c.name, .sources = c.sources };
     q.collections = defs;
@@ -295,6 +298,8 @@ pub const Caller = struct {
     cookie: ?[]const u8 = null,
     body: []const u8 = "",
     host: ?[]const u8 = null,
+    /// The request's Accept-Language header: pages in other languages rank lower.
+    accept_language: ?[]const u8 = null,
     signed: ?dk.identity.Signed = null,
     /// A `dk-nonce` without a signature: the caller only wants the answer signed.
     nonce_only: ?[]const u8 = null,
@@ -384,6 +389,7 @@ fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8, ca
 
 fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Services, method: http.Method, target: []const u8, authorization: ?[]const u8, caller: Caller) error{OutOfMemory}!Response {
     var services = services_in;
+    services.accept_language = caller.accept_language;
     const regex = services.regex;
     const t = query.parseTarget(arena, target) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -2159,6 +2165,16 @@ fn cachedPages(arena: Allocator, cache: ?*dk.retrievecache.Cache, store: dk.stor
     return dk.retrieve.PageIndex.build(arena, t) catch null;
 }
 
+/// Whether the search itself says what sort of file it wants (`kind:`, `mime:`, `ext:`), in a filter or in its words.
+fn asksForMedia(q: dk.search.Query) bool {
+    const keys = [_][]const u8{ "kind:", "mime:", "ext:" };
+    for (keys) |k| {
+        if (std.ascii.findIgnoreCase(q.text, k) != null) return true;
+        for (q.filter_strings) |f| if (std.ascii.findIgnoreCase(f, k) != null) return true;
+    }
+    return false;
+}
+
 fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexsearch.Service, services: Services, sources: []const html.SourceChoice, boosts: []const dk.search.SourceBoost, params: query.Params) error{OutOfMemory}!Response {
     const parsed = switch (try parseQuery(arena, params, true)) {
         .ok => |p| p,
@@ -2174,6 +2190,13 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         more[q.filter_strings.len] = "kind:image";
         q.filter_strings = more;
         q.limit = gallery_page_size;
+    } else if (!asksForMedia(q)) {
+        // Pictures are found with the Images button: an ordinary search is about pages. (A picture indexed from a page
+        // carries the page's address and the page's words, and would crowd out the page itself.)
+        const more = try arena.alloc([]const u8, q.filter_strings.len + 1);
+        @memcpy(more[0..q.filter_strings.len], q.filter_strings);
+        more[q.filter_strings.len] = "-kind:image";
+        q.filter_strings = more;
     }
     try limitQuery(arena, &q, services);
     // The ticked sources (`source`, repeatable) and the older single `connector`: each is a source name or
@@ -4015,6 +4038,16 @@ test "the Images button shows only pictures as a gallery, from this server's own
     try testing.expect(std.mem.indexOf(u8, run(&fake, .GET, "/", &ar).body, "name=\"images\" value=\"1\"") != null);
     const ordinary = run(&fake, .GET, "/search?q=wallpapers", &ar);
     try testing.expect(std.mem.indexOf(u8, ordinary.body, "class=\"gallery\"") == null and std.mem.indexOf(u8, ordinary.body, "<ol class=\"results\"") != null);
+    // An ordinary search leaves pictures out (the button finds them), unless the search itself asks for a kind of file.
+    var left_out = false;
+    for (fake.last.?.filter_strings) |f| if (std.mem.eql(u8, f, "-kind:image")) {
+        left_out = true;
+    };
+    try testing.expect(left_out);
+    _ = run(&fake, .GET, "/search?q=wallpapers+kind%3Aimage", &ar);
+    for (fake.last.?.filter_strings) |f| try testing.expect(!std.mem.eql(u8, f, "-kind:image"));
+    _ = run(&fake, .GET, "/search?q=wallpapers&filter=ext%3Apng", &ar);
+    for (fake.last.?.filter_strings) |f| try testing.expect(!std.mem.eql(u8, f, "-kind:image"));
     // With the button: the kind filter is added, the page is a grid of 40, and the pager keeps `images=1`.
     const g = run(&fake, .GET, "/search?q=wallpapers&images=1", &ar);
     try testing.expectEqual(http.Status.ok, g.status);
@@ -4408,4 +4441,16 @@ test "results report how the query was read and whether typos were allowed" {
     try testing.expect(std.mem.indexOf(u8, page.body, "similar spellings") != null);
     try testing.expect(std.mem.indexOf(u8, page.body, "&amp;fuzzy=0\">Search exactly as typed") != null);
     try testing.expect(std.mem.indexOf(u8, page.body, "Searching for: <code>linux OR bsd</code>") != null);
+}
+
+test "the browser's Accept-Language reaches the search, which ranks other languages lower" {
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    _ = handleSigned(a, fake.searcher(), .{}, .GET, "/search?q=odin", null, .{ .accept_language = "fr-CA,fr;q=0.9,en;q=0.5" });
+    try testing.expectEqual(@as(usize, 2), fake.last.?.prefer_languages.len);
+    try testing.expectEqualStrings("fr", fake.last.?.prefer_languages[0]);
+    _ = handleSigned(a, fake.searcher(), .{}, .GET, "/api/v1/search?q=odin", null, .{});
+    try testing.expectEqual(@as(usize, 0), fake.last.?.prefer_languages.len);
 }

@@ -249,6 +249,8 @@ pub const Scan = struct {
     generator: ?[]const u8 = null,
     /// `<link rel="EditURI" href="...">`: where a MediaWiki's API is (the address with `?action=rsd`).
     edit_uri: ?[]const u8 = null,
+    /// `<html lang="...">`: the language the page says it is in (as written, at most 35 characters).
+    lang: ?[]const u8 = null,
 };
 
 /// A picture of a page: where it is (as written in the page: it may be relative), what the page says it shows.
@@ -303,6 +305,13 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
             continue;
         }
         const body = html[lt..t.end];
+        if (out.lang == null and std.ascii.eqlIgnoreCase(t.name, "html")) {
+            if (attr(body, "lang")) |l| {
+                const v = std.mem.trim(u8, l, " \t\r\n\"'");
+                if (v.len >= 2 and v.len <= 35) out.lang = try arena.dupe(u8, v);
+            }
+            continue;
+        }
         if (max_images > 0 and images.items.len < max_images and std.ascii.eqlIgnoreCase(t.name, "img")) {
             const raw = attr(body, "src") orelse (attr(body, "data-src") orelse continue);
             const src = std.mem.trim(u8, raw, " \t\r\n");
@@ -600,4 +609,12 @@ test "a MediaWiki page says so, and where its API is" {
     try testing.expectEqualStrings("//wiki.e.org/w/api.php?action=rsd", s.edit_uri.?);
     const plain = try scan(ar.allocator(), "<head><meta name=\"robots\" content=\"noindex\"></head>", 10);
     try testing.expect(plain.generator == null and plain.edit_uri == null and plain.noindex);
+}
+
+test "the page's own language comes from the html element" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const s = try scan(ar.allocator(), "<!doctype html><html lang=\"zh-CN\" class=a><head><title>x</title></head><body></body></html>", 10);
+    try testing.expectEqualStrings("zh-CN", s.lang.?);
+    try testing.expect((try scan(ar.allocator(), "<html><body>x</body></html>", 10)).lang == null);
 }

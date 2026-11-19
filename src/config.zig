@@ -257,7 +257,7 @@ pub const SearchSettings = struct {
     /// Memory for the chunks of recently retrieved documents (MiB). 0 turns the cache off.
     retrieve_cache_mb: u32 = 128,
     /// The most results one domain may have in a search (0: no limit).
-    per_domain: u32 = 0,
+    per_domain: u32 = 3,
     /// Results of the sources boosted at least `trusted_min_boost` percent come first.
     trusted_first: bool = false,
     trusted_min_boost: u32 = 150,
