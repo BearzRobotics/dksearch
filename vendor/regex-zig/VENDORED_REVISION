@@ -1,3 +1,3 @@
-v0.3.0 (release tarball https://github.com/BearzRobotics/regex-zig/archive/refs/tags/v0.3.0.tar.gz, sha256 aceeb017df9009c906f8f39990101aa36c1785ea339ddb0731430a4e784334b3, 2026-11-19)
+v0.4.0 (release tarball https://github.com/BearzRobotics/regex-zig/archive/refs/tags/v0.4.0.tar.gz, sha256 81e33ddf0deffbcf079992096bc2c89369fa266332998c8f1198fa8df55164eb, 2026-11-20)
 
-Unmodified upstream: `src/`, `build.zig`, `build.zig.zon` and `SPEC.md` are copied as released. The local `utf8` change that dksearch carried on top of v0.1.0 (docs/decisions/0050-regex-on-characters.md) is gone: upstream has its own UTF-8 mode since 0.2.0 (`Options.utf8`), which dksearch uses.
+Unmodified upstream: `src/`, `build.zig`, `build.zig.zon`, `SPEC.md` and `README.md` are copied as released (the benchmarks, tools, docs and changelog are not vendored). The local `utf8` change that dksearch carried on top of v0.1.0 (docs/decisions/0050-regex-on-characters.md) is gone: upstream has its own UTF-8 mode since 0.2.0 (`Options.utf8`), which dksearch uses.
