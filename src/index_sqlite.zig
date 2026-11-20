@@ -1130,6 +1130,9 @@ pub const SqliteIndex = struct {
 
     /// A word in fewer documents than this is as likely a typo that is on a few pages as a word: it may be respelled.
     const known_min_docs = 30;
+    /// Words in fewer documents than this are not offered as corrections, in an index of at least `correction_min_total` documents.
+    const correction_min_docs = 5;
+    const correction_min_total = 1000;
 
     /// Whether the index has this word (lower case) as a word of its own: in at least `known_min_docs` documents.
     fn wordKnown(self: *SqliteIndex, word: []const u8) bool {
@@ -1155,6 +1158,10 @@ pub const SqliteIndex = struct {
         if (word.len == 0 or max_edits == 0) return &.{};
         const Found = struct { term: []const u8, edits: u8, docs: i64 };
         var found: std.ArrayList(Found) = .empty;
+        // A word in only a few documents is as likely a typo as a word: it is not offered as a correction. (This also makes the
+        // scan of the vocabulary several times faster: most of its terms are in a document or two.) A small index has no
+        // such words to ignore.
+        const min_docs: i64 = if (self.documentTotal() >= correction_min_total) correction_min_docs else 1;
         const lo_len: i64 = @as(i64, @intCast(word.len)) - max_edits;
         const hi_len: i64 = @as(i64, @intCast(word.len)) + max_edits;
         var guard: Deadline = undefined;
@@ -1171,9 +1178,9 @@ pub const SqliteIndex = struct {
             } else guard = .{ .io = undefined, .deadline_ns = 0 };
             // Tier 0: words with the same first letter (a range of the vocabulary). Tier 1: all of them.
             const sql = if (tier == 0)
-                "SELECT term, doc, dk_edits(term, ?1, ?2) FROM fts_vocab WHERE term >= ?3 AND term < ?4 AND length(term) BETWEEN ?5 AND ?6 AND dk_edits(term, ?1, ?2) IS NOT NULL"
+                "SELECT term, doc, dk_edits(term, ?1, ?2) FROM fts_vocab WHERE term >= ?3 AND term < ?4 AND length(term) BETWEEN ?5 AND ?6 AND doc >= ?7 AND dk_edits(term, ?1, ?2) IS NOT NULL"
             else
-                "SELECT term, doc, dk_edits(term, ?1, ?2) FROM fts_vocab WHERE length(term) BETWEEN ?5 AND ?6 AND dk_edits(term, ?1, ?2) IS NOT NULL";
+                "SELECT term, doc, dk_edits(term, ?1, ?2) FROM fts_vocab WHERE length(term) BETWEEN ?5 AND ?6 AND doc >= ?7 AND dk_edits(term, ?1, ?2) IS NOT NULL";
             const st = Stmt.prepare(self.db, sql) catch return &.{}; // an index made before this table: variants are used
             defer st.deinit();
             st.text(1, word) catch |e| return searchError(e);
@@ -1189,6 +1196,7 @@ pub const SqliteIndex = struct {
             }
             st.int(5, @max(lo_len, 1)) catch |e| return searchError(e);
             st.int(6, hi_len) catch |e| return searchError(e);
+            st.int(7, min_docs) catch |e| return searchError(e);
             while (st.step() catch |e| {
                 if (guard.fired) break; // out of time: what was found so far is used
                 return searchError(e);
@@ -3155,4 +3163,32 @@ test "a search of nothing but common words is a phrase when it can be, and other
     // An ordinary search is ranked as ever.
     const ranked = try searchAll(a, &idx, "question");
     try testing.expectEqual(@as(usize, 1), ranked.hits.len);
+}
+
+test "corrections are words of some standing: a word in a few documents is not offered, in a large index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{ .sync = .off });
+    defer idx.close();
+    idx.setFuzzyMode(.auto);
+    // 1,100 documents; "language" is in twenty of them and "langage" (a typo that is on two pages) in two.
+    var i: usize = 0;
+    while (i < 1100) : (i += 1) {
+        const text: []const u8 = if (i < 20) "a page about the language of notes" else if (i < 22) "a page about the langage of notes" else "plain filler words here";
+        _ = try put(&idx, "t", try std.fmt.allocPrint(a, "d{d}", .{i}), "Page", text);
+    }
+    // "langauge" is a typo of "language" (twenty documents), and also two edits from "langage" (two documents): only the first
+    // is offered, so the search finds the twenty.
+    const fixed = try searchAll(a, &idx, "langauge");
+    try testing.expectEqual(@as(usize, 10), fixed.hits.len); // the first page of the twenty
+    for (fixed.hits) |h| try testing.expect(std.mem.indexOf(u8, h.snippet.?, "langage") == null);
+    // The words of the corrections: "language" is, "langage" is not.
+    const near = try idx.searcher().words(a, "langauge", .spelling, 10);
+    var has_language = false;
+    for (near) |w| {
+        try testing.expect(!std.mem.eql(u8, w, "langage"));
+        if (std.mem.eql(u8, w, "language")) has_language = true;
+    }
+    try testing.expect(has_language);
 }

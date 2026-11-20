@@ -37,7 +37,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 
 **Search quality**
 - Near-duplicate collapse beyond the same address or text; related searches; the score breakdown on the results page (`explain=1` exists); opt-in browser-side session context.
-- Typo correction: about a second for a long word (a scan of the vocabulary), and rare near-words can outrank the word meant.
+- Typo correction now offers only words in five or more documents (in an index of a thousand or more), which is quicker and stops one-off garbage tokens being offered ("sourdough strater" finds the Sourdough article first). It still takes about a second when the corrected word is common ("lanague" matches 22,000 documents), because ranking is per matching row: every match is read, filtered and given its factors before the best are kept, and the per-domain step reads them all again. The fix is to rank the best few hundred candidates by the text score first and apply the filters, factors and per-domain limit to those, which touches paging and cursors (measured: 0.59 s for a search matching 22,000 documents, 0.24 s of it even when sorted by date).
 - The language of Latin-script pages that did not say it (a French page without `lang`) is still unknown, so the language factor cannot demote it; a small statistical guess from common words is the next step.
 - Other languages: question words, word forms and the language-of-address list are English only.
 
