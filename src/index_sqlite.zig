@@ -1113,13 +1113,17 @@ pub const SqliteIndex = struct {
         return out.items;
     }
 
-    /// Whether the index has this word (lower case) as a word of its own.
+    /// A word in fewer documents than this is as likely a typo that is on a few pages as a word: it may be respelled.
+    const known_min_docs = 30;
+
+    /// Whether the index has this word (lower case) as a word of its own: in at least `known_min_docs` documents.
     fn wordKnown(self: *SqliteIndex, word: []const u8) bool {
         if (!self.has_vocab or word.len == 0 or word.len > 64) return false;
-        const st = Stmt.prepare(self.db, "SELECT 1 FROM fts_vocab WHERE term = ?1 LIMIT 1") catch return false;
+        const st = Stmt.prepare(self.db, "SELECT doc FROM fts_vocab WHERE term = ?1 LIMIT 1") catch return false;
         defer st.deinit();
         st.text(1, word) catch return false;
-        return st.step() catch false;
+        if (!(st.step() catch false)) return false;
+        return st.colInt(0) >= known_min_docs;
     }
 
     fn knownCb(ctx: *anyopaque, word: []const u8) bool {
@@ -1199,8 +1203,22 @@ pub const SqliteIndex = struct {
             };
             if (at_best >= 1 and best < max_edits) n = @min(n, at_best);
         }
-        const out = try arena.alloc([]const u8, n);
-        for (found.items[0..n], out) |f, *o| o.* = f.term;
+        // A far commoner word that is further away is the likelier meant ("lanague": "langue" is one edit away, but
+        // "language" is in twenty times as many documents): it is added.
+        var extra: ?usize = null;
+        if (found.items.len > n) {
+            var top_close: i64 = 0;
+            for (found.items[0..n]) |f| top_close = @max(top_close, f.docs);
+            var best_docs: i64 = 0;
+            for (found.items[n..], n..) |f, i| if (f.docs > best_docs) {
+                best_docs = f.docs;
+                extra = i;
+            };
+            if (best_docs < top_close * 10) extra = null;
+        }
+        const out = try arena.alloc([]const u8, n + @as(usize, if (extra != null) 1 else 0));
+        for (found.items[0..n], out[0..n]) |f, *o| o.* = f.term;
+        if (extra) |i| out[n] = found.items[i].term;
         return out;
     }
 
@@ -3075,6 +3093,14 @@ test "a repeat for a misspelling respells only the words the index does not have
     _ = try put(&idx, "t", "2", "Linus", "Linus Torvalds started it");
     _ = try put(&idx, "t", "3", "Wheat", "wheat is a grain");
     _ = try put(&idx, "t", "4", "Cooking", "a language of food written in recipes");
+    // The words the index has are in many documents (a word on a few pages might be a typo); "langue" is one edit from
+    // "lanague" but rare, "language" is three edits away and common.
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        _ = try put(&idx, "t", try std.fmt.allocPrint(a, "n{d}", .{i}), "Note", try std.fmt.allocPrint(a, "linux written notes number {d}", .{i}));
+        _ = try put(&idx, "t", try std.fmt.allocPrint(a, "m{d}", .{i}), "Manual", try std.fmt.allocPrint(a, "language reference manual number {d}", .{i}));
+    }
+    _ = try put(&idx, "t", "fr", "Langue", "une langue vivante");
     // "lanague" is three edits from "language"; "what", "is" and "in" are question words, "linux" and "written" are words
     // the index has (and "linus" and "wheat" are near them, which must not matter).
     const page = try searchAll(a, &idx, "what lanague is linux written in");
