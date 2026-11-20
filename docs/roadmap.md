@@ -10,6 +10,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 - Pictures stay out of ordinary results (the Images button finds them), pages in languages the browser did not ask for rank lower, three results a domain by default (ADR 0061); question and filler words are not required (0062); a search of only common words is a phrase, or not ranked, and answers in milliseconds instead of seconds (0069); common words and excerpts made fast on a 414,000-document index (0056).
 - The title weight chosen against the owner's marks (0065). Spelling: only words the index lacks are respelled, and "Did you mean" no longer rewrites words that are right; filenames-as-titles rank lower; more HTML entities decoded.
 - Tried and measured, not adopted: other forms of a word by query (kept as the option `word_forms`, 0063) and a stemming index (mixed result, 0063).
+- `dksearch repair` brings stored crawl documents up to date without fetching: entities in titles decoded, untidy addresses merged or moved (166 duplicates removed on the playground), languages from the address or the script (0071).
 - A results page with "Page N" and links back to earlier pages; the gallery uses the width of the window.
 
 **The owner's tools**
@@ -37,7 +38,7 @@ Standing rules that shape every item: the core stays lexical and works with no A
 **Search quality**
 - Near-duplicate collapse beyond the same address or text; related searches; the score breakdown on the results page (`explain=1` exists); opt-in browser-side session context.
 - Typo correction: about a second for a long word (a scan of the vocabulary), and rare near-words can outrank the word meant.
-- Old documents keep what they had when stored: no page language, addresses with dot segments, entities in titles. A one-off backfill or a recrawl that does not stop at "not modified" would bring them up to date.
+- The language of Latin-script pages that did not say it (a French page without `lang`) is still unknown, so the language factor cannot demote it; a small statistical guess from common words is the next step.
 - Other languages: question words, word forms and the language-of-address list are English only.
 
 **Engineering**
