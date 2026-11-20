@@ -547,6 +547,28 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     }
 
     try writeFallback(w, f);
+    if (!f.images and page.hits.len >= 3) {
+        var buf: [max_narrow_tags]NarrowTag = undefined;
+        const common = commonTags(page.hits, &buf);
+        if (common.len > 0) {
+            try w.writeAll("<p class=\"related narrow\">Narrow by tag: ");
+            for (common) |c| {
+                if (std.mem.indexOfScalar(u8, c.tag, '"') != null) continue;
+                var tb: [96]u8 = undefined;
+                const clause = if (std.mem.indexOfScalar(u8, c.tag, ' ') != null)
+                    std.fmt.bufPrint(&tb, "tag:\"{s}\"", .{c.tag}) catch continue
+                else
+                    std.fmt.bufPrint(&tb, "tag:{s}", .{c.tag}) catch continue;
+                var lb: [400]u8 = undefined;
+                var lw: Writer = .fixed(&lb);
+                lw.writeAll("#") catch continue;
+                writeEscaped(&lw, c.tag) catch continue;
+                try writeSearchLink(w, f, 0, clause, lb[0..lw.end]);
+                try w.writeAll(" ");
+            }
+            try w.writeAll("</p>\n");
+        }
+    }
     if (f.related.len > 0 and !f.images) {
         try w.writeAll("<p class=\"related\">Related searches: ");
         for (f.related, 0..) |word, i| {
@@ -730,6 +752,55 @@ fn writeGallery(w: *Writer, f: Form, hits: []const dk.search.Hit) Writer.Error!v
     try w.writeAll("</ul>\n");
 }
 
+/// A tag as a link that lists every page with it (`tag:nature`, quoted when it has a space). A tag with a quote is not offered.
+fn writeTagChip(w: *Writer, tag: []const u8) Writer.Error!void {
+    if (tag.len == 0 or std.mem.indexOfScalar(u8, tag, '"') != null) return;
+    try w.writeAll("<a class=\"tag\" href=\"/search?q=tag%3A");
+    if (std.mem.indexOfScalar(u8, tag, ' ') != null) {
+        try w.writeAll("%22");
+        try query.writeEncoded(w, tag);
+        try w.writeAll("%22");
+    } else try query.writeEncoded(w, tag);
+    try w.writeAll("\" title=\"Every page tagged ");
+    try writeEscaped(w, tag);
+    try w.writeAll("\">#");
+    try writeEscaped(w, tag);
+    try w.writeAll("</a> ");
+}
+
+/// The tags that occur on at least two of the results, commonest first (at most `max_narrow_tags`): ways to narrow the search.
+const max_narrow_tags = 8;
+const NarrowTag = struct { tag: []const u8, count: u32 };
+
+fn commonTags(hits: []const dk.search.Hit, out: *[max_narrow_tags]NarrowTag) []const NarrowTag {
+    var seen: [96]NarrowTag = undefined;
+    var n: usize = 0;
+    for (hits) |h| for (h.tags) |t| {
+        var found = false;
+        for (seen[0..n]) |*s| if (std.mem.eql(u8, s.tag, t)) {
+            s.count += 1;
+            found = true;
+            break;
+        };
+        if (!found and n < seen.len) {
+            seen[n] = .{ .tag = t, .count = 1 };
+            n += 1;
+        }
+    };
+    var k: usize = 0;
+    while (k < max_narrow_tags) : (k += 1) {
+        var best: ?usize = null;
+        for (seen[0..n], 0..) |s, i| {
+            if (s.count < 2) continue;
+            if (best == null or s.count > seen[best.?].count) best = i;
+        }
+        const b = best orelse break;
+        out[k] = seen[b];
+        seen[b].count = 0;
+    }
+    return out[0..k];
+}
+
 fn finishHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
     if (h.snippet) |s| if (s.len > 0) {
         try w.writeAll("<p class=\"snippet\">");
@@ -739,6 +810,11 @@ fn finishHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
     for (h.more_snippets) |m| {
         try w.writeAll("<p class=\"snippet more\">");
         try writeSnippet(w, m);
+        try w.writeAll("</p>");
+    }
+    if (h.tags.len > 0) {
+        try w.writeAll("<p class=\"tags\">");
+        for (h.tags) |t| try writeTagChip(w, t);
         try w.writeAll("</p>");
     }
     try w.writeAll("<div class=\"source\">");
@@ -759,6 +835,10 @@ fn finishHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
         try w.writeAll(" &middot; ");
         try writeSize(w, n);
     }
+    if (h.author) |au| if (au.len > 0) {
+        try w.writeAll(" &middot; by ");
+        try writeEscaped(w, au);
+    };
     if (h.modified_at) |t| {
         try w.writeAll(" &middot; ");
         try writeDate(w, t);
@@ -1197,4 +1277,31 @@ test "related searches are links with the word added to the query, and nothing i
     const none = try render(writeResults, .{ Form{ .q = "linux" }, page, @as(u32, 0), @as(u32, 10) });
     defer testing.allocator.free(none);
     try testing.expect(std.mem.indexOf(u8, none, "Related searches") == null);
+}
+
+test "a result shows its tags as links, and tags shared by several results are offered to narrow the search" {
+    const t1 = [_][]const u8{ "nature", "long exposure", "a&b" };
+    const t2 = [_][]const u8{ "nature", "night" };
+    const t3 = [_][]const u8{ "nature", "long exposure", "say \"hi\"" };
+    var hits = [_]dk.search.Hit{
+        .{ .id = @splat(1), .connector = "web", .url = "https://e.org/a", .title = "A", .snippet = null, .score = 3, .tags = &t1 },
+        .{ .id = @splat(2), .connector = "web", .url = "https://e.org/b", .title = "B", .snippet = null, .score = 2, .tags = &t2 },
+        .{ .id = @splat(3), .connector = "web", .url = "https://e.org/c", .title = "C", .snippet = null, .score = 1, .tags = &t3 },
+    };
+    const out = try render(writeResults, .{ Form{ .q = "sky" }, dk.search.Page{ .hits = &hits, .has_more = false }, @as(u32, 0), @as(u32, 10) });
+    defer testing.allocator.free(out);
+    // Chips: a space is quoted, markup is escaped, a tag with a quote is not offered.
+    try testing.expect(std.mem.indexOf(u8, out, "<a class=\"tag\" href=\"/search?q=tag%3Anature\" title=\"Every page tagged nature\">#nature</a>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "href=\"/search?q=tag%3A%22long%20exposure%22\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, ">#a&amp;b</a>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "say") == null);
+    // Narrowing: only tags on two or more results, commonest first, added to the query.
+    try testing.expect(std.mem.indexOf(u8, out, "Narrow by tag: <a href=\"/search?q=sky%20tag%3Anature\">#nature</a> <a href=\"/search?q=sky%20tag%3A%22long%20exposure%22\">#long exposure</a>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "#night</a> <") == null or std.mem.indexOf(u8, out, "Narrow by tag: <a href=\"/search?q=sky%20tag%3Anight") == null);
+    // Without tags nothing is shown.
+    var bare = [_]dk.search.Hit{ hits[0], hits[1], hits[2] };
+    for (&bare) |*h| h.tags = &.{};
+    const none = try render(writeResults, .{ Form{ .q = "sky" }, dk.search.Page{ .hits = &bare, .has_more = false }, @as(u32, 0), @as(u32, 10) });
+    defer testing.allocator.free(none);
+    try testing.expect(std.mem.indexOf(u8, none, "Narrow by tag") == null and std.mem.indexOf(u8, none, "class=\"tags\"") == null);
 }

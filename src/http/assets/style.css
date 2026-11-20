@@ -418,3 +418,7 @@ details.why p { margin: 0.2rem 0 0; font-variant-numeric: tabular-nums; }
 
 /* Related searches under the results */
 p.related { margin: 1.4rem 0 0; color: var(--muted); font-size: 0.95rem; }
+p.related.narrow a { margin-right: 0.35rem; }
+p.tags { margin: 0.2rem 0 0; font-size: 0.85rem; line-height: 1.7; }
+p.tags a.tag { color: var(--muted); text-decoration: none; margin-right: 0.15rem; padding: 0.05rem 0.4rem; border: 1px solid var(--border, currentColor); border-radius: 0.8rem; white-space: nowrap; }
+p.tags a.tag:hover { text-decoration: underline; }

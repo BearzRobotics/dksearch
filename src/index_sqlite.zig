@@ -137,6 +137,12 @@ pub const SqliteIndex = struct {
     /// Newer documents rank higher by up to this many percent (0 = off); the boost halves for every
     /// `recency_days` of age (`[search] recency_boost`, `recency_half_life_days`).
     recency_percent: u32 = 0,
+    /// `[search] tag_boost`: percent more for a page whose tags include a word of the search.
+    tag_boost_percent: u32 = 0,
+    /// Set around one search: the plain words of the query (a weak match with a page's tags), and the hashtags typed (`#nature`:
+    /// pages with that tag first).
+    tag_words: []const []const u8 = &.{},
+    hash_tags: []const []const u8 = &.{},
     recency_days: u32 = 365,
     /// Stop words and synonyms applied to searches (must outlive the index); null for none.
     lexicon: ?*const lexicon_mod.Lexicon = null,
@@ -295,6 +301,10 @@ pub const SqliteIndex = struct {
         if (safe and !l.safe.isEmpty()) return " AND NOT dk_banned(d.domain, 1)";
         if (!l.blocked.isEmpty()) return " AND NOT dk_banned(d.domain, 0)";
         return "";
+    }
+
+    pub fn setTagBoost(self: *SqliteIndex, percent: u32) void {
+        self.tag_boost_percent = percent;
     }
 
     pub fn setRecency(self: *SqliteIndex, percent: u32, half_life_days: u32) void {
@@ -1008,7 +1018,37 @@ pub const SqliteIndex = struct {
         return out.items;
     }
 
+    /// A search, then the tags of the hits it found (a few small reads) for the page to show.
     pub fn searchImpl(ptr: *anyopaque, arena: Allocator, q: search.Query) search.Error!search.Page {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
+        self.hash_tags = if (self.has_meta) try hashtagsOf(arena, q.text) else &.{};
+        defer {
+            self.hash_tags = &.{};
+            self.tag_words = &.{};
+        }
+        var page = try searchInner(ptr, arena, q);
+        if (self.has_meta and page.hits.len > 0) {
+            const hits = try arena.dupe(search.Hit, page.hits);
+            for (hits) |*h| h.tags = self.tagsOf(arena, h.id);
+            page.hits = hits;
+        }
+        return page;
+    }
+
+    /// The tags of a document, at most `search.max_hit_tags`, in the order they were stored (the page's own order); none on an error.
+    fn tagsOf(self: *SqliteIndex, arena: Allocator, id: doc.Id) []const []const u8 {
+        const st = Stmt.prepare(self.db, "SELECT m.value FROM doc_meta m JOIN docs d ON d.rowid = m.doc WHERE d.id = ?1 AND m.key = 'tag' AND m.value <> 'image' ORDER BY m.rowid LIMIT ?2") catch return &.{};
+        defer st.deinit();
+        st.blob(1, &id) catch return &.{};
+        st.int(2, search.max_hit_tags) catch return &.{};
+        var out: std.ArrayList([]const u8) = .empty;
+        while (st.step() catch return out.items) {
+            if (st.colText(0)) |t| out.append(arena, arena.dupe(u8, t) catch return out.items) catch return out.items;
+        }
+        return out.items;
+    }
+
+    fn searchInner(ptr: *anyopaque, arena: Allocator, q: search.Query) search.Error!search.Page {
         const self: *SqliteIndex = @ptrCast(@alignCast(ptr));
 
         const limit: u32 = if (q.limit == 0) search.default_limit else q.limit;
@@ -1052,6 +1092,7 @@ pub const SqliteIndex = struct {
             return e;
         };
         const all = try mergeFilters(arena, base_filters, first.filters);
+        if (self.tag_boost_percent > 0) self.tag_words = try plainTagWords(arena, first.terms);
         const t0: i96 = if (self.timeout) |t| Io.Timestamp.now(t.io, .awake).nanoseconds else 0;
         const own = first.terms.len > 0 and !self.isPorter();
         // A search of nothing but words too common to rank ("the", "to be or not to be"): several words are tried as one phrase
@@ -1576,12 +1617,22 @@ pub const SqliteIndex = struct {
         if (self.has_meta and text_mode) if (try langprefer.csv(arena, q.prefer_languages)) |list| {
             lang_expr = try std.fmt.allocPrint(arena, " * dk_foreign(d.language, d.path, '{s}')", .{list});
         };
-        try factors.print(arena, "{s} * {s}{s}{s}{s}", .{ src_expr, rec_expr, demote_expr, lang_expr, file_title_expr });
+        // Pages whose own tags match: a hashtag typed (`#nature`) puts the pages with that tag well ahead; a plain word of the
+        // search that is also one of the page's tags counts `tag_boost` percent (off by default).
+        var tag_expr: []const u8 = "";
+        if (self.has_meta and text_mode and !self.unranked) {
+            if (self.hash_tags.len > 0) tag_expr = try tagFactor(arena, self.hash_tags, "3.0");
+            if (self.tag_boost_percent > 0 and self.tag_words.len > 0) {
+                const weak = try std.fmt.allocPrint(arena, "{d}.{d:0>2}", .{ 1 + self.tag_boost_percent / 100, self.tag_boost_percent % 100 });
+                tag_expr = try std.fmt.allocPrint(arena, "{s}{s}", .{ tag_expr, try tagFactor(arena, self.tag_words, weak) });
+            }
+        }
+        try factors.print(arena, "{s} * {s}{s}{s}{s}{s}", .{ src_expr, rec_expr, demote_expr, lang_expr, file_title_expr, tag_expr });
         // A heavy search (only words too common to rank, `unranked`): no ranking, the most recently stored documents first,
         // which SQLite can stop reading after a page; ranking millions of matches is what took seconds.
         const bm = if (self.unranked) "0.0" else if (self.candidate_k != null) try std.fmt.allocPrint(arena, "c.score * {s}", .{factors.items}) else try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0) * {s}", .{ self.title_weight, self.body_weight, factors.items });
         const explain_cols = if (q.explain and text_mode)
-            try std.fmt.allocPrint(arena, ", -bm25(fts, {d}.0, {d}.0), -bm25(fts, 1.0, 0.0), -bm25(fts, 0.0, 1.0), {s}, {s}, 1.0{s}{s}{s}", .{ self.title_weight, self.body_weight, src_expr, rec_expr, demote_expr, lang_expr, file_title_expr })
+            try std.fmt.allocPrint(arena, ", -bm25(fts, {d}.0, {d}.0), -bm25(fts, 1.0, 0.0), -bm25(fts, 0.0, 1.0), {s}, {s}, 1.0{s}{s}{s}{s}", .{ self.title_weight, self.body_weight, src_expr, rec_expr, demote_expr, lang_expr, file_title_expr, tag_expr })
         else
             "";
         // Trusted first: the sources boosted at least `trusted_min_percent` form the first group.
@@ -1788,6 +1839,10 @@ pub const SearchPool = struct {
 
     pub fn setLexicon(self: *SearchPool, l: ?*const lexicon_mod.Lexicon) void {
         for (self.slots) |*sl| sl.index.setLexicon(l);
+    }
+
+    pub fn setTagBoost(self: *SearchPool, percent: u32) void {
+        for (self.slots) |*sl| sl.index.setTagBoost(percent);
     }
 
     pub fn setRecency(self: *SearchPool, percent: u32, half_life_days: u32) void {
@@ -3274,4 +3329,86 @@ test "the candidates shortcut gives the exact first page, and the exact query wh
     // A deep page is not served from the candidates, and a search with few matches does not use them at all.
     const few = try idx.searcher().search(a, .{ .text = "longer gadget", .limit = 5, .offset = 590 });
     try testing.expect(few.hits.len <= 5);
+}
+
+/// A word safe to write into SQL as a tag to compare with: letters, digits and non-ASCII bytes only, lower-cased.
+fn tagWord(arena: Allocator, w: []const u8) Allocator.Error!?[]const u8 {
+    if (w.len < 2 or w.len > 60) return null;
+    for (w) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch >= 0x80)) return null;
+    return try std.ascii.allocLowerString(arena, w);
+}
+
+/// The plain (not prefix) words of a query that can be compared with a page's tags.
+fn plainTagWords(arena: Allocator, terms: []const @import("snippets.zig").Term) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (terms) |t| {
+        if (t.prefix or out.items.len >= 8) continue;
+        if (try tagWord(arena, t.text)) |w| try out.append(arena, w);
+    }
+    return out.items;
+}
+
+/// The hashtags typed in a search (`#Nature #3d`): a `#` at the start or after a space, then letters and digits; lower case, at most 8.
+fn hashtagsOf(arena: Allocator, text: []const u8) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, i, '#')) |h| {
+        i = h + 1;
+        if (h > 0 and !std.ascii.isWhitespace(text[h - 1]) and text[h - 1] != '(' and text[h - 1] != '-') continue;
+        var e = i;
+        while (e < text.len and (std.ascii.isAlphanumeric(text[e]) or text[e] >= 0x80)) : (e += 1) {}
+        const word = text[i..e];
+        i = e;
+        if (out.items.len >= 8) break;
+        if (try tagWord(arena, word)) |w| try out.append(arena, w);
+    }
+    return out.items;
+}
+
+test "hashtags typed in a search are found; the middle of a word and other characters are not" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const got = try hashtagsOf(a, "#Linux kernel #Nature (#3D) C# a#b #' # #x");
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqualStrings("linux", got[0]);
+    try testing.expectEqualStrings("nature", got[1]);
+    try testing.expectEqualStrings("3d", got[2]);
+}
+
+/// ` * (CASE WHEN <the page has one of these tags> THEN <factor> ELSE 1.0 END)`; the words are safe (see `tagWord`).
+fn tagFactor(arena: Allocator, words: []const []const u8, factor: []const u8) Allocator.Error![]const u8 {
+    var list: std.ArrayList(u8) = .empty;
+    for (words, 0..) |w, k| {
+        if (k > 0) try list.append(arena, ',');
+        try list.print(arena, "'{s}'", .{w});
+    }
+    return std.fmt.allocPrint(arena, " * (CASE WHEN EXISTS (SELECT 1 FROM doc_meta m WHERE m.doc = d.rowid AND m.key = 'tag' AND m.value IN ({s})) THEN {s} ELSE 1.0 END)", .{ list.items, factor });
+}
+
+test "a hashtag in the search puts pages with that tag first, and a hit carries its tags" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    // "sunset" is the whole text of the first page, so by text alone it would rank first; the third is tagged.
+    try putDoc(&idx, .{ .connector = "web", .source_id = "1", .title = "Sunset", .text = "sunset sunset sunset", .canonical_url = "https://a.example/1" });
+    try putDoc(&idx, .{ .connector = "web", .source_id = "2", .title = "Notes", .text = "a long page that mentions a sunset once among many other words about boats and tides", .canonical_url = "https://b.example/2" });
+    try putDoc(&idx, .{ .connector = "web", .source_id = "3", .title = "Gallery", .text = "pictures of the evening sky. Tags: sunset, long exposure", .canonical_url = "https://c.example/3", .extra = &.{ .{ .key = "tag", .value = "sunset" }, .{ .key = "tag", .value = "long exposure" } } });
+    // Without the hashtag the tag counts for nothing (the option is off): the page that says it most ranks first.
+    const plain = try searchAll(a, &idx, "sunset");
+    try testing.expectEqual(@as(usize, 3), plain.hits.len);
+    try testing.expectEqualStrings("Sunset", plain.hits[0].title.?);
+    // With it, the tagged page is first, and the other pages that have the word are still found.
+    const tagged = try searchAll(a, &idx, "#Sunset");
+    try testing.expectEqual(@as(usize, 3), tagged.hits.len);
+    try testing.expectEqualStrings("Gallery", tagged.hits[0].title.?);
+    try testing.expectEqual(@as(usize, 2), tagged.hits[0].tags.len);
+    try testing.expectEqualStrings("sunset", tagged.hits[0].tags[0]);
+    try testing.expectEqual(@as(usize, 0), tagged.hits[1].tags.len);
+    // The option makes a plain word count too.
+    idx.setTagBoost(500);
+    const boosted = try searchAll(a, &idx, "sunset");
+    try testing.expectEqualStrings("Gallery", boosted.hits[0].title.?);
 }

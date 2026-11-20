@@ -1392,9 +1392,11 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         p.setSimpleSyntax(!cfg.search.advanced_syntax);
         p.setWeights(cfg.search.title_weight, cfg.search.body_weight);
         p.setRecency(cfg.search.recency_boost, cfg.search.recency_half_life_days);
+        p.setTagBoost(cfg.search.tag_boost);
     }
     index.setWeights(cfg.search.title_weight, cfg.search.body_weight);
     index.setRecency(cfg.search.recency_boost, cfg.search.recency_half_life_days);
+    index.setTagBoost(cfg.search.tag_boost);
     index.setFuzzyMode(fuzzy_mode);
     index.setCommonPercent(cfg.search.common_word_percent);
     index.setWordForms(cfg.search.word_forms);
@@ -2011,6 +2013,7 @@ fn evalCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, judgments_p
     // The search settings of the configuration, as `serve` applies them, so the numbers are those of the running search.
     index.setWeights(cfg.search.title_weight, cfg.search.body_weight);
     index.setRecency(cfg.search.recency_boost, cfg.search.recency_half_life_days);
+    index.setTagBoost(cfg.search.tag_boost);
     index.setFuzzyMode(switch (cfg.search.fuzzy) {
         .off => .off,
         .auto => .auto,

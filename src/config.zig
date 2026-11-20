@@ -253,6 +253,8 @@ pub const SearchSettings = struct {
     /// Newer documents rank higher by up to this many percent (0 = off), the boost halving for every
     /// `recency_half_life_days` of age.
     recency_boost: u32 = 0,
+    /// A page whose own tags include a word of the query ranks this many percent higher; 0: off (ADR 0075).
+    tag_boost: u32 = 0,
     recency_half_life_days: u32 = 365,
     /// Files of stop words and of synonym groups applied to searches (see the manual); null for none.
     chunk_index_min_kb: u32 = 64,
@@ -496,7 +498,7 @@ const server_keys = [_][]const u8{
 const admin_keys = server_keys ++ [_][]const u8{ "secrets_file", "session_idle_minutes", "session_max_hours", "cookie_secure", "actions", "backup_dir", "zim_dir" };
 const storage_keys = [_][]const u8{"data_dir"};
 const index_keys = [_][]const u8{"tokenizer"};
-const search_keys = [_][]const u8{ "common_word_percent", "word_forms", "fuzzy", "title_weight", "body_weight", "recency_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "per_domain", "trusted_first", "trusted_min_boost", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
+const search_keys = [_][]const u8{ "common_word_percent", "word_forms", "fuzzy", "title_weight", "body_weight", "recency_boost", "tag_boost", "recency_half_life_days", "stop_words_file", "synonyms_file", "chunk_index_min_kb", "retrieve_cache_mb", "per_domain", "trusted_first", "trusted_min_boost", "peer_cache_seconds", "default_collection", "query_syntax", "query_timeout_ms", "regex", "regex_max_pattern", "regex_max_candidates", "regex_budget_ms", "regex_max_steps", "regex_concurrency" };
 const top_keys = [_][]const u8{ "server", "admin", "storage", "index", "search", "source", "collection", "access", "node", "peer", "docserver", "embeddings", "fallback", "ollama", "answers", "filters", "safe_search", "images" };
 
 /// Parses and validates configuration text. `source_name` is only used in
@@ -647,6 +649,7 @@ fn build(gpa: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) 
         if (try intIn(src, "search", t, "trusted_min_boost", 101, 10000, diag)) |n| cfg.search.trusted_min_boost = @intCast(n);
         if (try intIn(src, "search", t, "peer_cache_seconds", 0, 3600, diag)) |n| cfg.search.peer_cache_seconds = @intCast(n);
         if (try intIn(src, "search", t, "recency_boost", 0, 1000, diag)) |n| cfg.search.recency_boost = @intCast(n);
+        if (try intIn(src, "search", t, "tag_boost", 0, 1000, diag)) |n| cfg.search.tag_boost = @intCast(n);
         if (try intIn(src, "search", t, "recency_half_life_days", 1, 36500, diag)) |n| cfg.search.recency_half_life_days = @intCast(n);
         if (try intIn(src, "search", t, "query_timeout_ms", 0, 60_000, diag)) |n| cfg.search.query_timeout_ms = @intCast(n);
         if (try optBool(src, "search", t, "regex", diag)) |b| cfg.search.regex = b;

@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const dates = @import("connectors/feeds/dates.zig");
 
 const block_tags = [_][]const u8{
     "p",  "br", "div", "li",    "ul",         "ol",  "h1", "h2",      "h3",      "h4",     "h5",     "h6",
@@ -282,7 +283,85 @@ pub const Scan = struct {
     tags: []const []const u8 = &.{},
     /// The page's own description (`<meta name="description">`, `og:description`, JSON-LD), at most `max_description` characters.
     description: ?[]const u8 = null,
+    /// Who the page says wrote it (`author` metas, JSON-LD `author`), when it was published and last changed (Unix seconds).
+    author: ?[]const u8 = null,
+    published_at: ?i64 = null,
+    modified_at: ?i64 = null,
+    /// What the page says about itself beyond words (ADR 0075): `type` (`og:type`: article, video.movie), `site`, and for a
+    /// video or picture its `duration` ("1:02:03") and `resolution` ("1920x1080").
+    facts: []const Fact = &.{},
 };
+
+pub const Fact = struct { key: []const u8, value: []const u8 };
+
+/// What the metas and JSON-LD of a page say about it, gathered while the page is scanned.
+const Meta = struct {
+    facts: std.ArrayList(Fact) = .empty,
+    width: ?[]const u8 = null,
+    height: ?[]const u8 = null,
+
+    fn fact(m: *Meta, arena: Allocator, key: []const u8, value: []const u8) Allocator.Error!void {
+        for (m.facts.items) |f| if (std.mem.eql(u8, f.key, key)) return;
+        const v = std.mem.trim(u8, value, " \t\r\n");
+        if (v.len == 0 or v.len > 80) return;
+        try m.facts.append(arena, .{ .key = key, .value = try decodeEntities(arena, v) });
+    }
+};
+
+/// The seconds of an ISO 8601 duration (`PT1H2M3S`, `PT90S`, `P1DT2H`; fractions of a second dropped), or null.
+pub fn isoDuration(s: []const u8) ?u64 {
+    if (s.len < 3 or s.len > 40 or (s[0] != 'P' and s[0] != 'p')) return null;
+    var total: u64 = 0;
+    var in_time = false;
+    var num: u64 = 0;
+    var have_num = false;
+    var any = false;
+    var frac = false;
+    for (s[1..]) |ch| {
+        if (std.ascii.isDigit(ch)) {
+            if (frac) continue;
+            num = num *| 10 +| (ch - '0');
+            have_num = true;
+        } else if (ch == '.' or ch == ',') {
+            frac = true;
+        } else {
+            const unit = std.ascii.toUpper(ch);
+            if (unit == 'T') {
+                in_time = true;
+                continue;
+            }
+            if (!have_num) return null;
+            const mult: u64 = switch (unit) {
+                'D' => 86400,
+                'H' => if (in_time) 3600 else return null,
+                'M' => if (in_time) 60 else 30 * 86400,
+                'S' => if (in_time) 1 else return null,
+                'W' => 7 * 86400,
+                else => return null,
+            };
+            total +|= num *| mult;
+            num = 0;
+            have_num = false;
+            frac = false;
+            any = true;
+        }
+    }
+    if (have_num or !any) return null;
+    return total;
+}
+
+/// "1:02:03" or "12:34" (a duration of at most a day), from seconds.
+fn formatDuration(arena: Allocator, secs: u64) Allocator.Error!?[]const u8 {
+    if (secs == 0 or secs > 86400 * 2) return null;
+    if (secs >= 3600) return try std.fmt.allocPrint(arena, "{d}:{d:0>2}:{d:0>2}", .{ secs / 3600, secs % 3600 / 60, secs % 60 });
+    return try std.fmt.allocPrint(arena, "{d}:{d:0>2}", .{ secs / 60, secs % 60 });
+}
+
+fn isNumber(s: []const u8) bool {
+    if (s.len == 0 or s.len > 5) return false;
+    for (s) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
 
 pub const max_tags = 100;
 pub const max_tag_len = 60;
@@ -418,35 +497,119 @@ fn innerText(arena: Allocator, html: []const u8, start: usize, closing: []const 
     return out.items;
 }
 
-/// The keywords and the description of a JSON-LD block (`{"keywords": "a, b", "description": "..."}`, possibly nested in
-/// `@graph` or arrays): a block that is not JSON, or is too deep, gives nothing.
-fn readJsonLd(arena: Allocator, content: []const u8, tags: *std.ArrayList([]const u8), description: *?[]const u8) Allocator.Error!void {
+/// What a JSON-LD block says about the page (`{"keywords": "a, b", "description": "...", "author": {"name": "..."}}`, possibly
+/// nested in `@graph` or arrays): keywords, description, author, dates, and a video's or picture's duration and size. A block
+/// that is not JSON, or is too deep, gives nothing.
+fn readJsonLd(arena: Allocator, content: []const u8, tags: *std.ArrayList([]const u8), out: *Scan, meta: *Meta) Allocator.Error!void {
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena, content, .{}) catch return;
-    try walkJsonLd(arena, root, 0, tags, description);
+    try walkJsonLd(arena, root, 0, tags, out, meta);
 }
 
-fn walkJsonLd(arena: Allocator, v: std.json.Value, depth: u32, tags: *std.ArrayList([]const u8), description: *?[]const u8) Allocator.Error!void {
+fn jsonText(v: std.json.Value) ?[]const u8 {
+    return switch (v) {
+        .string => |s| s,
+        .integer, .float, .number_string => null,
+        else => null,
+    };
+}
+
+/// A name from a JSON-LD author: a string, an object with a `name`, or the first of an array of them.
+fn ldAuthor(v: std.json.Value) ?[]const u8 {
+    switch (v) {
+        .string => |s| return s,
+        .object => |o| if (o.get("name")) |n| return jsonText(n),
+        .array => |a| if (a.items.len > 0) return ldAuthor(a.items[0]),
+        else => {},
+    }
+    return null;
+}
+
+fn walkJsonLd(arena: Allocator, v: std.json.Value, depth: u32, tags: *std.ArrayList([]const u8), out: *Scan, meta: *Meta) Allocator.Error!void {
     if (depth > 6) return;
     switch (v) {
         .object => |o| {
             var it = o.iterator();
             while (it.next()) |e| {
                 const key = e.key_ptr.*;
+                const val = e.value_ptr.*;
                 if (std.ascii.eqlIgnoreCase(key, "keywords")) {
-                    switch (e.value_ptr.*) {
+                    switch (val) {
                         .string => |s| try addTagList(arena, tags, s, ",;"),
                         .array => |a| for (a.items[0..@min(a.items.len, 100)]) |item| if (item == .string) try addTag(arena, tags, item.string),
                         else => {},
                     }
                 } else if (std.ascii.eqlIgnoreCase(key, "description")) {
-                    if (description.* == null and e.value_ptr.* == .string) description.* = try cleanDescription(arena, e.value_ptr.string);
+                    if (out.description == null and val == .string) out.description = try cleanDescription(arena, val.string);
+                } else if (std.ascii.eqlIgnoreCase(key, "author") or std.ascii.eqlIgnoreCase(key, "creator")) {
+                    if (out.author == null) if (ldAuthor(val)) |n| {
+                        out.author = try cleanAuthor(arena, n);
+                    };
+                    if (val == .object) try walkJsonLd(arena, val, depth + 1, tags, out, meta);
+                } else if (std.ascii.eqlIgnoreCase(key, "datePublished") or std.ascii.eqlIgnoreCase(key, "uploadDate") or std.ascii.eqlIgnoreCase(key, "dateCreated")) {
+                    if (out.published_at == null) if (jsonText(val)) |s| {
+                        out.published_at = dates.parseIso(s);
+                    };
+                } else if (std.ascii.eqlIgnoreCase(key, "dateModified")) {
+                    if (out.modified_at == null) if (jsonText(val)) |s| {
+                        out.modified_at = dates.parseIso(s);
+                    };
+                } else if (std.ascii.eqlIgnoreCase(key, "duration")) {
+                    if (jsonText(val)) |s| if (isoDuration(s)) |secs| if (try formatDuration(arena, secs)) |f| try meta.fact(arena, "duration", f);
+                } else if (std.mem.eql(u8, key, "width") or std.mem.eql(u8, key, "height")) {
+                    var buf: [16]u8 = undefined;
+                    const text: ?[]const u8 = switch (val) {
+                        .integer => |n| if (n > 0 and n < 100000) std.fmt.bufPrint(&buf, "{d}", .{n}) catch null else null,
+                        .string => |s| if (isNumber(s)) s else null,
+                        else => null,
+                    };
+                    if (text) |t| {
+                        const kept = try arena.dupe(u8, t);
+                        if (key[0] == 'w') {
+                            if (meta.width == null) meta.width = kept;
+                        } else if (meta.height == null) meta.height = kept;
+                    }
                 } else {
-                    try walkJsonLd(arena, e.value_ptr.*, depth + 1, tags, description);
+                    try walkJsonLd(arena, val, depth + 1, tags, out, meta);
                 }
             }
         },
-        .array => |a| for (a.items[0..@min(a.items.len, 50)]) |item| try walkJsonLd(arena, item, depth + 1, tags, description),
+        .array => |a| for (a.items[0..@min(a.items.len, 50)]) |item| try walkJsonLd(arena, item, depth + 1, tags, out, meta),
         else => {},
+    }
+}
+
+/// An author's name: not an address, not a long text; entities decoded.
+fn cleanAuthor(arena: Allocator, raw: []const u8) Allocator.Error!?[]const u8 {
+    const t = std.mem.trim(u8, raw, " \t\r\n");
+    if (t.len == 0 or t.len > 120 or std.mem.indexOf(u8, t, "://") != null) return null;
+    return try decodeEntities(arena, t);
+}
+
+/// The author, dates, type, site, and a video's or picture's duration and size that a `<meta>` gives.
+fn readMetaFacts(arena: Allocator, name: []const u8, content: []const u8, out: *Scan, meta: *Meta) Allocator.Error!void {
+    const author_metas = [_][]const u8{ "author", "article:author", "og:article:author", "parsely-author", "dc.creator", "sailthru.author", "video:director" };
+    const published_metas = [_][]const u8{ "article:published_time", "og:article:published_time", "datepublished", "uploaddate", "date", "dc.date", "dc.date.issued", "pubdate", "publishdate", "parsely-pub-date", "og:video:release_date", "video:release_date", "sailthru.date" };
+    const modified_metas = [_][]const u8{ "article:modified_time", "og:updated_time", "datemodified", "og:article:modified_time" };
+    if (out.author == null) for (author_metas) |m| if (std.ascii.eqlIgnoreCase(name, m)) {
+        out.author = try cleanAuthor(arena, content);
+    };
+    if (out.published_at == null) for (published_metas) |m| if (std.ascii.eqlIgnoreCase(name, m)) {
+        out.published_at = dates.parseIso(content);
+    };
+    if (out.modified_at == null) for (modified_metas) |m| if (std.ascii.eqlIgnoreCase(name, m)) {
+        out.modified_at = dates.parseIso(content);
+    };
+    const c = std.mem.trim(u8, content, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(name, "og:type")) {
+        if (c.len <= 40) try meta.fact(arena, "type", try std.ascii.allocLowerString(arena, c));
+    } else if (std.ascii.eqlIgnoreCase(name, "og:site_name")) {
+        try meta.fact(arena, "site", c);
+    } else if (std.ascii.eqlIgnoreCase(name, "og:video:duration") or std.ascii.eqlIgnoreCase(name, "video:duration") or std.ascii.eqlIgnoreCase(name, "music:duration")) {
+        if (isNumber(c)) if (try formatDuration(arena, std.fmt.parseInt(u64, c, 10) catch 0)) |f| try meta.fact(arena, "duration", f);
+    } else if (std.ascii.eqlIgnoreCase(name, "og:video:width") or std.ascii.eqlIgnoreCase(name, "og:image:width")) {
+        if (isNumber(c) and meta.width == null) meta.width = try arena.dupe(u8, c);
+    } else if (std.ascii.eqlIgnoreCase(name, "og:video:height") or std.ascii.eqlIgnoreCase(name, "og:image:height")) {
+        if (isNumber(c) and meta.height == null) meta.height = try arena.dupe(u8, c);
     }
 }
 
@@ -465,6 +628,7 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
     var images: std.ArrayList(PageImage) = .empty;
     var feeds: std.ArrayList([]const u8) = .empty;
     var tags: std.ArrayList([]const u8) = .empty;
+    var meta: Meta = .{};
     var missing_end: [dropped_tags.len]bool = @splat(false);
     var budget: Budget = .{};
     var i: usize = 0;
@@ -495,7 +659,7 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
                     if (std.ascii.eqlIgnoreCase(t.name, "script")) if (attr(html[lt..t.end], "type")) |ty| if (std.ascii.findIgnoreCase(ty, "ld+json") != null) {
                         const raw = html[t.end..e];
                         const cut = std.mem.lastIndexOf(u8, raw, "</") orelse raw.len;
-                        if (cut <= max_ld_bytes) try readJsonLd(arena, raw[0..cut], &tags, &out.description);
+                        if (cut <= max_ld_bytes) try readJsonLd(arena, raw[0..cut], &tags, &out, &meta);
                     };
                     i = e;
                 } else missing_end[k] = true;
@@ -563,7 +727,7 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
             if (try innerText(arena, html, t.end, "</a")) |tx| try addTag(arena, &tags, tx);
         };
         if (std.ascii.eqlIgnoreCase(t.name, "meta")) {
-            const name = attr(body, "name") orelse (attr(body, "property") orelse continue);
+            const name = attr(body, "name") orelse (attr(body, "property") orelse (attr(body, "itemprop") orelse continue));
             if (attr(body, "content")) |c| {
                 const keyword_metas = [_][]const u8{ "keywords", "news_keywords", "parsely-tags", "sailthru.tags" };
                 const single_tag_metas = [_][]const u8{ "article:tag", "og:video:tag", "video:tag", "book:tag" };
@@ -573,6 +737,7 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
                 if (out.description == null) for (description_metas) |m| if (std.ascii.eqlIgnoreCase(name, m)) {
                     out.description = try cleanDescription(arena, c);
                 };
+                try readMetaFacts(arena, name, c, &out, &meta);
             }
             if (std.ascii.eqlIgnoreCase(name, "generator")) {
                 if (attr(body, "content")) |g| if (out.generator == null and g.len <= 120) {
@@ -596,6 +761,11 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
     out.images = images.items;
     out.feeds = feeds.items;
     out.tags = tags.items;
+    if (meta.width != null and meta.height != null) {
+        const res = try std.fmt.allocPrint(arena, "{s}x{s}", .{ meta.width.?, meta.height.? });
+        try meta.fact(arena, "resolution", res);
+    }
+    out.facts = meta.facts.items;
     return out;
 }
 
@@ -933,4 +1103,63 @@ test "hashtags in the text are tags; colours, code, numbers and the middle of wo
     for (tags) |t| {
         for ([_][]const u8{ "top", "fff", "00ff00", "123", "include", "heading", "l" }) |bad| try testing.expect(!std.mem.eql(u8, t, bad));
     }
+}
+
+test "ISO 8601 durations" {
+    try testing.expectEqual(@as(?u64, 3723), isoDuration("PT1H2M3S"));
+    try testing.expectEqual(@as(?u64, 90), isoDuration("PT90S"));
+    try testing.expectEqual(@as(?u64, 93600), isoDuration("P1DT2H"));
+    try testing.expectEqual(@as(?u64, 754), isoDuration("PT12M34.5S"));
+    try testing.expectEqual(@as(?u64, null), isoDuration("PT"));
+    try testing.expectEqual(@as(?u64, null), isoDuration("12:34"));
+    try testing.expectEqual(@as(?u64, null), isoDuration("PT5"));
+    try testing.expectEqual(@as(?u64, null), isoDuration("P5H"));
+}
+
+test "author, dates, type, duration and size come from metas and JSON-LD" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const meta_page =
+        \\<head><meta name="author" content="Lea Pinto &amp; Co"><meta property="article:published_time" content="2024-05-01T12:30:00Z">
+        \\<meta property="article:modified_time" content="2024-06-02"><meta property="og:type" content="Video.Movie"><meta property="og:site_name" content="Vids">
+        \\<meta property="og:video:duration" content="3723"><meta property="og:video:width" content="1920"><meta property="og:video:height" content="1080"></head>
+    ;
+    const m = try scanWith(a, meta_page, 10, 0);
+    try testing.expectEqualStrings("Lea Pinto & Co", m.author.?);
+    try testing.expectEqual(@as(?i64, 1714566600), m.published_at);
+    try testing.expectEqual(@as(?i64, 1717286400), m.modified_at);
+    var got: [4][]const u8 = .{ "", "", "", "" };
+    for (m.facts) |f| {
+        if (std.mem.eql(u8, f.key, "type")) got[0] = f.value;
+        if (std.mem.eql(u8, f.key, "site")) got[1] = f.value;
+        if (std.mem.eql(u8, f.key, "duration")) got[2] = f.value;
+        if (std.mem.eql(u8, f.key, "resolution")) got[3] = f.value;
+    }
+    try testing.expectEqualStrings("video.movie", got[0]);
+    try testing.expectEqualStrings("Vids", got[1]);
+    try testing.expectEqualStrings("1:02:03", got[2]);
+    try testing.expectEqualStrings("1920x1080", got[3]);
+
+    const ld_page =
+        \\<script type="application/ld+json">{"@type":"VideoObject","name":"x","author":{"@type":"Person","name":"Sam"},"uploadDate":"2023-01-02T03:04:05+01:00",
+        \\"dateModified":"2023-02-01","duration":"PT12M34S","width":1280,"height":"720","keywords":"a, b"}</script>
+    ;
+    const l = try scanWith(a, ld_page, 10, 0);
+    try testing.expectEqualStrings("Sam", l.author.?);
+    try testing.expectEqual(@as(?i64, 1672625045), l.published_at);
+    try testing.expect(l.modified_at != null);
+    try testing.expectEqual(@as(usize, 2), l.tags.len);
+    var dur: []const u8 = "";
+    var res: []const u8 = "";
+    for (l.facts) |f| {
+        if (std.mem.eql(u8, f.key, "duration")) dur = f.value;
+        if (std.mem.eql(u8, f.key, "resolution")) res = f.value;
+    }
+    try testing.expectEqualStrings("12:34", dur);
+    try testing.expectEqualStrings("1280x720", res);
+
+    // An author that is an address, a date that is not one, and a duration of nonsense give nothing.
+    const bad = try scanWith(a, "<meta name=author content='https://example.org/u/1'><meta name=date content='soon'><meta property=og:video:duration content='0'>", 10, 0);
+    try testing.expect(bad.author == null and bad.published_at == null and bad.facts.len == 0);
 }

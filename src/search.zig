@@ -188,6 +188,8 @@ pub const Explain = struct {
     adjust: f64 = 1.0,
 };
 
+pub const max_hit_tags = 12;
+
 pub const Hit = struct {
     id: doc.Id,
     connector: []const u8,
@@ -210,6 +212,8 @@ pub const Hit = struct {
     published_at: ?i64 = null,
     indexed_at: ?i64 = null,
     explain: ?Explain = null,
+    /// The page's own tags (docs/decisions/0074), at most `max_hit_tags`; filled by the index for a search.
+    tags: []const []const u8 = &.{},
     /// The name of the peer node this result came from; null for this node's own results.
     node: ?[]const u8 = null,
     /// Where the document's page is, on the node that has it (an absolute address; only for results of peers).

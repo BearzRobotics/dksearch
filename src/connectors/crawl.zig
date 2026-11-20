@@ -1147,6 +1147,16 @@ fn tagsLine(a: Allocator, tags: []const []const u8) Allocator.Error![]const u8 {
     return out.items;
 }
 
+/// The page's tags, then what it says about itself (`type`, `site`, `duration`, `resolution`), as extras of the document.
+fn pageExtras(a: Allocator, tags: []const []const u8, facts: []const htmltext.Fact) Allocator.Error![]const doc.Extra {
+    if (facts.len == 0) return tagExtras(a, tags, null);
+    const base = try tagExtras(a, tags, null);
+    const out = try a.alloc(doc.Extra, base.len + facts.len);
+    @memcpy(out[0..base.len], base);
+    for (facts, out[base.len..]) |f, *dst| dst.* = .{ .key = f.key, .value = f.value };
+    return out;
+}
+
 /// Each tag as a `tag` of the document (the `tag:` search finds them), after `first` when given.
 fn tagExtras(a: Allocator, tags: []const []const u8, first: ?[]const u8) Allocator.Error![]const doc.Extra {
     const n = tags.len + @as(usize, if (first != null) 1 else 0);
@@ -2012,7 +2022,7 @@ const Run = struct {
         // The tags the page's markup gives, and the hashtags in its text (`#Linux #Nature`).
         const page_tags: []const []const u8 = if (is_html) try htmltext.withHashtags(a, scanned.tags, body_text) else &.{};
         const text = if (is_html) try textWithTags(a, body_text, scanned.description, page_tags) else body_text;
-        const extras: []const doc.Extra = if (is_html) try tagExtras(a, page_tags, null) else &.{};
+        const extras: []const doc.Extra = if (is_html) try pageExtras(a, page_tags, scanned.facts) else &.{};
         const title: ?[]const u8 = if (is_html) try htmltext.titleOf(a, utf8) else null;
 
         const u = parseUrl(url).?;
@@ -2024,6 +2034,10 @@ const Run = struct {
             .title = title,
             .text = text,
             .extra = extras,
+            // What the page says about itself: who wrote it, when it was published and changed (ADR 0075).
+            .author = if (is_html) scanned.author else null,
+            .published_at = if (is_html) scanned.published_at else null,
+            .modified_at = if (is_html) (scanned.modified_at orelse scanned.published_at) else null,
             // The source's language, else the page's own (`<html lang>`), else a guess from its text (a language other than English).
             .language = self.conn.language orelse (if (scanned.lang) |l| (if (files.validLanguageTag(l)) l else null) else null) orelse (if (is_html) langprefer.languageOfText(text) else null),
             .content_type = if (is_html) "text/html" else "text/plain",
