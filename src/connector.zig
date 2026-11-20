@@ -112,6 +112,9 @@ pub fn parseReasons(text: []const u8) ReasonCounts {
 /// Cooperative control and progress, shared between the runner and a connector.
 pub const Control = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
+    /// The server is shutting down: the run was stopped by that, not by the person (see `Manager.deinit`). The job is then
+    /// recorded as interrupted, which the scheduler resumes at once, and not as cancelled, which it leaves alone.
+    stopping: std.atomic.Value(bool) = .init(false),
     /// Documents the connector handed to the sink and the sink accepted.
     submitted: std.atomic.Value(u64) = .init(0),
     /// Items the connector itself refused before submitting them (too large,

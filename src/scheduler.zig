@@ -25,7 +25,9 @@ pub const quiet_seconds = 120;
 /// When a watched source's seeds file was last changed.
 pub const Changed = struct { source: []const u8, at: i64 };
 
-pub const LastStart = struct { source: []const u8, started_at: i64 };
+/// `resume`: the last job was interrupted (the server stopped, or crashed, while it ran): it is picked up again at once, from
+/// its checkpoint, without waiting for the interval. A job a person cancelled, or one that failed, waits its interval.
+pub const LastStart = struct { source: []const u8, started_at: i64, resume_now: bool = false };
 
 /// The name of the source to start now, or null. `last` holds, per source, when its latest job started.
 pub fn nextDue(sources: []const config.Source, last: []const LastStart, now: i64) ?[]const u8 {
@@ -40,11 +42,14 @@ pub fn nextDueWith(sources: []const config.Source, last: []const LastStart, chan
     for (sources) |s| {
         if (!s.enabled) continue;
         var last_started: ?i64 = null;
+        var resume_now = false;
         for (last) |l| if (std.mem.eql(u8, l.source, s.name)) {
             last_started = l.started_at;
+            resume_now = l.resume_now;
         };
         var due_at: i64 = std.math.maxInt(i64);
         if (s.schedule_seconds > 0) due_at = if (last_started) |ls| ls + s.schedule_seconds else std.math.minInt(i64) / 2; // never imported: due long ago
+        if (resume_now and last_started != null) due_at = @min(due_at, last_started.?); // interrupted: due now
         for (changed) |c| if (std.mem.eql(u8, c.source, s.name)) {
             if (last_started == null or c.at > last_started.?) due_at = @min(due_at, c.at + quiet_seconds);
         };
@@ -106,7 +111,7 @@ fn tick(gpa: Allocator, io: Io, manager: *jobs.Manager, state_path: [:0]const u8
     for (sources) |s| {
         if (s.schedule_seconds == 0 and !watches(s)) continue;
         const j = (state.lastJob(arena, s.name) catch continue) orelse continue;
-        last.append(arena, .{ .source = s.name, .started_at = j.started_at }) catch return;
+        last.append(arena, .{ .source = s.name, .started_at = j.started_at, .resume_now = j.state == .interrupted }) catch return;
     }
     startDue(io, manager, sources, last.items, changed.items, log);
 }
@@ -177,4 +182,17 @@ test "a watched seeds file makes its source due after the quiet time, once, and 
     try testing.expectEqualStrings("suggested", nextDueWith(&sources, &.{.{ .source = "daily", .started_at = now - 100 }}, &.{.{ .source = "suggested", .at = now - 500 }}, now).?);
     // A source that is not watched and has no schedule is never due, whatever else changes.
     try testing.expect(nextDueWith(&sources, &fresh, &.{.{ .source = "other", .at = now - 500 }}, now) == null);
+}
+
+test "an interrupted job is resumed at once, wherever its interval is; a cancelled or failed one waits" {
+    const sources = [_]config.Source{
+        .{ .name = "weekly", .kind = "crawl", .schedule_seconds = 7 * 86400 },
+        .{ .name = "other", .kind = "crawl", .schedule_seconds = 7 * 86400 },
+    };
+    const now: i64 = 100 * 86400;
+    // Both ran an hour ago; "weekly" was interrupted (a restart), "other" ended some other way: only the first is due.
+    const last = [_]LastStart{ .{ .source = "weekly", .started_at = now - 3600, .resume_now = true }, .{ .source = "other", .started_at = now - 3600 } };
+    try testing.expectEqualStrings("weekly", nextDue(&sources, &last, now).?);
+    const waiting = [_]LastStart{ .{ .source = "weekly", .started_at = now - 3600 }, .{ .source = "other", .started_at = now - 3600 } };
+    try testing.expect(nextDue(&sources, &waiting, now) == null);
 }

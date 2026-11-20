@@ -185,7 +185,8 @@ pub fn runImport(
         checkpoint = outcome.checkpoint orelse js.last_checkpoint;
         if (outcome.interrupted) {
             if (control.isCancelled()) {
-                final = .cancelled;
+                // Stopped by the server shutting down: it is to be resumed (the scheduler does so); stopped by a person: not.
+                final = if (control.stopping.load(.acquire)) .interrupted else .cancelled;
             } else {
                 final = .failed;
                 failure = "stopped by the ingestion pipeline (storage full or shutting down)";

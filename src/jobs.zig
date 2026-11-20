@@ -194,7 +194,10 @@ pub const Manager = struct {
     pub fn deinit(self: *Manager) void {
         self.mutex.lockUncancelable(self.io);
         self.closing = true;
-        if (self.running) |r| r.control.cancel();
+        if (self.running) |r| {
+            r.control.stopping.store(true, .release);
+            r.control.cancel();
+        }
         self.mutex.unlock(self.io);
         self.group.await(self.io) catch {};
         for (self.queue.items) |it| it.free(self.gpa);
