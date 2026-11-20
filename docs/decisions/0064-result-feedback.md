@@ -8,7 +8,7 @@ Ranking was being judged by eye and by 11 queries picked by the author, which ar
 
 ## Decision
 
-With the owner signed in, each result carries a *good* and a *bad* button (search.js; the server puts `data-feedback` on the list only for the owner). A mark is POSTed to `/feedback` and appended to `data_dir/feedback.jsonl` as one JSON line (query, address, grade 1, -1 or 0 to take a mark back, time). Only the owner's cookie is accepted; the public listener has no store and no route. The file is capped at 32 MB. `dksearch eval` reads those lines as they are: marks and judgment lines with the same query are one query, the last mark for an address wins, good results are relevant, bad ones are counted as unwanted in the top k (*Bad@k*), and a query with only bad marks is reported without scores.
+With the owner signed in, each result carries a *good* and a *bad* button (search.js; the server puts `data-feedback` on the list only for the owner). A mark is POSTed to `/feedback` and appended to `data_dir/feedback.jsonl` as one JSON line (query, address, grade 1, -1 or 0 to take a mark back, time). Only the owner's cookie is accepted (anyone else is answered 403 and nothing is written), and the store exists only when an owner password has been set. The file is capped at 32 MB. `dksearch eval` reads those lines as they are: marks and judgment lines with the same query are one query, the last mark for an address wins, good results are relevant, bad ones are counted as unwanted in the top k (*Bad@k*), and a query with only bad marks is reported without scores.
 
 ## Consequences
 
