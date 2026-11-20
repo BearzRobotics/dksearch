@@ -1463,10 +1463,11 @@ pub const SqliteIndex = struct {
             rec_expr = try std.fmt.allocPrint(arena, "(1.0 + {d}.{d:0>2} / (1.0 + MAX(0, CAST(strftime('%s','now') AS INTEGER) - COALESCE(d.modified_at, d.published_at, d.indexed_at, 0)) / 86400.0 / {d}.0))", .{ self.recency_percent / 100, self.recency_percent % 100, self.recency_days });
         }
         const demote_expr: []const u8 = if (self.domains) |l| (if (!l.demoted.isEmpty() and self.has_meta) " * dk_demote(d.domain)" else "") else "";
-        // A web page whose "title" is a file or directory name (words joined by underscores, no spaces: an open directory listing)
-        // says nothing a person searched for beyond the words in its name: it ranks lower. Files on this machine keep theirs.
+        // A web page whose title starts with a file or directory name (words joined by underscores, three or more: an open
+        // directory listing, "The_Big_Report_2024 • Library") says nothing a person searched for beyond the words in its
+        // name: it ranks lower. Files on this machine keep theirs.
         const file_title_expr: []const u8 = if (self.has_meta and text_mode)
-            " * (CASE WHEN d.title IS NOT NULL AND instr(d.title, ' ') = 0 AND length(d.title) - length(replace(d.title, '_', '')) >= 3 AND d.url LIKE 'http%' THEN 0.4 ELSE 1.0 END)"
+            " * (CASE WHEN d.title IS NOT NULL AND d.url LIKE 'http%' AND length(substr(d.title, 1, instr(d.title || ' ', ' ') - 1)) - length(replace(substr(d.title, 1, instr(d.title || ' ', ' ') - 1), '_', '')) >= 3 THEN 0.4 ELSE 1.0 END)"
         else
             "";
         var lang_expr: []const u8 = "";
@@ -3035,7 +3036,7 @@ test "a web page whose title is a file name ranks lower; a file on this machine 
     const a = arena.allocator();
     var idx = try SqliteIndex.open(":memory:", .{ .sync = .off });
     defer idx.close();
-    try putDoc(&idx, .{ .connector = "web", .source_id = "1", .title = "The_Communist_Program_for_World_Conquest_Gen", .text = "program listing", .canonical_url = "https://files.example.org/?dir=x", .content_type = "text/html" });
+    try putDoc(&idx, .{ .connector = "web", .source_id = "1", .title = "The_Communist_Program_for_World_Conquest_Gen \u{2022} Avalon Library", .text = "program listing", .canonical_url = "https://files.example.org/?dir=x", .content_type = "text/html" });
     try putDoc(&idx, .{ .connector = "web", .source_id = "2", .title = "Program listing", .text = "program listing", .canonical_url = "https://docs.example.org/p", .content_type = "text/html" });
     try putDoc(&idx, .{ .connector = "files", .source_id = "3", .title = "my_notes_on_the_program", .text = "program listing", .canonical_url = "file:///home/me/my_notes_on_the_program.txt", .content_type = "text/plain" });
     const page = try idx.searcher().search(a, .{ .text = "program" });
