@@ -149,6 +149,9 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const test_step = b.step("test", "Run unit tests");
+    // The tests alone do not compile the command-line program (a test build analyses only what a test reaches), so a mistake
+    // in main.zig used to pass them: building the program is part of testing.
+    test_step.dependOn(&exe.step);
     const unit = b.addTest(.{ .root_module = core });
     test_step.dependOn(&b.addRunArtifact(unit).step);
     const http_unit = b.addTest(.{ .root_module = http });
