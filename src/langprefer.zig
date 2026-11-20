@@ -105,6 +105,94 @@ pub fn foreign(language: ?[]const u8, path: ?[]const u8, preferred: []const u8) 
     return true;
 }
 
+const Latin = enum(u4) { en, fr, de, es, it, pt, nl, sv, da, pl, tr, id, cs, fi };
+
+/// The commonest words of each language that are not also the commonest of another (a few are shared: the words of a text
+/// are counted against every list). Lower case; a text is read as running words, so single letters are included where a
+/// language has them.
+const stopword_lists = [_]struct { Latin, []const u8 }{
+    .{ .en, "the of and to in is that for it with as was on are this be by at or from have not you we they which an can but all will has their there been more when who one if also its about into than what your said do were so out up other time these may such only most over new would some them could first any use after our then like many just now how" },
+    .{ .fr, "le la les des du de un une et est en pour dans que qui pas sur au aux avec ce cette ces sont nous vous il elle ils ne plus par ou se son sa ses leur être avoir fait comme mais tout aussi très entre sans sous cet où dont ainsi été peut ont" },
+    .{ .de, "der die das und ist nicht ein eine zu von mit den dem auf für sich auch es wir sie im bei wird oder aus nach als wie werden sind einen einer eines dass kann nur noch dieser diese über zum zur durch haben hat wenn aber ich du er" },
+    .{ .es, "el la los las de que y en un una es por con para no se del al su como más pero este esta estos son fue sus también entre sobre ser tiene han muy sin hay donde cuando todo porque" },
+    .{ .it, "il lo la le gli di che e è un una per con non sono del della nel nella dei delle anche come più ma questo questa essere stato hanno tra fra dal alla sul loro quando tutti ogni molto" },
+    .{ .pt, "o a os as de que e é um uma para com não em do da dos das no na por mais se mas como foi são também seu sua pelo pela entre sobre muito ainda quando todos" },
+    .{ .nl, "de het een en van is dat op te in niet voor met zijn ook aan er maar om dit als bij naar door meer worden wordt heeft kan uit nog wel dan hun deze over" },
+    .{ .sv, "och att det som en är på av för med den har inte ett till om de vi från kan eller ska vara blir också mycket alla sig" },
+    .{ .da, "og i det at en er som på af for med til ikke den har de et var vi fra kan eller skal være også meget alle sig" },
+    .{ .pl, "nie się w na i z do że to jest jak ale po co dla przez od tak być który która które może został tylko już oraz jego jej ich ten ta te" },
+    .{ .tr, "ve bir bu için ile da de çok gibi daha olarak en ne var ama kadar sonra olan her şey ise" },
+    .{ .id, "yang dan di ini itu dengan untuk dari pada tidak adalah akan atau dalam juga oleh kita saya ke karena sebagai" },
+    .{ .cs, "a je se na že to v s z do nebo jako pro které který byl být jsou má jeho její ale také tak" },
+    .{ .fi, "ja on ei että se oli mutta kun kuin joka tai vain myös ovat sen sekä" },
+};
+
+/// word -> the languages whose list has it (a bit each).
+const word_masks = blk: {
+    @setEvalBranchQuota(2_000_000);
+    var entries: [stopword_lists.len * 80]struct { []const u8, u16 } = undefined;
+    var n: usize = 0;
+    for (stopword_lists) |sl| {
+        var it = std.mem.tokenizeScalar(u8, sl[1], ' ');
+        while (it.next()) |w| {
+            const bit: u16 = 1 << @backingInt(sl[0]);
+            var found = false;
+            for (entries[0..n]) |*e| if (std.mem.eql(u8, e[0], w)) {
+                e[1] |= bit;
+                found = true;
+            };
+            if (!found) {
+                entries[n] = .{ w, bit };
+                n += 1;
+            }
+        }
+    }
+    break :blk std.StaticStringMap(u16).initComptime(entries[0..n].*);
+};
+
+/// The language of a running text of Latin letters, from how many of its words are the commonest words of each language
+/// (`en`, `fr`, `de`, `es`, `it`, `pt`, `nl`, `sv`, `da`, `pl`, `tr`, `id`, `cs`, `fi`). Conservative: null unless the text
+/// has at least 30 words, the best language has at least 15% of them and clearly more than the second.
+pub fn guessLatin(text: []const u8) ?[]const u8 {
+    var hits: [stopword_lists.len]u32 = @splat(0);
+    var tokens: u32 = 0;
+    const sample = text[0..@min(text.len, 4000)];
+    var buf: [16]u8 = undefined;
+    var len: usize = 0;
+    var too_long = false;
+    var i: usize = 0;
+    while (i <= sample.len) : (i += 1) {
+        const c: u8 = if (i < sample.len) sample[i] else ' ';
+        if (std.ascii.isAlphabetic(c) or c >= 0x80) {
+            if (len < buf.len) {
+                buf[len] = std.ascii.toLower(c);
+                len += 1;
+            } else too_long = true;
+        } else if (len > 0) {
+            tokens += 1;
+            if (!too_long) if (word_masks.get(buf[0..len])) |mask| {
+                for (&hits, 0..) |*h, k| if (mask & (@as(u16, 1) << @intCast(k)) != 0) {
+                    h.* += 1;
+                };
+            };
+            len = 0;
+            too_long = false;
+        }
+    }
+    if (tokens < 30) return null;
+    var best: usize = 0;
+    for (hits, 0..) |h, k| if (h > hits[best]) {
+        best = k;
+    };
+    var second: u32 = 0;
+    for (hits, 0..) |h, k| if (k != best and h > second) {
+        second = h;
+    };
+    if (hits[best] * 100 < tokens * 15) return null;
+    if (hits[best] * 10 < second * 14) return null;
+    return @tagName(@as(Latin, @fromBackingInt(@intCast(best))));
+}
+
 /// A guess at the language of a text from its script, for pages that do not say (no `lang`, no language in the address):
 /// Chinese, Japanese (kana), Korean, Hebrew, Greek and Thai by name, and the scripts shared by several languages as
 /// `und-Cyrl`, `und-Arab` and `und-Deva` ("undetermined, in this script"). Null when the text is mostly Latin letters, or
@@ -162,7 +250,7 @@ pub fn languageOfText(text: []const u8) ?[]const u8 {
             best = s;
         }
     }
-    if (best_count * 100 < total * 40) return null;
+    if (best_count * 100 < total * 40) return latinOtherThanEnglish(text);
     return switch (best) {
         .han, .kana => if (counts[@backingInt(Script.kana)] * 10 >= counts[@backingInt(Script.han)]) "ja" else "zh",
         .hangul => "ko",
@@ -172,8 +260,14 @@ pub fn languageOfText(text: []const u8) ?[]const u8 {
         .greek => "el",
         .thai => "th",
         .devanagari => "und-Deva",
-        .latin => null,
+        .latin => latinOtherThanEnglish(text),
     };
+}
+
+/// A language other than English found by `guessLatin`; English is not stated (a page with no language is read as English).
+fn latinOtherThanEnglish(text: []const u8) ?[]const u8 {
+    const g = guessLatin(text) orelse return null;
+    return if (std.mem.eql(u8, g, "en")) null else g;
 }
 
 const testing = std.testing;
@@ -221,4 +315,23 @@ test "the script of a text says its language when it is not Latin" {
     try testing.expect(languageOfText("This is a page about operating systems and programming languages, with plenty of text to read.") == null);
     try testing.expect(languageOfText("Un système d'exploitation, le noyau: ça évolue. 日本語 and русский appear once each in this long English-like text.") == null);
     try testing.expect(languageOfText("日本語") == null and languageOfText("") == null);
+}
+
+test "Latin-script texts: the language is found from the commonest words, and English is not stated" {
+    const fr = "Le système d'exploitation est un logiciel qui permet de gérer les ressources de l'ordinateur et de faire fonctionner les programmes que nous utilisons tous les jours pour travailler dans de bonnes conditions avec une grande rapidité.";
+    const de = "Das Betriebssystem ist ein Programm, das die Hardware eines Computers verwaltet und es den Anwendungen ermöglicht, die wir jeden Tag nutzen, mit dem Rechner zu arbeiten, ohne dass wir uns um die Details kümmern müssen.";
+    const es = "El sistema operativo es un programa que gestiona los recursos del ordenador y permite que las aplicaciones que usamos todos los días funcionen con una gran rapidez y sin que tengamos que preocuparnos por los detalles del equipo.";
+    const nl = "Het besturingssysteem is een programma dat de hardware van een computer beheert en het mogelijk maakt dat de toepassingen die we elke dag gebruiken met het apparaat kunnen werken zonder dat we ons om de details hoeven te bekommeren.";
+    const en = "The operating system is a program that manages the resources of the computer and makes it possible for the applications that we use every day to work with the machine without having to worry about the details of the hardware.";
+    try testing.expectEqualStrings("fr", guessLatin(fr).?);
+    try testing.expectEqualStrings("de", guessLatin(de).?);
+    try testing.expectEqualStrings("es", guessLatin(es).?);
+    try testing.expectEqualStrings("nl", guessLatin(nl).?);
+    try testing.expectEqualStrings("en", guessLatin(en).?);
+    // languageOfText states the others and leaves English unsaid.
+    try testing.expectEqualStrings("fr", languageOfText(fr).?);
+    try testing.expect(languageOfText(en) == null);
+    // Too short, no words of any list, or code: nothing is guessed.
+    try testing.expect(guessLatin("Bonjour le monde") == null and guessLatin("") == null);
+    try testing.expect(guessLatin("int main(void) { return printf(\"%d\", x1 + y2 * z3); } struct foo bar baz qux quux corge grault garply waldo fred plugh xyzzy thud") == null);
 }

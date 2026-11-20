@@ -14,7 +14,7 @@ dksearch - self-hosted search engine: import documents, serve a search index ove
 
     dksearch rebuild [--config FILE]
 
-    dksearch repair [--config FILE] [--dry-run]
+    dksearch repair [--config FILE] [--dry-run | --audit-languages]
 
     dksearch check [--config FILE]
 
@@ -98,11 +98,11 @@ Usage: dksearch rebuild [--config FILE]
 
 repair
 
-Bring the stored documents of the crawl sources up to date with what the crawler does now, without fetching anything. A document keeps what it had when it was stored: a title with `&bull;` in it, an address with `./` or a tracking parameter in it (the crawler now tidies these, so the same page is fetched again under the tidy address and the index has it twice), no language. **repair** decodes HTML entities in titles; for a document whose address is not tidy, removes it if the page is already stored under the tidy address and else moves it there (a new document id, the same text and record); and gives a page with no language one from the first part of its address (`/ja/`, `/zh-CN/`) or from the script of its text (Chinese, Japanese, Korean, Cyrillic, Arabic, Hebrew, Greek, Thai, Devanagari; Latin text is left alone). The work is done in batches, so it can be stopped and run again. A document whose text is not retained is left as it is.
+Bring the stored documents of the crawl sources up to date with what the crawler does now, without fetching anything. A document keeps what it had when it was stored: a title with `&bull;` in it, an address with `./` or a tracking parameter in it (the crawler now tidies these, so the same page is fetched again under the tidy address and the index has it twice), no language. **repair** decodes HTML entities in titles; for a document whose address is not tidy, removes it if the page is already stored under the tidy address and else moves it there (a new document id, the same text and record); and gives a page with no language one from the first part of its address (`/ja/`, `/zh-CN/`) or from its text: by script (Chinese, Japanese, Korean, Cyrillic, Arabic, Hebrew, Greek, Thai, Devanagari) or, for Latin letters, by how many of its words are the commonest words of French, German, Spanish, Italian, Portuguese, Dutch, Swedish, Danish, Polish, Turkish, Indonesian, Czech or Finnish (at least 30 words, 15% of them from one language's list and clearly more than from any other; English is not stated, since a page with no language is read as English). The crawler does the same for the pages it stores. The work is done in batches, so it can be stopped and run again. A document whose text is not retained is left as it is.
 
-Usage: dksearch repair [--config FILE] [--dry-run]
+Usage: dksearch repair [--config FILE] [--dry-run | --audit-languages]
 
-Arguments: **--dry-run** only counts what would be done, changes nothing and does not need `serve` to be stopped; without it the writers' lock is needed, as for **rebuild**.
+Arguments: **--audit-languages** runs that language guess over the pages that state their own language and prints how often it agrees, and how many English pages it would have called another language (it reads only). **--dry-run** only counts what would be done, changes nothing and does not need `serve` to be stopped; without it the writers' lock is needed, as for **rebuild**.
 
 check
 

@@ -264,6 +264,7 @@ fn run(init: std.process.Init) u8 {
     if (eq(first, "repair")) {
         var config_path: ?[]const u8 = null;
         var dry_run = false;
+        var audit_languages = false;
         while (args.next()) |a| {
             if (eq(a, "--config")) {
                 config_path = args.next() orelse return usageError(io, "--config needs a FILE");
@@ -271,12 +272,14 @@ fn run(init: std.process.Init) u8 {
                 config_path = a["--config=".len..];
             } else if (eq(a, "--dry-run")) {
                 dry_run = true;
+            } else if (eq(a, "--audit-languages")) {
+                audit_languages = true;
             } else {
                 err(io, "unknown option for repair: {s}", .{a});
                 return exit_usage;
             }
         }
-        return repairCmd(io, gpa, config_path, dry_run);
+        return repairCmd(io, gpa, config_path, dry_run or audit_languages, audit_languages);
     }
 
     if (eq(first, "serve") or eq(first, "rebuild") or eq(first, "embed")) {
@@ -1828,7 +1831,7 @@ fn rebuildCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     return exit_ok;
 }
 
-fn repairCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, dry_run: bool) u8 {
+fn repairCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, dry_run: bool, audit_languages: bool) u8 {
     var diag: dk.config.Diagnostic = .{};
     var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
     defer cfg.deinit();
@@ -1850,6 +1853,17 @@ fn repairCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, dry_run: 
 
     var crawl: std.ArrayList([]const u8) = .empty;
     for (cfg.sources) |s| if (std.mem.eql(u8, s.kind, "crawl")) crawl.append(arena, s.name) catch return exit_io;
+    if (audit_languages) {
+        const au = dk.repair.auditLanguages(gpa, arena, content.store(), state.documents(), crawl.items) catch |e| {
+            err(io, "audit failed: {t}", .{e});
+            return exit_io;
+        };
+        out(io, "pages that state their language (English or a language the guesser knows): {d}\n", .{au.pages});
+        out(io, "  English pages: {d}: guessed English {d}, guessed another language {d} (the costly mistake), no guess {d}\n", .{ au.english, au.english_right, au.english_wrong, au.english_unsure });
+        out(io, "  other languages: {d}: guessed right {d}, wrong {d}, no guess {d}\n", .{ au.other, au.other_right, au.other_wrong, au.other_unsure });
+        for (au.mistakes.items) |line| out(io, "  mistake: {s}\n", .{line});
+        return exit_ok;
+    }
     const stats = dk.repair.run(gpa, index.indexer(), content.store(), state.documents(), .{ .dry_run = dry_run, .crawl_sources = crawl.items }) catch |e| {
         err(io, "repair failed: {t}. What was done is consistent; run repair again to finish", .{e});
         return exit_io;

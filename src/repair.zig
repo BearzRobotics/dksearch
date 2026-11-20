@@ -213,6 +213,77 @@ fn apply(gpa: Allocator, index: indexer.Indexer, content: storage.ContentStore, 
     if (fix.language != null) stats.languages += 1;
 }
 
+/// How well the language guesser agrees with pages that state their own language (`dksearch repair --audit-languages`).
+pub const Audit = struct {
+    /// Pages with a stated language that is English or one the guesser knows.
+    pages: u64 = 0,
+    english: u64 = 0,
+    /// English pages the guesser calls English, calls another language (the costly mistake: such a page would be demoted), or cannot tell.
+    english_right: u64 = 0,
+    english_wrong: u64 = 0,
+    english_unsure: u64 = 0,
+    other: u64 = 0,
+    other_right: u64 = 0,
+    other_wrong: u64 = 0,
+    other_unsure: u64 = 0,
+    /// Up to twenty mistakes, `stated -> guessed url`.
+    mistakes: std.ArrayList([]const u8) = .empty,
+};
+
+fn primaryTag(arena: Allocator, label: []const u8) Allocator.Error![]const u8 {
+    const end = std.mem.indexOfAny(u8, label, "-_") orelse label.len;
+    return std.ascii.allocLowerString(arena, label[0..end]);
+}
+
+const known_latin = [_][]const u8{ "en", "fr", "de", "es", "it", "pt", "nl", "sv", "da", "pl", "tr", "id", "cs", "fi" };
+
+const AuditWalk = struct {
+    gpa: Allocator,
+    arena: Allocator,
+    content: storage.ContentStore,
+    crawl: []const []const u8,
+    audit: Audit = .{},
+
+    fn visit(ptr: *anyopaque, rec: storage.Record) storage.Error!void {
+        const self: *AuditWalk = @ptrCast(@alignCast(ptr));
+        const m = rec.meta;
+        if (!isCrawl(self.crawl, m.connector)) return;
+        const label_raw = m.language orelse return;
+        const is_page = if (m.content_type) |ct| std.ascii.startsWithIgnoreCase(ct, "text/html") else false;
+        if (!is_page) return;
+        const label = primaryTag(self.arena, label_raw) catch return error.OutOfMemory;
+        var known = false;
+        for (known_latin) |k| if (std.mem.eql(u8, k, label)) {
+            known = true;
+        };
+        if (!known) return;
+        const text = self.content.get(self.gpa, rec.id) catch return;
+        defer self.gpa.free(text);
+        const guess: ?[]const u8 = langprefer.languageOfText(text) orelse langprefer.guessLatin(text);
+        const a = &self.audit;
+        a.pages += 1;
+        const is_en = std.mem.eql(u8, label, "en");
+        if (is_en) a.english += 1 else a.other += 1;
+        if (guess) |g| {
+            if (std.mem.eql(u8, g, label)) {
+                if (is_en) a.english_right += 1 else a.other_right += 1;
+                return;
+            }
+            if (is_en) a.english_wrong += 1 else a.other_wrong += 1;
+            if (a.mistakes.items.len < 20) a.mistakes.append(self.arena, std.fmt.allocPrint(self.arena, "{s} -> {s}  {s}", .{ label, g, m.canonical_url orelse m.source_id }) catch return error.OutOfMemory) catch return error.OutOfMemory;
+        } else {
+            if (is_en) a.english_unsure += 1 else a.other_unsure += 1;
+        }
+    }
+};
+
+/// Runs the language guesser over the pages of the crawl sources that state their language, and counts agreement.
+pub fn auditLanguages(gpa: Allocator, arena: Allocator, content: storage.ContentStore, docs: storage.DocumentStore, crawl_sources: []const []const u8) Error!Audit {
+    var walk: AuditWalk = .{ .gpa = gpa, .arena = arena, .content = content, .crawl = crawl_sources };
+    try docs.forEach(.{ .ptr = &walk, .visit = AuditWalk.visit });
+    return walk.audit;
+}
+
 const testing = std.testing;
 const memory = @import("memory.zig");
 const index_sqlite = @import("index_sqlite.zig");

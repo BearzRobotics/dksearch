@@ -28,6 +28,7 @@ const config = @import("../config.zig");
 const api = @import("../connector.zig");
 const doc = @import("../document.zig");
 const files = @import("files.zig");
+const langprefer = @import("../langprefer.zig");
 const htmltext = @import("../htmltext.zig");
 const robots = @import("crawl/robots.zig");
 const fetch = @import("crawl/fetch.zig");
@@ -1970,7 +1971,8 @@ const Run = struct {
             .source_dataset = u.host,
             .title = title,
             .text = text,
-            .language = self.conn.language orelse (if (scanned.lang) |l| (if (files.validLanguageTag(l)) l else null) else null),
+            // The source's language, else the page's own (`<html lang>`), else a guess from its text (a language other than English).
+            .language = self.conn.language orelse (if (scanned.lang) |l| (if (files.validLanguageTag(l)) l else null) else null) orelse (if (is_html) langprefer.languageOfText(text) else null),
             .content_type = if (is_html) "text/html" else "text/plain",
             .rights = .{
                 .attribution = try std.fmt.allocPrint(a, "Fetched from {s}", .{u.host}),
