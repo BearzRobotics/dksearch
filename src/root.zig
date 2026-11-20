@@ -140,6 +140,7 @@ test {
     if (connectors.have_wikipedia) _ = connectors.wikipedia;
     if (connectors.have_feeds) _ = connectors.feeds;
     _ = @import("htmltext.zig");
+    _ = @import("fuzz.zig");
     if (connectors.have_crawler) _ = connectors.crawl;
     if (connectors.have_crawler) _ = connectors.archive;
     if (connectors.have_crawler) _ = connectors.peer;
