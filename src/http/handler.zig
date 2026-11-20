@@ -50,7 +50,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, unlock_page, lock_action, login_page, logout_action, feedback_action, search_script, api_export, api_peers, api_health, style, document, zim, wopi, other };
+const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, unlock_page, lock_action, login_page, logout_action, feedback_action, suggest_action, search_script, api_export, api_peers, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -66,6 +66,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/login")) return .login_page;
     if (std.mem.eql(u8, path, "/logout")) return .logout_action;
     if (std.mem.eql(u8, path, "/feedback")) return .feedback_action;
+    if (std.mem.eql(u8, path, "/suggest")) return .suggest_action;
     if (std.mem.eql(u8, path, "/api/v1/suggest")) return .api_suggest;
     if (std.mem.eql(u8, path, "/api/v1/similar")) return .api_similar;
     if (std.mem.eql(u8, path, "/api/v1/export")) return .api_export;
@@ -408,7 +409,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         if (is_api) return apiError(arena, .not_found, "not_found", "no such endpoint");
         return htmlError(arena, .not_found, "Not found", "That page does not exist.");
     }
-    if (method != .GET and method != .HEAD and !((r == .unlock_page or r == .lock_action or r == .login_page or r == .logout_action or r == .feedback_action) and method == .POST)) {
+    if (method != .GET and method != .HEAD and !((r == .unlock_page or r == .lock_action or r == .login_page or r == .logout_action or r == .feedback_action or r == .suggest_action) and method == .POST)) {
         var resp = if (is_api)
             try apiError(arena, .method_not_allowed, "method_not_allowed", "use GET")
         else
@@ -481,6 +482,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         .login_page => try loginPage(arena, services, method, caller),
         .logout_action => try logoutAction(arena, services),
         .feedback_action => try feedbackAction(arena, services, method, caller),
+        .suggest_action => try suggestAction(arena, services, method, caller),
         .lock_action => try lockAction(arena, services, caller),
         .api_similar => try apiSimilar(arena, searcher, services, t.params),
         .api_export => try apiExport(arena, searcher, services, t.params),
@@ -1033,6 +1035,33 @@ fn feedbackAction(arena: Allocator, services: Services, method: http.Method, cal
         error.Io => plain(.service_unavailable, "the feedback could not be saved\n"),
     };
     var resp = plain(.ok, "ok\n");
+    resp.headers = headersWith(arena, &.{no_store});
+    return resp;
+}
+
+/// `/suggest`: the owner says a site should have been among the results of a search (POST `q`, `url`). The site is added to
+/// `suggested-sites.txt` (a crawl source reads it, so the site is indexed on the next run) and kept as a good answer for
+/// that search (`feedback.jsonl`), which `dksearch eval` then reports as missing until it is found.
+fn suggestAction(arena: Allocator, services: Services, method: http.Method, caller: Caller) error{OutOfMemory}!Response {
+    if (method != .POST) {
+        var resp = plain(.method_not_allowed, "use POST\n");
+        resp.headers = headersWith(arena, &.{ .{ .name = "allow", .value = "POST" }, no_store });
+        return resp;
+    }
+    const store = services.feedback orelse return plain(.not_found, "no feedback on this server\n");
+    if (!services.is_owner) return plain(.forbidden, "sign in as the owner to suggest sites\n");
+    const form_target = try std.fmt.allocPrint(arena, "/?{s}", .{std.mem.trimEnd(u8, caller.body, "\r\n")});
+    const t = query.parseTarget(arena, form_target) catch return plain(.bad_request, "the form could not be read\n");
+    const url = std.mem.trim(u8, t.params.get("url") orelse "", " \t\r\n");
+    const added = store.addSuggested(arena, url) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Invalid => plain(.bad_request, "that is not an address to crawl (it must start with http:// or https:// and have a domain name)\n"),
+        error.TooBig => plain(.insufficient_storage, "the list of suggested sites is full\n"),
+        error.Io => plain(.service_unavailable, "the suggestion could not be saved\n"),
+    };
+    const q = t.params.get("q") orelse "";
+    if (q.len > 0) store.record(arena, q, url, 1, std.Io.Clock.real.now(store.io).toSeconds()) catch {};
+    var resp = plain(.ok, if (added) "added: it will be crawled the next time the suggested-sites source runs\n" else "already suggested\n");
     resp.headers = headersWith(arena, &.{no_store});
     return resp;
 }
@@ -4561,4 +4590,38 @@ test "a spelling suggestion respells only the words the index does not have" {
     try testing.expect(std.mem.indexOf(u8, page.body, "Did you mean") != null);
     try testing.expect(std.mem.indexOf(u8, page.body, "what linux language") != null);
     try testing.expect(std.mem.indexOf(u8, page.body, "linus") == null and std.mem.indexOf(u8, page.body, "wheat") == null);
+}
+
+test "suggest: only the owner can add a site; it goes to the crawl list and is kept as a good answer" {
+    var fake: FakeSearch = .{ .result = .{ .hits = &.{}, .has_more = false } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var owner = try dk.owner.OwnerLogin.init(testing.allocator, testing.io, tmp.dir, 30);
+    defer owner.deinit();
+    try owner.setPassword("correct horse battery");
+    var store = dk.feedback.Store.init(testing.io, tmp.dir);
+    const services: Services = .{ .owner = &owner, .feedback = &store };
+    // A visitor: no form, a suggestion is refused and nothing is written.
+    try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), services, .GET, "/search?q=linux+rescue+cd", null, .{}).body, "form class=\"suggest\"") == null);
+    try testing.expectEqual(http.Status.forbidden, handleSigned(a, fake.searcher(), services, .POST, "/suggest", null, .{ .body = "q=x&url=https%3A%2F%2Fclonezilla.org%2F" }).status);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, dk.feedback.suggested_file, .{}));
+    // The owner: the form is on the page even with no results; the site is added once and kept as a good answer.
+    const good = handleSigned(a, fake.searcher(), services, .POST, "/login", null, .{ .body = "credential=correct+horse+battery" });
+    const set = headerValue(good, "set-cookie").?;
+    const header = try std.fmt.allocPrint(a, "dks_owner={s}", .{set["dks_owner=".len..std.mem.indexOfScalar(u8, set, ';').?]});
+    const page = handleSigned(a, fake.searcher(), services, .GET, "/search?q=linux+rescue+cd", null, .{ .cookie = header });
+    try testing.expect(std.mem.indexOf(u8, page.body, "<form class=\"suggest\" data-q=\"linux rescue cd\">") != null);
+    const first = handleSigned(a, fake.searcher(), services, .POST, "/suggest", null, .{ .cookie = header, .body = "q=linux+rescue+cd&url=https%3A%2F%2Fclonezilla.org%2F" });
+    try testing.expectEqual(http.Status.ok, first.status);
+    try testing.expect(std.mem.startsWith(u8, first.body, "added"));
+    const again = handleSigned(a, fake.searcher(), services, .POST, "/suggest", null, .{ .cookie = header, .body = "q=linux+rescue+cd&url=https%3A%2F%2Fclonezilla.org%2F" });
+    try testing.expect(std.mem.startsWith(u8, again.body, "already"));
+    try testing.expectEqual(http.Status.bad_request, handleSigned(a, fake.searcher(), services, .POST, "/suggest", null, .{ .cookie = header, .body = "q=x&url=javascript%3Aalert(1)" }).status);
+    try testing.expectEqual(http.Status.method_not_allowed, handleSigned(a, fake.searcher(), services, .GET, "/suggest", null, .{ .cookie = header }).status);
+    try testing.expectEqualStrings("https://clonezilla.org/\n", try tmp.dir.readFileAlloc(testing.io, dk.feedback.suggested_file, a, .limited(10_000)));
+    const marks = try tmp.dir.readFileAlloc(testing.io, dk.feedback.file_name, a, .limited(10_000));
+    try testing.expect(std.mem.indexOf(u8, marks, "\"query\":\"linux rescue cd\"") != null and std.mem.indexOf(u8, marks, "https://clonezilla.org/") != null and std.mem.indexOf(u8, marks, "\"grade\":1") != null);
 }

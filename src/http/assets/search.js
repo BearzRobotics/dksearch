@@ -40,6 +40,23 @@
   });
 })();
 
+// The owner's "a site is missing" form under the results: the address is sent to /suggest, which adds it to the sites to
+// crawl and keeps it as a good answer for this search.
+"use strict";
+(function () {
+  var form = document.querySelector("form.suggest[data-q]");
+  if (!form || !window.fetch) return;
+  var msg = form.querySelector(".msg");
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var url = form.elements["url"].value.trim();
+    msg.textContent = "…";
+    fetch("/suggest", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "q=" + encodeURIComponent(form.getAttribute("data-q")) + "&url=" + encodeURIComponent(url) })
+      .then(function (r) { return r.text().then(function (t) { msg.textContent = t.trim(); if (r.ok) form.elements["url"].value = ""; }); })
+      .catch(function () { msg.textContent = "could not reach the server"; });
+  });
+})();
+
 // The search box as a multi-line field: Enter searches, Shift+Enter starts a new line, and the box grows with its text.
 // The page works without this file (a one-line box that searches on Enter); this only upgrades it.
 "use strict";

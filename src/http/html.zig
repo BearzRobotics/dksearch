@@ -545,6 +545,11 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     }
 
     try writeFallback(w, f);
+    if (f.feedback and f.q.len > 0 and !f.images) {
+        try w.writeAll("<details class=\"suggest\"><summary>A site missing from these results?</summary><form class=\"suggest\" data-q=\"");
+        try writeEscaped(w, f.q);
+        try w.writeAll("\"><input type=\"url\" name=\"url\" placeholder=\"https://example.org/\" required maxlength=\"2000\" aria-label=\"Address of the site\"> <button type=\"submit\">Suggest this site</button> <span class=\"msg\" role=\"status\"></span></form><p class=\"hint\">It is added to the sites to crawl and kept as a good answer for this search.</p></details>\n");
+    }
     if (offset > 0 or page.has_more) {
         try w.writeAll("<nav class=\"pager\" aria-label=\"Pages\"><span>");
         if (offset > 0) try writePagerLink(w, f, offset -| page_size, "&larr; Previous");

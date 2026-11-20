@@ -402,3 +402,11 @@ form.search textarea[name="q"] {
 /* The picture gallery is as wide as the window; the search box and the notices above it keep the reading width. */
 main.gallery-page { max-width: none; padding-left: 1.5rem; padding-right: 1.5rem; }
 .gallery-page > :not(ul.gallery) { max-width: 44rem; }
+
+/* The owner's "a site is missing" form */
+details.suggest { margin: 1.5rem 0 1rem; color: var(--muted); font-size: 0.9rem; }
+details.suggest summary { cursor: pointer; }
+form.suggest { margin: 0.6rem 0 0.2rem; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+form.suggest input[type="url"] { flex: 1 1 18rem; font: inherit; padding: 0.3rem 0.5rem; border: 1px solid var(--border); border-radius: 0.4rem; background: var(--bg); color: var(--fg); }
+form.suggest button { font: inherit; padding: 0.3rem 0.7rem; }
+details.suggest .hint { margin: 0.2rem 0 0; font-size: 0.8rem; }
