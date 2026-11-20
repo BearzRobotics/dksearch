@@ -105,7 +105,10 @@ ol.results li { margin: 0 0 1.5rem; }
 .snippet { margin: 0.2rem 0; overflow-wrap: anywhere; }
 .snippet mark { background: var(--mark); color: inherit; }
 .source { color: var(--muted); font-size: 0.8rem; }
-nav.pager { display: flex; justify-content: space-between; }
+nav.pager { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+nav.pager .pages { color: var(--muted); text-align: center; flex: 1 1 auto; overflow-wrap: anywhere; }
+nav.pager .pages a { margin: 0 0.15rem; }
+nav.pager .pages strong { color: var(--fg); margin-left: 0.15rem; }
 
 /* Administration interface */
 :root {

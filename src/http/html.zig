@@ -548,6 +548,8 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     if (offset > 0 or page.has_more) {
         try w.writeAll("<nav class=\"pager\" aria-label=\"Pages\"><span>");
         if (offset > 0) try writePagerLink(w, f, offset -| page_size, "&larr; Previous");
+        try w.writeAll("</span><span class=\"pages\">");
+        try writePageNumbers(w, f, offset, page_size);
         try w.writeAll("</span><span>");
         if (page.has_more) try writePagerLink(w, f, offset + page_size, "Next &rarr;");
         try w.writeAll("</span></nav>\n");
@@ -923,6 +925,26 @@ fn metaRow(w: *Writer, name: []const u8, value: []const u8) Writer.Error!void {
     try w.writeAll("</dd>");
 }
 
+/// "Page 4" with the pages before it as links (the first, then the last eight before this one), so a reader can see how
+/// far they have gone and step back to any of them. The pages after this one are not known: only "Next".
+fn writePageNumbers(w: *Writer, f: Form, offset: u32, page_size: u32) Writer.Error!void {
+    if (page_size == 0) return;
+    const current: u32 = offset / page_size + 1;
+    try w.writeAll("Page ");
+    const first_shown: u32 = if (current > 9) current - 8 else 1;
+    if (first_shown > 1) {
+        try writePagerLink(w, f, 0, "1");
+        try w.writeAll(" &hellip; ");
+    }
+    var p: u32 = first_shown;
+    while (p < current) : (p += 1) {
+        var label: [12]u8 = undefined;
+        try writePagerLink(w, f, (p - 1) * page_size, std.fmt.bufPrint(&label, "{d}", .{p}) catch "");
+        try w.writeAll(" ");
+    }
+    try w.print("<strong aria-current=\"page\">{d}</strong>", .{current});
+}
+
 fn writePagerLink(w: *Writer, f: Form, offset: u32, label_html: []const u8) Writer.Error!void {
     try w.writeAll("<a href=\"/search?q=");
     try query.writeEncoded(w, f.q);
@@ -1104,6 +1126,8 @@ test "results page: escapes titles, only links safe URLs, shows pager" {
     // Pager: previous goes to offset 0 (no offset param), next to offset 20.
     try testing.expect(std.mem.indexOf(u8, out, "href=\"/search?q=a%20%22b%22%20%3Cc%3E&amp;language=en\">&larr; Previous") != null);
     try testing.expect(std.mem.indexOf(u8, out, "&amp;offset=20\">Next") != null);
+    // "Page 2" with page 1 as a link, and the current page not a link.
+    try testing.expect(std.mem.indexOf(u8, out, "Page <a href=\"/search?q=a%20%22b%22%20%3Cc%3E&amp;language=en\">1</a> <strong aria-current=\"page\">2</strong>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "<ol class=\"results\" start=\"11\">") != null);
 }
 
