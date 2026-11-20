@@ -15,6 +15,10 @@ const block_tags = [_][]const u8{
     "p",  "br", "div", "li",    "ul",         "ol",  "h1", "h2",      "h3",      "h4",     "h5",     "h6",
     "tr", "td", "th",  "table", "blockquote", "pre", "hr", "section", "article", "header", "footer",
 };
+/// Elements that start a new word when they open: a run of links or spans is a list (tags, menus, breadcrumbs, categories) whose
+/// items must not be glued together ("digital art" "artwork" must not become "digital artartwork"). Emphasis (`b`, `i`, `em`,
+/// `strong`) is not here: it can start in the middle of a word.
+const separating_tags = [_][]const u8{ "a", "span", "button", "label", "option", "dt", "dd", "summary" };
 const dropped_tags = [_][]const u8{ "script", "style", "head", "noscript" };
 
 pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
@@ -50,7 +54,11 @@ pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
                         continue;
                     }
                 }
-                if (isOneOf(t.name, &block_tags)) try out.append(arena, '\n');
+                if (isOneOf(t.name, &block_tags)) {
+                    try out.append(arena, '\n');
+                } else if (!t.closing and isOneOf(t.name, &separating_tags)) {
+                    if (out.items.len > 0 and !std.ascii.isWhitespace(out.items[out.items.len - 1])) try out.append(arena, ' ');
+                }
                 i = t.end;
                 continue;
             }
@@ -632,4 +640,16 @@ test "common named entities are decoded" {
     defer ar.deinit();
     try testing.expectEqualStrings("Library \u{2022} Index \u{b7} A \u{2192} B \u{2122}", (try titleOf(ar.allocator(), "<title>Library &bull; Index &middot; A &rarr; B &trade;</title>")).?);
     try testing.expectEqualStrings("a&unknown;b", (try titleOf(ar.allocator(), "<title>a&unknown;b</title>")).?);
+}
+
+test "links and spans that follow one another are separate words; emphasis in the middle of a word is not a break" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectEqualStrings("digital art artwork concept art", try toText(a, "<div class=tags><a href=/t/1>digital art</a><a href=/t/2>artwork</a><a href=/t/3>concept art</a></div>"));
+    try testing.expectEqualStrings("nature plants", try toText(a, "<span class=tag>nature</span><span class=tag>plants</span>"));
+    try testing.expectEqualStrings("Home Docs Blog", try toText(a, "<nav><a href=/>Home</a><a href=/d>Docs</a><a href=/b>Blog</a></nav>"));
+    // Unchanged: text before a link, a plural after one, and emphasis.
+    try testing.expectEqualStrings("the cats and boldface", try toText(a, "the <a href=/c>cat</a>s and <b>bold</b>face"));
+    try testing.expectEqualStrings("a b", try toText(a, "a <span>b</span>"));
 }
