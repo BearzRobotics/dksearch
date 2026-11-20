@@ -1463,11 +1463,17 @@ pub const SqliteIndex = struct {
             rec_expr = try std.fmt.allocPrint(arena, "(1.0 + {d}.{d:0>2} / (1.0 + MAX(0, CAST(strftime('%s','now') AS INTEGER) - COALESCE(d.modified_at, d.published_at, d.indexed_at, 0)) / 86400.0 / {d}.0))", .{ self.recency_percent / 100, self.recency_percent % 100, self.recency_days });
         }
         const demote_expr: []const u8 = if (self.domains) |l| (if (!l.demoted.isEmpty() and self.has_meta) " * dk_demote(d.domain)" else "") else "";
+        // A web page whose "title" is a file or directory name (words joined by underscores, no spaces: an open directory listing)
+        // says nothing a person searched for beyond the words in its name: it ranks lower. Files on this machine keep theirs.
+        const file_title_expr: []const u8 = if (self.has_meta and text_mode)
+            " * (CASE WHEN d.title IS NOT NULL AND instr(d.title, ' ') = 0 AND length(d.title) - length(replace(d.title, '_', '')) >= 3 AND d.url LIKE 'http%' THEN 0.4 ELSE 1.0 END)"
+        else
+            "";
         var lang_expr: []const u8 = "";
         if (self.has_meta and text_mode) if (try langprefer.csv(arena, q.prefer_languages)) |list| {
             lang_expr = try std.fmt.allocPrint(arena, " * dk_foreign(d.language, d.path, '{s}')", .{list});
         };
-        try factors.print(arena, "{s} * {s}{s}{s}", .{ src_expr, rec_expr, demote_expr, lang_expr });
+        try factors.print(arena, "{s} * {s}{s}{s}{s}", .{ src_expr, rec_expr, demote_expr, lang_expr, file_title_expr });
         const bm = try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0) * {s}", .{ self.title_weight, self.body_weight, factors.items });
         const explain_cols = if (q.explain and text_mode)
             try std.fmt.allocPrint(arena, ", -bm25(fts, {d}.0, {d}.0), -bm25(fts, 1.0, 0.0), -bm25(fts, 0.0, 1.0), {s}, {s}", .{ self.title_weight, self.body_weight, src_expr, rec_expr })
@@ -3021,4 +3027,18 @@ test "other forms of a word are found, in the excerpt too; off, the word is foun
     idx.setWordForms(false);
     const off = try searchAll(a, &idx, "program c");
     try testing.expectEqual(@as(usize, 0), off.hits.len);
+}
+
+test "a web page whose title is a file name ranks lower; a file on this machine does not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{ .sync = .off });
+    defer idx.close();
+    try putDoc(&idx, .{ .connector = "web", .source_id = "1", .title = "The_Communist_Program_for_World_Conquest_Gen", .text = "program listing", .canonical_url = "https://files.example.org/?dir=x", .content_type = "text/html" });
+    try putDoc(&idx, .{ .connector = "web", .source_id = "2", .title = "Program listing", .text = "program listing", .canonical_url = "https://docs.example.org/p", .content_type = "text/html" });
+    try putDoc(&idx, .{ .connector = "files", .source_id = "3", .title = "my_notes_on_the_program", .text = "program listing", .canonical_url = "file:///home/me/my_notes_on_the_program.txt", .content_type = "text/plain" });
+    const page = try idx.searcher().search(a, .{ .text = "program" });
+    try testing.expectEqual(@as(usize, 3), page.hits.len);
+    try testing.expectEqualStrings("https://files.example.org/?dir=x", page.hits[2].url.?); // last of three, though its title matches
 }

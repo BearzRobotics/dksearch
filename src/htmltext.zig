@@ -151,6 +151,13 @@ fn entity(arena: Allocator, out: *std.ArrayList(u8), s: []const u8, i: *usize) A
         .{ "quot", "\"" },         .{ "apos", "'" },         .{ "ndash", "\u{2013}" }, .{ "mdash", "\u{2014}" },
         .{ "hellip", "\u{2026}" }, .{ "rsquo", "\u{2019}" }, .{ "lsquo", "\u{2018}" }, .{ "rdquo", "\u{201d}" },
         .{ "ldquo", "\u{201c}" },  .{ "copy", "\u{a9}" },    .{ "times", "\u{d7}" },   .{ "deg", "\u{b0}" },
+        .{ "bull", "\u{2022}" },   .{ "middot", "\u{b7}" },  .{ "laquo", "\u{ab}" },   .{ "raquo", "\u{bb}" },
+        .{ "reg", "\u{ae}" },      .{ "trade", "\u{2122}" }, .{ "euro", "\u{20ac}" },  .{ "pound", "\u{a3}" },
+        .{ "yen", "\u{a5}" },      .{ "cent", "\u{a2}" },    .{ "sect", "\u{a7}" },    .{ "para", "\u{b6}" },
+        .{ "larr", "\u{2190}" },   .{ "rarr", "\u{2192}" },  .{ "uarr", "\u{2191}" },  .{ "darr", "\u{2193}" },
+        .{ "sbquo", "\u{201a}" },  .{ "bdquo", "\u{201e}" }, .{ "prime", "\u{2032}" }, .{ "minus", "\u{2212}" },
+        .{ "ensp", " " },          .{ "emsp", " " },         .{ "thinsp", " " },       .{ "shy", "" },
+        .{ "plusmn", "\u{b1}" },   .{ "frac12", "\u{bd}" },  .{ "micro", "\u{b5}" },   .{ "check", "\u{2713}" },
     };
     for (named) |n| if (std.mem.eql(u8, name, n[0])) {
         try out.appendSlice(arena, n[1]);
@@ -617,4 +624,11 @@ test "the page's own language comes from the html element" {
     const s = try scan(ar.allocator(), "<!doctype html><html lang=\"zh-CN\" class=a><head><title>x</title></head><body></body></html>", 10);
     try testing.expectEqualStrings("zh-CN", s.lang.?);
     try testing.expect((try scan(ar.allocator(), "<html><body>x</body></html>", 10)).lang == null);
+}
+
+test "common named entities are decoded" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expectEqualStrings("Library \u{2022} Index \u{b7} A \u{2192} B \u{2122}", (try titleOf(ar.allocator(), "<title>Library &bull; Index &middot; A &rarr; B &trade;</title>")).?);
+    try testing.expectEqualStrings("a&unknown;b", (try titleOf(ar.allocator(), "<title>a&unknown;b</title>")).?);
 }
