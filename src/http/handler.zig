@@ -1205,12 +1205,17 @@ fn didYouMean(arena: Allocator, searcher: dk.search.Searcher, q: dk.search.Query
     while (it.next()) |w| {
         if (fixed.items.len > 0) try fixed.append(arena, ' ');
         var use = w;
-        if (plainWord(w) and w.len >= 3) {
+        // Only a word the index does not have is respelled: a word it has ("linux", "written") is already right, and
+        // question words are not worth correcting.
+        if (plainWord(w) and w.len >= 3 and !dk.queryparse.isFiller(w)) {
             const lower = try std.ascii.allocLowerString(arena, w);
-            const near = searcher.words(arena, lower, .spelling, 1) catch &.{};
-            if (near.len > 0) {
-                use = near[0];
-                changed = true;
+            const have = searcher.words(arena, lower, .known, 1) catch &.{};
+            if (have.len == 0) {
+                const near = searcher.words(arena, lower, .spelling, 1) catch &.{};
+                if (near.len > 0) {
+                    use = near[0];
+                    changed = true;
+                }
             }
         }
         try fixed.appendSlice(arena, use);
@@ -3598,6 +3603,7 @@ test "suggestions complete the last word; an empty result offers a spelling that
         }
         fn words(_: *anyopaque, arena: Allocator, w: []const u8, kind: dk.search.WordKind, _: u32) dk.search.Error![]const []const u8 {
             const list = try arena.alloc([]const u8, 1);
+            if (kind == .known) return &.{}; // nothing typed in this test is a word the index has
             list[0] = if (kind == .prefix) "elephant" else if (std.mem.eql(u8, w, "elefant")) "elephant" else "zzz";
             return if (kind == .spelling and !std.mem.eql(u8, w, "elefant")) &.{} else list;
         }
@@ -4522,4 +4528,37 @@ test "feedback: only the owner signed in sees the buttons and can mark a result;
     const without_store: Services = .{ .owner = &owner };
     try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), without_store, .GET, "/search?q=c", null, .{ .cookie = header }).body, "data-feedback") == null);
     try testing.expectEqual(http.Status.not_found, handleSigned(a, fake.searcher(), without_store, .POST, "/feedback", null, .{ .cookie = header, .body = "q=c&url=u&grade=1" }).status);
+}
+
+test "a spelling suggestion respells only the words the index does not have" {
+    const Spell = struct {
+        var hit = [_]dk.search.Hit{.{ .id = @splat(7), .connector = "t", .url = "https://e.org/l", .title = "Linux", .snippet = null, .score = 1 }};
+        fn search(_: *anyopaque, _: Allocator, q: dk.search.Query) dk.search.Error!dk.search.Page {
+            if (std.mem.indexOf(u8, q.text, "language") != null) return .{ .hits = &hit, .has_more = false };
+            return .{ .hits = &.{}, .has_more = false };
+        }
+        fn words(_: *anyopaque, arena: Allocator, w: []const u8, kind: dk.search.WordKind, _: u32) dk.search.Error![]const []const u8 {
+            const list = try arena.alloc([]const u8, 1);
+            switch (kind) {
+                .known => {
+                    if (!std.mem.eql(u8, w, "linux") and !std.mem.eql(u8, w, "what")) return &.{};
+                    list[0] = w;
+                },
+                .spelling => {
+                    list[0] = if (std.mem.eql(u8, w, "lanague")) "language" else if (std.mem.eql(u8, w, "linux")) "linus" else "wheat";
+                },
+                .prefix => return &.{},
+            }
+            return list;
+        }
+    };
+    var dummy: u8 = 0;
+    const s: dk.search.Searcher = .{ .ptr = &dummy, .vtable = &.{ .search = Spell.search, .words = Spell.words } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const page = handle(a, s, .GET, "/search?q=what+linux+lanague");
+    try testing.expect(std.mem.indexOf(u8, page.body, "Did you mean") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "what linux language") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "linus") == null and std.mem.indexOf(u8, page.body, "wheat") == null);
 }

@@ -855,6 +855,12 @@ pub const SqliteIndex = struct {
                 const got = try self.expandWord(arena, word, if (edits == 0) 1 else edits);
                 return got[0..@min(got.len, limit)];
             },
+            .known => {
+                if (!self.wordKnown(word)) return &.{};
+                const out = try arena.alloc([]const u8, 1);
+                out[0] = try arena.dupe(u8, word);
+                return out;
+            },
             .prefix => {
                 var upper = try arena.dupe(u8, word);
                 upper[upper.len - 1] +%= 1;
@@ -1107,6 +1113,20 @@ pub const SqliteIndex = struct {
         return out.items;
     }
 
+    /// Whether the index has this word (lower case) as a word of its own.
+    fn wordKnown(self: *SqliteIndex, word: []const u8) bool {
+        if (!self.has_vocab or word.len == 0 or word.len > 64) return false;
+        const st = Stmt.prepare(self.db, "SELECT 1 FROM fts_vocab WHERE term = ?1 LIMIT 1") catch return false;
+        defer st.deinit();
+        st.text(1, word) catch return false;
+        return st.step() catch false;
+    }
+
+    fn knownCb(ctx: *anyopaque, word: []const u8) bool {
+        const self: *SqliteIndex = @ptrCast(@alignCast(ctx));
+        return self.wordKnown(word);
+    }
+
     fn expandCb(ctx: *anyopaque, arena: Allocator, word: []const u8, max_edits: u8) Allocator.Error![]const []const u8 {
         const self: *SqliteIndex = @ptrCast(@alignCast(ctx));
         return self.expandWord(arena, word, max_edits) catch &.{};
@@ -1242,7 +1262,7 @@ pub const SqliteIndex = struct {
     }
 
     fn parseQuery(self: *SqliteIndex, arena: Allocator, text: []const u8, fuzzy_words: bool, now: i64) search.Error!queryparse.Parsed {
-        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now, .lexicon = self.lexicon, .forms = if (self.word_forms and self.has_vocab) .{ .ctx = @constCast(self), .f = formsCb } else null, .common = if (self.common_percent > 0 and self.has_vocab) .{ .ctx = self, .isCommon = commonCb } else null, .expander = if (self.has_vocab) .{ .ctx = @constCast(self), .f = expandCb } else null }) catch |e| switch (e) {
+        return queryparse.parseWith(arena, text, .{ .fuzzy_words = fuzzy_words, .now = now, .lexicon = self.lexicon, .forms = if (self.word_forms and self.has_vocab) .{ .ctx = @constCast(self), .f = formsCb } else null, .common = if (self.common_percent > 0 and self.has_vocab) .{ .ctx = self, .isCommon = commonCb } else null, .expander = if (self.has_vocab) .{ .ctx = @constCast(self), .f = expandCb, .known = knownCb } else null }) catch |e| switch (e) {
             error.EmptyQuery => error.EmptyQuery,
             error.InvalidQuery => error.InvalidQuery,
             error.OutOfMemory => error.OutOfMemory,
@@ -3042,4 +3062,25 @@ test "a web page whose title is a file name ranks lower; a file on this machine 
     const page = try idx.searcher().search(a, .{ .text = "program" });
     try testing.expectEqual(@as(usize, 3), page.hits.len);
     try testing.expectEqualStrings("https://files.example.org/?dir=x", page.hits[2].url.?); // last of three, though its title matches
+}
+
+test "a repeat for a misspelling respells only the words the index does not have, and leaves question words out" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{ .sync = .off });
+    defer idx.close();
+    idx.setFuzzyMode(.auto);
+    _ = try put(&idx, "t", "1", "Linux", "The Linux kernel is written in the C programming language by many people");
+    _ = try put(&idx, "t", "2", "Linus", "Linus Torvalds started it");
+    _ = try put(&idx, "t", "3", "Wheat", "wheat is a grain");
+    _ = try put(&idx, "t", "4", "Cooking", "a language of food written in recipes");
+    // "lanague" is three edits from "language"; "what", "is" and "in" are question words, "linux" and "written" are words
+    // the index has (and "linus" and "wheat" are near them, which must not matter).
+    const page = try searchAll(a, &idx, "what lanague is linux written in");
+    try testing.expectEqual(@as(usize, 1), page.hits.len);
+    try testing.expectEqualStrings("Linux", page.hits[0].title.?);
+    // The index says which words it has.
+    try testing.expectEqual(@as(usize, 1), (try idx.searcher().words(a, "linux", .known, 1)).len);
+    try testing.expectEqual(@as(usize, 0), (try idx.searcher().words(a, "lanague", .known, 1)).len);
 }

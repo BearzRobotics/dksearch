@@ -75,6 +75,9 @@ pub const Options = struct {
 /// Looks words up in the index's vocabulary. `f` returns the words within `max_edits` of `word` (not `word`
 /// itself), best first, at most `max_expansions`.
 pub const Expander = struct {
+    /// Whether the index has this word (lower case). A word it has is not respelled when the search is repeated with
+    /// typo tolerance on its own account: only a word that is not there is.
+    known: ?*const fn (ctx: *anyopaque, word: []const u8) bool = null,
     ctx: *anyopaque,
     f: *const fn (ctx: *anyopaque, arena: Allocator, word: []const u8, max_edits: u8) Allocator.Error![]const []const u8,
 };
@@ -82,7 +85,7 @@ pub const Expander = struct {
 /// How many edits a fuzzy word may be off: one for words of three to five letters, two from six, unless the
 /// person wrote `word~1` or `word~2`.
 pub fn autoEdits(len: usize) u8 {
-    return if (len < fuzzy_min_len) 0 else if (len <= 5) 1 else 2;
+    return if (len < fuzzy_min_len) 0 else if (len <= 5) 1 else if (len <= 6) 2 else 3;
 }
 
 pub const max_expansions = 12;
@@ -745,21 +748,29 @@ fn quoted(arena: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocator.Er
     try out.append(arena, '"');
 }
 
+/// Whether a plain word is left out of the required words (a question or filler word, or one so common in the index that
+/// it does not help), noting it for the page to say so. Words with a column, and words someone asked to be respelled
+/// (`word~2`), are never left out.
+fn leftOut(arena: Allocator, lx: Lx, t: Term) Allocator.Error!bool {
+    const c = lx.common orelse return false;
+    if (t.column != null) return false;
+    if (!(isFiller(t.text) or c.isCommon(c.ctx, t.text))) return false;
+    if (lx.ignored) |list| {
+        var seen = false;
+        for (list.items) |w| if (std.ascii.eqlIgnoreCase(w, t.text)) {
+            seen = true;
+        };
+        if (!seen) try list.append(arena, t.text);
+    }
+    return true;
+}
+
 /// Emits one term; false if it ends up with nothing to search for.
 fn emitTerm(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, t: Term) Allocator.Error!bool {
     switch (t.kind) {
         .word => {
             if (lx.stops and (lx.lexicon.?).isStop(t.text)) return false;
-            if (lx.common) |c| if (t.column == null and (isFiller(t.text) or c.isCommon(c.ctx, t.text))) {
-                if (lx.ignored) |list| {
-                    var seen = false;
-                    for (list.items) |w| if (std.ascii.eqlIgnoreCase(w, t.text)) {
-                        seen = true;
-                    };
-                    if (!seen) try list.append(arena, t.text);
-                }
-                return false;
-            };
+            if (try leftOut(arena, lx, t)) return false;
             const syn: []const []const u8 = if (lx.lexicon) |l| l.synonymsOf(t.text) else &.{};
             var stem_buf: [wordforms.max_word]u8 = undefined;
             if (lx.forms) |fl| if (t.column == null) if (wordforms.stemPrefix(&stem_buf, t.text)) |st| {
@@ -812,6 +823,8 @@ fn emitTerm(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, t: Term) Allocato
         },
         .fuzzy => {
             if (lx.stops and (lx.lexicon.?).isStop(t.text)) return false;
+            // A word that was only made fuzzy by the repeat of a search that found nothing is left out like any other.
+            if (t.n == 0 and try leftOut(arena, lx, t)) return false;
             try emitFuzzy(arena, out, lx, t.text, @intCast(t.n));
         },
         .near => {
@@ -871,6 +884,7 @@ fn emitFuzzy(arena: Allocator, out: *std.ArrayList(u8), lx: Lx, word: []const u8
     const lower = try std.ascii.allocLowerString(arena, word);
     // With the index's vocabulary: the words that exist within the allowed number of edits, best first.
     if (lx.expander) |ex| {
+        if (asked_edits == 0) if (ex.known) |is_known| if (is_known(ex.ctx, lower)) return quoted(arena, out, lower);
         const edits = if (asked_edits > 0) asked_edits else autoEdits(lower.len);
         const found = try ex.f(ex.ctx, arena, lower, edits);
         try out.append(arena, '(');

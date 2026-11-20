@@ -271,7 +271,8 @@ pub const ExportRow = struct {
 /// What the index holds for one source.
 pub const SourceStat = struct { name: []const u8, docs: u64, last_added: ?i64 = null };
 
-pub const WordKind = enum { prefix, spelling };
+/// `prefix`: words that begin with it; `spelling`: words a few edits away; `known`: the word itself if the index has it.
+pub const WordKind = enum { prefix, spelling, known };
 
 pub const Searcher = struct {
     ptr: *anyopaque,

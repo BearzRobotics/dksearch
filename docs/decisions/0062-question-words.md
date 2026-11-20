@@ -13,3 +13,7 @@ A fixed list of English question and filler words (how, what, why, when, where, 
 ## Consequences
 
 A search for the band "The Who" is searched as typed (all words are fillers). A query such as "who wrote hamlet" becomes "wrote hamlet", which is what is meant. The list is English only; other languages rely on the frequency rule.
+
+## Spelling repeats and suggestions
+
+A search that found nothing is repeated with typo tolerance (ADR 0003-era `fuzzy = auto`), and the page offers "Did you mean". Both used to respell every word: "what lanague is linux written in" became "wheat langue is linus witten in", and found nothing. Now a word the index has is never respelled (`WordKind.known`), question and filler words are left out of the repeat as in the first search, a word that is not in the index may be three edits away when it is seven letters or more ("lanague" is three from "language"), and the suggestion respells only the words the index lacks.
