@@ -116,3 +116,17 @@ English Wikipedia's article text is on the order of 20 GB. Scaling the numbers a
 ## Not measured
 
 The effect of the `porter` tokenizer; cold-cache latency; and the admin interface under load.
+
+## Searches of only common words (2026-11-19)
+
+Measured with `crap` (a fork of poop: wall time of `curl -s -o /dev/null http://127.0.0.1:18103/search?q=...`, several runs each) against the live playground server, 414,000 documents, 12 logical CPUs, the index on NVMe. Across 35 ordinary searches the median was 47 ms; the slow ones were queries made only of words too common to rank.
+
+| Search | Before | After |
+|---|---|---|
+| `the` | 5.21 s (the query time limit) | 9.5 ms |
+| `a` | 5.0 s | not timed after the change (the same path as `the`) |
+| `to be or not to be` | 2.03 s | 0.37 s |
+| `linux kernel scheduler` (control) | 49 ms | 47 ms |
+
+What it was: ranking millions of matches, and then the per-domain step reading up to 100,000 rows before its window (a `perf record -e cpu-clock:u` profile showed SQLite's row processing, not ranking, after the first fix: "the" fell from 5.2 s to 1.1 s with the phrase and unranked paths and to 9.5 ms once the window was skipped). See docs/decisions/0069-common-word-searches.md.
+

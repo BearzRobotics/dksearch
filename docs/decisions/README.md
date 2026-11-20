@@ -67,3 +67,22 @@ Each record states the context, the options considered, the decision and who mad
 | 0049 | Safe search that adults can turn off |
 | 0050 | Regular expressions over characters |
 | 0051 | Adaptive recrawl of pages |
+| 0052 | Pictures of the web, shown through a relay that stores nothing |
+| 0053 | Export file, sign-in with a key, and public mode |
+| 0054 | Owner login on the search page, and the multi-line search box |
+| 0055 | The thumbnail cache |
+| 0056 | Search speed on a large index: common words and excerpts |
+| 0057 | Crawl report and polite backoff |
+| 0058 | The crawler's frontier: tidy addresses, traps, priority, sitemaps and feeds |
+| 0059 | MediaWiki sites are listed through their API |
+| 0060 | Optional rendering of script-built pages with an external program |
+| 0061 | Result quality: pages not pictures, the reader's language, one site not a whole page |
+| 0062 | Question and filler words are not required |
+| 0063 | Other forms of a word are found by the query, not by the index |
+| 0064 | The owner marks results good or bad; the marks are the test set |
+| 0065 | The title weight, chosen against the owner's marks |
+| 0066 | The owner suggests a site that should have been found |
+| 0067 | regex-zig 0.3.0 |
+| 0068 | Embedding prefixes, and vectors made as searches need them |
+| 0069 | A search of only common words is a phrase, or not ranked |
+| 0070 | Fuzzing the parsers of outside input |

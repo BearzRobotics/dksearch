@@ -10,6 +10,7 @@ Needs Zig 0.17.1 and nothing else. All dependencies are vendored (SQLite, a TOML
 
     zig build -Doptimize=ReleaseSafe     # binary: zig-out/bin/dksearch
     zig build test                       # all tests; they run offline
+    zig build test --fuzz=300K           # fuzz the parsers of outside input (src/fuzz.zig; docs/decisions/0070-fuzzing.md)
     zig build -Dwikipedia=false -Dfeeds=false -Dcrawler=false   # leave out those connectors and what they need
 
 ## Help
