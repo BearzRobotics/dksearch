@@ -15,9 +15,10 @@ const block_tags = [_][]const u8{
     "p",  "br", "div", "li",    "ul",         "ol",  "h1", "h2",      "h3",      "h4",     "h5",     "h6",
     "tr", "td", "th",  "table", "blockquote", "pre", "hr", "section", "article", "header", "footer",
 };
-/// Elements that start a new word when they open: a run of links or spans is a list (tags, menus, breadcrumbs, categories) whose
-/// items must not be glued together ("digital art" "artwork" must not become "digital artartwork"). Emphasis (`b`, `i`, `em`,
-/// `strong`) is not here: it can start in the middle of a word.
+/// Elements that start a new word when they open straight after another of them has closed: a run of links or spans is a
+/// list (tags, menus, breadcrumbs, categories) whose items must not be glued together ("digital art" "artwork" must not become
+/// "digital artartwork"). One that opens after text is not a break (`a<span>b</span>c` is "abc": a span can start inside a word),
+/// and emphasis (`b`, `i`, `em`, `strong`) is not here at all.
 const separating_tags = [_][]const u8{ "a", "span", "button", "label", "option", "dt", "dd", "summary" };
 const dropped_tags = [_][]const u8{ "script", "style", "head", "noscript" };
 
@@ -27,6 +28,8 @@ pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
     // A dropped tag whose end tag is missing is searched for only once: after
     // that it is just a tag. This keeps unclosed `<script>` soup linear.
     var missing_end: [dropped_tags.len]bool = @splat(false);
+    // The last thing seen was the end of a link or span (no text since): the next link or span starts a new word.
+    var after_item = false;
     var i: usize = 0;
     while (i < html.len) {
         const ch = html[i];
@@ -56,9 +59,15 @@ pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
                 }
                 if (isOneOf(t.name, &block_tags)) {
                     try out.append(arena, '\n');
-                } else if (!t.closing and isOneOf(t.name, &separating_tags)) {
-                    if (out.items.len > 0 and !std.ascii.isWhitespace(out.items[out.items.len - 1])) try out.append(arena, ' ');
-                }
+                    after_item = false;
+                } else if (isOneOf(t.name, &separating_tags)) {
+                    if (t.closing) {
+                        after_item = true;
+                    } else {
+                        if (after_item and out.items.len > 0 and !std.ascii.isWhitespace(out.items[out.items.len - 1])) try out.append(arena, ' ');
+                        after_item = false;
+                    }
+                } else after_item = false;
                 i = t.end;
                 continue;
             }
@@ -66,6 +75,7 @@ pub fn toText(arena: Allocator, html: []const u8) Allocator.Error![]const u8 {
             if (try entity(arena, &out, html, &i)) continue;
         }
         try out.append(arena, ch);
+        after_item = false;
         i += 1;
     }
     return tidy(arena, out.items);
@@ -266,10 +276,22 @@ pub const Scan = struct {
     edit_uri: ?[]const u8 = null,
     /// `<html lang="...">`: the language the page says it is in (as written, at most 35 characters).
     lang: ?[]const u8 = null,
+    /// The page's own tags (docs/decisions/0074), lower case, at most `max_tags` (100) of at most `max_tag_len` characters: the
+    /// `<meta name="keywords">` and `article:tag` / `og:video:tag` metas, links marked `rel="tag"`, `data-tags` and
+    /// `data-tag-name` attributes (image boards write their tags there), and the keywords of a JSON-LD block.
+    tags: []const []const u8 = &.{},
+    /// The page's own description (`<meta name="description">`, `og:description`, JSON-LD), at most `max_description` characters.
+    description: ?[]const u8 = null,
 };
 
+pub const max_tags = 100;
+pub const max_tag_len = 60;
+pub const max_description = 600;
+/// A JSON-LD block longer than this is not read.
+const max_ld_bytes = 128 * 1024;
+
 /// A picture of a page: where it is (as written in the page: it may be relative), what the page says it shows.
-pub const PageImage = struct { src: []const u8, alt: []const u8, title: []const u8 };
+pub const PageImage = struct { src: []const u8, alt: []const u8, title: []const u8, tags: []const []const u8 = &.{} };
 
 /// The smallest side (pixels, when the page says it) that makes a picture worth recording: icons and tracking pixels are not.
 pub const min_image_side: u32 = 100;
@@ -283,11 +305,166 @@ pub fn scan(arena: Allocator, html: []const u8, max_links: usize) Allocator.Erro
 
 /// Like `scan`, and also up to `max_images` pictures: `<img>` with a `src` (or a lazy-loading `data-src`) that is not an inline
 /// `data:` address and is not marked smaller than `min_image_side`, and the page's `og:image`.
+/// Adds `raw` to `list` as a tag: entities decoded, lower case, underscores as spaces (`long_hair` is "long hair"), spaces
+/// collapsed, `#` and quotes trimmed; not an empty or over-long one, not one with no letter or digit, not one already there.
+fn addTag(arena: Allocator, list: *std.ArrayList([]const u8), raw: []const u8) Allocator.Error!void {
+    if (list.items.len >= max_tags) return;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n\"'#,;");
+    if (trimmed.len == 0 or trimmed.len > max_tag_len * 2) return;
+    const decoded = try decodeEntities(arena, trimmed);
+    var buf = try arena.alloc(u8, decoded.len);
+    var n: usize = 0;
+    var prev_space = true;
+    for (decoded) |c| {
+        const ch: u8 = if (c == '_') ' ' else std.ascii.toLower(c);
+        if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') {
+            if (!prev_space) {
+                buf[n] = ' ';
+                n += 1;
+                prev_space = true;
+            }
+        } else {
+            buf[n] = ch;
+            n += 1;
+            prev_space = false;
+        }
+    }
+    while (n > 0 and buf[n - 1] == ' ') n -= 1;
+    if (n == 0 or n > max_tag_len) return;
+    var has_word = false;
+    for (buf[0..n]) |c| if (std.ascii.isAlphanumeric(c) or c >= 0x80) {
+        has_word = true;
+        break;
+    };
+    if (!has_word) return;
+    for (list.items) |x| if (std.mem.eql(u8, x, buf[0..n])) return;
+    try list.append(arena, buf[0..n]);
+}
+
+fn addTagList(arena: Allocator, list: *std.ArrayList([]const u8), raw: []const u8, separators: []const u8) Allocator.Error!void {
+    var it = std.mem.tokenizeAny(u8, raw, separators);
+    while (it.next()) |part| try addTag(arena, list, part);
+}
+
+/// The tags in an attribute value like `data-tags="long_hair blue_eyes"`, as a slice (for a picture).
+fn tagSlice(arena: Allocator, raw: ?[]const u8) Allocator.Error![]const []const u8 {
+    const r = raw orelse return &.{};
+    var list: std.ArrayList([]const u8) = .empty;
+    try addTagList(arena, &list, r, " \t\r\n,");
+    return list.items;
+}
+
+/// C preprocessor words and the like: `#include` and `#define` in a page of code are not tags.
+const not_hashtags = [_][]const u8{ "include", "define", "ifdef", "ifndef", "endif", "pragma", "else", "elif", "undef", "error", "warning", "if", "region", "endregion", "import", "end", "top", "main", "content" };
+
+/// Adds the hashtags of `text` (`#Linux #Nature`) to `list`: a `#` at the start or after a space or punctuation (not in
+/// the middle of a word: `C#`, `page.html#top`), then letters, digits, `_` or non-ASCII letters, with at least one letter, not a
+/// colour (`#fff`, `#00ff00`) and not a preprocessor word. A hashtag written in camel case (`#DigitalArt`) is added as it is
+/// (`digitalart`) and as words (`digital art`), since people search for the words.
+fn addHashtags(arena: Allocator, list: *std.ArrayList([]const u8), text: []const u8) Allocator.Error!void {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, i, '#')) |h| {
+        i = h + 1;
+        if (list.items.len >= max_tags) return;
+        if (h > 0 and (std.ascii.isAlphanumeric(text[h - 1]) or text[h - 1] == '#' or text[h - 1] == '&' or text[h - 1] == '/' or text[h - 1] >= 0x80)) continue;
+        var e = i;
+        var letters: usize = 0;
+        var hex_only = true;
+        while (e < text.len and (std.ascii.isAlphanumeric(text[e]) or text[e] == '_' or text[e] >= 0x80)) : (e += 1) {
+            if (std.ascii.isAlphabetic(text[e]) or text[e] >= 0x80) letters += 1;
+            if (!std.ascii.isHex(text[e])) hex_only = false;
+        }
+        const raw = text[i..e];
+        i = e;
+        if (raw.len < 2 or raw.len > max_tag_len or letters == 0) continue;
+        if (hex_only and (raw.len == 3 or raw.len == 4 or raw.len == 6 or raw.len == 8)) continue; // a colour
+        var skip = false;
+        for (not_hashtags) |w| if (std.ascii.eqlIgnoreCase(raw, w)) {
+            skip = true;
+        };
+        if (skip) continue;
+        try addTag(arena, list, raw);
+        // Camel case as words: lower-to-upper changes are breaks (`DigitalArt`, `3DModeling`).
+        var words: std.ArrayList(u8) = .empty;
+        var broke = false;
+        for (raw, 0..) |c, k| {
+            if (k > 0 and std.ascii.isUpper(c) and (std.ascii.isLower(raw[k - 1]) or std.ascii.isDigit(raw[k - 1]))) {
+                try words.append(arena, ' ');
+                broke = true;
+            }
+            try words.append(arena, c);
+        }
+        if (broke) try addTag(arena, list, words.items);
+    }
+}
+
+/// The page's tags with the hashtags of its text added (each once, at most `max_tags`).
+pub fn withHashtags(arena: Allocator, tags: []const []const u8, text: []const u8) Allocator.Error![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    try list.appendSlice(arena, tags);
+    try addHashtags(arena, &list, text);
+    return list.items;
+}
+
+/// The text inside the element that opened just before `start`, up to its closing tag (tags inside it dropped), when short.
+fn innerText(arena: Allocator, html: []const u8, start: usize, closing: []const u8) Allocator.Error!?[]const u8 {
+    const window = html[start..@min(html.len, start + 300)];
+    const end = std.ascii.findIgnoreCase(window, closing) orelse return null;
+    var out: std.ArrayList(u8) = .empty;
+    var in_tag = false;
+    for (window[0..end]) |c| {
+        if (c == '<') in_tag = true else if (c == '>') in_tag = false else if (!in_tag) try out.append(arena, c);
+    }
+    return out.items;
+}
+
+/// The keywords and the description of a JSON-LD block (`{"keywords": "a, b", "description": "..."}`, possibly nested in
+/// `@graph` or arrays): a block that is not JSON, or is too deep, gives nothing.
+fn readJsonLd(arena: Allocator, content: []const u8, tags: *std.ArrayList([]const u8), description: *?[]const u8) Allocator.Error!void {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, content, .{}) catch return;
+    try walkJsonLd(arena, root, 0, tags, description);
+}
+
+fn walkJsonLd(arena: Allocator, v: std.json.Value, depth: u32, tags: *std.ArrayList([]const u8), description: *?[]const u8) Allocator.Error!void {
+    if (depth > 6) return;
+    switch (v) {
+        .object => |o| {
+            var it = o.iterator();
+            while (it.next()) |e| {
+                const key = e.key_ptr.*;
+                if (std.ascii.eqlIgnoreCase(key, "keywords")) {
+                    switch (e.value_ptr.*) {
+                        .string => |s| try addTagList(arena, tags, s, ",;"),
+                        .array => |a| for (a.items[0..@min(a.items.len, 100)]) |item| if (item == .string) try addTag(arena, tags, item.string),
+                        else => {},
+                    }
+                } else if (std.ascii.eqlIgnoreCase(key, "description")) {
+                    if (description.* == null and e.value_ptr.* == .string) description.* = try cleanDescription(arena, e.value_ptr.string);
+                } else {
+                    try walkJsonLd(arena, e.value_ptr.*, depth + 1, tags, description);
+                }
+            }
+        },
+        .array => |a| for (a.items[0..@min(a.items.len, 50)]) |item| try walkJsonLd(arena, item, depth + 1, tags, description),
+        else => {},
+    }
+}
+
+fn cleanDescription(arena: Allocator, raw: []const u8) Allocator.Error!?[]const u8 {
+    const t = std.mem.trim(u8, raw, " \t\r\n");
+    if (t.len == 0) return null;
+    const decoded = try decodeEntities(arena, t[0..@min(t.len, max_description * 2)]);
+    var end = @min(decoded.len, max_description);
+    while (end > 0 and end < decoded.len and (decoded[end] & 0xC0) == 0x80) end -= 1; // not inside a character
+    return decoded[0..end];
+}
+
 pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images: usize) Allocator.Error!Scan {
     var out: Scan = .{};
     var links: std.ArrayList([]const u8) = .empty;
     var images: std.ArrayList(PageImage) = .empty;
     var feeds: std.ArrayList([]const u8) = .empty;
+    var tags: std.ArrayList([]const u8) = .empty;
     var missing_end: [dropped_tags.len]bool = @splat(false);
     var budget: Budget = .{};
     var i: usize = 0;
@@ -314,12 +491,23 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
             if (std.ascii.eqlIgnoreCase(t.name, "head")) continue;
             if (!t.self_closing and !missing_end[k]) {
                 if (endOf(html, t.end, t.name)) |e| {
+                    // A JSON-LD block says what the page is (keywords, description): read before it is skipped.
+                    if (std.ascii.eqlIgnoreCase(t.name, "script")) if (attr(html[lt..t.end], "type")) |ty| if (std.ascii.findIgnoreCase(ty, "ld+json") != null) {
+                        const raw = html[t.end..e];
+                        const cut = std.mem.lastIndexOf(u8, raw, "</") orelse raw.len;
+                        if (cut <= max_ld_bytes) try readJsonLd(arena, raw[0..cut], &tags, &out.description);
+                    };
                     i = e;
                 } else missing_end[k] = true;
             }
             continue;
         }
         const body = html[lt..t.end];
+        // Image boards put a post's tags in a `data-tags` attribute (of the post, the picture or the link).
+        if (std.mem.indexOf(u8, body, "data-tag") != null) {
+            if (attr(body, "data-tags")) |dt| try addTagList(arena, &tags, dt, " \t\r\n,");
+            if (attr(body, "data-tag-name")) |tn| try addTag(arena, &tags, tn);
+        }
         if (out.lang == null and std.ascii.eqlIgnoreCase(t.name, "html")) {
             if (attr(body, "lang")) |l| {
                 const v = std.mem.trim(u8, l, " \t\r\n\"'");
@@ -341,6 +529,7 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
                 .src = try decodeEntities(arena, src),
                 .alt = try decodeEntities(arena, std.mem.trim(u8, attr(body, "alt") orelse "", " \t\r\n")),
                 .title = try decodeEntities(arena, std.mem.trim(u8, attr(body, "title") orelse "", " \t\r\n")),
+                .tags = try tagSlice(arena, attr(body, "data-tags")),
             });
             continue;
         }
@@ -369,8 +558,22 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
             }
             continue;
         }
+        // Links marked as tags (`rel="tag"`, WordPress and many others): the text of the link is a tag.
+        if (std.ascii.eqlIgnoreCase(t.name, "a")) if (attr(body, "rel")) |rel| if (hasToken(rel, "tag")) {
+            if (try innerText(arena, html, t.end, "</a")) |tx| try addTag(arena, &tags, tx);
+        };
         if (std.ascii.eqlIgnoreCase(t.name, "meta")) {
-            const name = attr(body, "name") orelse continue;
+            const name = attr(body, "name") orelse (attr(body, "property") orelse continue);
+            if (attr(body, "content")) |c| {
+                const keyword_metas = [_][]const u8{ "keywords", "news_keywords", "parsely-tags", "sailthru.tags" };
+                const single_tag_metas = [_][]const u8{ "article:tag", "og:video:tag", "video:tag", "book:tag" };
+                const description_metas = [_][]const u8{ "description", "og:description", "twitter:description" };
+                for (keyword_metas) |m| if (std.ascii.eqlIgnoreCase(name, m)) try addTagList(arena, &tags, c, ",;");
+                for (single_tag_metas) |m| if (std.ascii.eqlIgnoreCase(name, m)) try addTag(arena, &tags, c);
+                if (out.description == null) for (description_metas) |m| if (std.ascii.eqlIgnoreCase(name, m)) {
+                    out.description = try cleanDescription(arena, c);
+                };
+            }
             if (std.ascii.eqlIgnoreCase(name, "generator")) {
                 if (attr(body, "content")) |g| if (out.generator == null and g.len <= 120) {
                     out.generator = try decodeEntities(arena, std.mem.trim(u8, g, " \t\r\n"));
@@ -392,6 +595,7 @@ pub fn scanWith(arena: Allocator, html: []const u8, max_links: usize, max_images
     if (!out.nofollow) out.links = links.items;
     out.images = images.items;
     out.feeds = feeds.items;
+    out.tags = tags.items;
     return out;
 }
 
@@ -652,4 +856,81 @@ test "links and spans that follow one another are separate words; emphasis in th
     // Unchanged: text before a link, a plural after one, and emphasis.
     try testing.expectEqualStrings("the cats and boldface", try toText(a, "the <a href=/c>cat</a>s and <b>bold</b>face"));
     try testing.expectEqualStrings("a b", try toText(a, "a <span>b</span>"));
+}
+
+test "a page's tags and description are found in its metas, links, data attributes and JSON-LD" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const page =
+        \\<html><head><title>T</title>
+        \\<meta name="keywords" content="Digital Art, artwork; concept art">
+        \\<meta property="article:tag" content="Night">
+        \\<meta property="og:video:tag" content="  stars ">
+        \\<meta name="description" content="A page &amp; its picture.">
+        \\<meta property="og:description" content="ignored: one description is enough">
+        \\<script type="application/ld+json">{"@type":"VideoObject","keywords":"anime, long_hair","description":"not used","@graph":[{"keywords":["Plants","trees"]}]}</script>
+        \\</head><body>
+        \\<a href="/t/x" rel="tag">Outdoors</a><a rel="nofollow tag" href="/t/y"><b>hotel</b></a>
+        \\<article data-tags="blue_eyes long_hair 1girl"><img src="/p.png" alt="pic" width=300 data-tags="school_uniform nurse"></article>
+        \\<a href="/z" data-tag-name="Cosplaying">z</a>
+        \\</body></html>
+    ;
+    const s = try scanWith(a, page, 10, 10);
+    const want = [_][]const u8{ "digital art", "artwork", "concept art", "night", "stars", "anime", "long hair", "plants", "trees", "outdoors", "hotel", "blue eyes", "1girl", "school uniform", "nurse", "cosplaying" };
+    for (want) |w| {
+        var found = false;
+        for (s.tags) |t| if (std.mem.eql(u8, t, w)) {
+            found = true;
+        };
+        if (!found) std.debug.print("missing tag: {s}\n", .{w});
+        try testing.expect(found);
+    }
+    // Each once ("long hair" was in two places), and the description is the first one, decoded.
+    try testing.expectEqual(@as(usize, want.len), s.tags.len);
+    try testing.expectEqualStrings("A page & its picture.", s.description.?);
+    // A picture keeps its own tags.
+    try testing.expectEqual(@as(usize, 1), s.images.len);
+    try testing.expectEqual(@as(usize, 2), s.images[0].tags.len);
+    try testing.expectEqualStrings("school uniform", s.images[0].tags[0]);
+}
+
+test "tags are normalised and limited: nothing but punctuation, nothing too long, at most sixty" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var html: std.ArrayList(u8) = .empty;
+    try html.appendSlice(a, "<meta name=keywords content=\"#Tag One, ---, '', ");
+    const too_long: [61]u8 = @splat('x');
+    try html.appendSlice(a, &too_long);
+    try html.appendSlice(a, ", ");
+    for (0..130) |i| try html.print(a, "t{d},", .{i});
+    try html.appendSlice(a, "\">");
+    const s = try scanWith(a, html.items, 10, 0);
+    try testing.expectEqual(@as(usize, max_tags), s.tags.len);
+    try testing.expectEqualStrings("tag one", s.tags[0]);
+    try testing.expectEqualStrings("t0", s.tags[1]); // "---", "''" and the long one are not tags
+    // A broken JSON-LD block, an unclosed script and deep nesting give nothing and never fail.
+    const bad = try scanWith(a, "<script type=\"application/ld+json\">{\"keywords\": [1,2,{\"x\"</script><script type=ld+json>{\"keywords\":\"never closed", 10, 0);
+    try testing.expectEqual(@as(usize, 0), bad.tags.len);
+}
+
+test "hashtags in the text are tags; colours, code, numbers and the middle of words are not" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const text = "Posted by Lea #Linux #Nature #DigitalArt, #3DModeling. See page.html#top, C# and F#, colour #fff and #00ff00, issue #123, #include <stdio.h>, # heading, #l, #Zebra_crossing!, #\u{65e5}\u{672c}\u{8a9e}";
+    const tags = try withHashtags(a, &.{"already"}, text);
+    const want = [_][]const u8{ "already", "linux", "nature", "digitalart", "digital art", "3dmodeling", "zebra crossing", "\u{65e5}\u{672c}\u{8a9e}" };
+    for (want) |w| {
+        var found = false;
+        for (tags) |t| if (std.mem.eql(u8, t, w)) {
+            found = true;
+        };
+        if (!found) std.debug.print("missing: {s}\n", .{w});
+        try testing.expect(found);
+    }
+    for (tags) |t| {
+        for ([_][]const u8{ "top", "fff", "00ff00", "123", "include", "heading", "l" }) |bad| try testing.expect(!std.mem.eql(u8, t, bad));
+    }
 }

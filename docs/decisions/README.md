@@ -88,3 +88,5 @@ Each record states the context, the options considered, the decision and who mad
 | 0070 | Fuzzing the parsers of outside input |
 | 0071 | Repairing what was stored before the crawler learned better |
 | 0072 | Ranking from the best candidates |
+| 0073 | Related searches from the titles of the results |
+| 0074 | The tags of a page are indexed |

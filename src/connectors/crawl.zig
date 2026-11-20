@@ -1118,6 +1118,52 @@ pub fn looksLikeChallenge(html: []const u8) bool {
     return false;
 }
 
+/// The page's text with its description (unless the text already says it) and its tags added, so that their words can be searched.
+fn textWithTags(a: Allocator, text: []const u8, description: ?[]const u8, tags: []const []const u8) Allocator.Error![]const u8 {
+    if (description == null and tags.len == 0) return text;
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, text);
+    if (description) |d| if (std.ascii.findIgnoreCase(text, d[0..@min(d.len, 80)]) == null) try out.print(a, "\n\nDescription: {s}", .{d});
+    if (tags.len > 0) {
+        try out.appendSlice(a, "\n\nTags: ");
+        for (tags, 0..) |t, i| {
+            if (i > 0) try out.appendSlice(a, ", ");
+            try out.appendSlice(a, t);
+        }
+    }
+    return std.mem.trim(u8, out.items, " \t\r\n");
+}
+
+/// "Tags: a, b, c" and a line end, or nothing when there are none (a picture's tags, from its `data-tags`).
+fn tagsLine(a: Allocator, tags: []const []const u8) Allocator.Error![]const u8 {
+    if (tags.len == 0) return "";
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "Tags: ");
+    for (tags, 0..) |t, i| {
+        if (i > 0) try out.appendSlice(a, ", ");
+        try out.appendSlice(a, t);
+    }
+    try out.append(a, '\n');
+    return out.items;
+}
+
+/// Each tag as a `tag` of the document (the `tag:` search finds them), after `first` when given.
+fn tagExtras(a: Allocator, tags: []const []const u8, first: ?[]const u8) Allocator.Error![]const doc.Extra {
+    const n = tags.len + @as(usize, if (first != null) 1 else 0);
+    if (n == 0) return &.{};
+    const out = try a.alloc(doc.Extra, n);
+    var k: usize = 0;
+    if (first) |f| {
+        out[0] = .{ .key = "tag", .value = f };
+        k = 1;
+    }
+    for (tags) |t| {
+        out[k] = .{ .key = "tag", .value = t };
+        k += 1;
+    }
+    return out;
+}
+
 const max_validators = 2_000_000;
 const max_images_seen = 2_000_000;
 const max_validators_bytes = 512 * 1024 * 1024;
@@ -1921,7 +1967,7 @@ const Run = struct {
                 break :blk abs[slash + @min(1, abs.len - slash) .. if (dot) |d| slash + d else end];
             };
             const label = if (img.alt.len > 0) img.alt else if (img.title.len > 0) img.title else stem;
-            const text = try std.fmt.allocPrint(a, "Image: {s}\nPage: {s}\n{s}\n{s}\nFrom the page: {s}\n", .{ abs, page_url, img.alt, img.title, page_title orelse "" });
+            const text = try std.fmt.allocPrint(a, "Image: {s}\nPage: {s}\n{s}\n{s}\nFrom the page: {s}\n{s}", .{ abs, page_url, img.alt, img.title, page_title orelse "", try tagsLine(a, img.tags) });
             const d: doc.Document = .{
                 .connector = self.conn.name,
                 .source_id = abs,
@@ -1931,7 +1977,7 @@ const Run = struct {
                 .text = text,
                 .language = self.conn.language,
                 .content_type = imageType(abs),
-                .extra = &.{.{ .key = "tag", .value = "image" }},
+                .extra = try tagExtras(a, img.tags, "image"),
                 .rights = .{
                     .attribution = try std.fmt.allocPrint(a, "A picture on a page of {s}", .{page_host}),
                     .access_notes = "Only the picture's address and words are kept; it belongs to its publisher.",
@@ -1959,8 +2005,14 @@ const Run = struct {
         const scanned: htmltext.Scan = if (is_html) try htmltext.scanWith(a, utf8, max_links_per_page, if (self.conn.index_images) self.conn.max_images_per_page else 0) else .{};
         // The page may say "do not index" yet still lead to pages that are fine.
         if (scanned.noindex) return .{ .result = self.reject(.no_text), .links = scanned.links };
-        const text = if (is_html) try htmltext.toText(a, utf8) else std.mem.trim(u8, utf8, " \t\r\n");
-        if (text.len == 0) return .{ .result = self.reject(.no_text), .links = scanned.links };
+        const body_text = if (is_html) try htmltext.toText(a, utf8) else std.mem.trim(u8, utf8, " \t\r\n");
+        // The page's own description and tags (docs/decisions/0074) are part of what it says: a page with nothing else to read
+        // but them (a gallery whose text is script-built) is still indexed.
+        if (body_text.len == 0 and scanned.description == null and scanned.tags.len == 0) return .{ .result = self.reject(.no_text), .links = scanned.links };
+        // The tags the page's markup gives, and the hashtags in its text (`#Linux #Nature`).
+        const page_tags: []const []const u8 = if (is_html) try htmltext.withHashtags(a, scanned.tags, body_text) else &.{};
+        const text = if (is_html) try textWithTags(a, body_text, scanned.description, page_tags) else body_text;
+        const extras: []const doc.Extra = if (is_html) try tagExtras(a, page_tags, null) else &.{};
         const title: ?[]const u8 = if (is_html) try htmltext.titleOf(a, utf8) else null;
 
         const u = parseUrl(url).?;
@@ -1971,6 +2023,7 @@ const Run = struct {
             .source_dataset = u.host,
             .title = title,
             .text = text,
+            .extra = extras,
             // The source's language, else the page's own (`<html lang>`), else a guess from its text (a language other than English).
             .language = self.conn.language orelse (if (scanned.lang) |l| (if (files.validLanguageTag(l)) l else null) else null) orelse (if (is_html) langprefer.languageOfText(text) else null),
             .content_type = if (is_html) "text/html" else "text/plain",
@@ -3582,4 +3635,50 @@ test "the rendering options are checked" {
     try validate(.{ .name = "w", .kind = "crawl", .options = &good }, &d);
     var slow = base ++ [_]config.Option{.{ .key = "render_timeout_seconds", .value = .{ .integer = 1 } }};
     try testing.expectError(error.InvalidValue, validate(.{ .name = "w", .kind = "crawl", .options = &slow }, &d));
+}
+
+test "a page's tags (metas, rel=tag, data-tags, JSON-LD) and hashtags are in its text and are its tags; a picture keeps its own" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/tagged", .body = "<html lang=en><head><title>Gallery</title><meta name=keywords content=\"Digital Art, artwork\"><meta name=description content=\"Pictures of night streets\"><script type=\"application/ld+json\">{\"keywords\":\"anime\"}</script></head><body><p>Night streets #Nature #DigitalArt</p><a rel=tag href=/t/s>stars</a><a rel=tag href=/t/h>hotel</a><article data-tags=\"blue_eyes long_hair\"><img src=/p.png alt=pic width=300 data-tags=\"nurse eyepatch\"></article></body></html>" },
+        .{ .path = "/plain", .body = "<p>just words</p>" },
+    });
+    defer srv.stop();
+    var ub: [2][96]u8 = undefined;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const seeds = try std.fmt.allocPrint(testing.allocator, "{s}\n{s}\n", .{ srv.url(&ub[0], "/tagged"), srv.url(&ub[1], "/plain") });
+    defer testing.allocator.free(seeds);
+    var conn = try testConnector(&tmp, seeds, "t/1");
+    defer conn.deinit();
+    conn.max_depth = 0;
+    conn.index_images = true;
+    conn.max_images_per_page = 5;
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    _ = try conn.connector().run(got.sink(), &ctl, null);
+    // The page, the picture, and the plain page.
+    try testing.expectEqual(@as(usize, 3), got.ids.items.len);
+    const page = for (got.ids.items, 0..) |id, k| {
+        if (std.mem.endsWith(u8, id, "/tagged")) break k;
+    } else return error.TestUnexpectedResult;
+    const text = got.texts.items[page];
+    try testing.expect(std.mem.indexOf(u8, text, "Night streets #Nature #DigitalArt") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Description: Pictures of night streets") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Tags: digital art, artwork, anime") != null);
+    for ([_][]const u8{ "stars", "hotel", "blue eyes", "long hair", "nature", "digitalart", "digital art" }) |t| {
+        try testing.expect(std.mem.indexOf(u8, got.tags.items[page], t) != null);
+    }
+    // The picture's tags are on the picture's document; the plain page has none, and no "Tags:" line.
+    const pic = for (got.ids.items, 0..) |id, k| {
+        if (std.mem.endsWith(u8, id, "/p.png")) break k;
+    } else return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, got.tags.items[pic], "image") != null and std.mem.indexOf(u8, got.tags.items[pic], "eyepatch") != null);
+    try testing.expect(std.mem.indexOf(u8, got.texts.items[pic], "Tags: nurse, eyepatch") != null);
+    const plain = for (got.ids.items, 0..) |id, k| {
+        if (std.mem.endsWith(u8, id, "/plain")) break k;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("just words", got.texts.items[plain]);
+    try testing.expectEqualStrings("", got.tags.items[plain]);
 }

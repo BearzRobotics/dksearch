@@ -162,10 +162,14 @@ pub const Collect = struct {
     titles: std.ArrayList([]u8) = .empty,
     ids: std.ArrayList([]u8) = .empty,
     texts: std.ArrayList([]u8) = .empty,
+    /// The `tag` extras of each document, `a|b|c`.
+    tags: std.ArrayList([]u8) = .empty,
     pub fn deinit(c: *Collect) void {
         for (c.titles.items) |t| testing.allocator.free(t);
         for (c.ids.items) |t| testing.allocator.free(t);
         for (c.texts.items) |t| testing.allocator.free(t);
+        for (c.tags.items) |t| testing.allocator.free(t);
+        c.tags.deinit(testing.allocator);
         c.titles.deinit(testing.allocator);
         c.ids.deinit(testing.allocator);
         c.texts.deinit(testing.allocator);
@@ -175,6 +179,13 @@ pub const Collect = struct {
         try c.titles.append(testing.allocator, try testing.allocator.dupe(u8, d.title orelse ""));
         try c.ids.append(testing.allocator, try testing.allocator.dupe(u8, d.source_id));
         try c.texts.append(testing.allocator, try testing.allocator.dupe(u8, d.text orelse ""));
+        var tags: std.ArrayList(u8) = .empty;
+        defer tags.deinit(testing.allocator);
+        for (d.extra) |x| if (std.mem.eql(u8, x.key, "tag")) {
+            if (tags.items.len > 0) try tags.append(testing.allocator, '|');
+            try tags.appendSlice(testing.allocator, x.value);
+        };
+        try c.tags.append(testing.allocator, try tags.toOwnedSlice(testing.allocator));
     }
     pub fn sink(c: *Collect) api.Sink {
         return .{ .ptr = c, .vtable = &.{ .submit = submit } };
