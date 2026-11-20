@@ -1,3 +1,3 @@
-794cd5dd9a0d00d0ccdd59f9063b0aaff4f9fc30
+v0.3.0 (release tarball https://github.com/BearzRobotics/regex-zig/archive/refs/tags/v0.3.0.tar.gz, sha256 aceeb017df9009c906f8f39990101aa36c1785ea339ddb0731430a4e784334b3, 2026-11-19)
 
-Local changes since this revision (docs/decisions/0050-regex-on-characters.md): the `utf8` option (characters, not bytes) in parse.zig, program.zig, backtrack.zig, root.zig and its tests in tests.zig. These are not in the upstream repository yet; a re-vendoring must carry them over or take upstream's own UTF-8 mode.
+Unmodified upstream: `src/`, `build.zig`, `build.zig.zon` and `SPEC.md` are copied as released. The local `utf8` change that dksearch carried on top of v0.1.0 (docs/decisions/0050-regex-on-characters.md) is gone: upstream has its own UTF-8 mode since 0.2.0 (`Options.utf8`), which dksearch uses.

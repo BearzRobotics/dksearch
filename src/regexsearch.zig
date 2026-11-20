@@ -502,12 +502,15 @@ test "bad patterns are refused with a reason" {
     defer arena.deinit();
     var diag: PatternDiag = .{};
     const q: search.Query = .{ .text = "text" };
-    for ([_][]const u8{ "(unclosed", "a{2,1}", "\\p{L}", x201, "" }) |p| {
+    for ([_][]const u8{ "(unclosed", "a{2,1}", "\\p{Nope}", x201, "" }) |p| {
         try testing.expectError(error.InvalidPattern, svc.run(arena.allocator(), f.index.searcher(), q, .{ .pattern = p }, &diag));
         try testing.expect(diag.message.len > 0);
     }
     // No words: the index has nothing to narrow with.
     try testing.expectError(error.EmptyQuery, svc.run(arena.allocator(), f.index.searcher(), .{ .text = "" }, .{ .pattern = "a" }, &diag));
+    // Unicode properties are understood (characters mode): a letter is found.
+    const letters = try svc.run(arena.allocator(), f.index.searcher(), q, .{ .pattern = "\\p{L}+" }, &diag);
+    try testing.expectEqual(@as(usize, 1), letters.page.hits.len);
 }
 
 test "a catastrophic pattern is cut off and refused, quickly" {
@@ -521,9 +524,13 @@ test "a catastrophic pattern is cut off and refused, quickly" {
     defer arena.deinit();
     var diag: PatternDiag = .{};
     const t0 = Io.Timestamp.now(testing.io, .awake);
-    try testing.expectError(error.TooComplex, svc.run(arena.allocator(), f.index.searcher(), .{ .text = "a" }, .{ .pattern = "(a+)+$" }, &diag));
+    // A back-reference needs the backtracking engine, which is bounded by the step budget.
+    try testing.expectError(error.TooComplex, svc.run(arena.allocator(), f.index.searcher(), .{ .text = "a" }, .{ .pattern = "(a+)+\\1$" }, &diag));
     const took_ms = @divTrunc(t0.durationTo(Io.Timestamp.now(testing.io, .awake)).nanoseconds, std.time.ns_per_ms);
     try testing.expect(took_ms < 2000);
+    // Without one the same shape runs in linear time (regex-zig 0.3.0): no hits, no refusal.
+    const linear = try svc.run(arena.allocator(), f.index.searcher(), .{ .text = "a" }, .{ .pattern = "(a+)+$" }, &diag);
+    try testing.expectEqual(@as(usize, 0), linear.page.hits.len);
 }
 
 test "the candidate cap and the size cap end a search with truncated set" {

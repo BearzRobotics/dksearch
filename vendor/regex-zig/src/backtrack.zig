@@ -7,6 +7,12 @@ const std = @import("std");
 const program = @import("program.zig");
 const parse = @import("parse.zig");
 const ByteSet = @import("byteset.zig").ByteSet;
+const ops = @import("ops.zig");
+const context = @import("context.zig");
+const pike = @import("pike.zig");
+const dfa = @import("dfa.zig");
+const utf8 = @import("utf8.zig");
+const unicode = @import("unicode.zig");
 
 const Program = program.Program;
 const unset = program.unset;
@@ -58,32 +64,71 @@ pub const Searcher = struct {
     prog: Program,
     limits: parse.Limits,
     regs: []usize,
+    /// Leftmost-longest mode: the longest match found so far from this start.
+    best: []usize = &.{},
+    have_best: bool = false,
+    /// The Pike VM, when the program was compiled for it (see Program.engine).
+    pike: ?pike.Pike = null,
+    /// The lazy DFA pair, when Program.engine is .dfa: forward finds where a
+    /// match ends, reverse where it starts.
+    fwd: ?dfa.Dfa = null,
+    rev: ?dfa.Dfa = null,
     stack: std.ArrayList(Frame) = .empty,
     steps: u64 = 0,
     /// Position recorded by the marker most recently removed by cutToMarker.
     cut_pos: usize = 0,
 
+    pub const isMatch = ops.isMatch;
+    pub const matches = ops.matches;
+    pub const count = ops.count;
+    pub const findAll = ops.findAll;
+    pub const split = ops.split;
+    pub const matchingLines = ops.matchingLines;
+    pub const replaceAll = ops.replaceAll;
+
     pub fn init(gpa: std.mem.Allocator, prog: Program, limits: parse.Limits) !Searcher {
-        return .{
-            .gpa = gpa,
-            .prog = prog,
-            .limits = limits,
-            .regs = try gpa.alloc(usize, prog.reg_count),
-        };
+        const regs = try gpa.alloc(usize, prog.reg_count);
+        errdefer gpa.free(regs);
+        var best: []usize = &.{};
+        if (prog.longest and prog.engine == .backtrack) best = try gpa.alloc(usize, prog.reg_count);
+        errdefer if (best.len > 0) gpa.free(best);
+        var vm: ?pike.Pike = null;
+        if (prog.engine == .pike or prog.engine == .dfa) vm = try pike.Pike.init(gpa, prog);
+        errdefer if (vm) |*v| v.deinit();
+        var fwd: ?dfa.Dfa = null;
+        var rev: ?dfa.Dfa = null;
+        if (prog.engine == .dfa) {
+            fwd = try dfa.Dfa.init(gpa, prog.nfa.?, false, prog.utf8, prog.first_bytes, prog.literal_prefix, limits.max_dfa_cache);
+            errdefer if (fwd) |*f| f.deinit();
+            rev = try dfa.Dfa.init(gpa, prog.reverse_nfa.?, true, prog.utf8, null, &.{}, limits.max_dfa_cache);
+        }
+        return .{ .gpa = gpa, .prog = prog, .limits = limits, .regs = regs, .best = best, .pike = vm, .fwd = fwd, .rev = rev };
     }
 
     pub fn deinit(s: *Searcher) void {
         s.gpa.free(s.regs);
+        if (s.best.len > 0) s.gpa.free(s.best);
+        if (s.pike) |*vm| vm.deinit();
+        if (s.fwd) |*f| f.deinit();
+        if (s.rev) |*r| r.deinit();
         s.stack.deinit(s.gpa);
     }
 
     /// Leftmost match at or after `from`. The returned Match borrows the
     /// searcher's registers and is valid until the next call.
     pub fn find(s: *Searcher, hay: []const u8, from: usize) MatchError!?Match {
+        if (s.fwd != null) return s.findDfa(hay, from);
+        if (s.pike) |*vm| {
+            const regs = vm.find(hay, from) orelse return null;
+            return .{ .regs = regs };
+        }
         s.steps = 0;
         var start = from;
         const first = s.prog.first_bytes;
         while (start <= hay.len) : (start += 1) {
+            // In utf8 mode a match never starts inside a character. A stray
+            // continuation byte is skipped too: nothing can match it anyway.
+            if (s.prog.utf8 and start < hay.len and hay[start] & 0xC0 == 0x80) continue;
             if (first) |set| {
                 // A pattern that cannot match empty needs a byte here.
                 if (start == hay.len) break;
@@ -94,6 +139,52 @@ pub const Searcher = struct {
             if (try s.run(hay, start, from)) return .{ .regs = s.regs };
         }
         return null;
+    }
+
+    fn findPike(s: *Searcher, hay: []const u8, from: usize) ?Match {
+        const regs = s.pike.?.find(hay, from) orelse return null;
+        return .{ .regs = regs };
+    }
+
+    /// The DFA cannot be used when `$` or `\Z` could match before a final newline.
+    fn dfaApplies(s: *const Searcher, hay: []const u8) bool {
+        return !(s.prog.final_newline_assertion and hay.len > 0 and hay[hay.len - 1] == '\n');
+    }
+
+    /// The span from the DFAs, then the Pike VM only when captures are needed.
+    fn findDfa(s: *Searcher, hay: []const u8, from: usize) MatchError!?Match {
+        if (!s.dfaApplies(hay)) return s.findPike(hay, from);
+        const end = (s.fwd.?.findEnd(hay, from, false) catch |e| switch (e) {
+            error.GaveUp => return s.findPike(hay, from),
+            error.OutOfMemory => return error.OutOfMemory,
+        }) orelse return null;
+        // Leftmost-longest: the DFA found that a match exists; its span follows
+        // a rule the DFA does not implement.
+        if (s.prog.longest) return s.findPike(hay, from);
+        const start = (s.rev.?.findStart(hay, from, end) catch |e| switch (e) {
+            error.GaveUp => return s.findPike(hay, from),
+            error.OutOfMemory => return error.OutOfMemory,
+        }) orelse return s.findPike(hay, from);
+        if (s.prog.group_count == 0) {
+            s.regs[0] = start;
+            s.regs[1] = end;
+            return .{ .regs = s.regs };
+        }
+        return s.findPike(hay, start);
+    }
+
+    /// True if there is a match anywhere (the grep question), without
+    /// computing where.
+    pub fn matchesAnywhere(s: *Searcher, hay: []const u8) MatchError!bool {
+        if (s.fwd != null and s.dfaApplies(hay)) {
+            if (s.fwd.?.findEnd(hay, 0, true) catch |e| switch (e) {
+                error.GaveUp => null,
+                error.OutOfMemory => return error.OutOfMemory,
+            }) |_| return true;
+            // null: either no match, or the DFA gave up; only the first is final.
+            if (s.fwd.?.search_flushes <= 4) return false;
+        }
+        return (try s.find(hay, 0)) != null;
     }
 
     fn push(s: *Searcher, f: Frame) MatchError!void {
@@ -145,7 +236,16 @@ pub const Searcher = struct {
         return marker.kind;
     }
 
+    /// Leftmost-longest mode, after the search from one start is exhausted:
+    /// the best match found, if any.
+    fn finishRun(s: *Searcher) bool {
+        if (!s.have_best) return false;
+        @memcpy(s.regs, s.best);
+        return true;
+    }
+
     fn run(s: *Searcher, hay: []const u8, start: usize, search_start: usize) MatchError!bool {
+        s.have_best = false;
         const insts = s.prog.insts;
         var pc: u32 = 0;
         var pos = start;
@@ -178,6 +278,14 @@ pub const Searcher = struct {
                 } else {
                     ok = false;
                 },
+                .cp_class => |i| if (context.decodeAt(hay, pos)) |d| {
+                    if (utf8.containsRange(s.prog.cp_sets[i], d.cp)) {
+                        pos += d.len;
+                        pc += 1;
+                    } else ok = false;
+                } else {
+                    ok = false;
+                },
                 .split => |sp| {
                     try s.push(.{ .branch = .{ .pc = sp.second, .pos = pos } });
                     pc = sp.first;
@@ -187,7 +295,7 @@ pub const Searcher = struct {
                     try s.setReg(r, pos);
                     pc += 1;
                 },
-                .assertion => |a| if (check(a, hay, pos, search_start, s.prog.utf8)) {
+                .assertion => |a| if (context.check(a, hay, pos, search_start, s.prog.utf8)) {
                     pc += 1;
                 } else {
                     ok = false;
@@ -198,13 +306,10 @@ pub const Searcher = struct {
                     // A group that did not participate makes the reference fail.
                     if (a == unset or e == unset) {
                         ok = false;
-                    } else {
-                        const len = e - a;
-                        if (hay.len - pos >= len and eqlBytes(hay[a..e], hay[pos..][0..len], b.ignore_case)) {
-                            pos += len;
-                            pc += 1;
-                        } else ok = false;
-                    }
+                    } else if (backrefLen(hay, a, e, pos, b.ignore_case, s.prog.utf8)) |n| {
+                        pos += n;
+                        pc += 1;
+                    } else ok = false;
                 },
                 .atomic_start => {
                     try s.push(.{ .marker = .{ .kind = .atomic, .pos = pos, .resume_pc = 0 } });
@@ -242,32 +347,46 @@ pub const Searcher = struct {
                     pc += 1;
                 },
                 .loop_end => |l| pc = if (s.regs[l.slot] == pos) pc + 1 else l.target,
-                .match => return true,
+                .match => if (s.prog.longest) {
+                    // Keep the longest; go on exploring the other alternatives.
+                    if (!s.have_best or s.regs[1] > s.best[1]) {
+                        @memcpy(s.best, s.regs);
+                        s.have_best = true;
+                    }
+                    ok = false;
+                } else return true,
             }
-            if (!ok) pc = s.backtrack(&pos) orelse return false;
+            if (!ok) pc = s.backtrack(&pos) orelse return s.finishRun();
         }
     }
 };
 
-fn check(a: @import("ast.zig").Assertion, hay: []const u8, pos: usize, search_start: usize, utf8: bool) bool {
-    return switch (a) {
-        .line_start => pos == 0 or hay[pos - 1] == '\n',
-        .line_end => pos == hay.len or hay[pos] == '\n',
-        .text_start => pos == 0,
-        .text_end => pos == hay.len,
-        .text_end_or_final_newline => pos == hay.len or (pos + 1 == hay.len and hay[pos] == '\n'),
-        .word_boundary => wordBefore(hay, pos, utf8) != wordAfter(hay, pos, utf8),
-        .not_word_boundary => wordBefore(hay, pos, utf8) == wordAfter(hay, pos, utf8),
-        .search_start => pos == search_start,
-    };
-}
-
-fn wordBefore(hay: []const u8, pos: usize, utf8: bool) bool {
-    return pos > 0 and (ByteSet.isWordByte(hay[pos - 1]) or (utf8 and hay[pos - 1] >= 0x80));
-}
-
-fn wordAfter(hay: []const u8, pos: usize, utf8: bool) bool {
-    return pos < hay.len and (ByteSet.isWordByte(hay[pos]) or (utf8 and hay[pos] >= 0x80));
+/// Length of the text at `pos` that equals the captured text hay[a..e], or
+/// null. Case-insensitive comparison in utf8 mode works on characters (simple
+/// case folding), so the two texts may differ in byte length.
+fn backrefLen(hay: []const u8, a: usize, e: usize, pos: usize, ignore_case: bool, utf8_mode: bool) ?usize {
+    if (!ignore_case or !utf8_mode) {
+        const len = e - a;
+        if (hay.len - pos >= len and eqlBytes(hay[a..e], hay[pos..][0..len], ignore_case)) return len;
+        return null;
+    }
+    var i = a;
+    var j = pos;
+    while (i < e) {
+        const x = context.decodeAt(hay, i);
+        const y = context.decodeAt(hay, j);
+        if (x != null and y != null and i + x.?.len <= e) {
+            if (!unicode.eqlFold(x.?.cp, y.?.cp)) return null;
+            i += x.?.len;
+            j += y.?.len;
+        } else {
+            // Not a whole character: compare the bytes themselves.
+            if (j >= hay.len or hay[j] != hay[i]) return null;
+            i += 1;
+            j += 1;
+        }
+    }
+    return j - pos;
 }
 
 fn eqlBytes(a: []const u8, b: []const u8, ignore_case: bool) bool {

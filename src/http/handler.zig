@@ -4416,7 +4416,7 @@ test "API regex errors are JSON with stable codes" {
     try small.init(.{ .max_complex = 1, .max_steps = 20_000 });
     defer small.deinit();
     try small.store.store().put(small.hits[0].id, &hay);
-    const r = small.get(&ar, true, "/api/v1/search?q=order&regex=(a%2B)%2B%24");
+    const r = small.get(&ar, true, "/api/v1/search?q=order&regex=(a%2B)%2B%5C1%24");
     try testing.expectEqual(http.Status.unprocessable_entity, r.status);
     try testing.expect(std.mem.indexOf(u8, r.body, "pattern_too_complex") != null);
 }

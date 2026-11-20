@@ -1,13 +1,18 @@
 //! regex-zig: a pure-Zig regular-expression library (see SPEC.md).
 //!
 //! Current state: the Perl, Oniguruma and POSIX ERE parsers and the bounded
-//! backtracking engine. POSIX BRE, the Rust dialect, the linear-time engine,
-//! UTF-8 and streaming are not implemented yet.
+//! backtracking engine, with isMatch/matches/count/findAll/split/replaceAll
+//! helpers on Searcher (ops.zig), and UTF-8 matching (Options.utf8) with Unicode
+//! properties and simple case folding (-Dunicode_tables=false leaves the
+//! tables out). POSIX BRE, the Rust dialect, the linear-time engine, full case
+//! folding and streaming are not implemented yet.
 
 const std = @import("std");
 const parse = @import("parse.zig");
 const program = @import("program.zig");
 const backtrack = @import("backtrack.zig");
+const ops = @import("ops.zig");
+const stream = @import("stream.zig");
 
 pub const Dialect = parse.Dialect;
 pub const Limits = parse.Limits;
@@ -16,21 +21,45 @@ pub const Diagnostic = parse.Diagnostic;
 pub const MatchError = backtrack.MatchError;
 pub const Match = backtrack.Match;
 pub const Searcher = backtrack.Searcher;
+pub const Engine = program.Engine;
+pub const Span = ops.Span;
+pub const Line = ops.Line;
+pub const MatchingLines = ops.MatchingLines;
+pub const LineStream = stream.LineStream;
+pub const Matches = ops.Matches;
+pub const ReplaceError = ops.ReplaceError;
 
 pub const Options = struct {
     dialect: Dialect = .perl,
     ignore_case: bool = false,
-    limits: Limits = .{},
-    /// Characters, not bytes: `.`, classes, escapes and literals match whole UTF-8 characters, `\\w` includes every
-    /// non-ASCII character, and a word boundary falls between a word and a non-word character. Case-insensitive matching
-    /// stays ASCII only. A haystack that is not valid UTF-8 never crashes the matcher; bytes that are not part of a valid
-    /// character are matched by nothing but a literal byte pattern.
+    /// Match over UTF-8: the pattern must be valid UTF-8, and `.`, classes,
+    /// negation and `\x{...}` work on Unicode scalar values. Invalid UTF-8 in
+    /// the haystack never matches `.` or a class and never causes a crash.
+    /// Also makes `\p{..}`, `\w \d \s \b` and the common POSIX classes
+    /// Unicode-aware, and `ignore_case` / `(?i)` uses Unicode simple case
+    /// folding. See docs/decisions/0001-utf8-matching.md for what is not
+    /// covered (full case folding).
     utf8: bool = false,
+    limits: Limits = .{},
+    /// Which engine runs the pattern. `.auto` picks the Pike VM (linear
+    /// time) unless the pattern needs the backtracker; `.backtrack` and
+    /// `.pike` force one, mainly for tests. See docs/decisions/0002-matching-engines.md.
+    engine: Engine = .auto,
 };
 
 /// A compiled pattern. Immutable after compile, so it may be shared between
 /// threads; matching state lives in a Searcher.
 pub const Regex = struct {
+    /// Compiles a parsed pattern; shared by `compile` and `RegexSet`.
+    fn compileParsed(gpa: std.mem.Allocator, parsed: parse.Parsed, options: Options, d: *Diagnostic) Error!Regex {
+        const prog = try program.compile(gpa, parsed, options.limits, .{
+            .utf8 = options.utf8,
+            .longest = options.dialect == .posix_ere or options.dialect == .posix_bre,
+            .engine = options.engine,
+        }, d);
+        return .{ .prog = prog, .limits = options.limits };
+    }
+
     prog: program.Program,
     limits: Limits,
 
@@ -40,9 +69,8 @@ pub const Regex = struct {
         const d = diag orelse &scratch;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
-        const parsed = try parse.parse(arena_state.allocator(), pattern, options.dialect, options.ignore_case, options.limits, d, options.utf8);
-        const prog = try program.compile(gpa, parsed, options.limits, d);
-        return .{ .prog = prog, .limits = options.limits };
+        const parsed = try parse.parse(arena_state.allocator(), pattern, options.dialect, options.ignore_case, options.utf8, options.limits, d);
+        return compileParsed(gpa, parsed, options, d);
     }
 
     pub fn deinit(re: *Regex, gpa: std.mem.Allocator) void {
@@ -60,7 +88,74 @@ pub const Regex = struct {
     }
 };
 
+/// Many patterns searched together (for `grep -f`). The combined pattern
+/// matches wherever any member does; with leftmost-first dialects an earlier
+/// pattern wins a tie at the same position. Capture groups are not reported
+/// and back-references are rejected. Each pattern is also compiled alone, so
+/// `matchedPatterns` can say which ones match.
+pub const RegexSet = struct {
+    all: Regex,
+    each: []Regex,
+
+    /// `diag.pattern` is the index of the pattern a failure is in.
+    pub fn compile(gpa: std.mem.Allocator, patterns: []const []const u8, options: Options, diag: ?*Diagnostic) Error!RegexSet {
+        var scratch: Diagnostic = .{};
+        const d = diag orelse &scratch;
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const parsed = try parse.parseSet(arena_state.allocator(), patterns, options.dialect, options.ignore_case, options.utf8, options.limits, d);
+        var all = try Regex.compileParsed(gpa, parsed, options, d);
+        errdefer all.deinit(gpa);
+        const each = try gpa.alloc(Regex, patterns.len);
+        var done: usize = 0;
+        errdefer {
+            for (each[0..done]) |*r| r.deinit(gpa);
+            gpa.free(each);
+        }
+        for (patterns, 0..) |pat, i| {
+            each[i] = Regex.compile(gpa, pat, options, d) catch |e| {
+                d.pattern = i;
+                return e;
+            };
+            done = i + 1;
+        }
+        return .{ .all = all, .each = each };
+    }
+
+    pub fn deinit(set: *RegexSet, gpa: std.mem.Allocator) void {
+        for (set.each) |*r| r.deinit(gpa);
+        gpa.free(set.each);
+        set.all.deinit(gpa);
+    }
+
+    pub fn len(set: *const RegexSet) usize {
+        return set.each.len;
+    }
+
+    /// A Searcher for the combined pattern: `find`, `isMatch`, `matches`, ...
+    /// The set must outlive it.
+    pub fn searcher(set: *const RegexSet, gpa: std.mem.Allocator) !Searcher {
+        return set.all.searcher(gpa);
+    }
+
+    /// The indices (ascending) of the patterns that match somewhere in `hay`.
+    /// The caller frees the result.
+    pub fn matchedPatterns(set: *const RegexSet, gpa: std.mem.Allocator, hay: []const u8) ![]usize {
+        var out: std.ArrayList(usize) = .empty;
+        errdefer out.deinit(gpa);
+        for (set.each, 0..) |*re, i| {
+            var s = try re.searcher(gpa);
+            defer s.deinit();
+            if (try s.isMatch(hay)) try out.append(gpa, i);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+};
+
 test {
+    _ = @import("stream.zig");
     _ = @import("byteset.zig");
+    _ = @import("utf8.zig");
+    _ = @import("unicode.zig");
     _ = @import("tests.zig");
 }

@@ -273,7 +273,7 @@ search.regex	Boolean	true	Offer the regular-expression filter on the public sear
 search.regex_max_pattern	Integer	200	Longest regular expression, in bytes, 1-2000.
 search.regex_max_candidates	Integer	200	Most candidate documents whose text is checked per query, 1-10000.
 search.regex_budget_ms	Integer	500	Wall-clock budget for one regex query, 10-60000 milliseconds. When it runs out the results so far are returned and marked as possibly incomplete.
-search.regex_max_steps	Integer	100000	Matching steps allowed per document, 1000-10000000. A pattern that exhausts them on several documents is refused as too complex.
+search.regex_max_steps	Integer	100000	Matching steps allowed per document, 1000-10000000. A pattern that exhausts them on several documents is refused as too complex. Only patterns that need the backtracking engine (back-references, look-around, atomic groups, possessive quantifiers) can: the others run in linear time, so `(a+)+$` is no longer a problem.
 search.regex_concurrency	Integer	2	Regex queries that may run at once, 1-64; others wait a moment and then get "busy" (HTTP 429).
 index.tokenizer	String	`unicode61`	How text is split and normalised: `unicode61` (case and diacritics folded) or `porter` (the same, plus English stemming, so "running" matches "run"). The index keeps the tokenizer it was built with; after changing this setting **serve** and **import** refuse the old index until **rebuild** recreates it.
 storage.data_dir	String	data	Directory for the index and other state. Must not be empty.
