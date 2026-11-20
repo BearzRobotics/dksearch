@@ -415,3 +415,6 @@ details.suggest .hint { margin: 0.2rem 0 0; font-size: 0.8rem; }
 details.why { margin: 0.2rem 0 0; font-size: 0.78rem; color: var(--muted); }
 details.why summary { cursor: pointer; display: inline; }
 details.why p { margin: 0.2rem 0 0; font-variant-numeric: tabular-nums; }
+
+/* Related searches under the results */
+p.related { margin: 1.4rem 0 0; color: var(--muted); font-size: 0.95rem; }

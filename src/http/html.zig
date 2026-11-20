@@ -97,6 +97,8 @@ pub const Form = struct {
     q: []const u8 = "",
     /// The owner is signed in and feedback is kept: the results carry good and bad buttons (added by search.js).
     feedback: bool = false,
+    /// Words that recur in the titles of the results (`related.zig`): offered under the results as searches with the word added.
+    related: []const []const u8 = &.{},
     /// Show the gallery through the thumbnail cache (`/thumb`) instead of the originals.
     gallery_thumbs: bool = false,
     login: LoginNote = .none,
@@ -545,6 +547,14 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     }
 
     try writeFallback(w, f);
+    if (f.related.len > 0 and !f.images) {
+        try w.writeAll("<p class=\"related\">Related searches: ");
+        for (f.related, 0..) |word, i| {
+            if (i > 0) try w.writeAll(" &middot; ");
+            try writeSearchLink(w, f, 0, word, word); // the words are letters and digits only (see related.zig)
+        }
+        try w.writeAll("</p>\n");
+    }
     if (f.feedback and f.q.len > 0 and !f.images) {
         try w.writeAll("<details class=\"suggest\"><summary>A site missing from these results?</summary><form class=\"suggest\" data-q=\"");
         try writeEscaped(w, f.q);
@@ -960,8 +970,17 @@ fn writePageNumbers(w: *Writer, f: Form, offset: u32, page_size: u32) Writer.Err
 }
 
 fn writePagerLink(w: *Writer, f: Form, offset: u32, label_html: []const u8) Writer.Error!void {
+    return writeSearchLink(w, f, offset, null, label_html);
+}
+
+/// A link to this search (with its choices) at `offset`, with `extra` added to the words when given.
+fn writeSearchLink(w: *Writer, f: Form, offset: u32, extra: ?[]const u8, label_html: []const u8) Writer.Error!void {
     try w.writeAll("<a href=\"/search?q=");
     try query.writeEncoded(w, f.q);
+    if (extra) |x| {
+        try w.writeAll("%20");
+        try query.writeEncoded(w, x);
+    }
     if (f.sort.len > 0) {
         try w.writeAll("&amp;sort=");
         try query.writeEncoded(w, f.sort);
@@ -1167,4 +1186,15 @@ test "a result with an explanation shows how its score came about; one without s
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "<details class=\"why\"><summary>why</summary><p>score 12.30 = text 12.30 (title alone 7.70, body alone 11.50) &times; source 1.00 &times; recency 1.00 &times; other 0.30</p></details>") != null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "class=\"why\""));
+}
+
+test "related searches are links with the word added to the query, and nothing is shown without any" {
+    var hits = [_]dk.search.Hit{.{ .id = @splat(1), .connector = "web", .url = "https://e.org/a", .title = "A", .snippet = null, .score = 1 }};
+    const page: dk.search.Page = .{ .hits = &hits, .has_more = false };
+    const some = try render(writeResults, .{ Form{ .q = "linux", .language = "en", .related = &.{ "kernel", "distribution" } }, page, @as(u32, 0), @as(u32, 10) });
+    defer testing.allocator.free(some);
+    try testing.expect(std.mem.indexOf(u8, some, "<p class=\"related\">Related searches: <a href=\"/search?q=linux%20kernel&amp;language=en\">kernel</a> &middot; <a href=\"/search?q=linux%20distribution&amp;language=en\">distribution</a></p>") != null);
+    const none = try render(writeResults, .{ Form{ .q = "linux" }, page, @as(u32, 0), @as(u32, 10) });
+    defer testing.allocator.free(none);
+    try testing.expect(std.mem.indexOf(u8, none, "Related searches") == null);
 }

@@ -2415,6 +2415,13 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
     else
         try std.fmt.allocPrint(arena, "Not ordered by meaning: {s}.", .{n.reason orelse "no reason given"});
     shown.hits = try withMoreSnippets(arena, services, try withFirstSnippets(arena, services, shown.hits, parsed.typed), parsed.typed, form.snippets);
+    // Related searches: words that recur in the titles of the results (for a plain search, first page, not the gallery).
+    if (!gallery and q.offset == 0 and shown.hits.len >= 5 and std.mem.indexOfAny(u8, parsed.typed, ":\"()~*") == null) {
+        var typed_words: std.ArrayList([]const u8) = .empty;
+        var tokens = std.mem.tokenizeAny(u8, parsed.typed, " \t\r\n,.;!?'-");
+        while (tokens.next()) |w| try typed_words.append(arena, try std.ascii.allocLowerString(arena, w));
+        form.related = try dk.related.words(arena, typed_words.items, shown.hits);
+    }
     try applyFallback(arena, services, params, &form, shown.hits.len, q.offset);
     if (shown.hits.len == 0 and q.offset == 0) form.did_you_mean = try didYouMean(arena, searcher, q);
     var aw: std.Io.Writer.Allocating = .init(arena);
