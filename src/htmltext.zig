@@ -427,7 +427,8 @@ fn hasToken(list: []const u8, token: []const u8) bool {
     return false;
 }
 
-fn decodeEntities(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
+/// `s` with the HTML entities (`&amp;`, `&bull;`, `&#8226;`) decoded.
+pub fn decodeEntities(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
     if (std.mem.indexOfScalar(u8, s, '&') == null) return s;
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;

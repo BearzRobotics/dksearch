@@ -61,6 +61,7 @@ pub const sourceedit = @import("sourceedit.zig");
 pub const regexsearch = @import("regexsearch.zig");
 pub const help = @import("help.zig");
 pub const rebuild = @import("rebuild.zig");
+pub const repair = @import("repair.zig");
 pub const index_sqlite = @import("index_sqlite.zig");
 pub const content_sqlite = @import("content_sqlite.zig");
 pub const state_sqlite = @import("state_sqlite.zig");

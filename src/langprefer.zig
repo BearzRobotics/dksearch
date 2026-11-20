@@ -105,6 +105,77 @@ pub fn foreign(language: ?[]const u8, path: ?[]const u8, preferred: []const u8) 
     return true;
 }
 
+/// A guess at the language of a text from its script, for pages that do not say (no `lang`, no language in the address):
+/// Chinese, Japanese (kana), Korean, Hebrew, Greek and Thai by name, and the scripts shared by several languages as
+/// `und-Cyrl`, `und-Arab` and `und-Deva` ("undetermined, in this script"). Null when the text is mostly Latin letters, or
+/// too short to tell: a Latin text could be any of dozens of languages and is left alone.
+pub fn languageOfText(text: []const u8) ?[]const u8 {
+    const Script = enum { latin, han, kana, hangul, cyrillic, arabic, hebrew, greek, thai, devanagari };
+    var counts: [@backingInt(Script.devanagari) + 1]usize = @splat(0);
+    const sample = text[0..@min(text.len, 6000)];
+    var i: usize = 0;
+    while (i < sample.len) {
+        const b = sample[i];
+        if (b < 0x80) {
+            if (std.ascii.isAlphabetic(b)) counts[@backingInt(Script.latin)] += 1;
+            i += 1;
+            continue;
+        }
+        const n = std.unicode.utf8ByteSequenceLength(b) catch {
+            i += 1;
+            continue;
+        };
+        if (i + n > sample.len) break;
+        const cp = std.unicode.utf8Decode(sample[i .. i + n]) catch {
+            i += 1;
+            continue;
+        };
+        i += n;
+        const script: ?Script = switch (cp) {
+            0xC0...0x24F => .latin,
+            0x4E00...0x9FFF, 0x3400...0x4DBF => .han,
+            0x3040...0x30FF => .kana,
+            0xAC00...0xD7AF, 0x1100...0x11FF => .hangul,
+            0x0400...0x052F => .cyrillic,
+            0x0600...0x06FF, 0x0750...0x077F => .arabic,
+            0x0590...0x05FF => .hebrew,
+            0x0370...0x03FF => .greek,
+            0x0E00...0x0E7F => .thai,
+            0x0900...0x097F => .devanagari,
+            else => null,
+        };
+        if (script) |s| counts[@backingInt(s)] += 1;
+    }
+    var total: usize = 0;
+    for (counts) |c| total += c;
+    if (total < 20) return null;
+    // Chinese and Japanese texts share the Han characters; kana says Japanese.
+    const cjk = counts[@backingInt(Script.han)] + counts[@backingInt(Script.kana)];
+    var best: Script = .latin;
+    var best_count: usize = 0;
+    for (counts, 0..) |c, k| {
+        const s: Script = @fromBackingInt(@intCast(k));
+        if (s == .latin) continue;
+        const c_eff = if (s == .han or s == .kana) cjk else c;
+        if (c_eff > best_count) {
+            best_count = c_eff;
+            best = s;
+        }
+    }
+    if (best_count * 100 < total * 40) return null;
+    return switch (best) {
+        .han, .kana => if (counts[@backingInt(Script.kana)] * 10 >= counts[@backingInt(Script.han)]) "ja" else "zh",
+        .hangul => "ko",
+        .cyrillic => "und-Cyrl",
+        .arabic => "und-Arab",
+        .hebrew => "he",
+        .greek => "el",
+        .thai => "th",
+        .devanagari => "und-Deva",
+        .latin => null,
+    };
+}
+
 const testing = std.testing;
 
 test "Accept-Language gives the preferred primary languages in order" {
@@ -138,4 +209,16 @@ test "pages in another language than the preferred ones are foreign; unknown is 
     try testing.expect(foreign(null, "/ja/x", "en"));
     try testing.expect(!foreign(null, "/en/x", "en") and !foreign(null, "/docs/x", "en") and !foreign(null, null, "en"));
     try testing.expect(!foreign("ja", "/ja/", "")); // nothing preferred: nothing is foreign
+}
+
+test "the script of a text says its language when it is not Latin" {
+    try testing.expectEqualStrings("zh", languageOfText("这是一个关于计算机操作系统和编程语言的页面，里面有很多文字内容可以阅读。").?);
+    try testing.expectEqualStrings("ja", languageOfText("これはオペレーティングシステムとプログラミング言語についてのページです。たくさんの文章があります。").?);
+    try testing.expectEqualStrings("ko", languageOfText("이것은 운영 체제와 프로그래밍 언어에 대한 페이지입니다. 읽을 수 있는 글이 많이 있습니다.").?);
+    try testing.expectEqualStrings("und-Cyrl", languageOfText("Это страница об операционных системах и языках программирования, на ней много текста.").?);
+    try testing.expectEqualStrings("und-Arab", languageOfText("هذه صفحة عن أنظمة التشغيل ولغات البرمجة وفيها الكثير من النصوص للقراءة.").?);
+    // Latin text, a mostly Latin text with a few foreign words, and a text too short to tell are left alone.
+    try testing.expect(languageOfText("This is a page about operating systems and programming languages, with plenty of text to read.") == null);
+    try testing.expect(languageOfText("Un système d'exploitation, le noyau: ça évolue. 日本語 and русский appear once each in this long English-like text.") == null);
+    try testing.expect(languageOfText("日本語") == null and languageOfText("") == null);
 }

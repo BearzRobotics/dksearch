@@ -14,6 +14,8 @@ dksearch - self-hosted search engine: import documents, serve a search index ove
 
     dksearch rebuild [--config FILE]
 
+    dksearch repair [--config FILE] [--dry-run]
+
     dksearch check [--config FILE]
 
     dksearch admin-token [--config FILE]
@@ -93,6 +95,14 @@ rebuild
 Delete the search index and rebuild it from the retained content and document records, without reading any source. Use it after deleting or losing `index.db`, after a version change, or after changing `index.tokenizer` (rebuild is the one command that recreates the index with a new tokenizer). Documents whose text was not retained (`retain_text = false`) cannot be rebuilt and are reported as skipped. It is safe to run again if interrupted. Searches made while it runs see a partial index, so stop **serve** first if that matters.
 
 Usage: dksearch rebuild [--config FILE]
+
+repair
+
+Bring the stored documents of the crawl sources up to date with what the crawler does now, without fetching anything. A document keeps what it had when it was stored: a title with `&bull;` in it, an address with `./` or a tracking parameter in it (the crawler now tidies these, so the same page is fetched again under the tidy address and the index has it twice), no language. **repair** decodes HTML entities in titles; for a document whose address is not tidy, removes it if the page is already stored under the tidy address and else moves it there (a new document id, the same text and record); and gives a page with no language one from the first part of its address (`/ja/`, `/zh-CN/`) or from the script of its text (Chinese, Japanese, Korean, Cyrillic, Arabic, Hebrew, Greek, Thai, Devanagari; Latin text is left alone). The work is done in batches, so it can be stopped and run again. A document whose text is not retained is left as it is.
+
+Usage: dksearch repair [--config FILE] [--dry-run]
+
+Arguments: **--dry-run** only counts what would be done, changes nothing and does not need `serve` to be stopped; without it the writers' lock is needed, as for **rebuild**.
 
 check
 

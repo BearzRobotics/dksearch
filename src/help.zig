@@ -185,6 +185,21 @@ pub const commands = [_]Command{
         ,
     },
     .{
+        .name = "repair",
+        .synopsis = "repair [--config FILE] [--dry-run]",
+        .summary = "Bring stored crawl documents up to date (titles, addresses, languages)",
+        .detail =
+        \\Brings the documents of the crawl sources up to date with what the crawler does
+        \\now, without fetching anything: HTML entities in titles are decoded; a document
+        \\whose address is not tidy (./, //, a tracking or session parameter) is merged
+        \\into the page at the tidy address if it is there, else moved to it; a page with
+        \\no language gets one from its address or from the script of its text. --dry-run
+        \\only counts what it would do (it can run while `serve` runs); the real run needs
+        \\`serve` stopped, as `rebuild` does, and can be run again to finish.
+        \\
+        ,
+    },
+    .{
         .name = "check",
         .synopsis = "check [--config FILE]",
         .summary = "Check the stored data for damage (read-only)",

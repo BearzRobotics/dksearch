@@ -261,6 +261,24 @@ fn run(init: std.process.Init) u8 {
         return restoreCmd(io, gpa, config_path, dir orelse return usageError(io, "restore needs the backup DIR"), rebuild_index);
     }
 
+    if (eq(first, "repair")) {
+        var config_path: ?[]const u8 = null;
+        var dry_run = false;
+        while (args.next()) |a| {
+            if (eq(a, "--config")) {
+                config_path = args.next() orelse return usageError(io, "--config needs a FILE");
+            } else if (std.mem.startsWith(u8, a, "--config=")) {
+                config_path = a["--config=".len..];
+            } else if (eq(a, "--dry-run")) {
+                dry_run = true;
+            } else {
+                err(io, "unknown option for repair: {s}", .{a});
+                return exit_usage;
+            }
+        }
+        return repairCmd(io, gpa, config_path, dry_run);
+    }
+
     if (eq(first, "serve") or eq(first, "rebuild") or eq(first, "embed")) {
         var config_path: ?[]const u8 = null;
         while (args.next()) |a| {
@@ -1807,6 +1825,42 @@ fn rebuildCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         return exit_io;
     };
     out(io, "index rebuilt: {d} documents indexed, {d} without retained text (skipped), {d} unreadable\n", .{ stats.reindexed, stats.unrecoverable, stats.failed });
+    return exit_ok;
+}
+
+fn repairCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8, dry_run: bool) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadForRun(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = Paths.make(arena, cfg.data_dir) catch return exit_io;
+    // A dry run only reads; the real run needs the writers' lock (stop `serve` first, as for `rebuild`).
+    const lock = if (dry_run) null else (lockWriters(io, cfg.data_dir, "repair") orelse return exit_io);
+    defer if (lock) |l| l.release(io);
+
+    var state = openState(io, gpa, paths.state) orelse return exit_io;
+    defer state.close();
+    var content = openContent(io, gpa, paths.content) orelse return exit_io;
+    defer content.close();
+    var index = openIndex(io, paths.index, &cfg, false) orelse return exit_io;
+    defer index.close();
+
+    var crawl: std.ArrayList([]const u8) = .empty;
+    for (cfg.sources) |s| if (std.mem.eql(u8, s.kind, "crawl")) crawl.append(arena, s.name) catch return exit_io;
+    const stats = dk.repair.run(gpa, index.indexer(), content.store(), state.documents(), .{ .dry_run = dry_run, .crawl_sources = crawl.items }) catch |e| {
+        err(io, "repair failed: {t}. What was done is consistent; run repair again to finish", .{e});
+        return exit_io;
+    };
+    out(io, "{d} documents looked at in {d} crawl sources\n", .{ stats.examined, crawl.items.len });
+    if (dry_run) {
+        out(io, "would fix: {d} titles with HTML entities, {d} untidy addresses (merged into the tidy page or moved to it), {d} pages without a language\n", .{ stats.titles_planned, stats.untidy_planned, stats.languages_planned });
+        out(io, "nothing was changed (--dry-run); stop `serve`, then run `dksearch repair` to do it\n", .{});
+    } else {
+        out(io, "fixed: {d} titles, {d} addresses ({d} duplicates removed, {d} documents moved), {d} languages; {d} left as they were (no retained text)\n", .{ stats.titles, stats.merged + stats.moved, stats.merged, stats.moved, stats.languages, stats.skipped });
+    }
     return exit_ok;
 }
 
