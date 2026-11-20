@@ -1039,7 +1039,8 @@ fn feedbackAction(arena: Allocator, services: Services, method: http.Method, cal
     return resp;
 }
 
-/// `/suggest`: the owner says a site should have been among the results of a search (POST `q`, `url`). The site is added to
+/// `/suggest`: the owner says sites should have been among the results of a search (POST `q`, `url`: one address or several,
+/// whitespace between them). Each is added to
 /// `suggested-sites.txt` (a crawl source reads it, so the site is indexed on the next run) and kept as a good answer for
 /// that search (`feedback.jsonl`), which `dksearch eval` then reports as missing until it is found.
 fn suggestAction(arena: Allocator, services: Services, method: http.Method, caller: Caller) error{OutOfMemory}!Response {
@@ -1052,16 +1053,40 @@ fn suggestAction(arena: Allocator, services: Services, method: http.Method, call
     if (!services.is_owner) return plain(.forbidden, "sign in as the owner to suggest sites\n");
     const form_target = try std.fmt.allocPrint(arena, "/?{s}", .{std.mem.trimEnd(u8, caller.body, "\r\n")});
     const t = query.parseTarget(arena, form_target) catch return plain(.bad_request, "the form could not be read\n");
-    const url = std.mem.trim(u8, t.params.get("url") orelse "", " \t\r\n");
-    const added = store.addSuggested(arena, url) catch |e| return switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Invalid => plain(.bad_request, "that is not an address to crawl (it must start with http:// or https:// and have a domain name)\n"),
-        error.TooBig => plain(.insufficient_storage, "the list of suggested sites is full\n"),
-        error.Io => plain(.service_unavailable, "the suggestion could not be saved\n"),
-    };
+    // One address, or a list: any whitespace between them (a line each, as a text area sends them). At most 50 at a time.
     const q = t.params.get("q") orelse "";
-    if (q.len > 0) store.record(arena, q, url, 1, std.Io.Clock.real.now(store.io).toSeconds()) catch {};
-    var resp = plain(.ok, if (added) "added: it will be crawled the next time the suggested-sites source runs\n" else "already suggested\n");
+    const now = std.Io.Clock.real.now(store.io).toSeconds();
+    var added: u32 = 0;
+    var known: u32 = 0;
+    var seen: u32 = 0;
+    var refused: std.ArrayList(u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, t.params.get("url") orelse "", " \t\r\n");
+    while (it.next()) |address| {
+        seen += 1;
+        if (seen > 50) return plain(.bad_request, "at most 50 addresses at a time\n");
+        const was_new = store.addSuggested(arena, address) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => {
+                if (refused.items.len < 200) try refused.print(arena, "{s}{s}", .{ if (refused.items.len > 0) ", " else "", address[0..@min(address.len, 60)] });
+                continue;
+            },
+            error.TooBig => return plain(.insufficient_storage, "the list of suggested sites is full\n"),
+            error.Io => return plain(.service_unavailable, "the suggestion could not be saved\n"),
+        };
+        if (was_new) added += 1 else known += 1;
+        if (q.len > 0) store.record(arena, q, address, 1, now) catch {};
+    }
+    if (added == 0 and known == 0) return plain(.bad_request, if (refused.items.len > 0)
+        try std.fmt.allocPrint(arena, "not an address to crawl (it must start with http:// or https:// and have a domain name): {s}\n", .{refused.items})
+    else
+        "give an address\n");
+    var msg: std.ArrayList(u8) = .empty;
+    if (added > 0) try msg.print(arena, "added {d}", .{added});
+    if (known > 0) try msg.print(arena, "{s}already there {d}", .{ if (msg.items.len > 0) "; " else "", known });
+    if (refused.items.len > 0) try msg.print(arena, "; not an address: {s}", .{refused.items});
+    if (added > 0) try msg.appendSlice(arena, " (they are crawled when the suggested-sites source next runs)");
+    try msg.append(arena, '\n');
+    var resp = plain(.ok, msg.items);
     resp.headers = headersWith(arena, &.{no_store});
     return resp;
 }
@@ -4613,7 +4638,7 @@ test "suggest: only the owner can add a site; it goes to the crawl list and is k
     const set = headerValue(good, "set-cookie").?;
     const header = try std.fmt.allocPrint(a, "dks_owner={s}", .{set["dks_owner=".len..std.mem.indexOfScalar(u8, set, ';').?]});
     const page = handleSigned(a, fake.searcher(), services, .GET, "/search?q=linux+rescue+cd", null, .{ .cookie = header });
-    try testing.expect(std.mem.indexOf(u8, page.body, "<form class=\"suggest\" data-q=\"linux rescue cd\">") != null);
+    try testing.expect(std.mem.indexOf(u8, page.body, "<form class=\"suggest\" data-q=\"linux rescue cd\"><textarea name=\"url\"") != null);
     const first = handleSigned(a, fake.searcher(), services, .POST, "/suggest", null, .{ .cookie = header, .body = "q=linux+rescue+cd&url=https%3A%2F%2Fclonezilla.org%2F" });
     try testing.expectEqual(http.Status.ok, first.status);
     try testing.expect(std.mem.startsWith(u8, first.body, "added"));
@@ -4622,6 +4647,12 @@ test "suggest: only the owner can add a site; it goes to the crawl list and is k
     try testing.expectEqual(http.Status.bad_request, handleSigned(a, fake.searcher(), services, .POST, "/suggest", null, .{ .cookie = header, .body = "q=x&url=javascript%3Aalert(1)" }).status);
     try testing.expectEqual(http.Status.method_not_allowed, handleSigned(a, fake.searcher(), services, .GET, "/suggest", null, .{ .cookie = header }).status);
     try testing.expectEqualStrings("https://clonezilla.org/\n", try tmp.dir.readFileAlloc(testing.io, dk.feedback.suggested_file, a, .limited(10_000)));
+    // Several at once, a line each: the new ones are added, the known one is counted, the rubbish is named.
+    const many = handleSigned(a, fake.searcher(), services, .POST, "/suggest", null, .{ .cookie = header, .body = "q=linux+rescue+cd&url=https%3A%2F%2Fa.example.org%2F%0D%0Ahttps%3A%2F%2Fclonezilla.org%2F%0D%0Anot+an+address%0D%0Ahttps%3A%2F%2Fb.example.org%2Fx" });
+    try testing.expectEqual(http.Status.ok, many.status);
+    try testing.expect(std.mem.indexOf(u8, many.body, "added 2; already there 1; not an address: not, an, address") != null);
+    try testing.expectEqualStrings("https://clonezilla.org/\nhttps://a.example.org/\nhttps://b.example.org/x\n", try tmp.dir.readFileAlloc(testing.io, dk.feedback.suggested_file, a, .limited(10_000)));
+    try testing.expectEqual(http.Status.bad_request, handleSigned(a, fake.searcher(), services, .POST, "/suggest", null, .{ .cookie = header, .body = "q=x&url=" }).status);
     const marks = try tmp.dir.readFileAlloc(testing.io, dk.feedback.file_name, a, .limited(10_000));
     try testing.expect(std.mem.indexOf(u8, marks, "\"query\":\"linux rescue cd\"") != null and std.mem.indexOf(u8, marks, "https://clonezilla.org/") != null and std.mem.indexOf(u8, marks, "\"grade\":1") != null);
 }

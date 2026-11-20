@@ -50,10 +50,18 @@
   form.addEventListener("submit", function (e) {
     e.preventDefault();
     var url = form.elements["url"].value.trim();
+    if (!url) return;
     msg.textContent = "…";
     fetch("/suggest", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "q=" + encodeURIComponent(form.getAttribute("data-q")) + "&url=" + encodeURIComponent(url) })
       .then(function (r) { return r.text().then(function (t) { msg.textContent = t.trim(); if (r.ok) form.elements["url"].value = ""; }); })
       .catch(function () { msg.textContent = "could not reach the server"; });
+  });
+  // A text area: Enter is a new line, Ctrl+Enter (or Cmd+Enter) sends, and the box grows with what is pasted.
+  var area = form.elements["url"];
+  function fit() { area.style.height = "auto"; area.style.height = Math.min(area.scrollHeight + 2, 240) + "px"; }
+  area.addEventListener("input", fit);
+  area.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing && form.requestSubmit) { e.preventDefault(); form.requestSubmit(); }
   });
 })();
 

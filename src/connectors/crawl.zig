@@ -88,7 +88,7 @@ const max_mediawiki_calls = 200;
 const feed_cap = 100;
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page", "report_file", "robots_sitemaps", "use_feeds", "mediawiki", "mediawiki_max_pages", "render_command", "render_args", "render_hosts", "render_timeout_seconds", "render_max_pages" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page", "report_file", "robots_sitemaps", "use_feeds", "mediawiki", "mediawiki_max_pages", "render_command", "render_args", "render_hosts", "render_timeout_seconds", "render_max_pages", "watch_seeds" };
 
 // ------------------------------------------------------------ validation
 
@@ -191,6 +191,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     try boolOption(source, "robots_sitemaps", diag);
     try boolOption(source, "use_feeds", diag);
     try boolOption(source, "mediawiki", diag);
+    try boolOption(source, "watch_seeds", diag);
     try intOption(source, "mediawiki_max_pages", 1, 100000, diag);
     try intOption(source, "render_timeout_seconds", 5, 300, diag);
     try intOption(source, "render_max_pages", 1, 100000, diag);

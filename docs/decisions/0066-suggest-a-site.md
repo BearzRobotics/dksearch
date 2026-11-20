@@ -18,3 +18,7 @@ Nothing is crawled at the moment of the request, and nothing reaches the network
 ## Consequences
 
 Adding a site takes one paste, from the page where its absence was noticed. The list is the owner's; a visitor cannot write to it. A suggested address is crawled as any seed is (robots.txt, delay, limits). The crawl source for the file is configuration (`seeds_file`), not built in, so a server without it only collects the suggestions.
+
+## Several addresses, and an import that follows
+
+The form is a text area: any number of addresses (up to 50 a request), a line each, and the answer says how many were added, how many were known and which were not addresses. A crawl source with `watch_seeds = true` is imported when its seeds file has changed since its last import began and has been quiet for two minutes (`scheduler.zig`), by the same job manager as a scheduled import: it is started only when nothing is running, so a manual import is never disturbed or doubled, and an import that began after the change counts as having read it.
