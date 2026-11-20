@@ -1,15 +1,13 @@
-% DKSEARCH-API(7) Version 0.0.0 | Project Manual
-% dksearch contributors
-% 2026-11-14
+# NAME
 
-NAME
 dksearch-api - HTTP interface of dksearch: JSON API version 1 and the HTML search page
 
-SYNOPSIS
-GET /api/v1/search?q=TEXT[&language=L][&content_type=T][&connector=C][&source=S]...[&filter=F]...[&sort=ORDER][&explain=1][&limit=N][&offset=N][&regex=PATTERN[&regex_flags=i][&regex_dialect=perl|ere]]
+# SYNOPSIS
 
-GET /api/v1/retrieve?q=TEXT[&source=S]...[&filter=F]...[&k=N][&candidates=N][&context=N][&chunk_chars=N][&overlap=N][&dedupe=0]
-: Passages for a RAG client: the best chunks of the documents a search for `q` finds. `q`, `source`, `connector` and `filter` mean what they mean for search (`regex` is not available here), and `q` needs at least one word to look for. A question in plain words is searched by its meaningful words joined by OR ("What did the ravens of Odin do?" looks for ravens or Odin; the most common English words are left out), so a passage need not contain every word; a query that uses the query language is searched as written. The same work in several formats in one source (`book.md`, `book.epub`, `book.pdf`) counts once, the format with the most structure being kept (Markdown, HTML, EPUB and Office formats before PDF); `dedupe=0` keeps them all, and `duplicates_merged` says how many were folded in. The picture addresses are served by the search server (`GET /doc/ID/image/N`, PNG, JPEG, GIF or WebP only, only for sources with `serve_originals`). A `page` comes from the stored text's own page breaks (`page_source` "text": PDF text has them after it is imported again) or, for a Markdown copy without them whose PDF copy is in the same source, by matching the passage's words against the PDF's pages (`page_source` "pdf"; a good guess, not a proof); otherwise it is null. Documents of at least `search.chunk_index_min_kb` (default 64) KiB also have their passages in a chunk index, so a passage inside a very large document is found even when the document as a whole ranks low; for those, `chunk_chars` and `overlap` do not apply (the index's own chunking, 1200 and 150, is used). The first `candidates` documents (default 30, at most 100) have their stored texts split into chunks of about `chunk_chars` bytes (default 1200, 200 to 8000, cut at paragraph ends and never across a heading unless the section is tiny) with `overlap` bytes (default 150) of the previous chunk repeated, and the chunks are ranked on the query's words with BM25 (a word in a heading counts double). Returns `chunks` (at most `k`, default 8, at most 50), `candidates` and `without_text` (candidates that have no stored text). Each chunk has `doc_id`, `view_url`, `source`, `title`, `url`, `heading` (the headings above it, outermost first), `index` and `of` (its place among the document's chunks), `start` and `end` (its byte span in the document's stored text), `page` (see below) and `page_source`, `entries` (bold terms that open paragraphs, which is how encyclopedias converted to Markdown mark their entries: what the passage is about), `score`, `text`, and `before` and `after`: the texts of up to `context` neighbouring chunks (0 to 3, default 0), and `images`: the pictures of the original file that sit in the passage (Markdown converted from a PDF carries its figures), each with its number `n` and, when the source serves its original files, its address `/doc/ID/image/N`. Chunks are made when asked, from the stored text, so nothing needs rebuilding. With `peers=1` the configured peers (see `peers` under `/api/v1/search`) are asked for their best passages for the same `q` (with `k`, `context`, `chunk_chars` and `overlap`, and twice the usual time limit), and the passages are merged with this node's by reciprocal-rank fusion (BM25 scores of different indexes are not comparable); the same passage of the same web page on several nodes counts once and names the others in `also_on`. A passage from a peer has `node` (its name), a `view_url` that is an absolute address on that peer, and no `images` (their addresses need the peer's key). The response gains `peers`, one entry per asked peer as for search; it is null when peers were not asked for, and peers are never asked for a caller whose view is limited. Errors: 400 `invalid_parameter` or `empty_query`, 503 `no_content` when nothing has been imported yet.
+    GET /api/v1/search?q=TEXT[&language=L][&content_type=T][&connector=C][&source=S]...[&filter=F]...[&sort=ORDER][&explain=1][&limit=N][&offset=N][&regex=PATTERN[&regex_flags=i][&regex_dialect=perl|ere]]
+
+    GET /api/v1/retrieve?q=TEXT[&source=S]...[&filter=F]...[&k=N][&candidates=N][&context=N][&chunk_chars=N][&overlap=N][&dedupe=0]
+    : Passages for a RAG client: the best chunks of the documents a search for `q` finds. `q`, `source`, `connector` and `filter` mean what they mean for search (`regex` is not available here), and `q` needs at least one word to look for. A question in plain words is searched by its meaningful words joined by OR ("What did the ravens of Odin do?" looks for ravens or Odin; the most common English words are left out), so a passage need not contain every word; a query that uses the query language is searched as written. The same work in several formats in one source (`book.md`, `book.epub`, `book.pdf`) counts once, the format with the most structure being kept (Markdown, HTML, EPUB and Office formats before PDF); `dedupe=0` keeps them all, and `duplicates_merged` says how many were folded in. The picture addresses are served by the search server (`GET /doc/ID/image/N`, PNG, JPEG, GIF or WebP only, only for sources with `serve_originals`). A `page` comes from the stored text's own page breaks (`page_source` "text": PDF text has them after it is imported again) or, for a Markdown copy without them whose PDF copy is in the same source, by matching the passage's words against the PDF's pages (`page_source` "pdf"; a good guess, not a proof); otherwise it is null. Documents of at least `search.chunk_index_min_kb` (default 64) KiB also have their passages in a chunk index, so a passage inside a very large document is found even when the document as a whole ranks low; for those, `chunk_chars` and `overlap` do not apply (the index's own chunking, 1200 and 150, is used). The first `candidates` documents (default 30, at most 100) have their stored texts split into chunks of about `chunk_chars` bytes (default 1200, 200 to 8000, cut at paragraph ends and never across a heading unless the section is tiny) with `overlap` bytes (default 150) of the previous chunk repeated, and the chunks are ranked on the query's words with BM25 (a word in a heading counts double). Returns `chunks` (at most `k`, default 8, at most 50), `candidates` and `without_text` (candidates that have no stored text). Each chunk has `doc_id`, `view_url`, `source`, `title`, `url`, `heading` (the headings above it, outermost first), `index` and `of` (its place among the document's chunks), `start` and `end` (its byte span in the document's stored text), `page` (see below) and `page_source`, `entries` (bold terms that open paragraphs, which is how encyclopedias converted to Markdown mark their entries: what the passage is about), `score`, `text`, and `before` and `after`: the texts of up to `context` neighbouring chunks (0 to 3, default 0), and `images`: the pictures of the original file that sit in the passage (Markdown converted from a PDF carries its figures), each with its number `n` and, when the source serves its original files, its address `/doc/ID/image/N`. Chunks are made when asked, from the stored text, so nothing needs rebuilding. With `peers=1` the configured peers (see `peers` under `/api/v1/search`) are asked for their best passages for the same `q` (with `k`, `context`, `chunk_chars` and `overlap`, and twice the usual time limit), and the passages are merged with this node's by reciprocal-rank fusion (BM25 scores of different indexes are not comparable); the same passage of the same web page on several nodes counts once and names the others in `also_on`. A passage from a peer has `node` (its name), a `view_url` that is an absolute address on that peer, and no `images` (their addresses need the peer's key). The response gains `peers`, one entry per asked peer as for search; it is null when peers were not asked for, and peers are never asked for a caller whose view is limited. Errors: 400 `invalid_parameter` or `empty_query`, 503 `no_content` when nothing has been imported yet.
 
 AUTHENTICATION
 : By default the search API needs no key. A server can limit what anonymous callers see (`[access] anonymous_collections`) and issue API keys (`dksearch api-key add`). A key is sent as `Authorization: Bearer dkk_...` and restricts the results of `/api/v1/search` and `/api/v1/retrieve`, and the documents, pictures and articles under `/doc/` and `/zim/`, to the collections it was made for. Signed requests: a request may carry `dk-node` (the sender's node id, `dkn_...`), `dk-time` (Unix seconds), `dk-nonce` (22 characters) and `dk-sig` (base64url Ed25519 signature of `"dksearch-v1 request\n" METHOD "\n" TARGET "\n" HOST "\n" TIME "\n" NONCE`, with TARGET the request target as sent and HOST the lower-case `Host`). A key bound to a node (`api-key add --node`) is accepted only with a valid, recent, unused signature by that node (401 `invalid_key` otherwise, the message says why). A caller that sends `dk-nonce` (signed or not) to a node that has an identity gets `dk-node` and `dk-sig` on the answer: a signature of `"dksearch-v1 response\n" NONCE "\n" STATUS "\n" SHA256-HEX-OF-BODY`. See NODE IDENTITY in **dksearch**(1). Errors: 429 `rate_limited` (with `Retry-After`, in seconds) for a key over its per-minute limit (`dksearch api-key add --rate`; every request with the key counts, the others are not affected); 401 `invalid_key` for a key that is not valid or is sent to a server with no keys, 401 `key_required` when the server gives anonymous callers nothing (`/api/v1/health` stays open). A document outside the key's scope is answered with 404, the same as one that does not exist. The `collection:NAME` filter of the query language and `source=collection:NAME` select a collection within the scope.
@@ -19,24 +17,30 @@ AUTHENTICATION
 `after=CURSOR` on `/api/v1/search` continues a search after the last result of the previous page; the previous reply's `next_cursor` (present when more results follow, for a search of words in relevance order) is the value to give. It replaces `offset`, is not limited to the first 10000 results (it walks up to 100000) and does not shift when documents are added between pages. Opaque: 48 hex digits. Not combined with `offset` or another `sort` (400 `invalid_query`); a malformed value is 400 `invalid_parameter`.
 
 GET /api/v1/similar
+
 Documents like one given. Parameters: `id` (the 32 hex digits of a document id, as in `view_url`), `limit` (1 to 50, default 10). Returns `{"hits": [...]}` like search, never including the document itself, limited to what the caller may see; 404 `not_found` for an unknown document. With a vector index (`[embeddings]`, ADR 0043) holding the document the nearest vectors are used; otherwise the words that set the document apart (frequent in it, rare in the index) are searched for with OR. Empty when the text is not stored. The document page shows five under *Similar documents*.
 
 GET /api/v1/suggest
+
 The query with its last word completed from the index's vocabulary, most common words first (at most 8). Parameters: `q`. Returns `{"query": ..., "suggestions": [...]}`; empty when the last word has operators or wildcards, or nothing starts with it. Public, like search; it reveals only words that are in documents the index holds.
 
 GET /api/v1/answer
+
 A short answer written by the local model of `[answers]` (Ollama) from the best passages for a question. Off unless `[answers] enabled`; 404 `answers_off` otherwise.
 
 Parameters:
+
 q
 : Required. The question, 3 to 500 characters.
 
 The answer is `{"answer": TEXT, "model": NAME, "sources": [{"n": 1, "title": ..., "source": ..., "view_url": ...}], "notice": ...}`: `sources` are the numbered passages the text may cite as [1], [2]. With no matching passage `answer` is null and `reason` says why (the model is not asked). Errors: 400 `invalid_parameter`, 429 `busy` (the server's per-minute limit of answers, with `Retry-After`), 503 `model_unavailable`. The caller's scope applies to the passages like to every search.
 
 GET /api/v1/export
+
 Copy the documents of a source to a peer that replicates them (`kind = "peer"`, see **dksearch**(1)).
 
 Parameters:
+
 source
 : Required. The name of a source whose owner set `share = true`.
 
@@ -49,6 +53,7 @@ limit
 Needs an API key (`Authorization: Bearer dkk_...`) whose collections include the source, whatever the anonymous setting of the server: 401 `key_required` without one. A source that does not exist, is off, is not shared, has `rights = "forbidden"` or is outside the key's collections answers 404 `not_shared`. The answer is `{"source": NAME, "documents": [...], "next": CURSOR or null}`. Each document has `id`, `ident` (see `/api/v1/search`), `source`, `url`, `title`, `text` (the full stored text; documents with no retained text or over 4 MiB are left out), `language`, `content_type`, `modified_at`, `published_at`, `author` and `redistribution` (what the source's owner says may be done with the text: `unknown`, `allowed` or `restricted`). Pages are in a stable order, so a replica can continue from a cursor.
 
 GET /api/v1/peers
+
 The peers this node is willing to introduce to the nodes it answers (`introduce = true` on the `[[peer]]`, and enabled). Needs an API key, like `/api/v1/export`. The answer is `{"node": NAME, "peers": [{"name": ..., "url": ...}]}`: names and addresses only, never keys. They are suggestions: the asking node's operator decides whether to add any, and needs a key from that peer's own node.
 
 GET /api/v1/health
@@ -57,19 +62,24 @@ GET /, GET /search?q=TEXT[&language=L][&source=S]...[&connector=C][&offset=N]
 
 GET /help/search and GET /help/regex\nHTML pages that explain the query language (with typo tolerance) and, when the server offers it, the regular-expression filter with the limits this server applies. `/help` is the same as `/help/search`. The search form links to both.\n\nGET /assets/style.css
 
-DESCRIPTION
+# DESCRIPTION
+
 The public, read-only interface served by dksearch(1). It needs no authentication. Every endpoint accepts GET and HEAD only; any other method receives 405 with `Allow: GET, HEAD`. Request bodies are refused with 400 and the connection is closed.
 
 There are two adapters over the same search service. The JSON API under `/api/v1/` is for programs. The HTML pages are for people and need no JavaScript.
 
-CONVENTIONS
+# CONVENTIONS
+
 Parameter values are percent-encoded; `+` in a query string means a space. Parameter and path names are case-sensitive. Paths are matched exactly: they are not percent-decoded, and a trailing slash is a different path. If a parameter is repeated, the first occurrence is used. Unknown parameters are ignored.
 
-COMMANDS
+# COMMANDS
+
 GET /api/v1/search
+
 Run a search.
 
 Parameters:
+
 q
 : Required. The text to search for, in a small query language. Words are combined with AND. Text in double quotes is a phrase. `OR` and `NOT` (capitals; `AND` too) combine terms, parentheses group them, a leading `-` excludes a word and a leading `+` is accepted (the word is required, as it already is), `comp*` matches words starting with comp, `word~` matches the word or any word one typo away, and `"two words"~5` matches the words within five positions of each other. In lower case `and`, `or` and `not` are ordinary words, and any operator can be searched for literally by quoting it. `title:word` and `body:word` (or `title:(a OR b)`) restrict words to the title or the text. Conditions on the document can be written in the query too: `ext:pdf`, `type:image` (page, text, markdown, pdf, image, video, audio, data, other), `mime:text/*`, `source:NAME`, `lang:en`, `site:example.org` (also `domain:`), `path:/docs/`, `author:"Jo Smith"`, `tag:linux`, `meta.NAME:text`, `size:>1mb` (also `<10k`, `10k..2mb`), `modified:>2026-01-01`, `modified:2026-03`, `modified:7d`, `created:` and `indexed:` likewise; a minus in front leaves matching documents out, and the same condition repeated (`ext:pdf ext:md`) means either. A search of conditions alone lists the matches, newest first. `re:/pattern/` or `re:/pattern/i` is a regular expression (see `regex` below). `^`, `NEAR(...)` and all other index syntax are never interpreted: they are searched as ordinary text. The parser is forgiving: a stray `)` is ignored and a missing one supplied. A query needs at least one word that is not excluded. At most 1024 bytes, 32 terms and 8 levels of parentheses. A query with nothing searchable is an `empty_query` error. A server can turn the language off (`[search] query_syntax = "simple"`), in which case every word is plain text.
 
@@ -141,92 +151,119 @@ Response: 200 with `application/json`:
 `interpreted` is how the query was read, as text like `linux OR bsd NOT android`, when it used the query language or typo tolerance, and null for plain words. `fuzzy` is true when the results include words one typo away from those typed. `id` is the 32-hex-digit stable document id. `url`, `title`, `snippet`, `language`, `content_type`, `kind`, `domain`, `author`, `size` and `modified_at` may be null (a source need not know them; documents indexed before these were recorded have none until they are imported again or the index is rebuilt). `view_url` is the document's page on this server, with its details and stored text. `kind` is page, text, markdown, pdf, image, video, audio, data or other; `domain` is the host of the address; `size` is in bytes; `modified_at` is Unix time in seconds. `score` is higher for better matches and is comparable only within one response. It is the weighted text match (title and text, `[search] title_weight` and `body_weight`) times the source's `boost` and, if `[search] recency_boost` is set, a factor for how new the document is. With `explain=1` every hit also has an `explain` object: `text` (the weighted text match), `source` (the boost factor) and `recency` (the age factor), with `score` = `text * source * recency`, plus `title` and `body`, how well the title and the text match on their own (unweighted; they do not add up to `text`, because the search engine weighs word counts before it saturates them). Without `explain` the member is null. Hits are ordered by score, ties by id, so paging an unchanged index is stable. `has_more` says whether another page follows. `snippet` brackets matched text with the control characters U+0002 and U+0003 (JSON `\u0002`, `\u0003`); a client must escape the text for its output format first and only then replace the markers with its own markup. Snippets come from untrusted documents and may themselves contain such characters.
 
 GET /api/v1/health
+
 Returns 200 and `{"status":"ok"}`. It reports that the process is serving requests and nothing about the index.
 
 GET /search and GET /
+
 HTML pages. `/` is the search form. `/search` takes `q`, `language`, `source` (repeatable: one per ticked source, a source name or `kind:NAME` for all sources of a kind; the Source list on the page is a set of tick boxes, none ticked means all), `connector` (one source, as before), `sort`, `offset`, `fuzzy` and, when the server offers it, `regex` and `regex_flags` (on the page a pattern is written in the search box as `re:/pattern/` or `re:/pattern/i`, with a minus in front to keep only documents that do not match; the same form works in the `q` parameter of the API and cannot be combined with `regex`); the page size is fixed at 10 and any `limit` is ignored. Result URLs are links only if they begin with `http://` or `https://`; otherwise they are shown as text. An empty `q` shows the form again.
 
 GET /assets/style.css
+
 The stylesheet, cacheable for one hour. All other responses are `Cache-Control: no-store`.
 
-OPTIONS
+# OPTIONS
+
 None beyond the query parameters above.
 
-OPERANDS
+# OPERANDS
+
 None.
 
-INPUT
+# INPUT
+
 Request heads larger than `server.max_header_bytes` receive 431. A request target is at most 8192 bytes, must start with `/`, may not contain spaces or control characters, and may have at most 32 query parameters; otherwise the response is 400 with a plain-text body. Percent-escapes must be valid and decode to valid UTF-8.
 
-OUTPUT
+# OUTPUT
+
 Errors from `/api/` have the form:
 
     {"error": {"code": "empty_query", "message": "the query has no searchable terms"}}
 
-Code	Status	Meaning
-invalid_parameter	400	A parameter is malformed (for example `limit=abc`); the message names it.
-empty_query	400	`q` is missing or has no searchable terms.
-invalid_query	400	The query is too long or has too many terms, or `limit`/`offset` are out of range.
-not_found	404	No such endpoint.
-method_not_allowed	405	Method other than GET or HEAD.
-internal_error	500	The search failed. The cause is never included; it is for the operator's logs.
+| Code | Status | Meaning |
+|---|---|---|
+| invalid_parameter | 400 | A parameter is malformed (for example `limit=abc`); the message names it. |
+| empty_query | 400 | `q` is missing or has no searchable terms. |
+| invalid_query | 400 | The query is too long or has too many terms, or `limit`/`offset` are out of range. |
+| not_found | 404 | No such endpoint. |
+| method_not_allowed | 405 | Method other than GET or HEAD. |
+| internal_error | 500 | The search failed. The cause is never included; it is for the operator's logs. |
+
 
 Messages are for humans and may change; the codes are stable. Every response, including errors, carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cross-Origin-Resource-Policy: same-origin` and a Content-Security-Policy with `default-src 'none'` that allows stylesheets and scripts only from the same origin, never inline (the only script is the administration interface's `/assets/admin.js`, which updates import progress; the public interface serves none). HTML responses are `text/html; charset=utf-8`; JSON is UTF-8.
 
-EXIT STATUS
+# EXIT STATUS
+
 Not applicable.
 
-ENVIRONMENT
+# ENVIRONMENT
+
 Not applicable.
 
-FILES
+# FILES
+
 Not applicable.
 
-CONFIGURATION
+# CONFIGURATION
+
 Limits are set in the `[server]` table of the configuration file; see dksearch(1).
 
-EXAMPLES
+# EXAMPLES
+
 Basic use
     curl 'http://127.0.0.1:8080/api/v1/search?q=truth'
 
 Phrase, filtered, second page
     curl 'http://127.0.0.1:8080/api/v1/search?q=%22truth+universally%22&language=en&limit=10&offset=10'
 
-DIAGNOSTICS
+# DIAGNOSTICS
+
 A 400 with a plain-text body means the request target itself was malformed. A connection closed without any response means a limit or timeout in dksearch(1) was exceeded.
 
-SECURITY CONSIDERATIONS
+# SECURITY CONSIDERATIONS
+
 See dksearch(1). In particular, never insert `snippet` into HTML without escaping it first.
 
-PRIVACY
+# PRIVACY
+
 The API sets no cookies and keeps no per-client state.
 
-RESOURCE USAGE
+# RESOURCE USAGE
+
 A response contains at most 100 hits.
 
-PERFORMANCE
+# PERFORMANCE
+
 Not measured.
 
-CONCURRENCY AND ATOMICITY
+# CONCURRENCY AND ATOMICITY
+
 Each request is independent. A search sees a consistent snapshot of the index.
 
-SIGNALS
+# SIGNALS
+
 Not applicable.
 
-NETWORK
+# NETWORK
+
 HTTP/1.1 over plain TCP; keep-alive is supported. See dksearch(1) for timeouts and connection limits.
 
-COMPATIBILITY
+# COMPATIBILITY
+
 Platforms
+
 Any HTTP client.
 
 Standards
+
 JSON (RFC 8259); HTTP semantics (RFC 9110) as far as implemented.
 
 Stability guarantees
+
 Within `/api/v1/`: adding response fields or optional parameters is allowed, so clients must ignore unknown fields. Removing a field, changing its meaning, or changing error codes requires a new version `/api/v2/`. A superseded version stays available for a documented period. The HTML pages and their markup are not part of the stable API.
 
-ADMINISTRATION API
+# ADMINISTRATION API
+
 The administration interface is a separate listener (see dksearch(1), `admin.*`), not part of the public API above. It has the same conventions (JSON, `error` objects with stable codes, `no-store`), accepts GET and HEAD for data, and requires authentication: `Authorization: Bearer TOKEN` (see **dksearch admin-token**) or a session cookie from signing in at `/login`. Without it the API answers 401 with `WWW-Authenticate: Bearer` and code `unauthorized`; pages redirect to `/login`. The endpoints below are read-only except the two that start and cancel imports, which work only when the server is configured with `admin.actions = true` (otherwise they answer 403 with code `actions_disabled`).
 
 GET /api/v1/admin/status
@@ -263,41 +300,55 @@ POST /api/v1/admin/maintenance
 
 The HTML pages `/` (dashboard) and `/jobs`, `POST /login` (field `credential`: the password or the token), `POST /logout` and, with actions enabled, `POST /actions/import` (fields `source`), `POST /actions/maintenance` (fields `op`, `source`, `confirm`), `POST /actions/sources` and `POST /actions/cancel` are for browsers; the page `/maintenance` shows the buttons; the last three carry the per-session form token in the field `csrf`. The same compatibility rules apply: fields may be added within `v1`.
 
-LIMITATIONS
+# LIMITATIONS
+
 No document endpoints. The administration API can start and cancel imports only when enabled, and cannot rebuild, remove, back up or change configuration. No sorting options, total counts, or faceting. The public API has no authentication or rate limiting; the administration API requires a credential.
 
-BUGS
+# BUGS
+
 See dksearch(1).
 
-TROUBLESHOOTING
+# TROUBLESHOOTING
+
 Empty `hits` for a query that should match: check the filters, and check that the index is populated (see **import** in dksearch(1)).
 
-NOTES
+# NOTES
+
 Document ids are derived from the connector name and the source's own identifier, so the same item keeps the same id across re-imports and index rebuilds.
 
-CAVEATS
+# CAVEATS
+
 Scores are not comparable between different queries.
 
-HISTORY
+# HISTORY
+
 Version 1 of the API is introduced with dksearch 0.0.0.
 
-DEPRECATION
+# DEPRECATION
+
 Nothing is deprecated.
 
-SEE ALSO
+# SEE ALSO
+
 dksearch(1)
 
-AUTHOR
+# AUTHOR
+
 dksearch contributors.
 
-COPYRIGHT
+# COPYRIGHT
+
 Copyright 2026 dksearch contributors. SPDX-License-Identifier: GPL-2.0-only
 
-LICENSE
+# LICENSE
+
 GNU General Public License, version 2 only. See dksearch(1).
 
-AVAILABILITY
+# AVAILABILITY
+
 Not yet published.
 
-VERSION
+# VERSION
+
 This manual describes the `/api/v1/` interface of dksearch version 0.0.0.
+
