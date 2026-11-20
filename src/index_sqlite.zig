@@ -145,8 +145,8 @@ pub const SqliteIndex = struct {
     retry_budget_ms: ?u32 = null,
     /// How many of the best matches by text score are read and scored in full (see `runMatch`); 0 turns the shortcut off.
     candidate_pool: u32 = 2000,
-    /// Set around the one query that is restricted to the candidates: their rowids, `1,2,3`.
-    candidates: ?[]const u8 = null,
+    /// Set around the one query that works from the best matches by text score: how many (see `runMatch`).
+    candidate_k: ?u32 = null,
     /// Set around the one search of a heavy query that is not ranked (see `runMatch`).
     unranked: bool = false,
     /// See `OpenOptions.chunk_min_bytes`.
@@ -1503,54 +1503,39 @@ pub const SqliteIndex = struct {
 
     /// `own_snippets`: SQLite's excerpt function (slow on a word that occurs thousands of times in a document) is not asked
     /// for; the caller makes the excerpts.
-    /// The best `candidate_pool` documents by the text score alone are found first, from the full-text index without
-    /// reading the documents; the filters, the factors, the per-domain limit and the final order are applied to those. Reading
-    /// and scoring every match is what takes the time when a search matches tens of thousands of documents (0.6 s for 22,000;
-    /// 0.1 s for the candidates). It is skipped where it would not be exact: orders other than relevance, a cursor, a deep
-    /// page, trusted sources first, and a search with few matches. When the filters leave too few of the candidates to fill the
-    /// page and there are more matches, the exact query is run instead, so nothing is lost.
+    /// The best `candidate_pool` matches by the text score alone are taken first, from the full-text index without reading the
+    /// documents (a subquery: `SELECT rowid, bm25(..) ... ORDER BY score LIMIT K`); the filters, the factors (source, recency,
+    /// language, demotion, a file name as a title), the per-domain limit and the final order are applied to those. Computing the
+    /// factors for every match is what takes the time when a search matches tens of thousands of documents (about 25 microseconds
+    /// a match: 0.6 s for 22,000); for 2,000 candidates it is a tenth of that. It is used where it is exact enough: the order is
+    /// relevance, no cursor, not a deep page, no trusted-sources-first, the excerpts are made by us and no explanation is asked
+    /// for (those need the full-text cursor). When the filters leave the page short and there were more matches than candidates,
+    /// the exact query is run, so nothing is lost.
     fn runMatch(self: *SqliteIndex, arena: Allocator, q: search.Query, filters: []const search.Filter, limit: u32, match: []const u8, interpreted: ?[]const u8, fuzzy: bool, own_snippets: bool) search.Error!search.Page {
         const wanted: u64 = @as(u64, q.offset) + limit;
-        const eligible = match.len > 0 and self.has_meta and q.sort == .relevance and q.after == null and !self.unranked and
+        const eligible = match.len > 0 and self.has_meta and q.sort == .relevance and q.after == null and !self.unranked and own_snippets and !q.explain and
             !(q.trusted_first orelse false) and wanted <= max_preselect_window and self.candidate_pool > 0;
         if (!eligible) return self.runMatchExact(arena, q, filters, limit, match, interpreted, fuzzy, own_snippets);
         const pool: u32 = @intCast(@max(@as(u64, self.candidate_pool), wanted * 4));
-        const found = (try self.topCandidates(arena, match, pool)) orelse return self.runMatchExact(arena, q, filters, limit, match, interpreted, fuzzy, own_snippets);
-        if (!found.truncated) return self.runMatchExact(arena, q, filters, limit, match, interpreted, fuzzy, own_snippets); // all matches are few
-        self.candidates = found.ids;
+        self.candidate_k = pool;
         const page = blk: {
-            defer self.candidates = null;
+            defer self.candidate_k = null;
             break :blk try self.runMatchExact(arena, q, filters, limit, match, interpreted, fuzzy, own_snippets);
         };
-        // More matches exist than the candidates: a page the filters left short may have been filled from the others.
-        if (!page.has_more) return self.runMatchExact(arena, q, filters, limit, match, interpreted, fuzzy, own_snippets);
+        // No more results to show: either the matches are few (done), or the filters left too little of the candidates.
+        if (!page.has_more and self.matchesExceed(match, pool)) return self.runMatchExact(arena, q, filters, limit, match, interpreted, fuzzy, own_snippets);
         return page;
     }
 
-    const Candidates = struct { ids: []const u8, truncated: bool };
-
-    /// The rowids of the best `pool` matches by the text score, as a list for SQL (`1,2,3`); `truncated` when there are more
-    /// matches than that. Null when it could not be done (the caller runs the exact query).
-    fn topCandidates(self: *SqliteIndex, arena: Allocator, match: []const u8, pool: u32) search.Error!?Candidates {
-        const sql = try std.fmt.allocPrintSentinel(arena, "SELECT rowid FROM fts WHERE fts MATCH ?1 ORDER BY bm25(fts, {d}.0, {d}.0) LIMIT {d}", .{ self.title_weight, self.body_weight, pool + 1 }, 0);
-        const st = Stmt.prepare(self.db, sql) catch return null;
+    /// Whether more than `n` documents match (a count that stops at n + 1, without ranking: cheap).
+    fn matchesExceed(self: *SqliteIndex, match: []const u8, n: u32) bool {
+        var buf: [96:0]u8 = undefined;
+        const sql = std.fmt.bufPrintSentinel(&buf, "SELECT count(*) FROM (SELECT 1 FROM fts WHERE fts MATCH ?1 LIMIT {d})", .{n + 1}, 0) catch return true;
+        const st = Stmt.prepare(self.db, sql) catch return true;
         defer st.deinit();
-        st.text(1, match) catch return null;
-        var guard: Deadline = undefined;
-        if (self.timeout) |t| {
-            guard = .{ .io = t.io, .deadline_ns = Io.Timestamp.now(t.io, .awake).nanoseconds + @as(i96, self.retry_budget_ms orelse t.ms) * std.time.ns_per_ms };
-            c.sqlite3_progress_handler(self.db, 2000, progressCallback, &guard);
-        } else guard = .{ .io = undefined, .deadline_ns = 0 };
-        defer if (self.timeout != null) c.sqlite3_progress_handler(self.db, 0, null, null);
-        var out: std.ArrayList(u8) = .empty;
-        var n: u32 = 0;
-        while (st.step() catch |e| return if (guard.fired) error.Timeout else if (e == error.OutOfMemory) error.OutOfMemory else null) {
-            if (n >= pool) return .{ .ids = out.items, .truncated = true };
-            if (n > 0) try out.append(arena, ',');
-            try out.print(arena, "{d}", .{st.colInt(0)});
-            n += 1;
-        }
-        return .{ .ids = out.items, .truncated = false };
+        st.text(1, match) catch return true;
+        if (!(st.step() catch return true)) return true;
+        return st.colInt(0) > n;
     }
 
     fn runMatchExact(self: *SqliteIndex, arena: Allocator, q: search.Query, filters: []const search.Filter, limit: u32, match: []const u8, interpreted: ?[]const u8, fuzzy: bool, own_snippets: bool) search.Error!search.Page {
@@ -1594,7 +1579,7 @@ pub const SqliteIndex = struct {
         try factors.print(arena, "{s} * {s}{s}{s}{s}", .{ src_expr, rec_expr, demote_expr, lang_expr, file_title_expr });
         // A heavy search (only words too common to rank, `unranked`): no ranking, the most recently stored documents first,
         // which SQLite can stop reading after a page; ranking millions of matches is what took seconds.
-        const bm = if (self.unranked) "0.0" else try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0) * {s}", .{ self.title_weight, self.body_weight, factors.items });
+        const bm = if (self.unranked) "0.0" else if (self.candidate_k != null) try std.fmt.allocPrint(arena, "c.score * {s}", .{factors.items}) else try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0) * {s}", .{ self.title_weight, self.body_weight, factors.items });
         const explain_cols = if (q.explain and text_mode)
             try std.fmt.allocPrint(arena, ", -bm25(fts, {d}.0, {d}.0), -bm25(fts, 1.0, 0.0), -bm25(fts, 0.0, 1.0), {s}, {s}, 1.0{s}{s}{s}", .{ self.title_weight, self.body_weight, src_expr, rec_expr, demote_expr, lang_expr, file_title_expr })
         else
@@ -1630,7 +1615,12 @@ pub const SqliteIndex = struct {
                 \\FROM fts JOIN docs d ON d.rowid = fts.rowid
                 \\WHERE fts MATCH ?3
             , .{ if (own_snippets) "NULL" else "snippet(fts, 1, ?1, ?2, '…', 16)", bm, columns, explain_cols, tier_col });
-            if (self.candidates) |ids| try sql.print(arena, " AND fts.rowid IN ({s})", .{ids});
+            if (self.candidate_k) |k| {
+                // From the best k matches by the text score: replace the join of every match with a subquery of the best.
+                const from = std.mem.indexOf(u8, sql.items, "FROM fts JOIN docs d ON d.rowid = fts.rowid\nWHERE fts MATCH ?3").?;
+                sql.items.len = from;
+                try sql.print(arena, "FROM (SELECT rowid AS rid, bm25(fts, {d}.0, {d}.0) AS score FROM fts WHERE fts MATCH ?3 ORDER BY score LIMIT {d}) c JOIN docs d ON d.rowid = c.rid\nWHERE 1", .{ self.title_weight, self.body_weight, k });
+            }
         } else {
             try sql.print(arena, "SELECT d.id, d.connector, d.url, d.title, NULL, 0.0, {s} FROM docs d WHERE 1", .{columns});
         }

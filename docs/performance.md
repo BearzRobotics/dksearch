@@ -130,3 +130,16 @@ Measured with `crap` (a fork of poop: wall time of `curl -s -o /dev/null http://
 
 What it was: ranking millions of matches, and then the per-domain step reading up to 100,000 rows before its window (a `perf record -e cpu-clock:u` profile showed SQLite's row processing, not ranking, after the first fix: "the" fell from 5.2 s to 1.1 s with the phrase and unranked paths and to 9.5 ms once the window was skipped). See docs/decisions/0069-common-word-searches.md.
 
+## Searches that match many documents (2026-11-19)
+
+The same method (`crap`, `curl` against the live server, 414,000 documents). The time of such a search was the factors computed for every match, not the ranking; ADR 0072. Taking the best 2,000 candidates by text score first:
+
+| Search | Matches | Before | After |
+|---|---|---|---|
+| `language` | 22,000 | 607 ms | 120 ms |
+| `linux` | 11,000 | 268 ms | 91 ms |
+| `lanague` (corrected to `language`) | 22,000 | 1.02 s | 461 ms |
+| `kernel scheduler` (control) | few | 40 ms | 39 ms |
+
+A first attempt (`rowid IN (...)`) made `language` take 5 s on this index while passing every unit test; the unit tests use a few hundred documents. Check a change of query shape on the large index before it is deployed.
+
