@@ -770,7 +770,16 @@ fn finishHit(w: *Writer, h: dk.search.Hit) Writer.Error!void {
             try writeEscaped(w, n);
         }
     }
-    try w.writeAll("</div></li>\n");
+    try w.writeAll("</div>");
+    if (h.explain) |e| try writeWhy(w, e, h.score);
+    try w.writeAll("</li>\n");
+}
+
+/// For the owner: how the score of a result came about. The text score (title and body weighted as configured) is multiplied
+/// by the source's boost, the recency factor and the other factors (a demoted domain, a page in another language than the
+/// reader's, a file name as a title); the text score alone for the title and for the body are shown for comparison.
+fn writeWhy(w: *Writer, e: dk.search.Explain, score: f64) Writer.Error!void {
+    try w.print("<details class=\"why\"><summary>why</summary><p>score {d:.2} = text {d:.2} (title alone {d:.2}, body alone {d:.2}) &times; source {d:.2} &times; recency {d:.2} &times; other {d:.2}</p></details>", .{ score, e.text, e.title, e.body, e.source, e.recency, e.adjust });
 }
 
 /// The page of the stored document: here, or on the peer that has it.
@@ -1147,4 +1156,15 @@ test "empty results page and home page" {
     defer testing.allocator.free(home);
     try testing.expect(std.mem.indexOf(u8, home, "Bad &lt;query&gt;") != null);
     try testing.expect(std.mem.indexOf(u8, home, "action=\"/search\"") != null);
+}
+
+test "a result with an explanation shows how its score came about; one without shows nothing" {
+    var hits = [_]dk.search.Hit{
+        .{ .id = @splat(1), .connector = "web", .url = "https://e.org/a", .title = "A", .snippet = null, .score = 12.3, .explain = .{ .text = 12.3, .title = 7.7, .body = 11.5, .source = 1.0, .recency = 1.0, .adjust = 0.3 } },
+        .{ .id = @splat(2), .connector = "web", .url = "https://e.org/b", .title = "B", .snippet = null, .score = 4 },
+    };
+    const out = try render(writeResults, .{ Form{ .q = "a" }, dk.search.Page{ .hits = &hits, .has_more = false }, @as(u32, 0), @as(u32, 10) });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<details class=\"why\"><summary>why</summary><p>score 12.30 = text 12.30 (title alone 7.70, body alone 11.50) &times; source 1.00 &times; recency 1.00 &times; other 0.30</p></details>") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "class=\"why\""));
 }

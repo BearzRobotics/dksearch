@@ -410,3 +410,8 @@ form.suggest { margin: 0.6rem 0 0.2rem; display: flex; flex-wrap: wrap; gap: 0.5
 form.suggest textarea { flex: 1 1 24rem; font: inherit; padding: 0.3rem 0.5rem; border: 1px solid var(--border); border-radius: 0.4rem; background: var(--bg); color: var(--fg); resize: vertical; min-height: 2.6rem; }
 form.suggest button { font: inherit; padding: 0.3rem 0.7rem; }
 details.suggest .hint { margin: 0.2rem 0 0; font-size: 0.8rem; }
+
+/* The owner's explanation of a score */
+details.why { margin: 0.2rem 0 0; font-size: 0.78rem; color: var(--muted); }
+details.why summary { cursor: pointer; display: inline; }
+details.why p { margin: 0.2rem 0 0; font-variant-numeric: tabular-nums; }

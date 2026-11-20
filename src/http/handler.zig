@@ -2295,6 +2295,8 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         q.filter_strings = more;
     }
     try limitQuery(arena, &q, services);
+    // The owner is shown how each score came about.
+    if (services.is_owner and !gallery) q.explain = true;
     // The ticked sources (`source`, repeatable) and the older single `connector`: each is a source name or
     // `kind:NAME` for every source of a kind. They are alternatives (`kind:zim` is all its sources).
     // The default collection applies when nothing is picked, the visitor did not ask for everything, and the
@@ -4567,6 +4569,7 @@ test "feedback: only the owner signed in sees the buttons and can mark a result;
     const services: Services = .{ .owner = &owner, .feedback = &store };
     // A visitor: no buttons, and a mark is refused and writes nothing.
     try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), services, .GET, "/search?q=c", null, .{}).body, "data-feedback") == null);
+    try testing.expect(!fake.last.?.explain);
     const refused = handleSigned(a, fake.searcher(), services, .POST, "/feedback", null, .{ .body = "q=c&url=https%3A%2F%2Fe.org%2Fc&grade=1" });
     try testing.expectEqual(http.Status.forbidden, refused.status);
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, dk.feedback.file_name, .{}));
@@ -4575,6 +4578,7 @@ test "feedback: only the owner signed in sees the buttons and can mark a result;
     const set = headerValue(good, "set-cookie").?;
     const header = try std.fmt.allocPrint(a, "dks_owner={s}", .{set["dks_owner=".len..std.mem.indexOfScalar(u8, set, ';').?]});
     const page = handleSigned(a, fake.searcher(), services, .GET, "/search?q=how+to+c", null, .{ .cookie = header });
+    try testing.expect(fake.last.?.explain); // the owner is shown the parts of each score; a visitor is not (above)
     try testing.expect(std.mem.indexOf(u8, page.body, "<ol class=\"results\" start=\"1\" data-feedback=\"1\" data-q=\"how to c\">") != null);
     const ok = handleSigned(a, fake.searcher(), services, .POST, "/feedback", null, .{ .cookie = header, .body = "q=how+to+c&url=https%3A%2F%2Fe.org%2Fc&grade=1" });
     try testing.expectEqual(http.Status.ok, ok.status);

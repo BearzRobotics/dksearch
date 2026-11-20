@@ -184,6 +184,8 @@ pub const Explain = struct {
     body: f64,
     source: f64,
     recency: f64,
+    /// The other factors multiplied: a demoted domain, a page in a language other than the reader's, a file name as the title.
+    adjust: f64 = 1.0,
 };
 
 pub const Hit = struct {

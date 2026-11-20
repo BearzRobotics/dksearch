@@ -1532,7 +1532,7 @@ pub const SqliteIndex = struct {
         // which SQLite can stop reading after a page; ranking millions of matches is what took seconds.
         const bm = if (self.unranked) "0.0" else try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0) * {s}", .{ self.title_weight, self.body_weight, factors.items });
         const explain_cols = if (q.explain and text_mode)
-            try std.fmt.allocPrint(arena, ", -bm25(fts, {d}.0, {d}.0), -bm25(fts, 1.0, 0.0), -bm25(fts, 0.0, 1.0), {s}, {s}", .{ self.title_weight, self.body_weight, src_expr, rec_expr })
+            try std.fmt.allocPrint(arena, ", -bm25(fts, {d}.0, {d}.0), -bm25(fts, 1.0, 0.0), -bm25(fts, 0.0, 1.0), {s}, {s}, 1.0{s}{s}{s}", .{ self.title_weight, self.body_weight, src_expr, rec_expr, demote_expr, lang_expr, file_title_expr })
         else
             "";
         // Trusted first: the sources boosted at least `trusted_min_percent` form the first group.
@@ -1640,7 +1640,7 @@ pub const SqliteIndex = struct {
                 break;
             }
             var hit = try hitFromRow(arena, st);
-            if (q.explain and text_mode) hit.explain = .{ .text = st.colFloat(13), .title = st.colFloat(14), .body = st.colFloat(15), .source = st.colFloat(16), .recency = st.colFloat(17) };
+            if (q.explain and text_mode) hit.explain = .{ .text = st.colFloat(13), .title = st.colFloat(14), .body = st.colFloat(15), .source = st.colFloat(16), .recency = st.colFloat(17), .adjust = st.colFloat(18) };
             try hits.append(arena, hit);
         }
         return .{ .hits = hits.items, .has_more = more, .interpreted = interpreted, .fuzzy = fuzzy };
@@ -2340,7 +2340,7 @@ test "a source's boost, the recency boost and the explanation of a score" {
     const e = h.explain.?;
     try testing.expectApproxEqRel(1.5, e.source, 1e-9);
     try testing.expect(e.recency > 1.9 and e.recency <= 2.0);
-    try testing.expectApproxEqRel(h.score, e.text * e.source * e.recency, 1e-9);
+    try testing.expectApproxEqRel(h.score, e.text * e.source * e.recency * e.adjust, 1e-9);
     try testing.expect(e.title > 0 and e.body > 0);
     // Without asking, nothing is added.
     try testing.expect((try idx.searcher().search(a, .{ .text = "anchor" })).hits[0].explain == null);
