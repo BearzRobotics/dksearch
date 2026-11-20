@@ -91,3 +91,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0073 | Related searches from the titles of the results |
 | 0074 | The tags of a page are indexed |
 | 0075 | Tags in results and ranking; author, dates and media details |
+| 0076 | Safe search by the tags of a page |

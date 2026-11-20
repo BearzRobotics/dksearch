@@ -90,6 +90,8 @@ pub const Options = struct {
     unlock: ?*dk.safesearch.Unlock = null,
     safe_enabled: bool = false,
     safe_unlock_hours: u32 = 8,
+    /// `[safe_search] tag_filter`: "off", "moderate" or "strict".
+    safe_tag_filter: []const u8 = "moderate",
     collections: []const dk.config.Collection = &.{},
     anonymous_collections: ?[]const []const u8 = null,
     /// The peers this node can ask, and its own name, for the Access page.
@@ -1856,7 +1858,7 @@ pub const App = struct {
         // Switch and unlock time.
         try w.writeAll("<section class=\"card\"><h2>Safe search for visitors</h2><p class=\"muted\">When it is on, visitors do not see the domains of the safe-search list. An API key made with <code>--adult</code> (see Access) or a browser unlocked with the PIN below sees everything except the ban. Applies after a restart.</p><form class=\"stack\" action=\"/actions/safesearch\" method=\"post\"><input type=\"hidden\" name=\"csrf\" value=\"");
         try html.writeEscaped(w, token);
-        try w.print("\"><label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{s}> Safe search is on for visitors</label><label>Unlock lasts (hours)<input type=\"number\" name=\"hours\" min=\"1\" max=\"720\" value=\"{d}\"></label><div><button type=\"submit\" class=\"btn\"{s}>Save</button></div></form></section>", .{ if (self.opts.safe_enabled) " checked" else "", self.opts.safe_unlock_hours, if (can_edit) "" else " disabled" });
+        try w.print("\"><label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{s}> Safe search is on for visitors</label><label>Hide pages by their tags<select name=\"tag_filter\"><option value=\"off\"{s}>Off (domains only)</option><option value=\"moderate\"{s}>Moderate: explicit content, fetish, adult services</option><option value=\"strict\"{s}>Strict: also suggestive and mature themes</option></select></label><label>Unlock lasts (hours)<input type=\"number\" name=\"hours\" min=\"1\" max=\"720\" value=\"{d}\"></label><div><button type=\"submit\" class=\"btn\"{s}>Save</button></div></form></section>", .{ if (self.opts.safe_enabled) " checked" else "", if (std.mem.eql(u8, self.opts.safe_tag_filter, "off")) " selected" else "", if (std.mem.eql(u8, self.opts.safe_tag_filter, "moderate")) " selected" else "", if (std.mem.eql(u8, self.opts.safe_tag_filter, "strict")) " selected" else "", self.opts.safe_unlock_hours, if (can_edit) "" else " disabled" });
 
         // The PIN.
         try w.writeAll("<section class=\"card\"><h2>Unlock PIN</h2><p class=\"muted\">A visitor who enters this PIN at <code>/unlock</code> sees everything in that browser for a while. It is stored only as a hash. Changing it locks every browser again.</p><form class=\"stack\" action=\"/actions/safesearch-pin\" method=\"post\" autocomplete=\"off\"><input type=\"hidden\" name=\"csrf\" value=\"");
@@ -1909,6 +1911,8 @@ pub const App = struct {
         const on = if (params.get("enabled")) |v| std.mem.eql(u8, v, "1") else false;
         const hours = std.fmt.parseInt(i64, params.get("hours") orelse "8", 10) catch return self.pageSafe(arena, csrf, "The unlock time must be a number of hours (1 to 720).", true);
         if (hours < 1 or hours > 720) return self.pageSafe(arena, csrf, "The unlock time must be a number of hours (1 to 720).", true);
+        const tag_filter = params.get("tag_filter") orelse "moderate";
+        if (!std.mem.eql(u8, tag_filter, "off") and !std.mem.eql(u8, tag_filter, "moderate") and !std.mem.eql(u8, tag_filter, "strict")) return self.pageSafe(arena, csrf, "The tag filter must be off, moderate or strict.", true);
         self.edit_mutex.lockUncancelable(self.io);
         defer self.edit_mutex.unlock(self.io);
         const text = Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
@@ -1919,6 +1923,7 @@ pub const App = struct {
         const out = dk.sourceedit.applySettings(arena, text, &.{
             .{ .table = "safe_search", .key = "enabled", .value = .{ .boolean = on } },
             .{ .table = "safe_search", .key = "unlock_hours", .value = .{ .integer = hours } },
+            .{ .table = "safe_search", .key = "tag_filter", .value = .{ .string = tag_filter } },
         }, &problem) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Invalid => return self.pageSafe(arena, csrf, try arena.dupe(u8, problem.message()), true),

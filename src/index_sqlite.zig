@@ -35,6 +35,7 @@ const lexicon_mod = @import("lexicon.zig");
 const retrieve = @import("retrieve.zig");
 const editdistance = @import("editdistance.zig");
 const docmeta = @import("docmeta.zig");
+const safetags = @import("safetags.zig");
 const derive = docmeta.derive;
 
 /// Most tags and custom fields kept per document.
@@ -139,6 +140,9 @@ pub const SqliteIndex = struct {
     recency_percent: u32 = 0,
     /// `[search] tag_boost`: percent more for a page whose tags include a word of the search.
     tag_boost_percent: u32 = 0,
+    /// SQL that leaves out, while safe search is on, the pages whose tags the safe-search categories describe (see safetags.zig).
+    /// Must outlive the index; empty: none.
+    safe_tags_clause: []const u8 = "",
     /// Set around one search: the plain words of the query (a weak match with a page's tags), and the hashtags typed (`#nature`:
     /// pages with that tag first).
     tag_words: []const []const u8 = &.{},
@@ -301,6 +305,10 @@ pub const SqliteIndex = struct {
         if (safe and !l.safe.isEmpty()) return " AND NOT dk_banned(d.domain, 1)";
         if (!l.blocked.isEmpty()) return " AND NOT dk_banned(d.domain, 0)";
         return "";
+    }
+
+    pub fn setSafeTags(self: *SqliteIndex, clause: []const u8) void {
+        self.safe_tags_clause = clause;
     }
 
     pub fn setTagBoost(self: *SqliteIndex, percent: u32) void {
@@ -986,6 +994,7 @@ pub const SqliteIndex = struct {
         try filterSql(arena, filters, q.collections, &sql, &binds);
         try scopeSql(arena, q.scope, &sql, &binds);
         try sql.appendSlice(arena, self.banClause(q.safe_search));
+        if (q.safe_search and self.has_meta) try sql.appendSlice(arena, self.safe_tags_clause);
         try sql.appendSlice(arena, " ORDER BY bm25(chunks_fts, 2.0, 1.0), d.id, m.idx LIMIT ?7");
         const st = Stmt.prepare(self.db, try arena.dupeSentinel(u8, sql.items, 0)) catch return &.{}; // no chunk index here
         defer st.deinit();
@@ -1683,6 +1692,7 @@ pub const SqliteIndex = struct {
         try filterSql(arena, filters, q.collections, &sql, &binds);
         try scopeSql(arena, q.scope, &sql, &binds);
         try sql.appendSlice(arena, self.banClause(q.safe_search));
+        if (q.safe_search and self.has_meta) try sql.appendSlice(arena, self.safe_tags_clause);
         if (q.sort != .relevance and q.sort != .title and !self.has_meta) return error.InvalidQuery; // an old index: `rebuild` upgrades it
         if (tier_expr) |t| {
             try sql.print(arena, " ORDER BY {s}, {s}, d.id", .{ t, bm });
@@ -1839,6 +1849,10 @@ pub const SearchPool = struct {
 
     pub fn setLexicon(self: *SearchPool, l: ?*const lexicon_mod.Lexicon) void {
         for (self.slots) |*sl| sl.index.setLexicon(l);
+    }
+
+    pub fn setSafeTags(self: *SearchPool, clause: []const u8) void {
+        for (self.slots) |*sl| sl.index.setSafeTags(clause);
     }
 
     pub fn setTagBoost(self: *SearchPool, percent: u32) void {
@@ -3411,4 +3425,44 @@ test "a hashtag in the search puts pages with that tag first, and a hit carries 
     idx.setTagBoost(500);
     const boosted = try searchAll(a, &idx, "sunset");
     try testing.expectEqualStrings("Gallery", boosted.hits[0].title.?);
+}
+
+test "safe search by tags: a strong tag or two weak ones hide a page, one weak tag and medical tags do not, and it only applies while safe search is on" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{});
+    defer idx.close();
+    const T = struct {
+        fn add(i: *SqliteIndex, id: []const u8, title: []const u8, tags: []const []const u8) !void {
+            var extras: [6]doc.Extra = undefined;
+            for (tags, 0..) |t, k| extras[k] = .{ .key = "tag", .value = t };
+            const url = try std.fmt.allocPrint(testing.allocator, "https://x{s}.example/p", .{id});
+            defer testing.allocator.free(url);
+            try putDoc(i, .{ .connector = "web", .source_id = id, .title = title, .text = "pictures and notes", .canonical_url = url, .extra = extras[0..tags.len] });
+        }
+    };
+    try T.add(&idx, "1", "Plain", &.{"landscape"});
+    try T.add(&idx, "2", "Strong", &.{ "landscape", "Rope_Bunny" });
+    try T.add(&idx, "3", "OneWeak", &.{ "nude", "landscape" });
+    try T.add(&idx, "4", "TwoWeak", &.{ "Nude", "Big Breasts" });
+    try T.add(&idx, "5", "Medical", &.{ "sex education", "sexual health", "anatomy", "reproductive health" });
+    try T.add(&idx, "6", "Swimwear", &.{ "bikini", "underwear" });
+    try T.add(&idx, "7", "Dashed", &.{ "x-rated", "rope-bunny" });
+    idx.setSafeTags(try safetags.build(a, safetags.default_text, .moderate, &.{}));
+    const s = idx.searcher();
+    var shown = try titles(a, &idx, "pictures", &.{});
+    try testing.expectEqual(@as(usize, 7), std.mem.count(u8, shown, ",") + 1); // not safe: everything
+    const safe = try s.search(a, .{ .text = "pictures", .safe_search = true, .limit = 20 });
+    var got: std.ArrayList(u8) = .empty;
+    for (safe.hits) |h| try got.print(a, "{s},", .{h.title.?});
+    shown = got.items;
+    for ([_][]const u8{ "Plain,", "OneWeak,", "Medical,", "Swimwear," }) |t| try testing.expect(std.mem.indexOf(u8, shown, t) != null);
+    for ([_][]const u8{ "Strong,", "TwoWeak,", "Dashed," }) |t| try testing.expect(std.mem.indexOf(u8, shown, t) == null);
+    // Strict also hides the pair of suggestive tags.
+    idx.setSafeTags(try safetags.build(a, safetags.default_text, .strict, &.{}));
+    const strict = try s.search(a, .{ .text = "pictures", .safe_search = true, .limit = 20 });
+    var got2: std.ArrayList(u8) = .empty;
+    for (strict.hits) |h| try got2.print(a, "{s},", .{h.title.?});
+    try testing.expect(std.mem.indexOf(u8, got2.items, "Swimwear,") == null and std.mem.indexOf(u8, got2.items, "Medical,") != null);
 }

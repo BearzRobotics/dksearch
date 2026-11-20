@@ -1,0 +1,50 @@
+# Safe search by tags (docs/decisions/0076). A page's own tags are evidence, not proof:
+#
+#   * one STRONG tag of an active category hides the page (a word that is almost only used for adult material);
+#   * WEAK tags hide it only when two of them are on the page (a word that has innocent uses: a bikini, "sex",
+#     a nude in an art class).
+#
+# A category with level = "moderate" is active in the Moderate and Strict modes; level = "strict" only in Strict.
+# Tags are compared without capitals, spaces, hyphens, underscores and "#": "Rope Bunny", "rope_bunny" and "#RopeBunny" are
+# one tag. A different word is a different tag: list aliases yourself, there is no pattern matching ("ropebunnyart" is not
+# "ropebunny"), because patterns hide innocent pages.
+#
+# Deliberately NOT here, so that nothing medical or educational is hidden: sex education, sexual and reproductive health,
+# anatomy, figure drawing, artistic nudes, naturism, breastfeeding, and the news and law of sexual crimes. Add a category
+# of your own in a copy of this file (`[safe_search] tags_file = "safe_tags.toml"`) if you want any of them hidden.
+
+[[category]]
+name = "explicit"
+level = "moderate"
+strong = ["porn", "porno", "pornography", "pornstar", "xxx", "hentai", "erotica", "nsfw", "rule34", "r34", "cumshot", "creampie", "blowjob", "handjob", "cunnilingus", "fellatio", "analsex", "oralsex", "gangbang", "bukkake", "nakadashi", "futanari", "milf", "adultanime", "adultcartoon", "explicit"]
+weak = ["sex", "sexual", "nude", "nudity", "naked", "topless", "boobs", "bigboobs", "bigbreasts", "tits", "bigass", "penis", "bigpenis", "vagina", "genitals", "genitalia", "intercourse", "orgasm", "slut", "whore", "lewd", "hardcore", "cum", "anal", "oral"]
+
+[[category]]
+name = "fetish"
+level = "moderate"
+strong = ["bdsm", "shibari", "kinbaku", "ropebunny", "ropebondage", "footfetish", "bimbofication", "femdom", "findom", "latexfetish", "transformationfetish"]
+weak = ["fetish", "bondage", "restraints", "sadism", "masochism", "dominatrix", "submissive", "rope"]
+
+[[category]]
+name = "adult-services"
+level = "moderate"
+strong = ["onlyfans", "fansly", "camgirl", "camgirls", "cammodel", "livecams", "phonesex", "adultservices", "adultdating", "adultcontent"]
+weak = ["escort", "escorts", "hookup", "casualsex", "sexwork", "sexworker", "prostitute", "prostitution", "stripper", "stripclub"]
+
+[[category]]
+name = "sexual-violence"
+level = "moderate"
+strong = ["guro", "ryona", "rapeplay", "noncon", "dubcon"]
+weak = []
+
+[[category]]
+name = "suggestive"
+level = "strict"
+strong = ["ecchi", "thirsttrap", "boudoir"]
+weak = ["lingerie", "underwear", "panties", "bikini", "stockings", "thighhighs", "pantyhose", "garterbelt", "suggestive", "seductive", "sexy", "cleavage", "upskirt", "schoolgirl", "bigbreasts", "bigboobs", "busty", "curvy"]
+
+[[category]]
+name = "mature-themes"
+level = "strict"
+strong = []
+weak = ["rape", "incest", "sexualviolence", "sexualabuse", "gore", "graphicviolence"]

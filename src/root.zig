@@ -39,6 +39,7 @@ pub const vindex = @import("vindex.zig");
 pub const snippets = @import("snippets.zig");
 pub const similar = @import("similar.zig");
 pub const domainlist = @import("domainlist.zig");
+pub const safetags = @import("safetags.zig");
 pub const listfetch = @import("listfetch.zig");
 pub const safesearch = @import("safesearch.zig");
 pub const embedjob = @import("embedjob.zig");
@@ -109,6 +110,7 @@ test {
     _ = snippets;
     _ = similar;
     _ = domainlist;
+    _ = safetags;
     _ = listfetch;
     _ = safesearch;
     _ = embedjob;

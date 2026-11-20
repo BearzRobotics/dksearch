@@ -1342,6 +1342,11 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     const lists_ptr: ?*const dk.domainlist.Lists = if (domain_lists.blocked.isEmpty() and domain_lists.demoted.isEmpty() and domain_lists.safe.isEmpty()) null else &domain_lists;
     if (pool) |*p| p.setDomains(lists_ptr);
     index.setDomains(lists_ptr);
+    // Safe search by tags: the categories (the built-in list, or the file named), as SQL. A file that cannot be read stops the
+    // server, like the domain lists: what was meant to be hidden is not shown by mistake.
+    const safe_tags_sql = buildSafeTags(io, lists_arena.allocator(), cfg, config_path) orelse return exit_config;
+    if (pool) |*p| p.setSafeTags(safe_tags_sql);
+    index.setSafeTags(safe_tags_sql);
     dk.domainlist.global = lists_ptr;
     defer dk.domainlist.global = null;
     // The relay that shows pictures of the web in the gallery without storing them (`[images] remote`).
@@ -1595,6 +1600,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .thumbs = if (thumb_cache != null) &thumb_cache.? else null,
             .safe_enabled = cfg.safe_search.enabled,
             .safe_unlock_hours = cfg.safe_search.unlock_hours,
+            .safe_tag_filter = @tagName(cfg.safe_search.tag_filter),
             .collections = cfg.collections,
             .anonymous_collections = cfg.access.anonymous_collections,
             .index_path = paths.index,
@@ -2131,6 +2137,24 @@ fn removeCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, source: []
 
 /// Reads the domain lists named by `[filters]` and (when on) `[safe_search]` into `la`: the blocklist, the demotion list
 /// and the ban lists. An unreadable file is an error, so that what was meant to be hidden is not shown.
+/// The SQL of safe search by tags for `cfg` (empty when it is off or safe search is), or null after saying what is wrong.
+fn buildSafeTags(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, config_path: ?[]const u8) ?[]const u8 {
+    if (!cfg.safe_search.enabled or cfg.safe_search.tag_filter == .off) return "";
+    var text: []const u8 = dk.safetags.default_text;
+    if (cfg.safe_search.tags_file) |f| {
+        const base: ?[]const u8 = if (config_path) |p| (std.fs.path.dirname(p) orelse ".") else null;
+        const full = if (f.len > 0 and f[0] == '/' or base == null) f else (std.fmt.allocPrint(la, "{s}/{s}", .{ base.?, f }) catch return null);
+        text = std.Io.Dir.cwd().readFileAlloc(io, full, la, .limited(4 * 1024 * 1024)) catch |e| {
+            err(io, "cannot read the safe-search tag file {s}: {t}", .{ full, e });
+            return null;
+        };
+    }
+    return dk.safetags.build(la, text, cfg.safe_search.tag_filter, cfg.safe_search.tags_off) catch |e| {
+        err(io, "the safe-search tag file is not valid ({t}): expected [[category]] tables with name, level, strong and weak", .{e});
+        return null;
+    };
+}
+
 fn buildDomainLists(io: Io, la: std.mem.Allocator, cfg: dk.config.Config, announce: bool, config_path: ?[]const u8) ?dk.domainlist.Lists {
     var lists: dk.domainlist.Lists = .{ .demote_percent = cfg.filters.demote_percent };
     var failed: []const u8 = "";

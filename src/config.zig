@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const toml = @import("toml");
+const safetags = @import("safetags.zig");
 const document = @import("document.zig");
 const fallback_mod = @import("fallback.zig");
 const ollama_mod = @import("ollama.zig");
@@ -408,6 +409,13 @@ pub const SafeSearch = struct {
     list: ?[]const u8 = null,
     /// How long a PIN unlock lasts in a browser.
     unlock_hours: u32 = 8,
+    /// Safe search by the tags of a page (docs/decisions/0076), while safe search is on: `off`, `moderate` (explicit content,
+    /// fetish, adult services) or `strict` (also suggestive and mature themes).
+    tag_filter: safetags.Mode = .moderate,
+    /// A TOML list of categories replacing the built-in one (relative to the configuration file).
+    tags_file: ?[]const u8 = null,
+    /// Names of categories not to apply.
+    tags_off: []const []const u8 = &.{},
 };
 
 /// Other search engines as a fallback (`[fallback]`), off unless `enabled`.
@@ -845,13 +853,21 @@ fn readImages(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnosti
 
 fn readSafeSearch(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!SafeSearch {
     const t = (try subTable(src, root, "safe_search", diag)) orelse return .{};
-    try checkKeys(src, "safe_search", t, &[_][]const u8{ "enabled", "ban", "ban_files", "list", "unlock_hours" }, diag);
+    try checkKeys(src, "safe_search", t, &[_][]const u8{ "enabled", "ban", "ban_files", "list", "unlock_hours", "tag_filter", "tags_file", "tags_off" }, diag);
     var s: SafeSearch = .{};
     if (try optBool(src, "safe_search", t, "enabled", diag)) |b| s.enabled = b;
     s.ban = try optStrings(a, src, "safe_search", t, "ban", diag);
     s.ban_files = try optStrings(a, src, "safe_search", t, "ban_files", diag);
     if (try str(src, "safe_search", t, "list", diag)) |v| s.list = try a.dupe(u8, v);
     if (try intIn(src, "safe_search", t, "unlock_hours", 1, 720, diag)) |n| s.unlock_hours = @intCast(n);
+    if (try str(src, "safe_search", t, "tag_filter", diag)) |v| {
+        s.tag_filter = std.meta.stringToEnum(safetags.Mode, v) orelse {
+            diag.set(src, "tag_filter", "must be \"off\", \"moderate\" or \"strict\"", .{});
+            return error.InvalidValue;
+        };
+    }
+    if (try str(src, "safe_search", t, "tags_file", diag)) |v| s.tags_file = try a.dupe(u8, v);
+    s.tags_off = try optStrings(a, src, "safe_search", t, "tags_off", diag);
     return s;
 }
 
