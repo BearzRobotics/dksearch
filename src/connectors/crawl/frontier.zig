@@ -60,6 +60,9 @@ pub fn tidy(arena: Allocator, url: []const u8) Allocator.Error![]const u8 {
         port = host[c + 1 ..];
         host = host[0..c];
     };
+    // A colon with no port after it (`host:`, or `host::` from a mistake) says nothing: all of them go, so that tidying twice is
+    // the same as tidying once (found by the fuzzer).
+    host = std.mem.trimEnd(u8, host, ":");
     for (host) |c| try out.append(arena, std.ascii.toLower(c));
     const default_port: []const u8 = if (std.ascii.eqlIgnoreCase(p.scheme, "https")) "443" else "80";
     if (port.len > 0 and !std.mem.eql(u8, port, default_port)) {
@@ -212,6 +215,9 @@ test "tidy: one page, one address" {
     // The same page reached with the parameters in another order is one address.
     try tidyTo("https://e.org/s?z=1&a=2", "https://e.org/s?a=2&z=1");
     try tidyTo("https://e.org/s?a=2&z=1", "https://e.org/s?a=2&z=1");
+    // A colon with no port: one or several are dropped, once and for all.
+    try tidyTo("http://example.org:/a", "http://example.org/a");
+    try tidyTo("s://e.orhttps:://e.org/", "s://e.orhttps/e.org/");
     // More than one session parameter in a path: all go, and a second tidying finds nothing more to do.
     try tidyTo("https://e.org/a;jsessionid=1/http://x.org/b;JSESSIONID=2/c;jsessionid=3?x=1", "https://e.org/a/http:/x.org/b/c?x=1");
     // Dot segments: `/./features/` is `/features/`, `..` goes up one.
