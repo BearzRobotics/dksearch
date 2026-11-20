@@ -1,6 +1,6 @@
 # Roadmap
 
-What is built is described in the manual (`docs/manpages/`) and the decision records (`docs/decisions/`). This page lists what has been built since the last update, then what is agreed but not built, roughly in the order planned. It records intent, not a promise of dates; items move when the maintainer decides. Last updated 2026-11-19.
+What is built is described in the manual (`docs/manpages/`) and the decision records (`docs/decisions/`). This page lists what has been built since the last update, then what is agreed but not built, roughly in the order planned. It records intent, not a promise of dates; items move when the maintainer decides. Last updated 2026-11-20.
 
 Standing rules that shape every item: the core stays lexical and works with no AI involved; anything that calls an external program or service (pdftotext, ffprobe, Docling, MinerU, Ollama, whisper, a headless browser, other search engines) is optional, off by default and documented; one search page that works without JavaScript; the admin panel should reach feature parity with the configuration file. Nothing is tuned by eye any more: a ranking change is measured with `dksearch eval` against the golden queries and the owner's marks (ADRs 0064, 0065).
 
@@ -25,6 +25,11 @@ Standing rules that shape every item: the core stays lexical and works with no A
 **Semantic search**
 - Embedding prefixes (for `nomic-embed-text`) and lazy vectors made as searches need them, so no multi-hour first pass is needed (0068). Built and tested against a fake server only.
 
+**Tags and page details**
+- Tags are indexed from meta keywords, `article:tag`, `rel=tag`, `data-tags`, JSON-LD and `#hashtags`; `tag:x` filters and `#word` searches (ADRs 0073, 0074). Results show tag chips and a "Narrow by tag" line; `tag_boost` ranks tagged pages higher (default 0 until measured with `dksearch eval`); author, dates, duration and resolution are read from metas and JSON-LD (0075).
+- Related searches (0073).
+- Safe search by tags: one strong tag or two weak ones of an active category hide a page; categories live in an editable TOML file; modes off/moderate/strict; medical and educational tags are never listed (0076).
+
 **Engineering**
 - regex-zig 0.3.0, with its own UTF-8 mode and linear-time engines (0067). Fuzz targets for the parsers of outside input, two bugs found and fixed (0070). `zig build test` also builds the program. The manual pages in dkman layout, installed by `zig build` (`-Dman=false` to skip); the Docs page reads them. The decision index is complete.
 
@@ -45,6 +50,8 @@ Standing rules that shape every item: the core stays lexical and works with no A
 - More fuzz targets: the zip reader (office files, EPUB), the HTTP request head and forms, the importers (export file, ZIM), the blocklist parser; a routine for running them; the "corrupted coverage file" message that ends a Zig 0.17.1 fuzz report.
 - Big files: `admin.zig`, `handler.zig`, `crawl.zig` and `index_sqlite.zig` are 3,000 to 5,000 lines each, much of it tests; split when touching them.
 - The test suite takes several minutes, mostly writing to a slow disk (see "Build and test cache on a fast disk" in the manual).
+
+- **Tags, next:** measure `tag_boost` once the crawl has re-fetched tagged pages; a `/tags` browse page; anchor-text and heading weighting; duration and resolution shown on results.
 
 ## Then
 
