@@ -50,6 +50,9 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
+/// Set by "Turn it back on": safe search stays on in this browser, owner and adult keys included (ended by the PIN).
+const safe_cookie = "dks_safe";
+
 const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, unlock_page, lock_action, login_page, logout_action, feedback_action, suggest_action, search_script, api_export, api_peers, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
@@ -429,7 +432,9 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
             services.keyed = c.keyed;
             services.is_owner = c.owner;
             // Safe search applies unless this caller is adult (a key marked so) or has unlocked this browser.
-            services.safe = services.safe_default and !c.adult and !(if (services.unlock) |u| u.unlocked(caller.cookie) else false);
+            // "Turn it back on" sets a cookie that keeps safe search on in this browser even for the owner or an adult key.
+            const forced = if (cookieValue(caller.cookie, safe_cookie)) |v| std.mem.eql(u8, v, "on") else false;
+            services.safe = services.safe_default and (forced or (!c.adult and !(if (services.unlock) |u| u.unlocked(caller.cookie) else false)));
             if (c.limited) |wait| {
                 const secs = try std.fmt.allocPrint(arena, "{d}", .{wait});
                 var resp = if (is_api) try apiError(arena, .too_many_requests, "rate_limited", "this API key has made too many requests this minute") else try htmlError(arena, .too_many_requests, "Too many requests", "This key has made too many requests this minute. Try again shortly.");
@@ -993,7 +998,8 @@ fn unlockPage(arena: Allocator, services: Services, method: http.Method, caller:
         switch (u.tryUnlock(t.params.get("pin") orelse "")) {
             .ok => |token| {
                 const cookie = try std.fmt.allocPrint(arena, "{s}={s}; HttpOnly; SameSite=Lax; Path=/; Max-Age={d}", .{ dk.safesearch.cookie_name, token, @as(u64, u.hours) * 3600 });
-                return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cookie }, no_store }) };
+                const unforced = try std.fmt.allocPrint(arena, "{s}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0", .{safe_cookie});
+                return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cookie }, .{ .name = "set-cookie", .value = unforced }, no_store }) };
             },
             .wrong => message = "That PIN is not right.",
             .throttled => {
@@ -1166,7 +1172,8 @@ fn logoutAction(arena: Allocator, services: Services) error{OutOfMemory}!Respons
 fn lockAction(arena: Allocator, services: Services, caller: Caller) error{OutOfMemory}!Response {
     if (services.unlock) |u| u.lock(caller.cookie);
     const cleared = try std.fmt.allocPrint(arena, "{s}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0", .{dk.safesearch.cookie_name});
-    return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cleared }, no_store }) };
+    const forced = try std.fmt.allocPrint(arena, "{s}=on; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000", .{safe_cookie});
+    return .{ .status = .see_other, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headersWith(arena, &.{ .{ .name = "location", .value = "/" }, .{ .name = "set-cookie", .value = cleared }, .{ .name = "set-cookie", .value = forced }, no_store }) };
 }
 
 /// Documents like `id`: by vector when the server has a vector index with this document in it, otherwise by the words
@@ -3917,6 +3924,17 @@ test "safe search: on for visitors, a PIN unlocks a browser for a while, an adul
     try testing.expectEqual(http.Status.see_other, back.status);
     try testing.expect(std.mem.indexOf(u8, headerValue(back, "set-cookie").?, "Max-Age=0") != null);
     _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = cookie });
+    try testing.expect(fake.last.?.safe_search);
+    // For a browser signed in with an adult key, "Turn it back on" sets a cookie that keeps safe search on.
+    const adult_cookie = try std.fmt.allocPrint(a, "dks_key={s}", .{&tok_adult});
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = adult_cookie });
+    try testing.expect(!fake.last.?.safe_search);
+    var sets_forced = false;
+    for (back.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "set-cookie") and std.mem.startsWith(u8, h.value, "dks_safe=on")) {
+        sets_forced = true;
+    };
+    try testing.expect(sets_forced);
+    _ = handleSigned(a, fake.searcher(), services, .GET, "/api/v1/search?q=odin", null, .{ .cookie = try std.fmt.allocPrint(a, "{s}; dks_safe=on", .{adult_cookie}) });
     try testing.expect(fake.last.?.safe_search);
     // Without a PIN, or with safe search off, there is nothing to unlock.
     const no_unlock: Services = .{ .lists = &lists, .safe_default = true };
