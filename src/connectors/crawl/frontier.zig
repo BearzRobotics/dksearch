@@ -68,7 +68,9 @@ pub fn tidy(arena: Allocator, url: []const u8) Allocator.Error![]const u8 {
     }
     // The path: one slash at a time, and a session parameter removed.
     var path = p.path;
-    if (std.ascii.findIgnoreCase(path, ";jsessionid")) |at| {
+    // Every one: tidying an address that is tidy must change nothing, or one page is asked for under two addresses (found by
+    // the fuzzer on a path with two session parameters).
+    while (std.ascii.findIgnoreCase(path, ";jsessionid")) |at| {
         var e = at + 1;
         while (e < path.len and path[e] != '/') e += 1;
         const cut = try std.mem.concat(arena, u8, &.{ path[0..at], path[e..] });
@@ -210,6 +212,8 @@ test "tidy: one page, one address" {
     // The same page reached with the parameters in another order is one address.
     try tidyTo("https://e.org/s?z=1&a=2", "https://e.org/s?a=2&z=1");
     try tidyTo("https://e.org/s?a=2&z=1", "https://e.org/s?a=2&z=1");
+    // More than one session parameter in a path: all go, and a second tidying finds nothing more to do.
+    try tidyTo("https://e.org/a;jsessionid=1/http://x.org/b;JSESSIONID=2/c;jsessionid=3?x=1", "https://e.org/a/http:/x.org/b/c?x=1");
     // Dot segments: `/./features/` is `/features/`, `..` goes up one.
     try tidyTo("https://www.dragonflybsd.org/./features/", "https://www.dragonflybsd.org/features/");
     try tidyTo("https://e.org/a/./b//c/../d/", "https://e.org/a/b/d/");

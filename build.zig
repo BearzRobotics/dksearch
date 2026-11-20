@@ -40,6 +40,9 @@ pub fn build(b: *std.Build) void {
     // (bzip2 for the dump's compression) and feeds. Both read XML with the vendored xml-zig.
     // `-Dwikipedia=false` and `-Dfeeds=false` leave them out; a library that no
     // enabled connector needs is not compiled or linked at all (docs/decisions/
+    // `zig build test --fuzz` instruments the Zig code it fuzzes; the C libraries are not what is being fuzzed (and their
+    // comparison tracing has no runtime to link to).
+    sqlite.fuzz = false;
     // 0007, 0011, 0016). Windows is not supported yet.
     const target_os = target.result.os.tag;
     const supported = target_os != .windows;
@@ -79,6 +82,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+        m.fuzz = false;
         });
         const m = tc.createModule();
         m.addCSourceFiles(.{
@@ -96,6 +100,7 @@ pub fn build(b: *std.Build) void {
     core_options.addOption(bool, "feeds", want_feeds);
     core_options.addOption(bool, "crawler", want_crawler);
     core_options.addOption(bool, "media", want_media);
+        m.fuzz = false;
 
     // The core library: search, storage and ingestion, plus the bundled
     // connectors behind the one connector interface. The search, storage and

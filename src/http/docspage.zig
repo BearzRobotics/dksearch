@@ -26,8 +26,25 @@ fn isHeading(line: []const u8) bool {
     return letters >= 3;
 }
 
-/// The sections of a manual page: a line of capitals on its own, after a blank line, starts one. Text before the
-/// first heading (the `%` title lines) is dropped.
+/// The title of a heading line, or null. A heading is `# TITLE` (a Markdown heading with the title in capitals, the layout
+/// of the manual pages: digits and punctuation are allowed, a lower-case letter is not, so `# a comment` is not one and an
+/// indented line, as in a code block, never is) or a line of capitals on its own (the older layout).
+fn headingTitle(line: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, line, "# ")) {
+        const t = std.mem.trim(u8, line[2..], " ");
+        if (t.len == 0 or t.len > 60) return null;
+        var capitals: usize = 0;
+        for (t) |ch| {
+            if (std.ascii.isLower(ch)) return null;
+            if (std.ascii.isUpper(ch)) capitals += 1;
+        }
+        return if (capitals >= 3) t else null;
+    }
+    return if (isHeading(line)) line else null;
+}
+
+/// The sections of a manual page: a heading (see `headingTitle`), after a blank line, starts one. Text before the first
+/// heading (the `%` title lines) is dropped.
 pub fn sections(arena: Allocator, text: []const u8) Allocator.Error![]const Section {
     var out: std.ArrayList(Section) = .empty;
     var title: ?[]const u8 = null;
@@ -38,11 +55,11 @@ pub fn sections(arena: Allocator, text: []const u8) Allocator.Error![]const Sect
         const end = std.mem.indexOfScalarPos(u8, text, pos, '\n') orelse text.len;
         const line = text[pos..end];
         const next = @min(end + 1, text.len);
-        if (prev_blank and isHeading(line) and !std.mem.startsWith(u8, line, "%")) {
+        if (prev_blank and !std.mem.startsWith(u8, line, "%")) if (headingTitle(line)) |found| {
             if (title) |t| try out.append(arena, .{ .title = t, .body = std.mem.trim(u8, text[body_start..pos], "\n") });
-            title = line;
+            title = found;
             body_start = next;
-        }
+        };
         prev_blank = line.len == 0;
         pos = next;
     }
@@ -117,6 +134,13 @@ test "the manuals split into their sections and each renders" {
         found = true;
     };
     try testing.expect(found);
+    // The layout of the manual pages: `# TITLE` after a blank line (digits allowed), not a lower-case one, not an indented one.
+    const hashed = try sections(a, "# NAME\n\nx\n\n# TOR AND I2P\n\ny\n\n# Not a heading\n\n    # nor this, in code\n\n# SEE ALSO\nz\n");
+    try testing.expectEqual(@as(usize, 3), hashed.len);
+    try testing.expectEqualStrings("NAME", hashed[0].title);
+    try testing.expectEqualStrings("TOR AND I2P", hashed[1].title);
+    try testing.expect(std.mem.indexOf(u8, hashed[1].body, "# Not a heading") != null and std.mem.indexOf(u8, hashed[1].body, "# nor this") != null);
+    try testing.expectEqualStrings("z", hashed[2].body);
     // A small text: headings after blank lines only.
     const tiny = try sections(a, "% T\n\nNAME\nx\n\nSEE ALSO\ny\nNOT HEADING\n");
     try testing.expectEqual(@as(usize, 2), tiny.len);
