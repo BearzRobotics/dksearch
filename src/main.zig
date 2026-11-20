@@ -1343,6 +1343,8 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         }
         if (owner_state) |*o| err(io, "owner login: {s}", .{if (o.hasPassword()) "a password is set (the Login button is on the search page)" else "no password yet (run `dksearch owner-password`, or set one on the Access page)"});
     }
+    // The owner's marks on results (feedback.jsonl in the data directory): offered on the main search page to the owner signed in.
+    var feedback_store: ?dk.feedback.Store = if (owner_state) |*o| dk.feedback.Store.init(io, o.dir) else null;
     if (pool) |*p| {
         p.setFuzzyMode(fuzzy_mode);
         p.setCommonPercent(cfg.search.common_word_percent);
@@ -1555,6 +1557,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .lists = lists_ptr,
             .unlock = if (unlock_state != null) &unlock_state.? else null,
             .owner = if (owner_state != null) &owner_state.? else null,
+            .feedback = if (feedback_store != null) &feedback_store.? else null,
             .thumbs = if (thumb_cache != null) &thumb_cache.? else null,
             .safe_enabled = cfg.safe_search.enabled,
             .safe_unlock_hours = cfg.safe_search.unlock_hours,

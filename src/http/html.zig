@@ -95,6 +95,8 @@ fn kindLabel(kind: []const u8) []const u8 {
 
 pub const Form = struct {
     q: []const u8 = "",
+    /// The owner is signed in and feedback is kept: the results carry good and bad buttons (added by search.js).
+    feedback: bool = false,
     /// Show the gallery through the thumbnail cache (`/thumb`) instead of the originals.
     gallery_thumbs: bool = false,
     login: LoginNote = .none,
@@ -484,7 +486,9 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     try w.writeAll("<body>");
     try writeLoginButton(w, f.login);
     try writeSidePanel(w, f.regex_enabled, f.login);
-    try w.writeAll("<main class=\"results-page\"><div class=\"head\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>");
+    // The gallery uses the width of the window (the text results keep a reading width).
+    try w.writeAll(if (f.images) "<main class=\"results-page gallery-page\">" else "<main class=\"results-page\">");
+    try w.writeAll("<div class=\"head\"><h1 class=\"brand\"><a href=\"/\">dksearch</a></h1>");
     try writeForm(w, f);
     try w.writeAll("</div>\n");
     if (f.semantic_text) |t| {
@@ -529,7 +533,13 @@ pub fn writeResults(w: *Writer, f: Form, page: dk.search.Page, offset: u32, page
     } else {
         try w.writeAll("<ol class=\"results\" start=\"");
         try w.print("{d}", .{offset + 1});
-        try w.writeAll("\">\n");
+        try w.writeAll("\"");
+        if (f.feedback) {
+            try w.writeAll(" data-feedback=\"1\" data-q=\"");
+            try writeEscaped(w, f.q);
+            try w.writeAll("\"");
+        }
+        try w.writeAll(">\n");
         for (page.hits) |h| try writeHit(w, h);
         try w.writeAll("</ol>\n");
     }

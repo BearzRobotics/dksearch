@@ -1,3 +1,45 @@
+// Good and bad marks on the results, for the owner signed in (the server puts data-feedback on the list only then): they are
+// sent to /feedback and kept in the data directory for `dksearch eval`. Nothing here works without the server's say-so.
+"use strict";
+(function () {
+  var list = document.querySelector("ol.results[data-feedback]");
+  if (!list || !window.fetch) return;
+  var query = list.getAttribute("data-q") || "";
+  function send(url, grade, done) {
+    var body = "q=" + encodeURIComponent(query) + "&url=" + encodeURIComponent(url) + "&grade=" + grade;
+    fetch("/feedback", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body })
+      .then(function (r) { done(r.ok); })
+      .catch(function () { done(false); });
+  }
+  Array.prototype.forEach.call(list.querySelectorAll("li"), function (li) {
+    var shown = li.querySelector(".url");
+    if (!shown) return;
+    var url = shown.textContent.trim();
+    var bar = document.createElement("span");
+    bar.className = "fb";
+    var state = 0;
+    [["good", 1, "A good answer to this search"], ["bad", -1, "This should not have been shown for this search"]].forEach(function (d) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = d[0];
+      b.title = d[2];
+      b.className = "fb-" + d[0];
+      b.addEventListener("click", function () {
+        var next = state === d[1] ? 0 : d[1]; // the same button again takes the mark back
+        send(url, next, function (ok) {
+          if (!ok) { bar.setAttribute("data-failed", "1"); return; }
+          bar.removeAttribute("data-failed");
+          state = next;
+          Array.prototype.forEach.call(bar.children, function (c) { c.classList.remove("on"); });
+          if (next !== 0) b.classList.add("on");
+        });
+      });
+      bar.appendChild(b);
+    });
+    shown.appendChild(bar);
+  });
+})();
+
 // The search box as a multi-line field: Enter searches, Shift+Enter starts a new line, and the box grows with its text.
 // The page works without this file (a one-line box that searches on Enter); this only upgrades it.
 "use strict";

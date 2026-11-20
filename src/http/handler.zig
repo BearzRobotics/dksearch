@@ -50,7 +50,7 @@ pub fn headersWith(arena: Allocator, extra: []const Header) []const Header {
     return out;
 }
 
-const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, unlock_page, lock_action, login_page, logout_action, search_script, api_export, api_peers, api_health, style, document, zim, wopi, other };
+const Route = enum { help_search, help_regex, home, search_page, sources_page, api_search, api_retrieve, api_answer, api_suggest, api_similar, unlock_page, lock_action, login_page, logout_action, feedback_action, search_script, api_export, api_peers, api_health, style, document, zim, wopi, other };
 
 fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/")) return .home;
@@ -65,6 +65,7 @@ fn route(path: []const u8) Route {
     if (std.mem.eql(u8, path, "/lock")) return .lock_action;
     if (std.mem.eql(u8, path, "/login")) return .login_page;
     if (std.mem.eql(u8, path, "/logout")) return .logout_action;
+    if (std.mem.eql(u8, path, "/feedback")) return .feedback_action;
     if (std.mem.eql(u8, path, "/api/v1/suggest")) return .api_suggest;
     if (std.mem.eql(u8, path, "/api/v1/similar")) return .api_similar;
     if (std.mem.eql(u8, path, "/api/v1/export")) return .api_export;
@@ -120,6 +121,10 @@ pub const Services = struct {
     cookie_secure: bool = false,
     /// What the request's `Accept-Language` said (set per request, never configured).
     accept_language: ?[]const u8 = null,
+    /// Where the owner's marks on results are kept (`feedback.jsonl`); null: no feedback buttons. And whether the request
+    /// being answered is from the owner signed in (set per request).
+    feedback: ?*dk.feedback.Store = null,
+    is_owner: bool = false,
     safe: bool = false,
     /// Results of highly boosted sources first (`[search] trusted_first`, from `trusted_min_boost` percent); a request's
     /// own `trusted=1` or `trusted=0` overrides it.
@@ -342,7 +347,7 @@ fn cookieValue(cookie: ?[]const u8, name: []const u8) ?[]const u8 {
 }
 
 /// The collections a bearer token's key may see, or an error message (a token that is not a valid key).
-fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8, caller: Caller, method: http.Method, target: []const u8) error{OutOfMemory}!union(enum) { ok: struct { scope: dk.access.Scope, keyed: bool, limited: ?u32 = null, adult: bool = false }, refused: []const u8 } {
+fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8, caller: Caller, method: http.Method, target: []const u8) error{OutOfMemory}!union(enum) { ok: struct { scope: dk.access.Scope, keyed: bool, limited: ?u32 = null, adult: bool = false, owner: bool = false }, refused: []const u8 } {
     if (authorization) |h| {
         const prefix = "Bearer ";
         if (std.ascii.startsWithIgnoreCase(h, prefix)) {
@@ -372,7 +377,7 @@ fn scopeFor(arena: Allocator, services: Services, authorization: ?[]const u8, ca
     }
     // A browser that signed in as the owner (the password at /login) sees everything, safe search lifted.
     if (authorization == null) if (services.owner) |o| if (o.valid(caller.cookie)) {
-        return .{ .ok = .{ .scope = .{}, .keyed = true, .limited = null, .adult = true } };
+        return .{ .ok = .{ .scope = .{}, .keyed = true, .limited = null, .adult = true, .owner = true } };
     };
     // A browser that signed in with a key (the cookie of /login) is that key. A key that is no longer valid, or that is
     // bound to a node (which needs signatures), is not an error here: the browser is simply anonymous again.
@@ -403,7 +408,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         if (is_api) return apiError(arena, .not_found, "not_found", "no such endpoint");
         return htmlError(arena, .not_found, "Not found", "That page does not exist.");
     }
-    if (method != .GET and method != .HEAD and !((r == .unlock_page or r == .lock_action or r == .login_page or r == .logout_action) and method == .POST)) {
+    if (method != .GET and method != .HEAD and !((r == .unlock_page or r == .lock_action or r == .login_page or r == .logout_action or r == .feedback_action) and method == .POST)) {
         var resp = if (is_api)
             try apiError(arena, .method_not_allowed, "method_not_allowed", "use GET")
         else
@@ -421,6 +426,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         .ok => |c| {
             services.scope = c.scope;
             services.keyed = c.keyed;
+            services.is_owner = c.owner;
             // Safe search applies unless this caller is adult (a key marked so) or has unlocked this browser.
             services.safe = services.safe_default and !c.adult and !(if (services.unlock) |u| u.unlocked(caller.cookie) else false);
             if (c.limited) |wait| {
@@ -474,6 +480,7 @@ fn handleInner(arena: Allocator, searcher: dk.search.Searcher, services_in: Serv
         .unlock_page => try unlockPage(arena, services, method, caller),
         .login_page => try loginPage(arena, services, method, caller),
         .logout_action => try logoutAction(arena, services),
+        .feedback_action => try feedbackAction(arena, services, method, caller),
         .lock_action => try lockAction(arena, services, caller),
         .api_similar => try apiSimilar(arena, searcher, services, t.params),
         .api_export => try apiExport(arena, searcher, services, t.params),
@@ -1003,6 +1010,31 @@ fn unlockPage(arena: Allocator, services: Services, method: http.Method, caller:
     var r = htmlResponse(arena, .ok, aw.written());
     r.headers = headersWith(arena, &.{no_store});
     return r;
+}
+
+/// `/feedback`: the owner's mark on a result (POST `q`, `url`, `grade` of 1, -1 or 0), added to `feedback.jsonl`. Only the
+/// owner signed in (the password at /login) may: anyone else is refused, and nothing is written.
+fn feedbackAction(arena: Allocator, services: Services, method: http.Method, caller: Caller) error{OutOfMemory}!Response {
+    if (method != .POST) {
+        var resp = plain(.method_not_allowed, "use POST\n");
+        resp.headers = headersWith(arena, &.{ .{ .name = "allow", .value = "POST" }, no_store });
+        return resp;
+    }
+    const store = services.feedback orelse return plain(.not_found, "no feedback on this server\n");
+    if (!services.is_owner) return plain(.forbidden, "sign in as the owner to mark results\n");
+    const form_target = try std.fmt.allocPrint(arena, "/?{s}", .{std.mem.trimEnd(u8, caller.body, "\r\n")});
+    const t = query.parseTarget(arena, form_target) catch return plain(.bad_request, "the form could not be read\n");
+    const grade = std.fmt.parseInt(i32, t.params.get("grade") orelse "", 10) catch return plain(.bad_request, "grade must be 1, -1 or 0\n");
+    const now = std.Io.Clock.real.now(store.io).toSeconds();
+    store.record(arena, t.params.get("q") orelse "", t.params.get("url") orelse "", grade, now) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Invalid => plain(.bad_request, "the query, the address or the grade is not valid\n"),
+        error.TooBig => plain(.insufficient_storage, "the feedback file is full\n"),
+        error.Io => plain(.service_unavailable, "the feedback could not be saved\n"),
+    };
+    var resp = plain(.ok, "ok\n");
+    resp.headers = headersWith(arena, &.{no_store});
+    return resp;
 }
 
 /// `/login`: the owner signs in with the password (`dksearch owner-password`), or a browser with an API key (made with
@@ -2213,7 +2245,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         .bad => |b| return htmlError(arena, .bad_request, "Bad request", try std.fmt.allocPrint(arena, "{s}: {s}", .{ b.name, b.message })),
     };
     const defaulted = if (default) |d| (picked.len == 1 and std.mem.startsWith(u8, picked[0], "collection:") and std.mem.eql(u8, picked[0]["collection:".len..], d) and (try params.all(arena, "source")).len == 0) else false;
-    var form: html.Form = .{ .login = loginNote(services), .safe_note = safeNote(services), .default_note = if (defaulted) default else null, .all_sources = all_asked, .q = parsed.typed, .language = q.language orelse "", .picked = picked, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .collections = try collectionChoices(arena, services), .sort = params.get("sort") orelse "" };
+    var form: html.Form = .{ .feedback = services.feedback != null and services.is_owner, .login = loginNote(services), .safe_note = safeNote(services), .default_note = if (defaulted) default else null, .all_sources = all_asked, .q = parsed.typed, .language = q.language orelse "", .picked = picked, .regex_enabled = regex != null, .exact_only = q.fuzzy == .off, .sources = sources, .collections = try collectionChoices(arena, services), .sort = params.get("sort") orelse "" };
     if (parsed.re) |req| {
         // A pattern typed in the box is already part of `q` and travels with it; only one given
         // as a parameter has to be carried separately (the pager and the exact-spelling link).
@@ -4453,4 +4485,41 @@ test "the browser's Accept-Language reaches the search, which ranks other langua
     try testing.expectEqualStrings("fr", fake.last.?.prefer_languages[0]);
     _ = handleSigned(a, fake.searcher(), .{}, .GET, "/api/v1/search?q=odin", null, .{});
     try testing.expectEqual(@as(usize, 0), fake.last.?.prefer_languages.len);
+}
+
+test "feedback: only the owner signed in sees the buttons and can mark a result; the mark is kept for eval" {
+    var hits = [_]dk.search.Hit{.{ .id = @splat(1), .connector = "web", .url = "https://e.org/c", .title = "Learn C", .snippet = null, .score = 2, .kind = "page" }};
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var owner = try dk.owner.OwnerLogin.init(testing.allocator, testing.io, tmp.dir, 30);
+    defer owner.deinit();
+    try owner.setPassword("correct horse battery");
+    var store = dk.feedback.Store.init(testing.io, tmp.dir);
+    const services: Services = .{ .owner = &owner, .feedback = &store };
+    // A visitor: no buttons, and a mark is refused and writes nothing.
+    try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), services, .GET, "/search?q=c", null, .{}).body, "data-feedback") == null);
+    const refused = handleSigned(a, fake.searcher(), services, .POST, "/feedback", null, .{ .body = "q=c&url=https%3A%2F%2Fe.org%2Fc&grade=1" });
+    try testing.expectEqual(http.Status.forbidden, refused.status);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, dk.feedback.file_name, .{}));
+    // The owner: buttons on the list (with the query), and the mark is written.
+    const good = handleSigned(a, fake.searcher(), services, .POST, "/login", null, .{ .body = "credential=correct+horse+battery" });
+    const set = headerValue(good, "set-cookie").?;
+    const header = try std.fmt.allocPrint(a, "dks_owner={s}", .{set["dks_owner=".len..std.mem.indexOfScalar(u8, set, ';').?]});
+    const page = handleSigned(a, fake.searcher(), services, .GET, "/search?q=how+to+c", null, .{ .cookie = header });
+    try testing.expect(std.mem.indexOf(u8, page.body, "<ol class=\"results\" start=\"1\" data-feedback=\"1\" data-q=\"how to c\">") != null);
+    const ok = handleSigned(a, fake.searcher(), services, .POST, "/feedback", null, .{ .cookie = header, .body = "q=how+to+c&url=https%3A%2F%2Fe.org%2Fc&grade=1" });
+    try testing.expectEqual(http.Status.ok, ok.status);
+    const bad_grade = handleSigned(a, fake.searcher(), services, .POST, "/feedback", null, .{ .cookie = header, .body = "q=how+to+c&url=https%3A%2F%2Fe.org%2Fc&grade=5" });
+    try testing.expectEqual(http.Status.bad_request, bad_grade.status);
+    try testing.expectEqual(http.Status.method_not_allowed, handleSigned(a, fake.searcher(), services, .GET, "/feedback", null, .{ .cookie = header }).status);
+    const text = try tmp.dir.readFileAlloc(testing.io, dk.feedback.file_name, a, .limited(10_000));
+    try testing.expect(std.mem.indexOf(u8, text, "\"query\":\"how to c\"") != null and std.mem.indexOf(u8, text, "\"grade\":1") != null);
+    // Without a store there are no buttons even for the owner.
+    const without_store: Services = .{ .owner = &owner };
+    try testing.expect(std.mem.indexOf(u8, handleSigned(a, fake.searcher(), without_store, .GET, "/search?q=c", null, .{ .cookie = header }).body, "data-feedback") == null);
+    try testing.expectEqual(http.Status.not_found, handleSigned(a, fake.searcher(), without_store, .POST, "/feedback", null, .{ .cookie = header, .body = "q=c&url=u&grade=1" }).status);
 }

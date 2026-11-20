@@ -387,3 +387,15 @@ form.search textarea[name="q"] {
   background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; cursor: pointer;
 }
 .loginbtn a:hover, .loginbtn button:hover, .loginbtn a:focus-visible, .loginbtn button:focus-visible { border-color: var(--accent); }
+
+/* The owner's good/bad marks on a result */
+.fb { margin-left: 0.6rem; white-space: nowrap; }
+.fb button { font: inherit; font-size: 0.75rem; color: var(--muted); background: transparent; border: 1px solid var(--border); border-radius: 4px; padding: 0 0.4rem; margin-right: 0.25rem; cursor: pointer; }
+.fb button:hover { color: var(--fg); border-color: var(--muted); }
+.fb button.on.fb-good { color: #1b6e2a; border-color: #1b6e2a; }
+.fb button.on.fb-bad { color: #a02323; border-color: #a02323; }
+.fb[data-failed] button { border-style: dashed; }
+
+/* The picture gallery is as wide as the window; the search box and the notices above it keep the reading width. */
+main.gallery-page { max-width: none; padding-left: 1.5rem; padding-right: 1.5rem; }
+.gallery-page > :not(ul.gallery) { max-width: 44rem; }

@@ -6,6 +6,15 @@
 //!     {"query": "lighthouse keeper", "relevant": ["https://en.wikipedia.org/wiki/Lighthouse_keeper"]}
 //!     {"query": "tide tables", "relevant": {"https://example.org/tides": 3, "https://example.org/moon": 1}}
 //!
+//! A line may also name results that are not wanted, `"irrelevant": ["https://..."]` (alone, or beside `relevant`), and
+//! the feedback file of the results page (`feedback.jsonl`) is read too: its lines are
+//!
+//!     {"query": "tide tables", "url": "https://example.org/tides", "grade": 1}
+//!
+//! a grade of 1 and up is relevant, -1 is not wanted, 0 takes an earlier grade back; the last line for a query and
+//! address wins. Lines with the same query are one query, so the golden file and the feedback file can be put together
+//! (`cat golden.jsonl feedback.jsonl`).
+//!
 //! A relevant document is named by its URL or by its id (as the search API
 //! shows it); a list means every document is equally relevant, an object gives
 //! each a grade (1 and up, higher is better). Blank lines and lines starting
@@ -32,9 +41,12 @@ pub const Relevant = struct {
 };
 
 pub const Judgment = struct {
+    /// The line the query first appeared on.
     line: usize,
     query: []const u8,
     relevant: []const Relevant,
+    /// Results that are not wanted (URLs or ids): the report counts how many are in the top k.
+    irrelevant: []const []const u8 = &.{},
 };
 
 pub const ParseError = error{ OutOfMemory, BadJudgments };
@@ -44,19 +56,38 @@ pub const Diagnostic = struct {
     message: []const u8 = "",
 };
 
+/// One query while the lines are being read: the grades of its documents in the order they were first given
+/// (1 and up relevant, -1 not wanted).
+const Entry = struct {
+    line: usize,
+    query: []const u8,
+    keys: std.ArrayList([]const u8) = .empty,
+    grades: std.ArrayList(i32) = .empty,
+
+    fn set(self: *Entry, arena: Allocator, key: []const u8, grade: i32) Allocator.Error!void {
+        for (self.keys.items, 0..) |k, i| if (std.mem.eql(u8, k, key)) {
+            if (grade == 0) {
+                _ = self.keys.orderedRemove(i);
+                _ = self.grades.orderedRemove(i);
+            } else self.grades.items[i] = grade;
+            return;
+        };
+        if (grade == 0) return;
+        try self.keys.append(arena, key);
+        try self.grades.append(arena, grade);
+    }
+};
+
 /// Parses the judgments text. On `BadJudgments`, `diag` says which line and why.
 pub fn parseJudgments(arena: Allocator, text: []const u8, diag: *Diagnostic) ParseError![]const Judgment {
-    var out: std.ArrayList(Judgment) = .empty;
+    var entries: std.ArrayList(Entry) = .empty;
+    var index: std.StringHashMapUnmanaged(usize) = .empty;
     var line_no: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
         line_no += 1;
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
-        if (out.items.len >= max_queries) {
-            diag.* = .{ .line = line_no, .message = "too many queries" };
-            return error.BadJudgments;
-        }
         const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch {
             diag.* = .{ .line = line_no, .message = "not valid JSON" };
             return error.BadJudgments;
@@ -82,47 +113,120 @@ pub fn parseJudgments(arena: Allocator, text: []const u8, diag: *Diagnostic) Par
             diag.* = .{ .line = line_no, .message = "\"query\" is empty or too long" };
             return error.BadJudgments;
         }
-        var rel: std.ArrayList(Relevant) = .empty;
-        switch (obj.get("relevant") orelse {
+        const at = if (index.get(q)) |i| i else blk: {
+            if (entries.items.len >= max_queries) {
+                diag.* = .{ .line = line_no, .message = "too many queries" };
+                return error.BadJudgments;
+            }
+            try entries.append(arena, .{ .line = line_no, .query = q });
+            try index.put(arena, q, entries.items.len - 1);
+            break :blk entries.items.len - 1;
+        };
+        const e = &entries.items[at];
+
+        // A line of the feedback file: one address and one grade.
+        if (obj.get("url")) |u| {
+            const url = switch (u) {
+                .string => |x| x,
+                else => {
+                    diag.* = .{ .line = line_no, .message = "\"url\" must be a string" };
+                    return error.BadJudgments;
+                },
+            };
+            const g: i32 = switch (obj.get("grade") orelse std.json.Value{ .integer = 1 }) {
+                .integer => |n| if (n >= -1 and n <= 100) @intCast(n) else {
+                    diag.* = .{ .line = line_no, .message = "\"grade\" must be an integer from -1 to 100" };
+                    return error.BadJudgments;
+                },
+                else => {
+                    diag.* = .{ .line = line_no, .message = "\"grade\" must be an integer from -1 to 100" };
+                    return error.BadJudgments;
+                },
+            };
+            if (url.len == 0 or url.len > 2000) {
+                diag.* = .{ .line = line_no, .message = "\"url\" is empty or too long" };
+                return error.BadJudgments;
+            }
+            try e.set(arena, url, g);
+            continue;
+        }
+
+        const rel_v = obj.get("relevant");
+        const irr_v = obj.get("irrelevant");
+        if (rel_v == null and irr_v == null) {
             diag.* = .{ .line = line_no, .message = "missing \"relevant\"" };
             return error.BadJudgments;
-        }) {
-            .array => |arr| for (arr.items) |item| {
-                const key = switch (item) {
-                    .string => |s| s,
-                    else => {
-                        diag.* = .{ .line = line_no, .message = "\"relevant\" entries must be strings" };
-                        return error.BadJudgments;
-                    },
-                };
-                try rel.append(arena, .{ .key = key, .grade = 1 });
-            },
-            .object => |o| {
-                var it = o.iterator();
-                while (it.next()) |e| {
-                    const g: u32 = switch (e.value_ptr.*) {
-                        .integer => |n| if (n >= 1 and n <= 100) @intCast(n) else {
-                            diag.* = .{ .line = line_no, .message = "grades must be integers from 1 to 100" };
-                            return error.BadJudgments;
-                        },
+        }
+        if (rel_v) |rv| {
+            var count: usize = 0;
+            switch (rv) {
+                .array => |arr| for (arr.items) |item| {
+                    const key = switch (item) {
+                        .string => |x| x,
                         else => {
-                            diag.* = .{ .line = line_no, .message = "grades must be integers from 1 to 100" };
+                            diag.* = .{ .line = line_no, .message = "\"relevant\" entries must be strings" };
                             return error.BadJudgments;
                         },
                     };
-                    try rel.append(arena, .{ .key = e.key_ptr.*, .grade = g });
+                    try e.set(arena, key, 1);
+                    count += 1;
+                },
+                .object => |o| {
+                    var it = o.iterator();
+                    while (it.next()) |entry| {
+                        const g: i32 = switch (entry.value_ptr.*) {
+                            .integer => |n| if (n >= 1 and n <= 100) @intCast(n) else {
+                                diag.* = .{ .line = line_no, .message = "grades must be integers from 1 to 100" };
+                                return error.BadJudgments;
+                            },
+                            else => {
+                                diag.* = .{ .line = line_no, .message = "grades must be integers from 1 to 100" };
+                                return error.BadJudgments;
+                            },
+                        };
+                        try e.set(arena, entry.key_ptr.*, g);
+                        count += 1;
+                    }
+                },
+                else => {
+                    diag.* = .{ .line = line_no, .message = "\"relevant\" must be a list or an object" };
+                    return error.BadJudgments;
+                },
+            }
+            if (count == 0 or count > max_relevant_per_query) {
+                diag.* = .{ .line = line_no, .message = "needs between 1 and 1000 relevant documents" };
+                return error.BadJudgments;
+            }
+        }
+        if (irr_v) |iv| switch (iv) {
+            .array => |arr| {
+                if (arr.items.len > max_relevant_per_query) {
+                    diag.* = .{ .line = line_no, .message = "at most 1000 irrelevant documents" };
+                    return error.BadJudgments;
                 }
+                for (arr.items) |item| switch (item) {
+                    .string => |x| try e.set(arena, x, -1),
+                    else => {
+                        diag.* = .{ .line = line_no, .message = "\"irrelevant\" entries must be strings" };
+                        return error.BadJudgments;
+                    },
+                };
             },
             else => {
-                diag.* = .{ .line = line_no, .message = "\"relevant\" must be a list or an object" };
+                diag.* = .{ .line = line_no, .message = "\"irrelevant\" must be a list" };
                 return error.BadJudgments;
             },
+        };
+    }
+    var out: std.ArrayList(Judgment) = .empty;
+    for (entries.items) |e| {
+        var rel: std.ArrayList(Relevant) = .empty;
+        var irr: std.ArrayList([]const u8) = .empty;
+        for (e.keys.items, e.grades.items) |k, g| {
+            if (g > 0) try rel.append(arena, .{ .key = k, .grade = @intCast(g) }) else try irr.append(arena, k);
         }
-        if (rel.items.len == 0 or rel.items.len > max_relevant_per_query) {
-            diag.* = .{ .line = line_no, .message = "needs between 1 and 1000 relevant documents" };
-            return error.BadJudgments;
-        }
-        try out.append(arena, .{ .line = line_no, .query = q, .relevant = rel.items });
+        if (rel.items.len == 0 and irr.items.len == 0) continue; // everything was taken back
+        try out.append(arena, .{ .line = e.line, .query = e.query, .relevant = rel.items, .irrelevant = irr.items });
     }
     if (out.items.len == 0) {
         diag.* = .{ .line = 0, .message = "no queries" };
@@ -143,6 +247,8 @@ pub const QueryResult = struct {
     /// 1 / rank of the first relevant hit within k, else 0.
     reciprocal_rank: f64 = 0,
     ndcg: f64 = 0,
+    /// Results that were marked not wanted, among the first k hits.
+    bad_in_k: u32 = 0,
     /// For each judged document, in the order given: its 1-based rank among
     /// the first 100 hits, or null.
     ranks: []const ?u32,
@@ -151,6 +257,12 @@ pub const QueryResult = struct {
 
 pub const Summary = struct {
     queries: usize = 0,
+    /// Queries that have a relevant document (the means are over these; a query with only "not wanted" results has none).
+    judged: usize = 0,
+    /// Results marked not wanted that were found among the first k, over all queries.
+    bad_in_k: u32 = 0,
+    /// Results marked not wanted, over all queries.
+    marked_bad: u32 = 0,
     failed: usize = 0,
     mean_precision: f64 = 0,
     mean_recall: f64 = 0,
@@ -184,6 +296,7 @@ pub fn evaluateWith(arena: Allocator, searcher: search.Searcher, judgments: []co
     var results: std.ArrayList(QueryResult) = .empty;
     var sum: Summary = .{};
     for (judgments) |j| {
+        sum.marked_bad += @intCast(j.irrelevant.len);
         var r: QueryResult = .{
             .query = j.query,
             .relevant_total = @intCast(j.relevant.len),
@@ -203,6 +316,7 @@ pub fn evaluateWith(arena: Allocator, searcher: search.Searcher, judgments: []co
                 r.failed = true;
                 sum.failed += 1;
                 sum.queries += 1;
+                if (j.relevant.len > 0) sum.judged += 1;
                 try results.append(arena, r);
                 continue;
             },
@@ -226,7 +340,22 @@ pub fn evaluateWith(arena: Allocator, searcher: search.Searcher, judgments: []co
                     grade = @max(grade, rel.grade);
                 }
             }
-            if (shown < k) try gains.append(arena, grade);
+            if (shown < k) {
+                try gains.append(arena, grade);
+                for (j.irrelevant) |bad| {
+                    if ((h.url != null and std.mem.eql(u8, h.url.?, bad)) or std.ascii.eqlIgnoreCase(&idhex, bad)) {
+                        r.bad_in_k += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        sum.bad_in_k += r.bad_in_k;
+        if (j.relevant.len == 0) {
+            // Only results that are not wanted were marked: nothing to score, only the count of those that came up.
+            sum.queries += 1;
+            try results.append(arena, r);
+            continue;
         }
 
         var dcg: f64 = 0;
@@ -250,6 +379,7 @@ pub fn evaluateWith(arena: Allocator, searcher: search.Searcher, judgments: []co
         r.ndcg = if (ideal > 0) dcg / ideal else 0;
 
         sum.queries += 1;
+        sum.judged += 1;
         sum.mean_precision += r.precision;
         sum.mean_recall += r.recall;
         sum.mrr += r.reciprocal_rank;
@@ -257,8 +387,8 @@ pub fn evaluateWith(arena: Allocator, searcher: search.Searcher, judgments: []co
         try results.append(arena, r);
     }
     // A failed query scores zero in every mean (it found nothing).
-    if (sum.queries > 0) {
-        const n: f64 = @floatFromInt(sum.queries);
+    if (sum.judged > 0) {
+        const n: f64 = @floatFromInt(sum.judged);
         sum.mean_precision /= n;
         sum.mean_recall /= n;
         sum.mrr /= n;
@@ -277,18 +407,23 @@ fn gain(grade: u32) f64 {
 /// A fixed-width table, then the means, then the judged documents that did not
 /// make the top k with their rank (or "not in the first 100").
 pub fn writeText(w: *std.Io.Writer, rep: Report) std.Io.Writer.Error!void {
-    try w.print("{s:<40} {s:>6} {s:>6} {s:>6} {s:>7}\n", .{ "query", "P@k", "R@k", "RR", "nDCG@k" });
+    try w.print("{s:<40} {s:>6} {s:>6} {s:>6} {s:>7} {s:>6}\n", .{ "query", "P@k", "R@k", "RR", "nDCG@k", "Bad@k" });
     for (rep.results) |r| {
         var qb: [40]u8 = undefined;
         const q = shortQuery(&qb, r.query);
         if (r.failed) {
             try w.print("{s:<40} search failed\n", .{q});
         } else {
-            try w.print("{s:<40} {d:>6.2} {d:>6.2} {d:>6.2} {d:>7.2}\n", .{ q, r.precision, r.recall, r.reciprocal_rank, r.ndcg });
+            if (r.relevant_total == 0) {
+                try w.print("{s:<40} {s:>6} {s:>6} {s:>6} {s:>7} {d:>6}\n", .{ q, "-", "-", "-", "-", r.bad_in_k });
+            } else {
+                try w.print("{s:<40} {d:>6.2} {d:>6.2} {d:>6.2} {d:>7.2} {d:>6}\n", .{ q, r.precision, r.recall, r.reciprocal_rank, r.ndcg, r.bad_in_k });
+            }
         }
     }
     const s = rep.summary;
     try w.print("\nk = {d}; {d} queries ({d} failed)\n", .{ rep.k, s.queries, s.failed });
+    if (s.marked_bad > 0) try w.print("results marked not wanted: {d}, of which {d} came up in the top k\n", .{ s.marked_bad, s.bad_in_k });
     try w.print("mean precision@k {d:.3}   mean recall@k {d:.3}   MRR {d:.3}   mean nDCG@k {d:.3}\n", .{ s.mean_precision, s.mean_recall, s.mrr, s.mean_ndcg });
     var header = false;
     for (rep.results) |r| {
@@ -326,6 +461,12 @@ pub fn writeJson(w: *std.Io.Writer, rep: Report) std.Io.Writer.Error!void {
     try s.write(rep.summary.queries);
     try s.objectField("failed");
     try s.write(rep.summary.failed);
+    try s.objectField("judged");
+    try s.write(rep.summary.judged);
+    try s.objectField("marked_bad");
+    try s.write(rep.summary.marked_bad);
+    try s.objectField("bad_in_k");
+    try s.write(rep.summary.bad_in_k);
     try s.objectField("mean_precision");
     try s.write(rep.summary.mean_precision);
     try s.objectField("mean_recall");
@@ -346,6 +487,8 @@ pub fn writeJson(w: *std.Io.Writer, rep: Report) std.Io.Writer.Error!void {
         try s.write(r.relevant_total);
         try s.objectField("found_in_k");
         try s.write(r.found_in_k);
+        try s.objectField("bad_in_k");
+        try s.write(r.bad_in_k);
         try s.objectField("precision");
         try s.write(r.precision);
         try s.objectField("recall");
@@ -495,4 +638,57 @@ test "ids match like urls, and the report prints" {
     try testing.expectEqual(@as(i64, 1), parsed.object.get("queries").?.integer);
     try testing.expectError(error.InvalidK, evaluate(a, fake.searcher(), j, 0));
     try testing.expectError(error.InvalidK, evaluate(a, fake.searcher(), j, 101));
+}
+
+test "feedback lines, not-wanted results and repeated queries are merged into one judgment per query" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diagnostic = .{};
+    const j = try parseJudgments(a,
+        \\{"query": "q", "relevant": ["good"]}
+        \\{"query": "q", "url": "bad", "grade": -1, "time": 5}
+        \\{"query": "q", "url": "wrong-click", "grade": 1}
+        \\{"query": "q", "url": "wrong-click", "grade": 0}
+        \\{"query": "q", "url": "good", "grade": 3}
+        \\{"query": "only bad", "irrelevant": ["x", "y"]}
+        \\{"query": "taken back", "url": "z", "grade": 1}
+        \\{"query": "taken back", "url": "z", "grade": 0}
+    , &d);
+    try testing.expectEqual(@as(usize, 2), j.len); // "taken back" is gone
+    try testing.expectEqualStrings("q", j[0].query);
+    try testing.expectEqual(@as(usize, 1), j[0].relevant.len);
+    try testing.expectEqual(@as(u32, 3), j[0].relevant[0].grade); // the last grade wins
+    try testing.expectEqual(@as(usize, 1), j[0].irrelevant.len);
+    try testing.expectEqualStrings("bad", j[0].irrelevant[0]);
+    try testing.expectEqual(@as(usize, 0), j[1].relevant.len);
+    try testing.expectEqual(@as(usize, 2), j[1].irrelevant.len);
+    try testing.expectEqual(@as(usize, 1), j[0].line);
+    var bad: Diagnostic = .{};
+    try testing.expectError(error.BadJudgments, parseJudgments(a, "{\"query\":\"q\",\"url\":\"u\",\"grade\":7.5}", &bad));
+    try testing.expectError(error.BadJudgments, parseJudgments(a, "{\"query\":\"q\",\"url\":\"u\",\"grade\":-5}", &bad));
+}
+
+test "results marked not wanted are counted in the top k, and a query with only those has no scores" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake: Fake = .{ .urls = &.{ "x1", "x2", "target" } };
+    var d: Diagnostic = .{};
+    const j = try parseJudgments(a,
+        \\{"query": "q", "relevant": ["target"], "irrelevant": ["x1", "gone"]}
+        \\{"query": "p", "irrelevant": ["x2", "x3"]}
+    , &d);
+    const rep = try evaluate(a, fake.searcher(), j, 10);
+    try testing.expectEqual(@as(u32, 1), rep.results[0].bad_in_k);
+    try testing.expectEqual(@as(u32, 1), rep.results[1].bad_in_k);
+    try testing.expectEqual(@as(usize, 2), rep.summary.queries);
+    try testing.expectEqual(@as(usize, 1), rep.summary.judged);
+    try testing.expectEqual(@as(u32, 4), rep.summary.marked_bad);
+    try testing.expectEqual(@as(u32, 2), rep.summary.bad_in_k);
+    try testing.expect(rep.summary.mrr > 0.3 and rep.summary.mrr < 0.34); // the means are over the judged query only
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeText(&w, rep);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "results marked not wanted: 4, of which 2 came up in the top k") != null);
 }
