@@ -1581,7 +1581,8 @@ pub const SqliteIndex = struct {
         if (tier_expr) |t| {
             try sql.print(arena, " ORDER BY {s}, {s}, d.id", .{ t, bm });
         } else try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm, self.unranked));
-        if (q.per_domain > 0 and text_mode and self.has_meta and q.sort == .relevance and !namesDomain(filters)) {
+        // (An unranked heavy search has no ranking to keep the best of each domain by, and the window would read a thousand rows.)
+        if (q.per_domain > 0 and text_mode and self.has_meta and q.sort == .relevance and !namesDomain(filters) and !self.unranked) {
             // Keep the best `per_domain` results of each domain (a document without a domain stands alone), in the
             // order of the full ranking. The LIMIT inside keeps the ranking function out of the outer query.
             try sql.print(arena, " LIMIT {d}", .{search.max_cursor_window});
