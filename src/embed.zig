@@ -19,6 +19,7 @@ const sqlite = @import("sqlite.zig");
 const doc = @import("document.zig");
 const search = @import("search.zig");
 const vindex = @import("vindex.zig");
+const storage = @import("storage.zig");
 
 const have_http = build_options.crawler;
 const fetch = if (have_http) @import("connectors/crawl/fetch.zig") else struct {};
@@ -36,7 +37,52 @@ pub const Settings = struct {
     max_chars: u32 = 2000,
     /// Documents per request when making vectors.
     batch: u32 = 16,
+    /// Text put before a query and before a document's text, for models trained with such prefixes (nomic-embed-text:
+    /// `search_query:` and `search_document:`). One space follows unless the prefix ends with whitespace.
+    query_prefix: []const u8 = "",
+    document_prefix: []const u8 = "",
+    /// Lazy mode: when a search asks for meaning, the lexical candidates that have no vector yet are embedded then (at most
+    /// `lazy_max` of them, within `lazy_timeout_ms`) and the vectors kept in `vectors.db`, so no pass over every document
+    /// is needed before semantic search is of use.
+    lazy: bool = false,
+    lazy_max: u32 = 20,
+    lazy_timeout_ms: u32 = 8000,
+    /// The name vectors are kept under in `vectors.db`: the model, plus a fingerprint of the prefixes when there are any
+    /// (vectors made with other prefixes are other vectors; see `keyFor`). Empty: the model.
+    key: []const u8 = "",
+
+    pub fn vectorKey(self: Settings) []const u8 {
+        return if (self.key.len > 0) self.key else self.model;
+    }
+
+    /// What is sent to be embedded for a search's words.
+    pub fn queryText(self: Settings, arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+        return prefixed(arena, self.query_prefix, text);
+    }
+
+    /// What is sent to be embedded for a document: the prefix, its title and the start of its text.
+    pub fn documentText(self: Settings, arena: Allocator, title: ?[]const u8, text: []const u8) Allocator.Error![]const u8 {
+        return prefixed(arena, self.document_prefix, try textFor(arena, title, text, self.max_chars));
+    }
 };
+
+fn prefixed(arena: Allocator, prefix: []const u8, text: []const u8) Allocator.Error![]const u8 {
+    if (prefix.len == 0) return text;
+    const last = prefix[prefix.len - 1];
+    const sep: []const u8 = if (last == ' ' or last == '\n' or last == '\t') "" else " ";
+    return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ prefix, sep, text });
+}
+
+/// The name vectors are kept under: the model alone when there are no prefixes, else the model and a fingerprint of the
+/// two prefixes, so that vectors made with other prefixes (or none) are never mixed with these.
+pub fn keyFor(arena: Allocator, model: []const u8, query_prefix: []const u8, document_prefix: []const u8) Allocator.Error![]const u8 {
+    if (query_prefix.len == 0 and document_prefix.len == 0) return model;
+    var h = std.hash.Wyhash.init(0);
+    h.update(query_prefix);
+    h.update("\x00");
+    h.update(document_prefix);
+    return std.fmt.allocPrint(arena, "{s}#{x:0>8}", .{ model, @as(u32, @truncate(h.final())) });
+}
 
 pub const Error = error{ NotAvailable, Unreachable, Refused, BadAnswer, OutOfMemory };
 
@@ -69,6 +115,11 @@ pub const Client = struct {
 
     /// One unit-length vector per text, in order.
     pub fn embed(self: *Client, arena: Allocator, texts: []const []const u8) Error![]const []const f32 {
+        return self.embedWithin(arena, texts, self.settings.timeout_ms);
+    }
+
+    /// As `embed`, giving up after `timeout_ms` (a search that makes vectors as it goes must not wait for a slow model).
+    pub fn embedWithin(self: *Client, arena: Allocator, texts: []const []const u8, timeout_ms: u32) Error![]const []const f32 {
         if (!have_http) return error.NotAvailable;
         const path: []const u8 = switch (self.settings.api) {
             .ollama => "/api/embed",
@@ -82,7 +133,7 @@ pub const Client = struct {
             .accept = "application/json",
             .max_body_bytes = 64 * 1024 * 1024,
             .body = payload,
-        }, .{ .nanoseconds = @as(i96, self.settings.timeout_ms) * std.time.ns_per_ms }) catch |e| return switch (e) {
+        }, .{ .nanoseconds = @as(i96, timeout_ms) * std.time.ns_per_ms }) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Unreachable,
         };
@@ -234,6 +285,32 @@ pub const Store = struct {
         return @intCast(@max(0, st.colInt(0)));
     }
 };
+
+/// Lazy mode: makes and keeps the vectors that `hits` (the lexical candidates, best first) lack, at most `max` documents,
+/// in one request that is given up after `within_ms`. Returns how many were made; a model that does not answer makes
+/// none and is not an error (the search goes on with the vectors there are). The text comes from `content`.
+pub fn fillMissing(arena: Allocator, client: *Client, store: *Store, content: storage.ContentStore, hits: []const search.Hit, max: u32, within_ms: u32) usize {
+    const key = client.settings.vectorKey();
+    var ids: std.ArrayList(doc.Id) = .empty;
+    var texts: std.ArrayList([]const u8) = .empty;
+    for (hits) |h| {
+        if (ids.items.len >= max) break;
+        if (store.has(h.id, key)) continue;
+        const text = content.get(arena, h.id) catch continue; // no retained text
+        const t = client.settings.documentText(arena, h.title, text) catch return 0;
+        if (std.mem.trim(u8, t, " \t\r\n").len == 0) continue;
+        ids.append(arena, h.id) catch return 0;
+        texts.append(arena, t) catch return 0;
+    }
+    if (ids.items.len == 0) return 0;
+    const vecs = client.embedWithin(arena, texts.items, within_ms) catch return 0;
+    var made: usize = 0;
+    for (ids.items, vecs) |id, v| {
+        store.put(id, key, v) catch continue;
+        made += 1;
+    }
+    return made;
+}
 
 // ------------------------------------------------------------------------------------------------ ranking
 
@@ -439,4 +516,68 @@ test "two orderings are merged by reciprocal rank, and what only the second foun
     try testing.expectEqual(@as(u8, 9), r.hits[3].id[0]);
     const alone = try fuseTwo(a, &lexical, &.{});
     for (alone.hits, 0..) |h, i| try testing.expectEqual(@as(u8, @intCast(i + 1)), h.id[0]);
+}
+
+test "prefixes: a space follows unless the prefix ends with whitespace, and vectors made with other prefixes are other vectors" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const nomic: Settings = .{ .url = "", .model = "nomic-embed-text", .query_prefix = "search_query:", .document_prefix = "search_document: ", .max_chars = 10 };
+    try testing.expectEqualStrings("search_query: how to program in c", try nomic.queryText(a, "how to program in c"));
+    try testing.expectEqualStrings("search_document: Title\n\nbody", try nomic.documentText(a, "Title", "body"));
+    const plain: Settings = .{ .url = "", .model = "m" };
+    try testing.expectEqualStrings("words", try plain.queryText(a, "words"));
+    try testing.expectEqualStrings("T\n\nb", try plain.documentText(a, "T", "b"));
+    // The key: the model alone without prefixes; with them the model and a fingerprint that follows the prefixes.
+    try testing.expectEqualStrings("m", try keyFor(a, "m", "", ""));
+    const k1 = try keyFor(a, "m", "q:", "d:");
+    const k2 = try keyFor(a, "m", "q:", "d: ");
+    try testing.expect(std.mem.startsWith(u8, k1, "m#") and !std.mem.eql(u8, k1, k2) and std.mem.eql(u8, k1, try keyFor(a, "m", "q:", "d:")));
+    try testing.expectEqualStrings("m", plain.vectorKey());
+    const keyed: Settings = .{ .url = "", .model = "m", .key = k1 };
+    try testing.expectEqualStrings(k1, keyed.vectorKey());
+}
+
+test "lazy mode makes and keeps the vectors that are missing, only for documents with a text, and a silent model changes nothing" {
+    if (!have_http) return error.SkipZigTest;
+    const memory = @import("memory.zig");
+    var srv: nettest.TestServer = undefined;
+    try srv.start(&.{.{ .path = "/api/embed", .content_type = "application/json", .body = "{\"embeddings\":[[3,4],[0,2]]}" }});
+    defer srv.stop();
+    var ub: [64]u8 = undefined;
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [200:0]u8 = undefined;
+    var store = try Store.open(try std.fmt.bufPrintSentinel(&pb, ".zig-cache/tmp/{s}/lazy.db", .{tmp.sub_path}, 0));
+    defer store.close();
+    var mem = memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    // Four candidates: 1 has a vector already, 2 and 3 have a text, 4 has no retained text.
+    const hits = [_]search.Hit{ hitOf(1), hitOf(2), hitOf(3), hitOf(4) };
+    try mem.store().put(hits[0].id, "already done");
+    try mem.store().put(hits[1].id, "second text");
+    try mem.store().put(hits[2].id, "third text");
+    try store.put(hits[0].id, "m", &.{ 1, 0 });
+    const client = try Client.init(testing.allocator, testing.io, .{ .url = srv.url(&ub, ""), .model = "m", .timeout_ms = 2000 });
+    defer client.deinit();
+    const made = fillMissing(a, client, &store, mem.store(), &hits, 20, 2000);
+    try testing.expectEqual(@as(usize, 2), made);
+    try testing.expectEqual(@as(usize, 1), srv.count("/api/embed")); // one request for both
+    try testing.expect(store.has(hits[1].id, "m") and store.has(hits[2].id, "m") and !store.has(hits[3].id, "m"));
+    try testing.expectApproxEqAbs(@as(f32, 0.6), store.get(a, hits[1].id, "m").?[0], 0.0001);
+    // Nothing is missing now (4 has no text): no request is made.
+    try testing.expectEqual(@as(usize, 0), fillMissing(a, client, &store, mem.store(), &hits, 20, 2000));
+    try testing.expectEqual(@as(usize, 1), srv.count("/api/embed"));
+    // The cap: with room for one, one is made. A model that cannot be reached makes none and breaks nothing.
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var store2 = try Store.open(try std.fmt.bufPrintSentinel(&pb, ".zig-cache/tmp/{s}/lazy2.db", .{tmp2.sub_path}, 0));
+    defer store2.close();
+    const down = try Client.init(testing.allocator, testing.io, .{ .url = "http://127.0.0.1:1", .model = "m", .timeout_ms = 300 });
+    defer down.deinit();
+    try testing.expectEqual(@as(usize, 0), fillMissing(a, down, &store2, mem.store(), &hits, 20, 300));
+    try testing.expectEqual(@as(u64, 0), store2.count("m"));
 }

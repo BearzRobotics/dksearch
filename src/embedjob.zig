@@ -46,7 +46,7 @@ const Work = struct {
             self.res.cancelled = true;
             return error.Io;
         };
-        if (self.d.store.has(rec.id, self.d.settings.model)) {
+        if (self.d.store.has(rec.id, self.d.settings.vectorKey())) {
             self.res.skipped += 1;
             return;
         }
@@ -56,7 +56,7 @@ const Work = struct {
             return;
         };
         defer self.d.gpa.free(text);
-        const t = embed.textFor(a, rec.meta.title, text, self.d.settings.max_chars) catch return error.OutOfMemory;
+        const t = self.d.settings.documentText(a, rec.meta.title, text) catch return error.OutOfMemory;
         if (std.mem.trim(u8, t, " \t\r\n").len == 0) return;
         self.ids.append(a, rec.id) catch return error.OutOfMemory;
         self.texts.append(a, t) catch return error.OutOfMemory;
@@ -70,7 +70,7 @@ const Work = struct {
             self.res.failed = e;
             return error.EmbedFailed;
         };
-        for (self.ids.items, vecs) |id, v| self.d.store.put(id, self.d.settings.model, v) catch return error.EmbedFailed;
+        for (self.ids.items, vecs) |id, v| self.d.store.put(id, self.d.settings.vectorKey(), v) catch return error.EmbedFailed;
         self.res.made += self.ids.items.len;
         if (self.d.control) |c| c.submitted.store(self.res.made, .monotonic);
         if (self.d.on_batch) |f| f(self.d.ctx, self.res.made);

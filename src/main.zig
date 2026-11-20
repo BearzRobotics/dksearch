@@ -375,6 +375,25 @@ fn run(init: std.process.Init) u8 {
     return exit_usage;
 }
 
+/// The embedding settings of `[embeddings]`, with the name the vectors are kept under (the model and a fingerprint of the
+/// prefixes). Strings live in `arena`.
+fn embedSettings(arena: std.mem.Allocator, ec: dk.config.Embeddings) std.mem.Allocator.Error!dk.embed.Settings {
+    return .{
+        .url = ec.url,
+        .api = if (std.mem.eql(u8, ec.api, "openai")) .openai else .ollama,
+        .model = ec.model,
+        .timeout_ms = ec.timeout_ms,
+        .max_chars = ec.max_chars,
+        .batch = ec.batch,
+        .query_prefix = ec.query_prefix,
+        .document_prefix = ec.document_prefix,
+        .lazy = ec.lazy,
+        .lazy_max = ec.lazy_max,
+        .lazy_timeout_ms = ec.lazy_timeout_ms,
+        .key = try dk.embed.keyFor(arena, ec.model, ec.query_prefix, ec.document_prefix),
+    };
+}
+
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
@@ -1508,14 +1527,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
                 err(io, "out of memory", .{});
                 return exit_io;
             };
-            const embed_settings_for_jobs: dk.embed.Settings = if (cfg.embeddings) |ec| .{
-                .url = ec.url,
-                .api = if (std.mem.eql(u8, ec.api, "openai")) .openai else .ollama,
-                .model = ec.model,
-                .timeout_ms = ec.timeout_ms,
-                .max_chars = ec.max_chars,
-                .batch = ec.batch,
-            } else .{ .url = "", .model = "" };
+            const embed_settings_for_jobs: dk.embed.Settings = if (cfg.embeddings) |ec| (embedSettings(arena_state.allocator(), ec) catch return exit_io) else .{ .url = "", .model = "" };
             job_manager = dk.jobs.Manager.init(gpa, io, .{
                 .store = &source_store,
                 .data_dir = cfg.data_dir,
@@ -1548,7 +1560,7 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
             .body_weight = cfg.search.body_weight,
             .peers = peer_service,
             .ollama_url = if (cfg.ollama) |o| o.url else dk.ollama.default_url,
-            .embeddings_model = if (cfg.embeddings) |e| e.model else null,
+            .embeddings_model = if (cfg.embeddings) |e| (dk.embed.keyFor(arena_state.allocator(), e.model, e.query_prefix, e.document_prefix) catch e.model) else null,
             .answers_model = if (cfg.answers.enabled) cfg.answers.model else null,
             .node_name = cfg.node_name,
             .node_id = node_id_text,
@@ -1624,17 +1636,11 @@ fn serve(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
     defer if (vector_holder) |*h| h.deinit();
     if (cfg.embeddings) |ec| {
         const vec_path = std.fmt.allocPrintSentinel(arena_state.allocator(), "{s}/vectors.db", .{cfg.data_dir}, 0) catch return exit_io;
-        embed_client = dk.embed.Client.init(gpa, io, .{
-            .url = ec.url,
-            .api = if (std.mem.eql(u8, ec.api, "openai")) .openai else .ollama,
-            .model = ec.model,
-            .timeout_ms = ec.timeout_ms,
-            .max_chars = ec.max_chars,
-            .batch = ec.batch,
-        }) catch return exit_io;
+        const settings = embedSettings(arena_state.allocator(), ec) catch return exit_io;
+        embed_client = dk.embed.Client.init(gpa, io, settings) catch return exit_io;
         embed_service = .{ .client = embed_client.?, .vectors_path = vec_path };
         if (ec.index_mb > 0) {
-            vector_holder = dk.vindex.Holder.init(gpa, io, vec_path, ec.model, @as(usize, ec.index_mb) * 1024 * 1024);
+            vector_holder = dk.vindex.Holder.init(gpa, io, vec_path, settings.vectorKey(), @as(usize, ec.index_mb) * 1024 * 1024);
             embed_service.holder = &vector_holder.?;
         }
     }
@@ -1748,14 +1754,7 @@ fn embedCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         return exit_io;
     };
     defer store.close();
-    const settings: dk.embed.Settings = .{
-        .url = ec.url,
-        .api = if (std.mem.eql(u8, ec.api, "openai")) .openai else .ollama,
-        .model = ec.model,
-        .timeout_ms = ec.timeout_ms,
-        .max_chars = ec.max_chars,
-        .batch = ec.batch,
-    };
+    const settings = embedSettings(arena, ec) catch return exit_io;
     const client = dk.embed.Client.init(gpa, io, settings) catch return exit_io;
     defer client.deinit();
 
@@ -1779,7 +1778,7 @@ fn embedCmd(io: Io, gpa: std.mem.Allocator, config_path: ?[]const u8) u8 {
         err(io, "the embedding server failed ({t}); {d} vectors were saved, run `embed` again to continue", .{ f, result.made });
         return exit_failure;
     }
-    out(io, "done: {d} vectors made, {d} documents skipped (already done, or no retained text); {d} in the store for this model\n", .{ result.made, result.skipped, store.count(settings.model) });
+    out(io, "done: {d} vectors made, {d} documents skipped (already done, or no retained text); {d} in the store for this model\n", .{ result.made, result.skipped, store.count(settings.vectorKey()) });
     return exit_ok;
 }
 

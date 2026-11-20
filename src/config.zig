@@ -339,6 +339,13 @@ pub const Embeddings = struct {
     /// Memory the in-memory vector index may use (MiB); 0 turns the index off (semantic search then only reorders
     /// the lexical results).
     index_mb: u32 = 2048,
+    /// Text put before a query and before a document's text, for models trained with such prefixes.
+    query_prefix: []const u8 = "",
+    document_prefix: []const u8 = "",
+    /// Vectors for the lexical candidates of a semantic search are made when it is asked for, and kept.
+    lazy: bool = false,
+    lazy_max: u32 = 20,
+    lazy_timeout_ms: u32 = 8000,
 };
 
 /// The Ollama server dksearch may talk to (`[ollama]`); the default address is also tried to detect one.
@@ -968,7 +975,7 @@ fn readFallback(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnos
 
 fn readEmbeddings(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagnostic) Error!?Embeddings {
     const t = (try subTable(src, root, "embeddings", diag)) orelse return null;
-    try checkKeys(src, "embeddings", t, &[_][]const u8{ "url", "api", "model", "timeout_ms", "max_chars", "batch", "index_mb" }, diag);
+    try checkKeys(src, "embeddings", t, &[_][]const u8{ "url", "api", "model", "timeout_ms", "max_chars", "batch", "index_mb", "query_prefix", "document_prefix", "lazy", "lazy_max", "lazy_timeout_ms" }, diag);
     var e: Embeddings = .{
         .url = try baseAddress(a, src, "embeddings.url", try reqStr(src, "embeddings", t, "url", diag), diag),
         .model = try a.dupe(u8, try reqStr(src, "embeddings", t, "model", diag)),
@@ -988,6 +995,18 @@ fn readEmbeddings(a: Allocator, src: []const u8, root: *toml.Table, diag: *Diagn
     if (try intIn(src, "embeddings", t, "max_chars", 100, 20000, diag)) |n| e.max_chars = @intCast(n);
     if (try intIn(src, "embeddings", t, "batch", 1, 256, diag)) |n| e.batch = @intCast(n);
     if (try intIn(src, "embeddings", t, "index_mb", 0, 1048576, diag)) |n| e.index_mb = @intCast(n);
+    inline for (.{ "query_prefix", "document_prefix" }) |key| {
+        if (try str(src, "embeddings", t, key, diag)) |v| {
+            if (v.len > 200 or std.mem.indexOfAny(u8, v, "\x00\r\n") != null) {
+                diag.set(src, "embeddings." ++ key, "must be at most 200 characters on one line", .{});
+                return error.InvalidValue;
+            }
+            @field(e, key) = try a.dupe(u8, v);
+        }
+    }
+    if (try optBool(src, "embeddings", t, "lazy", diag)) |b| e.lazy = b;
+    if (try intIn(src, "embeddings", t, "lazy_max", 1, 100, diag)) |n| e.lazy_max = @intCast(n);
+    if (try intIn(src, "embeddings", t, "lazy_timeout_ms", 200, 60000, diag)) |n| e.lazy_timeout_ms = @intCast(n);
     return e;
 }
 
@@ -2064,4 +2083,21 @@ test "search.common_word_percent is read and checked" {
     try testing.expectEqual(@as(u32, 15), plain.search.common_word_percent);
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[search]\ncommon_word_percent = 1\n", &d));
     try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "[search]\ncommon_word_percent = 95\n", &d));
+}
+
+test "embeddings: prefixes and lazy mode are read and checked" {
+    var d: Diagnostic = .{};
+    const base = "[storage]\ndata_dir = \"/tmp/x\"\n[embeddings]\nurl = \"http://127.0.0.1:11434\"\nmodel = \"nomic-embed-text\"\n";
+    var c = try loadFromSlice(testing.allocator, "t.toml", base ++ "query_prefix = \"search_query:\"\ndocument_prefix = \"search_document:\"\nlazy = true\nlazy_max = 30\nlazy_timeout_ms = 5000\n", &d);
+    defer c.deinit();
+    const e = c.embeddings.?;
+    try testing.expectEqualStrings("search_query:", e.query_prefix);
+    try testing.expectEqualStrings("search_document:", e.document_prefix);
+    try testing.expect(e.lazy and e.lazy_max == 30 and e.lazy_timeout_ms == 5000);
+    var plain = try loadFromSlice(testing.allocator, "t.toml", base, &d);
+    defer plain.deinit();
+    try testing.expect(!plain.embeddings.?.lazy and plain.embeddings.?.query_prefix.len == 0 and plain.embeddings.?.lazy_max == 20);
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "lazy_max = 0\n", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "lazy_timeout_ms = 10\n", &d));
+    try testing.expectError(error.InvalidValue, loadFromSlice(testing.allocator, "t.toml", base ++ "query_prefix = \"a\\nb\"\n", &d));
 }

@@ -658,7 +658,7 @@ pub const Manager = struct {
             return;
         }
         out.state = .completed;
-        self.summaryPrint(out, "Made {d} vectors with {s}; {d} documents already had one or have no retained text. {d} documents now have a vector.", .{ r.made, e.settings.model, r.skipped, store.count(e.settings.model) });
+        self.summaryPrint(out, "Made {d} vectors with {s}; {d} documents already had one or have no retained text. {d} documents now have a vector.", .{ r.made, e.settings.model, r.skipped, store.count(e.settings.vectorKey()) });
     }
 
     fn runPull(self: *Manager, name: []const u8, control: *connector.Control, out: *Outcome) void {

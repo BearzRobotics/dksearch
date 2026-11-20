@@ -653,7 +653,7 @@ const ApiHit = struct {
     same_in: []const []const u8 = &.{},
 };
 /// What `semantic=1` did: whether the order was changed by meaning, and why not when it was not.
-const SemanticNote = struct { used: bool, model: ?[]const u8 = null, compared: u32 = 0, reason: ?[]const u8 = null, index: bool = false, from_vectors: u32 = 0 };
+const SemanticNote = struct { used: bool, model: ?[]const u8 = null, compared: u32 = 0, reason: ?[]const u8 = null, index: bool = false, from_vectors: u32 = 0, made_now: u32 = 0 };
 
 const PeerNote = struct { peer: []const u8, status: []const u8, ms: u32, results: u32, http_status: ?u16 = null, cached: bool = false };
 const ApiPage = struct { hits: []const ApiHit, has_more: bool, interpreted: ?[]const u8 = null, fuzzy: bool = false, ignored_words: []const []const u8 = &.{}, peers: ?[]const PeerNote = null, semantic: ?SemanticNote = null, external: ?[]const dk.fallback.External = null, external_status: ?[]const ExternalStatus = null, next_cursor: ?[]const u8 = null };
@@ -694,14 +694,19 @@ fn semanticSearch(arena: Allocator, searcher: dk.search.Searcher, services: Serv
     const svc = services.embed orelse return lexical(arena, searcher, q, "this server has no embedding model configured");
     const text = params.get("q") orelse "";
     if (text.len == 0 or q.offset != 0) return lexical(arena, searcher, q, "semantic ordering applies to the first page of a search with words");
-    var store = dk.embed.Store.openReadOnly(svc.vectors_path) orelse return lexical(arena, searcher, q, "no vectors yet (run `dksearch embed`)");
+    // Lazy mode makes the vectors a search lacks, so it needs the store to write to (and creates it) and the texts to embed.
+    const lazy = svc.client.settings.lazy and services.content != null;
+    var store = (if (lazy) (dk.embed.Store.open(svc.vectors_path) catch null) else dk.embed.Store.openReadOnly(svc.vectors_path)) orelse
+        return lexical(arena, searcher, q, if (lazy) "the vector store could not be opened" else "no vectors yet (run `dksearch embed`)");
     defer store.close();
     const model = svc.client.settings.model;
-    const vecs = svc.client.embed(arena, &.{text}) catch return lexical(arena, searcher, q, "the embedding server could not be reached or refused the query");
+    const key = svc.client.settings.vectorKey();
+    const vecs = svc.client.embed(arena, &.{try svc.client.settings.queryText(arena, text)}) catch return lexical(arena, searcher, q, "the embedding server could not be reached or refused the query");
     var wide = q;
     const want: u32 = if (q.limit == 0) 10 else q.limit;
     wide.limit = @min(@max(want * 3, 30), 100);
     const page = searcher.search(arena, wide) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Search;
+    const made_now: u32 = if (lazy) @intCast(dk.embed.fillMissing(arena, svc.client, &store, services.content.?, page.hits, svc.client.settings.lazy_max, svc.client.settings.lazy_timeout_ms)) else 0;
     // With the vector index and no filters: the nearest documents of the whole index join the lexical candidates, so
     // a document the words missed can be found. (A filter or a language needs the lexical side to apply it.)
     if (svc.holder) |holder| if (q.filters.len == 0 and q.connector == null and q.language == null and q.content_type == null) {
@@ -726,14 +731,14 @@ fn semanticSearch(arena: Allocator, searcher: dk.search.Searcher, services: Serv
             var out = page;
             out.hits = merged.hits[0..@min(merged.hits.len, want)];
             out.has_more = page.has_more or merged.hits.len > want;
-            return .{ .page = out, .note = .{ .used = true, .model = model, .compared = @intCast(near.len), .index = true, .from_vectors = @intCast(merged.only_second) } };
+            return .{ .page = out, .note = .{ .used = true, .model = model, .compared = @intCast(near.len), .index = true, .from_vectors = @intCast(merged.only_second), .made_now = made_now } };
         }
     };
-    const fused = try dk.embed.fuse(arena, &store, model, vecs[0], page.hits);
+    const fused = try dk.embed.fuse(arena, &store, key, vecs[0], page.hits);
     var out = page;
     out.hits = fused.hits[0..@min(fused.hits.len, want)];
     out.has_more = page.has_more or fused.hits.len > want;
-    return .{ .page = out, .note = .{ .used = fused.compared > 0, .model = model, .compared = @intCast(fused.compared), .reason = if (fused.compared == 0) "none of these documents has a vector yet" else null } };
+    return .{ .page = out, .note = .{ .used = fused.compared > 0, .model = model, .compared = @intCast(fused.compared), .made_now = made_now, .reason = if (fused.compared == 0) "none of these documents has a vector yet" else null } };
 }
 
 fn wantsPeers(params: query.Params) bool {
@@ -1172,7 +1177,7 @@ fn similarTo(arena: Allocator, searcher: dk.search.Searcher, services: Services,
         if (dk.embed.Store.openReadOnly(svc.vectors_path)) |opened| {
             var store = opened;
             defer store.close();
-            if (store.get(arena, id, svc.client.settings.model)) |vec| if (holder.acquire()) |idx| {
+            if (store.get(arena, id, svc.client.settings.vectorKey())) |vec| if (holder.acquire()) |idx| {
                 defer holder.release(idx);
                 for (try idx.search(arena, vec, limit + 1)) |n| {
                     if (std.mem.eql(u8, &n.id, &id)) continue;
@@ -2404,7 +2409,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
     form.semantic_offered = services.embed != null;
     form.semantic_checked = semantic_note != null;
     if (semantic_note) |n| form.semantic_text = if (n.used)
-        try std.fmt.allocPrint(arena, "Ordered by meaning with {s}{s}.", .{ n.model orelse "the embedding model", if (n.index) " (documents the words missed are included)" else "" })
+        try std.fmt.allocPrint(arena, "Ordered by meaning with {s}{s}{s}.", .{ n.model orelse "the embedding model", if (n.index) " (documents the words missed are included)" else "", if (n.made_now > 0) try std.fmt.allocPrint(arena, "; {d} documents were embedded just now and kept", .{n.made_now}) else "" })
     else
         try std.fmt.allocPrint(arena, "Not ordered by meaning: {s}.", .{n.reason orelse "no reason given"});
     shown.hits = try withMoreSnippets(arena, services, try withFirstSnippets(arena, services, shown.hits, parsed.typed), parsed.typed, form.snippets);
