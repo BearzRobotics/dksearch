@@ -3,6 +3,21 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // Manual pages (Markdown, read by dkman and dkde-help): share/man/manN/NAME.N.md.
+    // The section N is the number in the file name.
+    if (b.option(bool, "man", "Install the manual pages (default: on)") orelse true) {
+        const pages = [_][]const u8{ "dksearch.1.md", "dksearch-api.7.md" };
+        for (pages) |page| {
+            const stem = page[0 .. page.len - ".md".len];
+            const section = stem[std.mem.lastIndexOfScalar(u8, stem, '.').? + 1 ..];
+            b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+                b.path(b.fmt("docs/manpages/{s}", .{page})),
+                .{ .custom = b.fmt("share/man/man{s}", .{section}) },
+                page,
+            ).step);
+        }
+    }
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -25,6 +40,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const sqlite = sqlite_c.createModule();
+    // `zig build test --fuzz` instruments the Zig code it fuzzes; the C libraries are not what is being fuzzed (and their
+    // comparison tracing has no runtime to link to).
+    sqlite.fuzz = false;
     sqlite.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
         .flags = &.{
@@ -40,9 +58,6 @@ pub fn build(b: *std.Build) void {
     // (bzip2 for the dump's compression) and feeds. Both read XML with the vendored xml-zig.
     // `-Dwikipedia=false` and `-Dfeeds=false` leave them out; a library that no
     // enabled connector needs is not compiled or linked at all (docs/decisions/
-    // `zig build test --fuzz` instruments the Zig code it fuzzes; the C libraries are not what is being fuzzed (and their
-    // comparison tracing has no runtime to link to).
-    sqlite.fuzz = false;
     // 0007, 0011, 0016). Windows is not supported yet.
     const target_os = target.result.os.tag;
     const supported = target_os != .windows;
@@ -67,6 +82,7 @@ pub fn build(b: *std.Build) void {
         });
         tc.addIncludePath(b.path("vendor/bzip2"));
         const m = tc.createModule();
+        m.fuzz = false;
         m.addCSourceFiles(.{
             .root = b.path("vendor/bzip2"),
             .files = &.{ "blocksort.c", "bzlib.c", "compress.c", "crctable.c", "decompress.c", "huffman.c", "randtable.c" },
@@ -82,9 +98,9 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-        m.fuzz = false;
         });
         const m = tc.createModule();
+        m.fuzz = false;
         m.addCSourceFiles(.{
             .root = b.path("vendor/wuffs"),
             .files = &.{"impl.c"},
@@ -100,7 +116,6 @@ pub fn build(b: *std.Build) void {
     core_options.addOption(bool, "feeds", want_feeds);
     core_options.addOption(bool, "crawler", want_crawler);
     core_options.addOption(bool, "media", want_media);
-        m.fuzz = false;
 
     // The core library: search, storage and ingestion, plus the bundled
     // connectors behind the one connector interface. The search, storage and
