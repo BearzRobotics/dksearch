@@ -152,6 +152,9 @@ pub const Parsed = struct {
     ignored: []const []const u8 = &.{},
     /// Only very common words were typed, so they are searched after all.
     heavy: bool = false,
+    /// For a heavy search of two or more plain words ("to be or not to be"): the words as one phrase, `"to be or not to be"`,
+    /// which is selective where the words alone are not. Null otherwise.
+    phrase: ?[]const u8 = null,
     /// The words the text is searched for (not those restricted to the title, nor excluded ones), lower case.
     terms: []const snippets.Term = &.{},
 };
@@ -734,7 +737,12 @@ pub fn parseWith(arena: Allocator, text: []const u8, options: Options) Error!Par
         if (shown.items.len > 0) try shown.append(arena, ' ');
         try shown.appendSlice(arena, t);
     }
-    return .{ .fts = fts.items, .shown = shown.items, .advanced = p.advanced, .fuzzy_applied = p.fuzzy_applied, .filters = p.filters.items, .ignored = ignored.items, .heavy = heavy, .terms = terms.items };
+    var phrase: ?[]const u8 = null;
+    if (heavy and !p.advanced and std.mem.indexOfScalar(u8, shown.items, ' ') != null) plain: {
+        for (shown.items) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == ' ' or ch == '\'')) break :plain;
+        phrase = try std.fmt.allocPrint(arena, "\"{s}\"", .{try std.ascii.allocLowerString(arena, shown.items)});
+    }
+    return .{ .phrase = phrase, .fts = fts.items, .shown = shown.items, .advanced = p.advanced, .fuzzy_applied = p.fuzzy_applied, .filters = p.filters.items, .ignored = ignored.items, .heavy = heavy, .terms = terms.items };
 }
 
 // ------------------------------------------------------------- FTS5 output

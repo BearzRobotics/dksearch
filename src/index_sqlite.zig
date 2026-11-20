@@ -143,6 +143,8 @@ pub const SqliteIndex = struct {
     /// What is left of the search's time limit for its second attempt (the typo-tolerant repeat), so that
     /// the two together never exceed the limit.
     retry_budget_ms: ?u32 = null,
+    /// Set around the one search of a heavy query that is not ranked (see `runMatch`).
+    unranked: bool = false,
     /// See `OpenOptions.chunk_min_bytes`.
     chunk_min_bytes: u32 = 0,
     /// A time limit for each search, if set (`setQueryTimeout`).
@@ -1048,7 +1050,20 @@ pub const SqliteIndex = struct {
         const all = try mergeFilters(arena, base_filters, first.filters);
         const t0: i96 = if (self.timeout) |t| Io.Timestamp.now(t.io, .awake).nanoseconds else 0;
         const own = first.terms.len > 0 and !self.isPorter();
-        var page = try self.runMatch(arena, q, all, limit, first.fts, interpretedOf(first), first.fuzzy_applied, own);
+        // A search of nothing but words too common to rank ("the", "to be or not to be"): several words are tried as one phrase
+        // first (selective, ranked as usual); else, or when no document has the phrase, the matches are not ranked.
+        const heavy_ok = first.heavy and q.sort == .relevance and q.after == null;
+        var page: search.Page = .{ .hits = &.{}, .has_more = false };
+        var by_phrase = false;
+        if (heavy_ok) if (first.phrase) |ph| {
+            page = try self.runMatch(arena, q, all, limit, ph, interpretedOf(first), false, own);
+            by_phrase = page.hits.len > 0;
+        };
+        if (!by_phrase) {
+            self.unranked = heavy_ok;
+            defer self.unranked = false;
+            page = try self.runMatch(arena, q, all, limit, first.fts, interpretedOf(first), first.fuzzy_applied, own);
+        }
         if (own) page = self.withOwnSnippets(arena, page, first.terms);
         page.ignored = first.ignored;
         if (forced == null and page.hits.len < auto_fuzzy_below and q.offset == 0 and first.fts.len > 0) {
@@ -1447,10 +1462,10 @@ pub const SqliteIndex = struct {
 
     /// The ORDER BY clause: relevance (or, with no words to rank by, recency) unless asked otherwise.
     /// Documents without the property sort last; ties fall back to relevance and then to the id.
-    fn orderBy(arena: Allocator, sort: search.Sort, text_mode: bool, bm: []const u8) Allocator.Error![]const u8 {
+    fn orderBy(arena: Allocator, sort: search.Sort, text_mode: bool, bm: []const u8, unranked: bool) Allocator.Error![]const u8 {
         const date = "COALESCE(d.modified_at, d.published_at, d.indexed_at";
         if (text_mode) return switch (sort) {
-            .relevance => try std.fmt.allocPrint(arena, " ORDER BY {s}, d.id", .{bm}),
+            .relevance => if (unranked) try arena.dupe(u8, " ORDER BY fts.rowid DESC") else try std.fmt.allocPrint(arena, " ORDER BY {s}, d.id", .{bm}),
             .newest => try std.fmt.allocPrint(arena, " ORDER BY {s}, -1) DESC, {s}, d.id", .{ date, bm }),
             .oldest => try std.fmt.allocPrint(arena, " ORDER BY {s}, 9223372036854775807) ASC, {s}, d.id", .{ date, bm }),
             .largest => try std.fmt.allocPrint(arena, " ORDER BY COALESCE(d.size, -1) DESC, {s}, d.id", .{bm}),
@@ -1513,7 +1528,9 @@ pub const SqliteIndex = struct {
             lang_expr = try std.fmt.allocPrint(arena, " * dk_foreign(d.language, d.path, '{s}')", .{list});
         };
         try factors.print(arena, "{s} * {s}{s}{s}{s}", .{ src_expr, rec_expr, demote_expr, lang_expr, file_title_expr });
-        const bm = try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0) * {s}", .{ self.title_weight, self.body_weight, factors.items });
+        // A heavy search (only words too common to rank, `unranked`): no ranking, the most recently stored documents first,
+        // which SQLite can stop reading after a page; ranking millions of matches is what took seconds.
+        const bm = if (self.unranked) "0.0" else try std.fmt.allocPrint(arena, "bm25(fts, {d}.0, {d}.0) * {s}", .{ self.title_weight, self.body_weight, factors.items });
         const explain_cols = if (q.explain and text_mode)
             try std.fmt.allocPrint(arena, ", -bm25(fts, {d}.0, {d}.0), -bm25(fts, 1.0, 0.0), -bm25(fts, 0.0, 1.0), {s}, {s}", .{ self.title_weight, self.body_weight, src_expr, rec_expr })
         else
@@ -1563,7 +1580,7 @@ pub const SqliteIndex = struct {
         if (q.sort != .relevance and q.sort != .title and !self.has_meta) return error.InvalidQuery; // an old index: `rebuild` upgrades it
         if (tier_expr) |t| {
             try sql.print(arena, " ORDER BY {s}, {s}, d.id", .{ t, bm });
-        } else try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm));
+        } else try sql.appendSlice(arena, try orderBy(arena, q.sort, text_mode, bm, self.unranked));
         if (q.per_domain > 0 and text_mode and self.has_meta and q.sort == .relevance and !namesDomain(filters)) {
             // Keep the best `per_domain` results of each domain (a document without a domain stands alone), in the
             // order of the full ranking. The LIMIT inside keeps the ranking function out of the outer query.
@@ -1933,7 +1950,9 @@ test "simple mode: buildMatchSimple quotes every term and neutralizes syntax" {
 test "a search past its time limit stops with Timeout; without a limit it finishes" {
     var idx = try SqliteIndex.open(":memory:", .{ .sync = .off });
     defer idx.close();
-    // Many documents share one word, so ranking them takes a measurable time.
+    // Many documents share one word, so ranking them takes a measurable time. (With the common-word rule on, a word in every
+    // document is not ranked at all and the search is fast; the rule is turned off here to have a slow, ranked search.)
+    idx.setCommonPercent(0);
     for (0..30_000) |i| {
         var idb: [16]u8 = undefined;
         var tb: [96]u8 = undefined;
@@ -3109,4 +3128,30 @@ test "a repeat for a misspelling respells only the words the index does not have
     // The index says which words it has.
     try testing.expectEqual(@as(usize, 1), (try idx.searcher().words(a, "linux", .known, 1)).len);
     try testing.expectEqual(@as(usize, 0), (try idx.searcher().words(a, "lanague", .known, 1)).len);
+}
+
+test "a search of nothing but common words is a phrase when it can be, and otherwise not ranked, so it answers at once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var idx = try SqliteIndex.open(":memory:", .{ .sync = .off });
+    defer idx.close();
+    // Forty documents that all say "to be" and "the", and one that is the famous line.
+    var i: usize = 0;
+    while (i < 40) : (i += 1) _ = try put(&idx, "t", try std.fmt.allocPrint(a, "d{d}", .{i}), "Doc", try std.fmt.allocPrint(a, "to run and then be the one number {d} in the line", .{i}));
+    _ = try put(&idx, "t", "hamlet", "Hamlet", "to be or not to be that is the question");
+    // Several words: the phrase is found, alone.
+    const phrase = try searchAll(a, &idx, "to be or not to be");
+    try testing.expectEqual(@as(usize, 1), phrase.hits.len);
+    try testing.expectEqualStrings("Hamlet", phrase.hits[0].title.?);
+    // A phrase nobody has: the words are searched unranked, and the documents that have all of them are listed.
+    const none = try searchAll(a, &idx, "be to the");
+    try testing.expect(none.hits.len > 0);
+    // One common word: answered, not ranked, the newest documents first (the last stored is "hamlet").
+    const one = try searchAll(a, &idx, "the");
+    try testing.expect(one.hits.len > 0);
+    try testing.expectEqualStrings("Hamlet", one.hits[0].title.?);
+    // An ordinary search is ranked as ever.
+    const ranked = try searchAll(a, &idx, "question");
+    try testing.expectEqual(@as(usize, 1), ranked.hits.len);
 }
