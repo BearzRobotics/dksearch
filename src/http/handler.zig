@@ -1640,6 +1640,18 @@ fn documentPage(arena: Allocator, searcher: dk.search.Searcher, services: Servic
     };
     var aw: std.Io.Writer.Allocating = .init(arena);
     const similar = try similarTo(arena, searcher, services, id, 5);
+    // A picture: shown itself, with its details under it.
+    if (hit.kind) |k| if (std.mem.eql(u8, k, "image")) {
+        const is_file = if (hit.url) |u| std.mem.startsWith(u8, u, "file://") else false;
+        const src: ?[]const u8 = if (is_file)
+            (if (can_open) try std.fmt.allocPrint(arena, "/doc/{s}/file", .{hex}) else null)
+        else if (services.relay != null and hit.node == null and (if (hit.url) |u| std.mem.startsWith(u8, u, "http") else false))
+            try std.fmt.allocPrint(arena, "/doc/{s}/image", .{hex})
+        else
+            null;
+        html.writeImageDocument(&aw.writer, hit, text, src, similar) catch return error.OutOfMemory;
+        return htmlResponse(arena, .ok, aw.written());
+    };
     html.writeDocument(&aw.writer, hit, text, cut, open_links.items, rendered, is_markdown, similar) catch return error.OutOfMemory;
     return htmlResponse(arena, .ok, aw.written());
 }
@@ -2268,6 +2280,18 @@ fn cachedPages(arena: Allocator, cache: ?*dk.retrievecache.Cache, store: dk.stor
     return dk.retrieve.PageIndex.build(arena, t) catch null;
 }
 
+/// The condition a search type adds (null for All and Images, which have their own handling): a list of file extensions
+/// for the office kinds, and the page type a site declares for video (`og:type` video.*, a VideoObject).
+fn modeFilter(mode: html.Mode) ?[]const u8 {
+    return switch (mode) {
+        .all, .images => null,
+        .video => "meta.type:video",
+        .docs => "ext:pdf,doc,docx,odt,rtf,epub",
+        .sheets => "ext:xls,xlsx,ods,csv,tsv",
+        .slides => "ext:ppt,pptx,odp,key",
+    };
+}
+
 /// Whether the search itself says what sort of file it wants (`kind:`, `mime:`, `ext:`), in a filter or in its words.
 fn asksForMedia(q: dk.search.Query) bool {
     const keys = [_][]const u8{ "kind:", "mime:", "ext:" };
@@ -2285,8 +2309,17 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
     };
     var q = parsed.q;
     q.boosts = boosts;
-    // The Images button: only pictures, shown as a gallery.
-    const gallery = if (params.get("images")) |v| std.mem.eql(u8, v, "1") else false;
+    // The search type chosen with the icons under the search box (`type=images`, `video`, `docs`, `sheets`, `slides`;
+    // the older `images=1` is the same as `type=images`).
+    var mode: html.Mode = if (params.get("type")) |v| (html.Mode.parse(v) orelse .all) else .all;
+    if (mode == .all and (if (params.get("images")) |v| std.mem.eql(u8, v, "1") else false)) mode = .images;
+    const gallery = mode == .images;
+    if (modeFilter(mode)) |extra| {
+        const more = try arena.alloc([]const u8, q.filter_strings.len + 1);
+        @memcpy(more[0..q.filter_strings.len], q.filter_strings);
+        more[q.filter_strings.len] = extra;
+        q.filter_strings = more;
+    }
     if (gallery) {
         const more = try arena.alloc([]const u8, q.filter_strings.len + 1);
         @memcpy(more[0..q.filter_strings.len], q.filter_strings);
@@ -2398,6 +2431,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         }
     }
     form.snippets = snippetCount(params);
+    form.mode = mode;
     if (gallery) {
         form.images = true;
         form.page_size = gallery_page_size;
@@ -4159,7 +4193,7 @@ test "the Images button shows only pictures as a gallery, from this server's own
     defer ar.deinit();
     const a = ar.allocator();
     // The form has the button; an ordinary search is the usual list and asks for no kind.
-    try testing.expect(std.mem.indexOf(u8, run(&fake, .GET, "/", &ar).body, "name=\"images\" value=\"1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, run(&fake, .GET, "/", &ar).body, "name=\"type\" value=\"images\"") != null);
     const ordinary = run(&fake, .GET, "/search?q=wallpapers", &ar);
     try testing.expect(std.mem.indexOf(u8, ordinary.body, "class=\"gallery\"") == null and std.mem.indexOf(u8, ordinary.body, "<ol class=\"results\"") != null);
     // An ordinary search leaves pictures out (the button finds them), unless the search itself asks for a kind of file.
@@ -4182,11 +4216,47 @@ test "the Images button shows only pictures as a gallery, from this server's own
     try testing.expect(has_kind);
     try testing.expectEqual(@as(u32, gallery_page_size), fake.last.?.limit);
     try testing.expect(std.mem.indexOf(u8, g.body, "<ul class=\"gallery\">") != null and std.mem.indexOf(u8, g.body, "<ol class=\"results\"") == null);
-    try testing.expect(std.mem.indexOf(u8, g.body, "images=1") != null); // in the next-page link
+    try testing.expect(std.mem.indexOf(u8, g.body, "type=images") != null); // in the next-page link
+    // The older `images=1` is the same as `type=images`.
+    _ = run(&fake, .GET, "/search?q=wallpapers&type=images", &ar);
+    try testing.expectEqual(@as(u32, gallery_page_size), fake.last.?.limit);
     // Without served originals there is no picture to show, only the names; the pages still open.
     try testing.expect(std.mem.indexOf(u8, g.body, "no preview") != null and std.mem.indexOf(u8, g.body, "<img") == null);
     try testing.expect(std.mem.indexOf(u8, g.body, "href=\"/doc/01010101") != null);
     _ = a;
+}
+
+test "search types: each adds its own condition, the bar marks the chosen one, and the Search button and the links keep it" {
+    var hits = [_]dk.search.Hit{.{ .id = @splat(1), .connector = "web", .url = "https://e.org/a.pdf", .title = "A", .snippet = null, .score = 2 }};
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = true } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const cases = [_]struct { mode: []const u8, filter: []const u8 }{
+        .{ .mode = "video", .filter = "meta.type:video" },
+        .{ .mode = "docs", .filter = "ext:pdf,doc,docx,odt,rtf,epub" },
+        .{ .mode = "sheets", .filter = "ext:xls,xlsx,ods,csv,tsv" },
+        .{ .mode = "slides", .filter = "ext:ppt,pptx,odp,key" },
+    };
+    for (cases) |c| {
+        const r = run(&fake, .GET, try std.fmt.allocPrint(ar.allocator(), "/search?q=report&type={s}", .{c.mode}), &ar);
+        try testing.expectEqual(http.Status.ok, r.status);
+        var found = false;
+        for (fake.last.?.filter_strings) |f| if (std.mem.eql(u8, f, c.filter)) {
+            found = true;
+        };
+        try testing.expect(found);
+        // The chosen type is lit, the Search button carries it (so Enter keeps it), and the next-page link keeps it.
+        try testing.expect(std.mem.indexOf(u8, r.body, try std.fmt.allocPrint(ar.allocator(), "value=\"{s}\" class=\"mode on\" aria-pressed=\"true\"", .{c.mode})) != null);
+        try testing.expect(std.mem.indexOf(u8, r.body, try std.fmt.allocPrint(ar.allocator(), "<button type=\"submit\" name=\"type\" value=\"{s}\">Search</button>", .{c.mode})) != null);
+        try testing.expect(std.mem.indexOf(u8, r.body, try std.fmt.allocPrint(ar.allocator(), "&amp;type={s}", .{c.mode})) != null);
+    }
+    // All is the plain search: no type condition, a plain Search button, nothing lit but All.
+    const all = run(&fake, .GET, "/search?q=report", &ar);
+    try testing.expect(std.mem.indexOf(u8, all.body, "<button type=\"submit\">Search</button>") != null);
+    try testing.expect(std.mem.indexOf(u8, all.body, "value=\"all\" class=\"mode on\"") != null);
+    // An unknown type is All.
+    _ = run(&fake, .GET, "/search?q=report&type=nonsense", &ar);
+    for (fake.last.?.filter_strings) |f| try testing.expect(std.mem.indexOf(u8, f, "ext:") == null);
 }
 
 test "web pictures: the gallery shows them through the relay, which fetches the recorded address and stores nothing" {

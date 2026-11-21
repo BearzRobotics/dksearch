@@ -1495,8 +1495,24 @@ pub const SqliteIndex = struct {
                         try cl.print(arena, "(lower(d.content_type) = {s} OR lower(d.content_type) LIKE {s} ESCAPE '\\')", .{ exact, with_params });
                     }
                 },
-                .kind => try cl.print(arena, "d.kind = {s}", .{try pb.add(.{ .text = f.text })}),
-                .ext => try cl.print(arena, "d.ext = {s}", .{try pb.add(.{ .text = f.text })}),
+                .kind, .ext => {
+                    // One value, or a comma list (`ext:pdf,docx`): any of them.
+                    const col: []const u8 = if (f.field == .kind) "d.kind" else "d.ext";
+                    if (std.mem.indexOfScalar(u8, f.text, ',') == null) {
+                        try cl.print(arena, "{s} = {s}", .{ col, try pb.add(.{ .text = f.text }) });
+                    } else {
+                        try cl.print(arena, "{s} IN (", .{col});
+                        var it = std.mem.splitScalar(u8, f.text, ',');
+                        var first = true;
+                        while (it.next()) |part| {
+                            if (part.len == 0) continue;
+                            if (!first) try cl.appendSlice(arena, ", ");
+                            first = false;
+                            try cl.appendSlice(arena, try pb.add(.{ .text = part }));
+                        }
+                        try cl.appendSlice(arena, ")");
+                    }
+                },
                 .domain => {
                     const exact = try pb.add(.{ .text = f.text });
                     const sub = try pb.add(.{ .text = try likeEscape(arena, f.text, "%.", "") });
@@ -3070,6 +3086,10 @@ test "the query text itself can carry filters and column restrictions" {
     try testing.expectEqualStrings("Notes", try titles(a, &idx, "window ext:pdf", &.{}));
     try testing.expectEqualStrings("Window manager", try titles(a, &idx, "window -ext:pdf", &.{}));
     try testing.expectEqualStrings("Notes,Window manager", try titles(a, &idx, "site:a.org type:pdf OR type:page", &.{}));
+    // A comma list is any of the extensions: what the Docs, Sheets and Slides search types use.
+    try testing.expectEqualStrings("Notes,Window manager", try titles(a, &idx, "window ext:pdf,html", &.{}));
+    try testing.expectEqualStrings("Window manager", try titles(a, &idx, "window ext:html,md,txt", &.{}));
+    try testing.expectEqualStrings("Notes", try titles(a, &idx, "window -ext:html,md", &.{}));
 }
 
 test "a search made only of filters lists matches, newest first; an old index refuses filters" {

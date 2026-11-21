@@ -93,6 +93,47 @@ fn kindLabel(kind: []const u8) []const u8 {
     return kind;
 }
 
+/// What a search is for: everything, or one sort of thing (the bar of little icons under the search box). The mode
+/// stays on while the words are changed, because the Search button and the Enter key both send it.
+pub const Mode = enum {
+    all,
+    images,
+    video,
+    docs,
+    sheets,
+    slides,
+
+    pub const list = [_]Mode{ .all, .images, .video, .docs, .sheets, .slides };
+
+    pub fn value(self: Mode) []const u8 {
+        return @tagName(self);
+    }
+    pub fn icon(self: Mode) []const u8 {
+        return switch (self) {
+            .all => "\u{1F50E}",
+            .images => "\u{1F5BC}\u{FE0F}",
+            .video => "\u{1F3AC}",
+            .docs => "\u{1F4C4}",
+            .sheets => "\u{1F4CA}",
+            .slides => "\u{1F4FD}\u{FE0F}",
+        };
+    }
+    pub fn label(self: Mode) []const u8 {
+        return switch (self) {
+            .all => "All",
+            .images => "Images",
+            .video => "Video",
+            .docs => "Docs",
+            .sheets => "Sheets",
+            .slides => "Slides",
+        };
+    }
+    pub fn parse(text: []const u8) ?Mode {
+        for (list) |m| if (std.mem.eql(u8, text, m.value())) return m;
+        return null;
+    }
+};
+
 pub const Form = struct {
     q: []const u8 = "",
     /// The owner is signed in and feedback is kept: the results carry good and bad buttons (added by search.js).
@@ -145,6 +186,8 @@ pub const Form = struct {
     /// The Images button was used: only pictures, as a gallery. `gallery_ok` says per result whether the picture itself can
     /// be shown (its original is served); `page_size` is the number of results a page holds.
     images: bool = false,
+    /// The search type chosen with the icons under the search box.
+    mode: Mode = .all,
     gallery_ok: []const bool = &.{},
     page_size: u32 = 10,
     /// What to say about safe search (nothing when it is not in use on this server).
@@ -355,7 +398,15 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
     try w.writeAll("<form class=\"search\" action=\"/search\" method=\"get\" role=\"search\">" ++
         "<input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Search\" autofocus value=\"");
     try writeEscaped(w, f.q);
-    try w.writeAll("\"><button type=\"submit\">Search</button><button type=\"submit\" name=\"images\" value=\"1\" class=\"secondary\">Images</button>");
+    // The Search button is the first button, so it is what the Enter key presses: it carries the mode, and a search
+    // started with Enter stays in it.
+    try w.writeAll("\">");
+    if (f.mode == .all) try w.writeAll("<button type=\"submit\">Search</button>") else try w.print("<button type=\"submit\" name=\"type\" value=\"{s}\">Search</button>", .{f.mode.value()});
+    try w.writeAll("<nav class=\"modes\" aria-label=\"Search type\">");
+    for (Mode.list) |m| {
+        try w.print("<button type=\"submit\" name=\"type\" value=\"{s}\" class=\"mode{s}\" aria-pressed=\"{s}\" title=\"Search {s}\"><span class=\"ico\" aria-hidden=\"true\">{s}</span><span class=\"lbl\">{s}</span></button>", .{ m.value(), if (m == f.mode) " on" else "", if (m == f.mode) "true" else "false", m.label(), m.icon(), m.label() });
+    }
+    try w.writeAll("</nav>");
     const open = if (f.language.len > 0 or f.picked.len > 0 or f.sort.len > 0 or f.peers_on) " open" else "";
     try w.writeAll("<div class=\"filterrow\">");
     try w.print("<details{s}><summary><span>Filters</span></summary><label>Language <input name=\"language\" maxlength=\"64\" value=\"", .{open});
@@ -1023,6 +1074,161 @@ pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool,
     try w.writeAll("<p><a href=\"/\">&larr; New search</a></p></main></body></html>\n");
 }
 
+/// The page of a picture: the picture itself first (from the original this server serves, or through the relay), with
+/// what is known about it laid out underneath: its direct link, the page it came from, its tags and words.
+pub fn writeImageDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, src: ?[]const u8, similar: []const dk.search.Hit) Writer.Error!void {
+    const label = h.title orelse h.url orelse "Picture";
+    try writeHead(w, label);
+    try w.writeAll("<body>");
+    try writeTopBar(w);
+    try w.writeAll("<main class=\"docpage imgpage\"><h2 class=\"doctitle\">");
+    try writeEscaped(w, label);
+    try w.writeAll("</h2>\n");
+
+    // What the stored text says: "Image: ADDRESS", "Page: ADDRESS", "From the page: TITLE", "Tags: a, b", and the
+    // words of the picture (alt text, title) on the other lines.
+    var image_url: ?[]const u8 = null;
+    var page_url: ?[]const u8 = h.url;
+    var from_page: ?[]const u8 = null;
+    var tags: ?[]const u8 = null;
+    var words: [8][]const u8 = undefined;
+    var n_words: usize = 0;
+    if (text) |t| {
+        var lines = std.mem.splitScalar(u8, t, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \r\t");
+            if (line.len == 0) continue;
+            if (image_url == null and std.mem.startsWith(u8, line, "Image: ")) {
+                image_url = std.mem.trim(u8, line["Image: ".len..], " ");
+            } else if (std.mem.startsWith(u8, line, "Page: ")) {
+                page_url = std.mem.trim(u8, line["Page: ".len..], " ");
+            } else if (std.mem.startsWith(u8, line, "From the page: ")) {
+                from_page = line["From the page: ".len..];
+            } else if (std.mem.startsWith(u8, line, "Tags: ")) {
+                tags = line["Tags: ".len..];
+            } else if (n_words < words.len and line.len <= 400) {
+                words[n_words] = line;
+                n_words += 1;
+            }
+        }
+    }
+
+    if (src) |s| {
+        try w.writeAll("<figure class=\"photo\"><a href=\"");
+        try writeEscaped(w, s);
+        try w.writeAll("\" title=\"Open the picture on its own\"><img alt=\"");
+        try writeEscaped(w, label);
+        try w.writeAll("\" src=\"");
+        try writeEscaped(w, s);
+        try w.writeAll("\"></a></figure>\n");
+    } else {
+        try w.writeAll("<p class=\"notice\">The picture itself cannot be shown from this server (its original is not served here, and the relay for pictures of the web is off). Its links are below.</p>\n");
+    }
+
+    try w.writeAll("<p class=\"photoactions\">");
+    if (image_url) |u| if (isLinkable(u)) {
+        try w.writeAll("<a class=\"button\" href=\"");
+        try writeEscaped(w, u);
+        try w.writeAll("\" rel=\"noopener noreferrer\">Direct link to the picture</a> ");
+    };
+    if (page_url) |u| if (isLinkable(u)) {
+        try w.writeAll("<a class=\"button secondary\" href=\"");
+        try writeEscaped(w, u);
+        try w.writeAll("\" rel=\"noopener noreferrer\">Page it came from</a> ");
+    };
+    if (src) |s| {
+        try w.writeAll("<a class=\"button secondary\" href=\"");
+        try writeEscaped(w, s);
+        try w.writeAll("\">Full size here</a>");
+    }
+    try w.writeAll("</p>\n");
+
+    try w.writeAll("<dl class=\"meta photometa\">");
+    if (image_url) |u| {
+        try w.writeAll("<dt>Picture file</dt><dd>");
+        if (isLinkable(u)) {
+            try w.writeAll("<a href=\"");
+            try writeEscaped(w, u);
+            try w.writeAll("\" rel=\"noopener noreferrer\">");
+            try writeEscaped(w, u);
+            try w.writeAll("</a>");
+        } else try writeEscaped(w, u);
+        try w.writeAll("</dd>");
+    }
+    if (page_url) |u| {
+        try w.writeAll("<dt>Found on</dt><dd>");
+        if (isLinkable(u)) {
+            try w.writeAll("<a href=\"");
+            try writeEscaped(w, u);
+            try w.writeAll("\" rel=\"noopener noreferrer\">");
+            try writeEscaped(w, from_page orelse u);
+            try w.writeAll("</a>");
+        } else try writeEscaped(w, u);
+        try w.writeAll("</dd>");
+    }
+    if (page_url) |u| if (hostOf(u)) |host| {
+        try w.writeAll("<dt>Site</dt><dd><a href=\"/search?q=site%3A");
+        try query.writeEncoded(w, host);
+        try w.writeAll("&amp;type=images\">");
+        try writeEscaped(w, host);
+        try w.writeAll("</a> <span class=\"muted small\">more pictures from this site</span></dd>");
+    };
+    if (h.content_type) |ct| try metaRow(w, "Format", ct);
+    if (h.size) |sz| {
+        try w.writeAll("<dt>File size</dt><dd>");
+        try writeSize(w, sz);
+        try w.writeAll("</dd>");
+    }
+    if (h.author) |a| try metaRow(w, "By", a);
+    if (h.language) |l| try metaRow(w, "Language", l);
+    try metaRow(w, "Source", h.connector);
+    inline for (.{ .{ "Taken or published", h.published_at }, .{ "Modified", h.modified_at }, .{ "Added here", h.indexed_at } }) |row| {
+        if (row[1]) |t| {
+            try w.print("<dt>{s}</dt><dd>", .{row[0]});
+            try writeDate(w, t);
+            try w.writeAll("</dd>");
+        }
+    }
+    try w.writeAll("</dl>\n");
+
+    if (tags) |tl| {
+        try w.writeAll("<p class=\"tags\">");
+        var it = std.mem.splitSequence(u8, tl, ", ");
+        while (it.next()) |tag| try writeTagChip(w, std.mem.trim(u8, tag, " "));
+        try w.writeAll("</p>\n");
+    }
+    if (n_words > 0) {
+        try w.writeAll("<h3>About the picture</h3>\n");
+        for (words[0..n_words]) |line| {
+            try w.writeAll("<p>");
+            try writeEscaped(w, line);
+            try w.writeAll("</p>");
+        }
+    }
+    if (similar.len > 0) {
+        try w.writeAll("<section class=\"similar\"><h3>Similar</h3><ul>");
+        for (similar) |sm| {
+            try w.writeAll("<li><a href=\"");
+            try writeViewHref(w, sm);
+            try w.writeAll("\">");
+            try writeEscaped(w, sm.title orelse sm.url orelse "(untitled)");
+            try w.writeAll("</a> <span class=\"muted\">");
+            try writeEscaped(w, sm.connector);
+            try w.writeAll("</span></li>");
+        }
+        try w.writeAll("</ul></section>");
+    }
+    try w.writeAll("<p><a href=\"/\">&larr; New search</a></p></main></body></html>\n");
+}
+
+fn hostOf(url: []const u8) ?[]const u8 {
+    const rest = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else return null;
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    const host = rest[0..end];
+    if (host.len == 0 or std.mem.indexOfAny(u8, host, " \"<>@") != null) return null;
+    return host;
+}
+
 fn metaRow(w: *Writer, name: []const u8, value: []const u8) Writer.Error!void {
     try w.print("<dt>{s}</dt><dd>", .{name});
     try writeEscaped(w, value);
@@ -1079,7 +1285,7 @@ fn writeSearchLink(w: *Writer, f: Form, offset: u32, extra: ?[]const u8, label_h
     if (f.exact_only) try w.writeAll("&amp;fuzzy=0");
     if (f.snippets > 1) try w.print("&amp;snippets={d}", .{f.snippets});
     if (f.semantic_checked) try w.writeAll("&amp;semantic=1");
-    if (f.images) try w.writeAll("&amp;images=1");
+    if (f.mode != .all) try w.print("&amp;type={s}", .{f.mode.value()});
     if (offset > 0) try w.print("&amp;offset={d}", .{offset});
     try w.writeAll("\">");
     try w.writeAll(label_html);

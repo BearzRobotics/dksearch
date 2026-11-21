@@ -505,11 +505,26 @@ fn makeFilter(arena: Allocator, key: []const u8, value_in: []const u8, now: i64)
             return .{ .field = f, .min = r.min, .max = r.max };
         },
         .ext => {
-            var v = value;
-            if (v[0] == '.') v = v[1..];
-            if (v.len == 0 or v.len > 8) return null;
-            for (v) |b| if (!std.ascii.isAlphanumeric(b)) return null;
-            return .{ .field = f, .text = try std.ascii.allocLowerString(arena, v) };
+            // One extension, or a list of them (`ext:pdf,docx,odt`): any of them.
+            var parts: usize = 0;
+            var it = std.mem.splitScalar(u8, value, ',');
+            while (it.next()) |part_in| {
+                var v = std.mem.trim(u8, part_in, " \t");
+                if (v.len > 0 and v[0] == '.') v = v[1..];
+                if (v.len == 0 or v.len > 8) return null;
+                for (v) |b| if (!std.ascii.isAlphanumeric(b)) return null;
+                parts += 1;
+                if (parts > 16) return null;
+            }
+            var clean: std.ArrayList(u8) = .empty;
+            var it2 = std.mem.splitScalar(u8, value, ',');
+            while (it2.next()) |part_in| {
+                var v = std.mem.trim(u8, part_in, " \t");
+                if (v.len > 0 and v[0] == '.') v = v[1..];
+                if (clean.items.len > 0) try clean.append(arena, ',');
+                for (v) |b| try clean.append(arena, std.ascii.toLower(b));
+            }
+            return .{ .field = f, .text = clean.items };
         },
         .domain => {
             for (value) |b| if (!(std.ascii.isAlphanumeric(b) or b == '.' or b == '-')) return null;

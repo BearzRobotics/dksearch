@@ -76,6 +76,23 @@ form.search button {
   cursor: pointer;
 }
 form.search details { flex-basis: 100%; text-align: left; color: var(--muted); }
+/* The search types: little icons with small text under the search box; the chosen one is lit and underlined. */
+form.search .modes { flex-basis: 100%; display: flex; gap: 0.15rem; overflow-x: auto; scrollbar-width: none; padding: 0.1rem 0; }
+.home form.search .modes { justify-content: center; }
+form.search .modes::-webkit-scrollbar { display: none; }
+form.search .modes button.mode {
+  display: inline-flex; flex-direction: column; align-items: center; gap: 0.1rem;
+  min-width: 3.6rem; padding: 0.3rem 0.6rem 0.25rem;
+  color: var(--muted); background: transparent; border: 0; border-radius: 0.5rem;
+  box-shadow: inset 0 -2px 0 transparent; transition: color 0.12s, background 0.12s, box-shadow 0.12s;
+}
+form.search .modes button.mode .ico { font-size: 1.2rem; line-height: 1.2; filter: grayscale(0.8); opacity: 0.8; transition: filter 0.12s, opacity 0.12s; }
+form.search .modes button.mode .lbl { font-size: 0.68rem; letter-spacing: 0.02em; }
+form.search .modes button.mode:hover { color: var(--fg); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+form.search .modes button.mode:hover .ico { filter: none; opacity: 1; }
+form.search .modes button.mode.on { color: var(--fg); background: color-mix(in srgb, var(--accent) 14%, transparent); box-shadow: inset 0 -2px 0 var(--accent); }
+form.search .modes button.mode.on .ico { filter: none; opacity: 1; }
+form.search .modes button.mode:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 form.search details > summary { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; list-style-position: inside; }
 form.search details > summary a.tips { font-weight: 400; font-size: 0.9em; }
 form.search details label { display: inline-block; margin: 0.5rem 1rem 0 0; }
@@ -422,3 +439,12 @@ p.related.narrow a { margin-right: 0.35rem; }
 p.tags { margin: 0.2rem 0 0; font-size: 0.85rem; line-height: 1.7; }
 p.tags a.tag { color: var(--muted); text-decoration: none; margin-right: 0.15rem; padding: 0.05rem 0.4rem; border: 1px solid var(--border, currentColor); border-radius: 0.8rem; white-space: nowrap; }
 p.tags a.tag:hover { text-decoration: underline; }
+
+/* A picture's own page: the picture large, its details under it. */
+.imgpage figure.photo { margin: 0.5rem 0 1rem; text-align: center; }
+.imgpage figure.photo img { max-width: 100%; max-height: 78vh; width: auto; height: auto; object-fit: contain; border-radius: 0.6rem; box-shadow: 0 2px 18px rgba(0, 0, 0, 0.25); background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.imgpage .photoactions { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; margin: 0 0 1.2rem; }
+.imgpage dl.photometa { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0.4rem 1.2rem; max-width: 60rem; margin: 0 auto 1rem; padding: 0.9rem 1.1rem; border: 1px solid var(--border); border-radius: 0.6rem; }
+.imgpage dl.photometa dt { color: var(--muted); font-size: 0.85rem; }
+.imgpage dl.photometa dd { margin: 0; overflow-wrap: anywhere; }
+.imgpage p.tags, .imgpage h3, .imgpage p, .imgpage section.similar { max-width: 60rem; margin-left: auto; margin-right: auto; }
