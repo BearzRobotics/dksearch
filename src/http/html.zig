@@ -192,6 +192,8 @@ pub const Form = struct {
     page_size: u32 = 10,
     /// What to say about safe search (nothing when it is not in use on this server).
     safe_note: SafeNote = .none,
+    /// The search the safe-search buttons return to (a `/search?...` address of this server; empty: the home page).
+    back: []const u8 = "",
     /// Search by meaning: offered when the server has an embedding model; ticked when this search used it; and what to
     /// tell the visitor about how the results were ordered.
     semantic_offered: bool = false,
@@ -435,7 +437,7 @@ fn writeForm(w: *Writer, f: Form) Writer.Error!void {
     try w.writeAll("</details>");
     try writeSafeNote(w, f.safe_note);
     try w.writeAll("</div></form>\n");
-    try writeSafeForms(w, f.safe_note);
+    try writeSafeForms(w, f.safe_note, f.back);
     if (f.regex_notice) |n| {
         try w.writeAll("<p class=\"error\" role=\"alert\">");
         try writeEscaped(w, n);
@@ -509,12 +511,19 @@ fn writeSafeNote(w: *Writer, note: SafeNote) Writer.Error!void {
 }
 
 /// The forms the safe-search controls belong to (empty: their fields are inside the search form).
-fn writeSafeForms(w: *Writer, note: SafeNote) Writer.Error!void {
-    switch (note) {
-        .on_unlockable => try w.writeAll("<form id=\"unlockform\" action=\"/unlock\" method=\"post\"></form>\n"),
-        .unlocked => try w.writeAll("<form id=\"lockform\" action=\"/lock\" method=\"post\"></form>\n"),
-        else => {},
+fn writeSafeForms(w: *Writer, note: SafeNote, back: []const u8) Writer.Error!void {
+    const id: []const u8, const action: []const u8 = switch (note) {
+        .on_unlockable => .{ "unlockform", "/unlock" },
+        .unlocked => .{ "lockform", "/lock" },
+        else => return,
+    };
+    try w.print("<form id=\"{s}\" action=\"{s}\" method=\"post\">", .{ id, action });
+    if (back.len > 0) {
+        try w.writeAll("<input type=\"hidden\" name=\"back\" value=\"");
+        try writeEscaped(w, back);
+        try w.writeAll("\">");
     }
+    try w.writeAll("</form>\n");
 }
 
 pub fn writeHomeForm(w: *Writer, notice: ?[]const u8, form: Form) Writer.Error!void {
@@ -1124,24 +1133,6 @@ pub fn writeImageDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, src: 
     } else {
         try w.writeAll("<p class=\"notice\">The picture itself cannot be shown from this server (its original is not served here, and the relay for pictures of the web is off). Its links are below.</p>\n");
     }
-
-    try w.writeAll("<p class=\"photoactions\">");
-    if (image_url) |u| if (isLinkable(u)) {
-        try w.writeAll("<a class=\"button\" href=\"");
-        try writeEscaped(w, u);
-        try w.writeAll("\" rel=\"noopener noreferrer\">Direct link to the picture</a> ");
-    };
-    if (page_url) |u| if (isLinkable(u)) {
-        try w.writeAll("<a class=\"button secondary\" href=\"");
-        try writeEscaped(w, u);
-        try w.writeAll("\" rel=\"noopener noreferrer\">Page it came from</a> ");
-    };
-    if (src) |s| {
-        try w.writeAll("<a class=\"button secondary\" href=\"");
-        try writeEscaped(w, s);
-        try w.writeAll("\">Full size here</a>");
-    }
-    try w.writeAll("</p>\n");
 
     try w.writeAll("<dl class=\"meta photometa\">");
     if (image_url) |u| {
