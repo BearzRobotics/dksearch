@@ -1027,6 +1027,10 @@ const Host = struct {
     extra_delay_ms: u32 = 0,
     not_before_ns: i96 = 0,
     ok_streak: u32 = 0,
+    /// Refusals in a row, with no other answer between: a site that does nothing else is given up for the run (the
+    /// spacing doubles to a minute and the site is asked by one worker at a time, so a long queue of its pages would
+    /// hold every worker for hours).
+    refusal_run: u32 = 0,
     gave_up: bool = false,
     /// The sitemaps named by robots.txt have been taken (once per site and run).
     sitemaps_done: std.atomic.Value(bool) = .init(false),
@@ -1041,6 +1045,8 @@ const robots_sitemap_cap = 5000;
 
 /// How many times a page refused with 429 or 503 is asked for (the first request included).
 const max_refusal_attempts = 3;
+/// A site that refuses this many times in a row, with no other answer between, is given up for the rest of the run.
+const max_refusal_run = 6;
 /// The longest `Retry-After` that is waited for; a site that asks for more is left alone for the rest of the run.
 const max_retry_after_s = 120;
 /// The most extra spacing a refusing site can make us add to every request.
@@ -1474,6 +1480,7 @@ const Run = struct {
                 if (refusals_seen >= max_refusal_attempts) return self.skip(.http_status);
                 continue;
             }
+            host.refusal_run = 0;
             if (got.status >= 400) self.noteStatus(url, got.status) else if (got.status >= 200) self.noteOk(host);
             if (got.status == 304 and cond != null and hops == 0) {
                 self.bump(url, .unchanged);
@@ -1571,6 +1578,11 @@ const Run = struct {
     fn noteRefusal(self: *Run, host: *Host, retry_after: ?[]const u8) void {
         const asked_s = parseRetryAfter(retry_after) orelse 0;
         host.ok_streak = 0;
+        host.refusal_run += 1;
+        if (host.refusal_run >= max_refusal_run) {
+            host.gave_up = true;
+            return;
+        }
         host.extra_delay_ms = if (host.extra_delay_ms == 0) @max(self.conn.delay_ms, self.conn.backoff_ms) else @min(host.extra_delay_ms * 2, max_extra_delay_ms);
         if (asked_s > max_retry_after_s) {
             host.gave_up = true;
@@ -3323,6 +3335,29 @@ test "a site that keeps refusing is given up on after three tries; one that asks
     try testing.expectEqual(@as(usize, 0), srv2.count("/next")); // the site was given up for the run
     try testing.expectEqual(@as(usize, 0), got2.ids.items.len);
     try testing.expect(std.mem.indexOf(u8, report2, "asks to be left alone") != null);
+}
+
+test "a site that refuses over and over is given up on after a few refusals, not asked for every queued page" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/p1", .body = "x", .refuse_first = 1000, .retry_after = "0" },
+        .{ .path = "/p2", .body = "x", .refuse_first = 1000, .retry_after = "0" },
+        .{ .path = "/p3", .body = "x", .refuse_first = 1000, .retry_after = "0" },
+        .{ .path = "/p4", .body = "x", .refuse_first = 1000, .retry_after = "0" },
+        .{ .path = "/p5", .body = "x", .refuse_first = 1000, .retry_after = "0" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    const report = try reportFor(&srv, &tmp, &.{ "/p1", "/p2", "/p3", "/p4", "/p5" }, &got, &ctl);
+    defer testing.allocator.free(report);
+    const total = srv.count("/p1") + srv.count("/p2") + srv.count("/p3") + srv.count("/p4") + srv.count("/p5");
+    try testing.expect(total <= max_refusal_run); // three tries for the first page, three for the second, then given up
+    try testing.expectEqual(@as(usize, 0), srv.count("/p5"));
+    try testing.expectEqual(@as(usize, 0), got.ids.items.len);
 }
 
 test "the report tells a blocked site (403), a robots.txt refusal and a good site apart" {
