@@ -93,3 +93,4 @@ Each record states the context, the options considered, the decision and who mad
 | 0075 | Tags in results and ranking; author, dates and media details |
 | 0076 | Safe search by the tags of a page |
 | 0077 | regex-zig 0.4.0 |
+| 0078 | A limit of pages per site in a run |

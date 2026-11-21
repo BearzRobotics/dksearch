@@ -89,7 +89,7 @@ const max_mediawiki_calls = 200;
 const feed_cap = 100;
 const accept_robots = "text/plain";
 
-const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page", "report_file", "robots_sitemaps", "use_feeds", "mediawiki", "mediawiki_max_pages", "render_command", "render_args", "render_hosts", "render_timeout_seconds", "render_max_pages", "watch_seeds" };
+const allowed_options = [_][]const u8{ "user_agent", "seeds_file", "delay_ms", "max_page_bytes", "max_depth", "max_pages", "follow_external", "allow_private_addresses", "max_hosts", "max_pages_per_host", "timeout_seconds", "ca_bundle", "language", "workers", "window", "validators_file", "tor_socks", "i2p_proxy", "hidden_links", "allow_unbanned_onions", "seeds_sections", "seeds_skip", "recrawl_adaptive", "recrawl_min_hours", "recrawl_max_days", "index_images", "max_images_per_page", "report_file", "robots_sitemaps", "use_feeds", "mediawiki", "mediawiki_max_pages", "render_command", "render_args", "render_hosts", "render_timeout_seconds", "render_max_pages", "watch_seeds" };
 
 // ------------------------------------------------------------ validation
 
@@ -178,6 +178,7 @@ pub fn validate(source: config.Source, diag: *config.Diagnostic) config.Error!vo
     try intOption(source, "max_depth", 0, hard_max_depth, diag);
     try intOption(source, "max_pages", 1, hard_max_pages, diag);
     try intOption(source, "max_hosts", 1, hard_max_hosts, diag);
+    try intOption(source, "max_pages_per_host", 1, hard_max_pages, diag);
     try boolOption(source, "follow_external", diag);
     try boolOption(source, "allow_private_addresses", diag);
     try intOption(source, "timeout_seconds", 1, max_timeout_s, diag);
@@ -247,6 +248,9 @@ pub const CrawlConnector = struct {
     max_depth: u32,
     max_pages: u32,
     max_hosts: u32,
+    /// The most requests one site gets in a run (0: no limit); the rest of its pages are skipped, so a site with
+    /// tens of thousands of pages cannot hold every worker for days (a site is asked by one worker at a time).
+    max_pages_per_host: u32,
     follow_external: bool,
     allow_private: bool,
     timeout_s: u32,
@@ -337,6 +341,7 @@ pub const CrawlConnector = struct {
             .max_depth = @intCast(source.optionInt("max_depth") orelse default_max_depth),
             .max_pages = @intCast(source.optionInt("max_pages") orelse default_max_pages),
             .max_hosts = @intCast(source.optionInt("max_hosts") orelse default_max_hosts),
+            .max_pages_per_host = @intCast(source.optionInt("max_pages_per_host") orelse 0),
             .follow_external = source.optionBool("follow_external") orelse false,
             .allow_private = source.optionBool("allow_private_addresses") orelse false,
             .timeout_s = @intCast(source.optionInt("timeout_seconds") orelse default_timeout_s),
@@ -1031,6 +1036,8 @@ const Host = struct {
     /// spacing doubles to a minute and the site is asked by one worker at a time, so a long queue of its pages would
     /// hold every worker for hours).
     refusal_run: u32 = 0,
+    /// Requests made to this site in this run, against `max_pages_per_host`.
+    requests: u32 = 0,
     gave_up: bool = false,
     /// The sitemaps named by robots.txt have been taken (once per site and run).
     sitemaps_done: std.atomic.Value(bool) = .init(false),
@@ -1430,6 +1437,7 @@ const Run = struct {
                 host.lock.unlock(self.conn.io);
             }
             if (host.gave_up) return self.skip(.http_status);
+            if (self.conn.max_pages_per_host != 0 and host.requests >= self.conn.max_pages_per_host) return self.skip(.limit);
             // A name of a hidden network goes to the proxy by name, over http only, and is never resolved here; with no
             // proxy for it, it is not contacted at all.
             const via = self.conn.routeFor(u.host) orelse return self.skip(.limit);
@@ -1442,6 +1450,7 @@ const Run = struct {
             }
             if (!host.rules.allowed(try targetOf(a, u))) return self.skip(.robots);
             if (!self.waitTurn(host)) return .stopped;
+            host.requests += 1;
 
             const resp = if (self.renders(u, via)) self.renderPage(a, url) else fetch.get(self.client, a, .{
                 .url = url,
@@ -3358,6 +3367,33 @@ test "a site that refuses over and over is given up on after a few refusals, not
     try testing.expect(total <= max_refusal_run); // three tries for the first page, three for the second, then given up
     try testing.expectEqual(@as(usize, 0), srv.count("/p5"));
     try testing.expectEqual(@as(usize, 0), got.ids.items.len);
+}
+
+test "max_pages_per_host: a site gets that many requests in a run and the rest of its pages are skipped" {
+    var srv: TestServer = undefined;
+    try srv.start(&.{
+        .{ .path = "/q1", .body = "<p>one</p>" },
+        .{ .path = "/q2", .body = "<p>two</p>" },
+        .{ .path = "/q3", .body = "<p>three</p>" },
+        .{ .path = "/q4", .body = "<p>four</p>" },
+    });
+    defer srv.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var seeds: std.ArrayList(u8) = .empty;
+    defer seeds.deinit(testing.allocator);
+    var b: [4][96]u8 = undefined;
+    for ([_][]const u8{ "/q1", "/q2", "/q3", "/q4" }, 0..) |p, i| try seeds.print(testing.allocator, "{s}\n", .{srv.url(&b[i], p)});
+    var conn = try testConnector(&tmp, seeds.items, "t/1");
+    defer conn.deinit();
+    conn.max_depth = 0;
+    conn.max_pages_per_host = 2;
+    var got: Collect = .{};
+    defer got.deinit();
+    var ctl: api.Control = .{};
+    _ = try conn.connector().run(got.sink(), &ctl, null);
+    try testing.expectEqual(@as(usize, 2), got.ids.items.len);
+    try testing.expectEqual(@as(usize, 0), srv.count("/q3") + srv.count("/q4"));
 }
 
 test "the report tells a blocked site (403), a robots.txt refusal and a good site apart" {
