@@ -4340,6 +4340,10 @@ test "web pictures: the gallery shows them through the relay, which fetches the 
     try testing.expect(std.mem.indexOf(u8, gallery.body, "src=\"/doc/71717171717171717171717171717171/image\"") != null);
     const none = handleServices(a, s, .{ .content = mem.store() }, .GET, "/search?q=sky&images=1");
     try testing.expect(std.mem.indexOf(u8, none.body, "<img") == null and std.mem.indexOf(u8, none.body, "no preview") != null);
+    // A picture's own page keeps the search type: Enter in its box searches pictures again.
+    const photo = handleServices(a, s, services, .GET, "/doc/71717171717171717171717171717171");
+    try testing.expectEqual(http.Status.ok, photo.status);
+    try testing.expect(std.mem.indexOf(u8, photo.body, "<button type=\"submit\" name=\"type\" value=\"images\">Search</button>") != null);
 }
 
 test "answers: off by default, a question is needed, nothing is asked of the model without passages, and an unreachable model is said" {

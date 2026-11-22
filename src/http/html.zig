@@ -975,18 +975,21 @@ pub fn writeDate(w: *Writer, secs: i64) Writer.Error!void {
 pub const OpenLink = struct { href: []const u8, label: []const u8 };
 
 /// One line at the top of the viewer pages: the name and a search box.
-fn writeTopBar(w: *Writer) Writer.Error!void {
+fn writeTopBar(w: *Writer, mode: Mode) Writer.Error!void {
     try w.writeAll("<header class=\"topbar\"><a class=\"brand\" href=\"/\">dksearch</a>" ++
         "<form class=\"search\" action=\"/search\" method=\"get\" role=\"search\">" ++
         "<input type=\"search\" name=\"q\" maxlength=\"1024\" aria-label=\"Search\" placeholder=\"Search\">" ++
-        "<button type=\"submit\">Search</button></form></header>\n");
+        "<button type=\"submit\"");
+    // A picture's page keeps searching pictures: Enter in the box sends the type like the results page does.
+    if (mode != .all) try w.print(" name=\"type\" value=\"{s}\"", .{mode.value()});
+    try w.writeAll(">Search</button></form></header>\n");
 }
 
 /// A page from a ZIM file. `body` was made safe by the sanitizer.
 pub fn writeArticle(w: *Writer, title: []const u8, source: []const u8, body: []const u8) Writer.Error!void {
     try writeHead(w, title);
     try w.writeAll("<body>");
-    try writeTopBar(w);
+    try writeTopBar(w, .all);
     try w.writeAll("<main class=\"docpage\"><h2 class=\"doctitle\">");
     try writeEscaped(w, title);
     try w.writeAll("</h2>\n<p class=\"muted small\">From the ZIM source <a href=\"/search?q=*&amp;connector=");
@@ -1001,7 +1004,7 @@ pub fn writeArticle(w: *Writer, title: []const u8, source: []const u8, body: []c
 pub fn writeDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, cut: bool, open_links: []const OpenLink, rendered: ?[]const u8, is_markdown: bool, similar: []const dk.search.Hit) Writer.Error!void {
     try writeHead(w, h.title orelse h.url orelse "Document");
     try w.writeAll("<body>");
-    try writeTopBar(w);
+    try writeTopBar(w, .all);
     try w.writeAll("<main class=\"docpage\"><h2 class=\"doctitle\">");
     try writeEscaped(w, h.title orelse h.url orelse "(untitled)");
     try w.writeAll("</h2>\n<dl class=\"meta\">");
@@ -1089,7 +1092,7 @@ pub fn writeImageDocument(w: *Writer, h: dk.search.Hit, text: ?[]const u8, src: 
     const label = h.title orelse h.url orelse "Picture";
     try writeHead(w, label);
     try w.writeAll("<body>");
-    try writeTopBar(w);
+    try writeTopBar(w, .images);
     try w.writeAll("<main class=\"docpage imgpage\"><h2 class=\"doctitle\">");
     try writeEscaped(w, label);
     try w.writeAll("</h2>\n");
