@@ -253,6 +253,21 @@ fn collectionVisible(services: Services, col: dk.config.Collection) bool {
 
 /// Results that hold the same text or are the same page, folded into the first (the best), which lists where else
 /// they are in `same_in`. Results without an identity are never folded.
+/// The gallery shows a picture once: the same picture found twice (stored by two sources, or listed twice on a page) has the
+/// same page, the same words and the same stored size.
+fn foldRepeatedPictures(arena: Allocator, hits: []const dk.search.Hit) error{OutOfMemory}![]const dk.search.Hit {
+    var out: std.ArrayList(dk.search.Hit) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (hits) |h| {
+        if (h.url != null and h.title != null) {
+            const key = try std.fmt.allocPrint(arena, "{s}\x00{s}\x00{d}", .{ h.url.?, h.title.?, h.size orelse 0 });
+            if ((try seen.getOrPut(arena, key)).found_existing) continue;
+        }
+        try out.append(arena, h);
+    }
+    return out.items;
+}
+
 fn groupDuplicates(arena: Allocator, hits: []const dk.search.Hit) error{OutOfMemory}![]const dk.search.Hit {
     var out: std.ArrayList(dk.search.Hit) = .empty;
     var first_of: std.StringHashMapUnmanaged(usize) = .empty;
@@ -2428,6 +2443,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         for (page.hits, with_ident) |h, *dst| dst.* = try withIdent(arena, services, h);
         shown.hits = try groupDuplicates(arena, with_ident);
     }
+    if (gallery and !(if (params.get("group")) |g| std.mem.eql(u8, g, "0") else false)) shown.hits = try foldRepeatedPictures(arena, page.hits);
     form.peer_names = try peerNames(arena, services);
     if (try federate(arena, services, params, q, page.hits)) |f| {
         shown.hits = f.hits;
@@ -4304,6 +4320,21 @@ test "search types: each adds its own condition, the bar marks the chosen one, a
     // An unknown type is All.
     _ = run(&fake, .GET, "/search?q=report&type=nonsense", &ar);
     for (fake.last.?.filter_strings) |f| try testing.expect(std.mem.indexOf(u8, f, "ext:") == null);
+}
+
+test "the gallery shows a picture once, even when two sources stored it; group=0 shows both" {
+    const hits = [_]dk.search.Hit{
+        .{ .id = @splat(1), .connector = "curated", .url = "https://example.org/walls", .title = "Sky", .snippet = null, .score = 3, .kind = "image", .size = 600 },
+        .{ .id = @splat(2), .connector = "curated-images", .url = "https://example.org/walls", .title = "Sky", .snippet = null, .score = 2, .kind = "image", .size = 600 },
+        .{ .id = @splat(3), .connector = "curated", .url = "https://example.org/walls", .title = "Sky", .snippet = null, .score = 1, .kind = "image", .size = 900 },
+    };
+    var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const once = run(&fake, .GET, "/search?q=sky&type=images", &ar);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, once.body, "<li><a href=\"/doc/"));
+    const all = run(&fake, .GET, "/search?q=sky&type=images&group=0", &ar);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, all.body, "<li><a href=\"/doc/"));
 }
 
 test "web pictures: the gallery shows them through the relay, which fetches the recorded address and stores nothing" {

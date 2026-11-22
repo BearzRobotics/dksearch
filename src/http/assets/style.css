@@ -3,6 +3,7 @@
   --fg: #1b1f23;
   --muted: #5a6370;
   --accent: #1a5fb4;
+  --visited: #7b3fa8;
   --border: #d5d9de;
   --mark: #fff1a8;
 }
@@ -12,6 +13,7 @@
     --fg: #e6e8eb;
     --muted: #9aa4b1;
     --accent: #78aeed;
+    --visited: #c09be0;
     --border: #2c323a;
     --mark: #5a4a00;
   }
@@ -117,6 +119,8 @@ a { color: var(--accent); }
 .error { color: #c01c28; }
 ol.results { list-style: none; padding: 0; margin: 1.5rem 0; }
 ol.results li { margin: 0 0 1.5rem; }
+/* A result you have opened is a different colour (a browser only lets a visited link change its colour). */
+ol.results a:visited, .gallery a:visited .cap { color: var(--visited); }
 .title { font-size: 1.1rem; }
 .url { color: var(--muted); font-size: 0.85rem; overflow-wrap: anywhere; }
 .snippet { margin: 0.2rem 0; overflow-wrap: anywhere; }
