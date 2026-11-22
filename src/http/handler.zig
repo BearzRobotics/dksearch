@@ -2358,6 +2358,9 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         q.filter_strings = more;
     }
     try limitQuery(arena, &q, services);
+    // A gallery, or a search type browsed with no words, is meant to fill the page: the few-per-site limit that keeps one
+    // site from crowding a page of text results would leave a row or two. (A request's own `per_domain` still counts.)
+    if ((gallery or (mode != .all and std.mem.trim(u8, q.text, " \t").len == 0)) and params.get("per_domain") == null) q.per_domain = 0;
     // The owner is shown how each score came about.
     if (services.is_owner and !gallery) q.explain = true;
     // The ticked sources (`source`, repeatable) and the older single `connector`: each is a source name or
@@ -4238,6 +4241,15 @@ test "the Images button shows only pictures as a gallery, from this server's own
     try testing.expect(left_out);
     _ = run(&fake, .GET, "/search?q=wallpapers+kind%3Aimage", &ar);
     for (fake.last.?.filter_strings) |f| try testing.expect(!std.mem.eql(u8, f, "-kind:image"));
+    // The gallery is not held to a few pictures per site (it would show a row or two); a text search is, and the box may be empty.
+    _ = handleServices(ar.allocator(), fake.searcher(), .{ .per_domain = 3 }, .GET, "/search?q=sky&type=images");
+    try testing.expectEqual(@as(u32, 0), fake.last.?.per_domain);
+    _ = handleServices(ar.allocator(), fake.searcher(), .{ .per_domain = 3 }, .GET, "/search?q=&type=images");
+    try testing.expectEqual(@as(u32, 0), fake.last.?.per_domain);
+    _ = handleServices(ar.allocator(), fake.searcher(), .{ .per_domain = 3 }, .GET, "/search?q=&type=docs");
+    try testing.expectEqual(@as(u32, 0), fake.last.?.per_domain);
+    _ = handleServices(ar.allocator(), fake.searcher(), .{ .per_domain = 3 }, .GET, "/search?q=sky");
+    try testing.expectEqual(@as(u32, 3), fake.last.?.per_domain);
     _ = run(&fake, .GET, "/search?q=wallpapers&filter=ext%3Apng", &ar);
     for (fake.last.?.filter_strings) |f| try testing.expect(!std.mem.eql(u8, f, "-kind:image"));
     // With the button: the kind filter is added, the page is a grid of 40, and the pager keeps `images=1`.
