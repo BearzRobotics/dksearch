@@ -2422,7 +2422,8 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
 
     var shown = page;
     // The same text in several sources is one result, naming the others (`group=0` shows them all).
-    if (!(if (params.get("group")) |g| std.mem.eql(u8, g, "0") else false)) {
+    // (Not in the gallery: the pictures of one page carry the page's text, and would be folded into one.)
+    if (!gallery and !(if (params.get("group")) |g| std.mem.eql(u8, g, "0") else false)) {
         const with_ident = try arena.alloc(dk.search.Hit, page.hits.len);
         for (page.hits, with_ident) |h, *dst| dst.* = try withIdent(arena, services, h);
         shown.hits = try groupDuplicates(arena, with_ident);
