@@ -253,19 +253,34 @@ fn collectionVisible(services: Services, col: dk.config.Collection) bool {
 
 /// Results that hold the same text or are the same page, folded into the first (the best), which lists where else
 /// they are in `same_in`. Results without an identity are never folded.
-/// The gallery shows a picture once: the same picture found twice (stored by two sources, or listed twice on a page) has the
-/// same page, the same words and the same stored size.
-fn foldRepeatedPictures(arena: Allocator, hits: []const dk.search.Hit) error{OutOfMemory}![]const dk.search.Hit {
+/// The gallery shows a picture once. The picture's own address (the first line of its stored text, `Image: ADDRESS`) says
+/// which file it is, so two records of one file (two sources stored it, or a page lists it twice) are one picture. When the
+/// text cannot be read, the page, the words and the stored size stand in for it.
+fn foldRepeatedPictures(arena: Allocator, services: Services, hits: []const dk.search.Hit) error{OutOfMemory}![]const dk.search.Hit {
     var out: std.ArrayList(dk.search.Hit) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (hits) |h| {
-        if (h.url != null and h.title != null) {
-            const key = try std.fmt.allocPrint(arena, "{s}\x00{s}\x00{d}", .{ h.url.?, h.title.?, h.size orelse 0 });
+        if (try pictureKey(arena, services, h)) |key| {
             if ((try seen.getOrPut(arena, key)).found_existing) continue;
         }
         try out.append(arena, h);
     }
     return out.items;
+}
+
+fn pictureKey(arena: Allocator, services: Services, h: dk.search.Hit) error{OutOfMemory}!?[]const u8 {
+    if (h.node == null) {
+        if (services.content) |store| {
+            const text = store.get(arena, h.id) catch null;
+            if (text) |t| {
+                const line = t[0..(std.mem.indexOfScalar(u8, t, '\n') orelse t.len)];
+                if (std.mem.startsWith(u8, line, "Image: ") and line.len > 7) return try std.fmt.allocPrint(arena, "i\x00{s}", .{line[7..]});
+            }
+        }
+    }
+    const url = h.url orelse return null;
+    const title = h.title orelse return null;
+    return try std.fmt.allocPrint(arena, "p\x00{s}\x00{s}\x00{d}", .{ url, title, h.size orelse 0 });
 }
 
 fn groupDuplicates(arena: Allocator, hits: []const dk.search.Hit) error{OutOfMemory}![]const dk.search.Hit {
@@ -2443,7 +2458,7 @@ fn pageSearch(arena: Allocator, searcher: dk.search.Searcher, regex: ?*dk.regexs
         for (page.hits, with_ident) |h, *dst| dst.* = try withIdent(arena, services, h);
         shown.hits = try groupDuplicates(arena, with_ident);
     }
-    if (gallery and !(if (params.get("group")) |g| std.mem.eql(u8, g, "0") else false)) shown.hits = try foldRepeatedPictures(arena, page.hits);
+    if (gallery and !(if (params.get("group")) |g| std.mem.eql(u8, g, "0") else false)) shown.hits = try foldRepeatedPictures(arena, services, page.hits);
     form.peer_names = try peerNames(arena, services);
     if (try federate(arena, services, params, q, page.hits)) |f| {
         shown.hits = f.hits;
@@ -4322,18 +4337,24 @@ test "search types: each adds its own condition, the bar marks the chosen one, a
     for (fake.last.?.filter_strings) |f| try testing.expect(std.mem.indexOf(u8, f, "ext:") == null);
 }
 
-test "the gallery shows a picture once, even when two sources stored it; group=0 shows both" {
+test "the gallery shows a picture once, by the address of the picture; group=0 shows every record" {
+    var mem = dk.memory.MemoryContentStore.init(testing.allocator);
+    defer mem.deinit();
+    try mem.store().put(@splat(1), "Image: https://example.org/a.png\nPage: https://example.org/walls\nSky");
+    try mem.store().put(@splat(2), "Image: https://example.org/a.png\nPage: https://example.org/walls\nSky");
+    try mem.store().put(@splat(3), "Image: https://example.org/b.png\nPage: https://example.org/walls\nSky");
     const hits = [_]dk.search.Hit{
-        .{ .id = @splat(1), .connector = "curated", .url = "https://example.org/walls", .title = "Sky", .snippet = null, .score = 3, .kind = "image", .size = 600 },
-        .{ .id = @splat(2), .connector = "curated-images", .url = "https://example.org/walls", .title = "Sky", .snippet = null, .score = 2, .kind = "image", .size = 600 },
-        .{ .id = @splat(3), .connector = "curated", .url = "https://example.org/walls", .title = "Sky", .snippet = null, .score = 1, .kind = "image", .size = 900 },
+        .{ .id = @splat(1), .connector = "curated", .url = "https://example.org/walls", .title = "Sky", .snippet = null, .score = 3, .kind = "image", .size = 60 },
+        .{ .id = @splat(2), .connector = "curated-images", .url = "https://example.org/walls", .title = "Sky", .snippet = null, .score = 2, .kind = "image", .size = 60 },
+        // The same page, words and size, but another file: a different picture.
+        .{ .id = @splat(3), .connector = "curated", .url = "https://example.org/walls", .title = "Sky", .snippet = null, .score = 1, .kind = "image", .size = 60 },
     };
     var fake: FakeSearch = .{ .result = .{ .hits = &hits, .has_more = false } };
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const once = run(&fake, .GET, "/search?q=sky&type=images", &ar);
+    const once = handleServices(ar.allocator(), fake.searcher(), .{ .content = mem.store() }, .GET, "/search?q=sky&type=images");
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, once.body, "<li><a href=\"/doc/"));
-    const all = run(&fake, .GET, "/search?q=sky&type=images&group=0", &ar);
+    const all = handleServices(ar.allocator(), fake.searcher(), .{ .content = mem.store() }, .GET, "/search?q=sky&type=images&group=0");
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, all.body, "<li><a href=\"/doc/"));
 }
 
