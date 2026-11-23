@@ -307,6 +307,7 @@ fn run(init: std.process.Init) u8 {
         var config_path: ?[]const u8 = null;
         var source: ?[]const u8 = null;
         var yes = false;
+        var blocked = false;
         while (args.next()) |a| {
             if (eq(a, "--config")) {
                 config_path = args.next() orelse return usageError(io, "--config needs a FILE");
@@ -314,6 +315,8 @@ fn run(init: std.process.Init) u8 {
                 config_path = a["--config=".len..];
             } else if (eq(a, "--yes")) {
                 yes = true;
+            } else if (eq(a, "--blocked")) {
+                blocked = true;
             } else if (std.mem.startsWith(u8, a, "-")) {
                 err(io, "unknown option for remove: {s}", .{a});
                 return exit_usage;
@@ -324,6 +327,10 @@ fn run(init: std.process.Init) u8 {
             }
         }
         if (config_path == null) return usageError(io, "remove needs --config FILE (it names the data directory)");
+        if (blocked) {
+            if (source != null) return usageError(io, "remove --blocked takes no SOURCE");
+            return removeBlockedCmd(io, gpa, config_path.?, yes);
+        }
         return removeCmd(io, gpa, config_path.?, source orelse return usageError(io, "remove needs a SOURCE name"), yes);
     }
 
@@ -2132,6 +2139,45 @@ fn removeCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, source: []
         return exit_io;
     };
     out(io, "{s}: removed {d} of {d} document{s}{s}\n", .{ source, r.removed, n, if (n == 1) "" else "s", if (r.complete) "" else " (stopped early; run again to finish)" });
+    return if (r.complete) exit_ok else exit_failure;
+}
+
+/// `remove --blocked`: deletes the documents whose address is on the blocked lists of the configuration (`[filters]` and the
+/// ban lists), which no search shows. Without --yes it only counts them.
+fn removeBlockedCmd(io: Io, gpa: std.mem.Allocator, config_path: []const u8, yes: bool) u8 {
+    var diag: dk.config.Diagnostic = .{};
+    var cfg = loadAndValidate(gpa, io, config_path, &diag) catch |e| return configFailure(io, e, &diag);
+    defer cfg.deinit();
+    if (!prepareDataDir(io, cfg.data_dir)) return exit_io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const la = arena_state.allocator();
+    const paths = Paths.make(la, cfg.data_dir) catch return exit_io;
+    const lists = buildDomainLists(io, la, cfg, false, config_path) orelse return exit_io;
+    if (lists.blocked.isEmpty()) {
+        out(io, "no blocked domains are configured: nothing to remove\n", .{});
+        return exit_ok;
+    }
+    const lock = lockWriters(io, cfg.data_dir, "remove") orelse return exit_io;
+    defer lock.release(io);
+
+    var state = openState(io, gpa, paths.state) orelse return exit_io;
+    defer state.close();
+    var content = openContent(io, gpa, paths.content) orelse return exit_io;
+    defer content.close();
+    var index = openIndex(io, paths.index, &cfg, false) orelse return exit_io;
+    defer index.close();
+    installSignalHandlers(onImportSignal);
+    var pipe = dk.pipeline.Pipeline.init(content.store(), state.documents(), index.indexer(), .{ .now = now });
+    const r = dk.runner.removeBlocked(la, &pipe, &lists, yes, &import_control) catch |e| {
+        err(io, "removal failed: {t}. Run it again to finish", .{e});
+        return exit_io;
+    };
+    if (!yes) {
+        out(io, "{d} of {d} documents are on a blocked domain. Nothing was removed; run again with --yes to remove them from the index, the retained text and the records (this cannot be undone)\n", .{ r.matched, r.seen });
+        return exit_ok;
+    }
+    out(io, "removed {d} of {d} documents on blocked domains{s}\n", .{ r.removed, r.matched, if (r.complete) "" else " (stopped early; run again to finish)" });
     return if (r.complete) exit_ok else exit_failure;
 }
 

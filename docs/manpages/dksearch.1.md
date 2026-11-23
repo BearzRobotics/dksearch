@@ -10,7 +10,7 @@ dksearch - self-hosted search engine: import documents, serve a search index ove
 
     dksearch import --config FILE (SOURCE | --all) [--prune]
 
-    dksearch remove --config FILE SOURCE [--yes]
+    dksearch remove --config FILE (SOURCE | --blocked) [--yes]
 
     dksearch rebuild [--config FILE]
 

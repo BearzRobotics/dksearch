@@ -51,12 +51,17 @@ pub const commands = [_]Command{
     },
     .{
         .name = "remove",
-        .synopsis = "remove --config FILE SOURCE [--yes]",
-        .summary = "Delete all documents a source imported",
+        .synopsis = "remove --config FILE (SOURCE | --blocked) [--yes]",
+        .summary = "Delete all documents a source imported, or those on blocked domains",
         .detail =
         \\Removes every document imported under the name SOURCE from the index, the stored
         \\text and the records, and forgets its import history. Nothing is removed unless
         \\you add --yes. SOURCE need not still be in the configuration file.
+        \\
+        \\With --blocked (and no SOURCE) it removes, from every source, the documents whose address
+        \\is on a blocked domain of the configuration ([filters] blocklist, blocklist_files and ban,
+        \\[safe_search] ban_files): the ones no search shows. Stop `serve` first; a dry run (no --yes)
+        \\only counts them.
         \\
         ,
     },

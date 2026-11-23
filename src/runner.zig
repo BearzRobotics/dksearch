@@ -19,6 +19,7 @@ const connector_mod = @import("connector.zig");
 const pipeline = @import("pipeline.zig");
 const state_sqlite = @import("state_sqlite.zig");
 const storage = @import("storage.zig");
+const domainlist = @import("domainlist.zig");
 
 pub const Result = struct {
     job_id: i64,
@@ -263,6 +264,61 @@ pub fn removeSource(
     return result;
 }
 
+/// The documents whose address is on the blocked list (what a search never shows), found by `removeBlocked`.
+const BlockedScan = struct {
+    arena: Allocator,
+    lists: *const domainlist.Lists,
+    ids: std.ArrayList(doc.Id) = .empty,
+    seen: u64 = 0,
+
+    fn visit(ptr: *anyopaque, rec: storage.Record) storage.Error!void {
+        const self: *BlockedScan = @ptrCast(@alignCast(ptr));
+        self.seen += 1;
+        if (self.lists.blocksUrl(rec.meta.canonical_url)) self.ids.append(self.arena, rec.id) catch return error.OutOfMemory;
+    }
+};
+
+pub const BlockedResult = struct { seen: u64, matched: u64, removed: u64 = 0, complete: bool = true };
+
+/// Removes every document whose address is on the blocked list, in batches of `page` (the stores and the index), or only
+/// counts them when `apply` is false. The records are read first and removed afterwards, since the store must not change
+/// during a visit. A repeat run finishes what an interrupted one left.
+pub fn removeBlocked(
+    arena: Allocator,
+    pipe: *pipeline.Pipeline,
+    lists: *const domainlist.Lists,
+    apply: bool,
+    control: *connector_mod.Control,
+) Error!BlockedResult {
+    var scan: BlockedScan = .{ .arena = arena, .lists = lists };
+    pipe.docs.forEach(.{ .ptr = &scan, .visit = BlockedScan.visit }) catch |e| return stateError(e);
+    var out: BlockedResult = .{ .seen = scan.seen, .matched = scan.ids.items.len };
+    if (!apply) return out;
+    var at: usize = 0;
+    while (at < scan.ids.items.len) {
+        if (control.isCancelled()) {
+            out.complete = false;
+            return out;
+        }
+        const end = @min(at + page, scan.ids.items.len);
+        pipe.beginBatch() catch |e| return stateError(e);
+        for (scan.ids.items[at..end]) |id| pipe.remove(id) catch |e| {
+            pipe.abortBatch();
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            out.complete = false;
+            return out;
+        };
+        pipe.commitBatch() catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            out.complete = false;
+            return out;
+        };
+        out.removed += end - at;
+        at = end;
+    }
+    return out;
+}
+
 /// Removes `entries` as one batch.
 fn removeEntries(pipe: *pipeline.Pipeline, entries: []const storage.Entry) !u64 {
     try pipe.beginBatch();
@@ -429,6 +485,39 @@ test "a complete run feeds the pipeline and records a finished job" {
     try testing.expectEqual(@as(u64, 3), job.submitted);
     // Nothing to resume once a run has completed.
     try testing.expect((try rig.state.resumePoint(rig.arena.allocator(), "src")) == null);
+}
+
+test "removeBlocked counts the documents of blocked domains, and removes them from every store only when asked" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const a = rig.arena.allocator();
+    const urls = [_][]const u8{ "https://bad.example/a", "https://www.bad.example/b", "https://good.example/c", "https://other.example/d" };
+    for (urls, 0..) |u, i| {
+        var name_buf: [8]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "d{d}", .{i});
+        try rig.pipe.submit(.{ .connector = if (i % 2 == 0) "one" else "two", .source_id = name, .canonical_url = u, .title = name, .text = "some words here" });
+    }
+    try testing.expectEqual(@as(usize, 4), rig.docs.count());
+    var lists: domainlist.Lists = .{};
+    _ = try lists.blocked.add(a, "bad.example");
+    var ctl: connector_mod.Control = .{};
+
+    // A dry run only counts (the subdomain is under the domain).
+    const dry = try removeBlocked(a, &rig.pipe, &lists, false, &ctl);
+    try testing.expectEqual(@as(u64, 4), dry.seen);
+    try testing.expectEqual(@as(u64, 2), dry.matched);
+    try testing.expectEqual(@as(u64, 0), dry.removed);
+    try testing.expectEqual(@as(usize, 4), rig.docs.count());
+
+    const real = try removeBlocked(a, &rig.pipe, &lists, true, &ctl);
+    try testing.expectEqual(@as(u64, 2), real.removed);
+    try testing.expect(real.complete);
+    try testing.expectEqual(@as(usize, 2), rig.docs.count());
+    try testing.expectEqual(@as(usize, 2), rig.content.count());
+    try testing.expectEqual(@as(u64, 2), try rig.idx.count());
+    // A repeat finds nothing more.
+    try testing.expectEqual(@as(u64, 0), (try removeBlocked(a, &rig.pipe, &lists, true, &ctl)).matched);
 }
 
 test "rejected documents are counted and do not stop the run" {
