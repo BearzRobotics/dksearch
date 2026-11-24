@@ -95,3 +95,5 @@ Each record states the context, the options considered, the decision and who mad
 | 0077 | regex-zig 0.4.0 |
 | 0078 | A limit of pages per site in a run |
 | 0079 | A crawl level does not wait for one big site |
+| 0080 | Search types, the picture page and a gallery that fills |
+| 0081 | Removing the documents of blocked domains, and hosts files as block lists |

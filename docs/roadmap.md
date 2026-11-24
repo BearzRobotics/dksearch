@@ -18,7 +18,10 @@ Standing rules that shape every item: the core stays lexical and works with no A
 - Good/bad marks on results, kept in `feedback.jsonl` and read by `dksearch eval`, which now measures what the page shows (0064); a box to suggest a missing site, one address or a list, crawled by a source that starts by itself after a change without disturbing a manual run (0066).
 - A thumbnail cache, opt-in, with a size cap (0055); pictures of the web shown through a relay that stores nothing (0052); admin buttons: restart, ZIM importer with queue and progress, block lists with Off/Ban/Hide per list.
 
+- Search types under the box (All, Images, Video, Docs, Sheets, Slides) that Enter and the pager keep, listing everything of a type when the box is empty; a picture's page with the picture and its details; a gallery that fills the page and shows a picture once; visited results in another colour; safe-search buttons that return to the search (0080).
+
 **Crawler**
+- A site that refuses six times in a row is given up for the run; `max_pages_per_host` caps one site's requests in a run (0078); a level ends two minutes after its queue empties when only a few busy sites remain, and the rest goes on into the next level (0079); `dksearch remove --blocked` deletes the documents of blocked domains, and a hosts file works as a block list (0081).
 - Per-site crawl report and polite backoff (0057); tidy addresses, trap avoidance, link priority, robots.txt sitemaps and feeds (0058); MediaWiki sites listed through their API (0059); optional rendering of script-built pages with an external program, enabled for DevDocs only (0060); dot segments and session parameters removed from addresses; the page's own language recorded.
 - Sites behind a bot check (the OSDev wiki and forum, brokenthorn.com) are reported as blocked and not worked around.
 
@@ -51,6 +54,8 @@ Standing rules that shape every item: the core stays lexical and works with no A
 - Big files: `admin.zig`, `handler.zig`, `crawl.zig` and `index_sqlite.zig` are 3,000 to 5,000 lines each, much of it tests; split when touching them.
 - The test suite takes several minutes, mostly writing to a slow disk (see "Build and test cache on a fast disk" in the manual).
 
+- **Crawler, next:** reading PDFs and office files (pdftotext and the office readers exist; Docs, Sheets and Slides are empty until the crawler uses them; ask the owner first); a pipelined frontier with no levels (0079 is the smaller fix); video files and their duration and resolution; the crawl keeps running on the owner's playground and should be left running (restarts send a running job back to level 0, so avoid them).
+- **Playground notes (owner's machine, not part of the code):** the old `curated-images` source's ~1,200 documents are left in the index on purpose (the gallery folds their repeats); the Anti-Porn HOSTS list is in `[filters] blocklist_files`, deviantart.com allowed; kink.com is not in `safesearch.toml` (asked, no answer).
 - **Tags, next:** measure `tag_boost` once the crawl has re-fetched tagged pages; a `/tags` browse page; anchor-text and heading weighting; duration and resolution shown on results.
 
 ## Then
