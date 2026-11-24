@@ -62,6 +62,11 @@ pub const max_timeout_s: u32 = 300;
 const max_redirects = 5;
 /// Links taken from one page, pending URLs per tree, and URLs remembered per run.
 const max_links_per_page = 2000;
+/// When a level's queue is empty and only pages of busy sites are left, the level waits this many seconds for them and then
+/// ends; what is left goes on into the next level. (Each site is asked by one worker at a time, so one big site's queue
+/// would otherwise hold every worker, and every other site's next level, for hours.)
+const tail_grace_s: i64 = 120;
+
 /// Pages found per level by one worker are kept up to this many (bounds the memory of a level).
 const max_level_items = 100_000;
 const max_visited = 2_000_000;
@@ -508,7 +513,15 @@ pub const CrawlConnector = struct {
                 // The next level: what the workers found, taken a seed at a time so that consecutive pages are on
                 // different sites (a site is asked by one worker at a time, so a run of one site's pages would
                 // leave the others idle).
-                const next = try self.nextLevel(outs, first, end);
+                var next = try self.nextLevel(outs, first, end);
+                // A level cut short (see `tail_grace_s`) hands the pages still set aside on to the next one.
+                if (ctx.cut.load(.monotonic) and ctx.deferred.items.len > 0) {
+                    const joined = try self.gpa.alloc(Task, ctx.deferred.items.len + next.len);
+                    @memcpy(joined[0..next.len], next);
+                    @memcpy(joined[next.len..], ctx.deferred.items);
+                    self.gpa.free(next);
+                    next = joined;
+                }
                 // Stopped part-way through the window: it is not finished (unless this was its last level and every
                 // page of it was fetched, in which case there is nothing left to repeat).
                 if ((control.isCancelled() or sh.stop.load(.monotonic) or sh.exhausted.load(.monotonic)) and !(all_taken and next.len == 0)) {
@@ -556,7 +569,29 @@ pub const CrawlConnector = struct {
         /// Pages set aside because their site was busy; fetched when the level's queue is empty.
         deferred: std.ArrayList(Task) = .empty,
         deferred_mutex: Io.Mutex = .init,
+        /// When the queue first ran empty with pages still set aside (0: not yet), and whether the level was cut short.
+        tail_since: i64 = 0,
+        cut: std.atomic.Value(bool) = .init(false),
     };
+
+    /// How many different sites the last pages of `tasks` (the ones taken next) belong to, looking at up to 64 of them.
+    fn distinctSites(tasks: []const Task) usize {
+        var seen: [64][]const u8 = undefined;
+        var n: usize = 0;
+        const from = tasks.len -| 64;
+        for (tasks[from..]) |t| {
+            var known = false;
+            for (seen[0..n]) |h| if (std.mem.eql(u8, h, t.site)) {
+                known = true;
+                break;
+            };
+            if (!known) {
+                seen[n] = t.site;
+                n += 1;
+            }
+        }
+        return n;
+    }
 
     /// A worker of one level: takes the next page of the level until there are none, fetching, storing and
     /// collecting the links of each into its own list.
@@ -565,7 +600,7 @@ pub const CrawlConnector = struct {
         const r = &ctx.runs[w];
         const sh = r.sh;
         while (true) {
-            if (r.control.isCancelled() or sh.stop.load(.monotonic) or sh.exhausted.load(.monotonic)) return;
+            if (r.control.isCancelled() or sh.stop.load(.monotonic) or sh.exhausted.load(.monotonic) or ctx.cut.load(.monotonic)) return;
             var task: ?Task = null;
             const index = ctx.next.fetchAdd(1, .monotonic);
             if (index < ctx.items.len) {
@@ -586,9 +621,17 @@ pub const CrawlConnector = struct {
                 task = t;
             } else {
                 ctx.deferred_mutex.lockUncancelable(self.io);
+                defer ctx.deferred_mutex.unlock(self.io);
+                if (ctx.deferred.items.len == 0) return;
+                const now_s: i64 = Io.Clock.real.now(self.io).toSeconds();
+                if (ctx.tail_since == 0) ctx.tail_since = now_s;
+                // A tail of many different sites keeps the workers busy: only a tail of a few sites is cut.
+                if (distinctSites(ctx.deferred.items) * 2 >= ctx.runs.len) ctx.tail_since = now_s;
+                if (now_s - ctx.tail_since >= tail_grace_s) {
+                    ctx.cut.store(true, .monotonic);
+                    return;
+                }
                 task = ctx.deferred.pop();
-                ctx.deferred_mutex.unlock(self.io);
-                if (task == null) return;
             }
             const result = r.fetchOne(task.?, &ctx.outs[w]) catch {
                 sh.out_of_memory.store(true, .monotonic);
@@ -3766,4 +3809,16 @@ test "a page's tags (metas, rel=tag, data-tags, JSON-LD) and hashtags are in its
     } else return error.TestUnexpectedResult;
     try testing.expectEqualStrings("just words", got.texts.items[plain]);
     try testing.expectEqualStrings("", got.tags.items[plain]);
+}
+
+test "distinctSites counts the sites among the pages taken next, so a tail of one big site is told from a wide one" {
+    const T = CrawlConnector.Task;
+    var one: [100]T = undefined;
+    for (&one) |*t| t.* = .{ .url = "https://big.example/x", .depth = 1, .seed = 0, .site = "big.example" };
+    try testing.expectEqual(@as(usize, 1), CrawlConnector.distinctSites(&one));
+    var wide: [10]T = undefined;
+    const hosts = [_][]const u8{ "a.example", "b.example", "c.example" };
+    for (&wide, 0..) |*t, i| t.* = .{ .url = "https://x/", .depth = 1, .seed = 0, .site = hosts[i % 3] };
+    try testing.expectEqual(@as(usize, 3), CrawlConnector.distinctSites(&wide));
+    try testing.expectEqual(@as(usize, 0), CrawlConnector.distinctSites(&.{}));
 }
